@@ -1,4 +1,4 @@
-# piezo2mic_improved.py
+# piezo2mic_qweight.py
 import os, glob, random, sys
 import numpy as np
 import soundfile as sf
@@ -6,244 +6,232 @@ import tensorflow as tf
 from sklearn.model_selection import train_test_split
 
 # ───────────────────────── PARAMETERS ─────────────────────────────────────────
-SR           = 48000          # Sample Rate
-SEG_LEN      = 8192*2           # Training segment length (model's fixed input size for training)
+
+FILTERS      = 32
+KERNEL_SIZE  = 63
+MAX_SUPPORTED_BLOCK_SIZE = 2048
+DILATIONS    = (1,2,4,8,16,32,64)  # 7 dilations
+RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
+SR           = 48000
+SEG_LEN      = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE
 BATCH_SIZE   = 32
-EPOCHS       = 1
-PATIENCE     = 5              # Increased patience for more stable convergence
+EPOCHS       = 1            # for quick debug, bump this up to full train
+PATIENCE     = 5
 SHUFFLE_BUF  = 1000
 SRC_DIR      = "./input/source"
 TGT_DIR      = "./input/target"
 OUT_DIR      = "./out"
-DEMO_SEC     = 60 * 5         # Length of the demo audio file to generate after training
+DEMO_SEC     = 60 * 2
+
+STATIC_MODEL_BASENAME      = "piezo2mic_resnet"
+DYNAMIC_MODEL_BASENAME     = STATIC_MODEL_BASENAME + "_dynamic"
+QUANT_MODEL_BASENAME       = DYNAMIC_MODEL_BASENAME + "_qweight"
+
+STATIC_MODEL_FILENAME      = STATIC_MODEL_BASENAME + ".keras"
+DYNAMIC_MODEL_FILENAME     = DYNAMIC_MODEL_BASENAME + ".keras"
+QUANT_MODEL_FILENAME       = QUANT_MODEL_BASENAME + ".keras"
+
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ───────────────────────── DATA LOADING ─────────────────────────────────────
-print("Looking for audio pairs...")
+# ───────────────────────── DATA LOADING ────────────────────────────────────────
+print("Looking for audio pairs…")
 srcs = sorted(glob.glob(os.path.join(SRC_DIR, "*_source.wav")))
 pairs = []
 for s in srcs:
-    # Find corresponding target file
     t = s.replace("_source.wav", "_target.wav").replace(SRC_DIR, TGT_DIR)
     if os.path.exists(t):
-        pairs.append((s, t))
-        
+        pairs.append((s,t))
 if not pairs:
-    print("Error: No source/target audio pairs found in ./input/ !")
-    print("Please ensure your files are named '..._source.wav' and '..._target.wav'")
-    sys.exit(1)
-
+    print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
 
-# ───────────────────── LOSS FUNCTIONS ───────────────────────────────────────
+# ───────────────────────── LOSS FUNCS ─────────────────────────────────────────
 def multi_stft_log_mse(y_true, y_pred):
-    """
-    Computes loss based on the log magnitude of the STFT across multiple resolutions.
-    This helps the model learn perceptually important frequency details.
-    """
     yt = tf.squeeze(y_true, -1)
     yp = tf.squeeze(y_pred, -1)
     loss = 0.0
-    # Using multiple FFT sizes helps capture both coarse and fine spectral details
-    for n_fft, hop in ((512, 128), (1024, 256), (2048, 512)):
+    for n_fft, hop in ((512,128),(1024,256),(2048,512)):
         S_true = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
         S_pred = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        mag_t = tf.abs(S_true)
-        mag_p = tf.abs(S_pred)
-        # Using log1p (log(1+x)) is more stable than log for small magnitudes
+        mag_t = tf.abs(S_true); mag_p = tf.abs(S_pred)
         loss += tf.reduce_mean((tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2)
     return loss
-        
-def combined_loss(y_true, y_pred):
-    """
-    A combination of time-domain (L1) and frequency-domain (multi-STFT) loss.
-    This provides a balanced optimization target.
-    """
-    l1_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
-    stft_loss = multi_stft_log_mse(y_true, y_pred)
-    # These weights can be tuned. 0.8 for time-domain encourages waveform matching,
-    # while 0.2 for spectral ensures frequency content is also corrected.
-    return 0.5 * l1_loss + 0.5 * stft_loss
-    #return 0.8 * l1_loss + 0.2 * stft_loss
 
-# ───────────────────── MODEL ARCHITECTURE ───────────────────────────────────
-def build_resnet(filters=32,
-                        kernel_size=63,
-                        dilations=(1,2,4,8,16,32,64),
-                        dynamic_time=False):
-    """
-    A version of your ResNet that is *strictly causal*: at time t
-    the network only ever looks at inputs <= t, so there is never
-    any right-edge zero padding to pollute your sliding window.
-    """
+def combined_loss(y_true, y_pred):
+    l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
+    stft = multi_stft_log_mse(y_true, y_pred)
+    return 0.5*l1 + 0.5*stft
+
+# ───────────────────────── MODEL ARCH ─────────────────────────────────────────
+def build_resnet(filters=FILTERS,
+                 kernel_size=KERNEL_SIZE,
+                 dilations=DILATIONS,
+                 dynamic_time=False):
     T = None if dynamic_time else SEG_LEN
     inp = tf.keras.Input(shape=(T,1), name="piezo_in")
+    x   = tf.keras.layers.Conv1D(filters,1,padding='same',name="init_pw")(inp)
 
-    # initial 1×1 projection (no change to receptive field)
-    x = tf.keras.layers.Conv1D(filters, 1,
-                               padding='same',
-                               name="init_pw")(inp)
+    for idx,d in enumerate(dilations):
+        res    = x
+        pad_amt= (kernel_size-1)*d
+        x      = tf.keras.layers.ZeroPadding1D((pad_amt,0),name=f"pad_{idx}")(x)
+        x      = tf.keras.layers.SeparableConv1D(
+                    filters=filters,
+                    kernel_size=kernel_size,
+                    dilation_rate=d,
+                    padding='valid',
+                    activation='relu',
+                    name=f"sep_{idx}"
+                 )(x)
+        x      = tf.keras.layers.Conv1D(filters,1,padding='same',name=f"pw_{idx}")(x)
+        x      = tf.keras.layers.Add(name=f"res_add_{idx}")([x,res])
 
-    # build each dilated block with explicit causal padding
-    for idx, d in enumerate(dilations):
-        res = x
-        # compute how many zeros to pad on the left so that
-        # a dilated conv of width K only sees real samples to the right.
-        pad_amt = (kernel_size - 1) * d
-
-        # left-only zero pad
-        x = tf.keras.layers.ZeroPadding1D((pad_amt, 0),
-                                          name=f"pad_{idx}")(x)
-
-        # now a “valid” dilated separable conv of the same kernel_size
-        x = tf.keras.layers.SeparableConv1D(
-                filters       = filters,
-                kernel_size   = kernel_size,
-                dilation_rate = d,
-                padding       = 'valid',      # we already padded
-                activation    = 'relu',
-                name          = f"sep_{idx}"
-            )(x)
-
-        # 1×1 projection—still no RF change, so can use “same”
-        x = tf.keras.layers.Conv1D(filters, 1,
-                                   padding='same',
-                                   name=f"pw_{idx}")(x)
-
-        # residual add
-        x = tf.keras.layers.Add(name=f"res_add_{idx}")([x, res])
-
-    # final 1×1 collapse + global residual
-    x = tf.keras.layers.Conv1D(1,1,padding='same',name="final_pw")(x)
+    x   = tf.keras.layers.Conv1D(1,1,padding='same',name="final_pw")(x)
     out = tf.keras.layers.Add(name="res_out")([x, inp])
+    return tf.keras.Model(inp,out,name="piezo2mic_resnet_causal")
 
-    return tf.keras.Model(inp, out, name="piezo2mic_resnet_causal")
+# ─────────────────── MANUAL WEIGHT-ONLY QUANTIZER ────────────────────────────
+def quantize_weights_inplace(model):
+    """
+    Per-tensor linear quantization of all float32 weights down to 8-bit levels.
+    We compute min/max of each weight tensor, map to [0..255], round, then
+    dequantize back to float32 (so your saved Keras model still has float32
+    weights but only 256 distinct levels).
+    """
+    new_vars = []
+    for w in model.get_weights():
+        w_min, w_max = w.min(), w.max()
+        if w_max <= w_min:
+            new_vars.append(w)
+            continue
+        scale = (w_max - w_min) / 255.0
+        # map to 0..255
+        q = np.round((w - w_min) / scale).astype(np.uint8)
+        # dequantize
+        w_dq = q.astype(np.float32) * scale + w_min
+        new_vars.append(w_dq)
+    model.set_weights(new_vars)
 
-# ───────────────────── MAIN TRAINING FUNCTION ────────────────────────────────
+# ───────────────────────── TRAINING ────────────────────────────────────────────
 def train():
-    # Split files into training and validation sets
-    n = len(pairs)
-    idx = list(range(n))
-    if n >= 2:
-        tr_i, va_i = train_test_split(idx, test_size=0.1, random_state=42)
+    # split train/val
+    n  = len(pairs)
+    idx= list(range(n))
+    if n>=2:
+        tr_i,va_i = train_test_split(idx,test_size=0.1,random_state=42)
     else:
-        # If only one pair, use it for both training and validation
-        tr_i = va_i = idx
-        
+        tr_i=va_i=idx
     train_pairs = [pairs[i] for i in tr_i]
     val_pairs   = [pairs[i] for i in va_i]
-    train_durs  = [sf.info(s).frames for s, _ in train_pairs]
-    val_durs    = [sf.info(s).frames for s, _ in val_pairs]
+    train_durs  = [sf.info(s).frames for s,_ in train_pairs]
+    val_durs    = [sf.info(s).frames for s,_ in val_pairs]
 
     def approx_steps(durs):
-        # Approximate how many segments can be drawn from the audio files per epoch
-        # Using a stride of half the segment length for data augmentation
-        return sum(max((d - SEG_LEN) // (SEG_LEN // 2) + 1, 0) for d in durs) // BATCH_SIZE
+        return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
 
-    steps_per_epoch  = max(approx_steps(train_durs), 1)
-    validation_steps = max(approx_steps(val_durs), 1)
-    print(f"≈ {steps_per_epoch} training steps/epoch, {validation_steps} validation steps")
+    steps_per_epoch  = max(approx_steps(train_durs),1)
+    validation_steps = max(approx_steps(val_durs),1)
+    print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
-    # On-the-fly data generator using tf.data.Dataset
+    # data generator
     def segment_generator(pairs_list, durs_list):
-        """Yields random (source_segment, target_segment) pairs."""
         while True:
-            # Pick a random file
-            i = random.randrange(len(pairs_list))
-            sp, tp = pairs_list[i]
-            dur    = durs_list[i]
-            # Pick a random start offset
-            offset = random.randrange(max(dur - SEG_LEN, 1))
-            
-            x, _ = sf.read(sp, start=offset, frames=SEG_LEN, dtype='float32', always_2d=True)
-            y, _ = sf.read(tp, start=offset, frames=SEG_LEN, dtype='float32', always_2d=True)
-            
-            # Pad if the read segment is too short (end of file)
-            if x.shape[0] < SEG_LEN:
-                pad = SEG_LEN - x.shape[0]
-                x = np.pad(x, ((0, pad), (0, 0)))
-                y = np.pad(y, ((0, pad), (0, 0)))
-
-            # Simple normalization: remove DC offset per segment
+            i       = random.randrange(len(pairs_list))
+            sp,tp   = pairs_list[i]
+            dur     = durs_list[i]
+            offset  = random.randrange(max(dur-SEG_LEN,1))
+            x,_     = sf.read(sp, start=offset, frames=SEG_LEN,
+                              dtype='float32',always_2d=True)
+            y,_     = sf.read(tp, start=offset, frames=SEG_LEN,
+                              dtype='float32',always_2d=True)
+            if x.shape[0]<SEG_LEN:
+                pad=SEG_LEN-x.shape[0]
+                x=np.pad(x,((0,pad),(0,0)))
+                y=np.pad(y,((0,pad),(0,0)))
             x = x - np.mean(x)
             y = y - np.mean(y)
-            
             yield x, y
 
-    sig = tf.TensorSpec((SEG_LEN, 1), tf.float32)
+    sig = tf.TensorSpec((SEG_LEN,1),tf.float32)
     train_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_pairs, train_durs),
-        output_signature=(sig, sig)
+        lambda: segment_generator(train_pairs,train_durs),
+        output_signature=(sig,sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-
-    val_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_pairs, val_durs),
-        output_signature=(sig, sig)
+    val_ds   = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_pairs,val_durs),
+        output_signature=(sig,sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
-    # Build and compile the model
-    model = build_resnet(dynamic_time=False)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-                  loss=combined_loss,
-                  metrics=['mae'])
-    model.summary()
+    # 1) Full-window FP32
+    print("\n≈ Training FP32 model")
+    static_model = build_resnet(dynamic_time=False)
+    static_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+                         loss=combined_loss, metrics=['mae'])
+    static_model.summary()
+    es = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                          patience=PATIENCE,
+                                          restore_best_weights=True)
+    static_model.fit(train_ds,
+                     epochs=EPOCHS,
+                     steps_per_epoch=steps_per_epoch,
+                     validation_data=val_ds,
+                     validation_steps=validation_steps,
+                     callbacks=[es])
+    path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
+    static_model.save(path_static)
+    print("✅ Saved FP32 static model:", path_static)
 
-    # Set up callbacks and train
-    es = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss', patience=PATIENCE, restore_best_weights=True)
-    
-    model.fit(
-        train_ds,
-        epochs=EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=[es]
-    )
+    # 2) Dynamic FP32
+    print("\n≈ Building + saving FP32 dynamic-time model")
+    dynamic_model = build_resnet(dynamic_time=True)
+    dynamic_model.set_weights(static_model.get_weights())
+    path_dyn = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+    dynamic_model.save(path_dyn)
+    print("✅ Saved FP32 dynamic model:", path_dyn)
 
-    # Save the final trained model
-    model.save(os.path.join(OUT_DIR, "piezo2mic_resnet_trained.keras"))
-    print("✅ Keras model saved to:", os.path.join(OUT_DIR, "piezo2mic_resnet_trained.keras"))
-    return model
+    # 3) Manual weight-only quantize
+    print("\n≈ Quantizing weights (8-bit) in dynamic model")
+    quant_model = tf.keras.models.clone_model(dynamic_model)
+    quant_model.set_weights(dynamic_model.get_weights())
+    quantize_weights_inplace(quant_model)
+    path_q   = os.path.join(OUT_DIR, QUANT_MODEL_FILENAME)
+    quant_model.save(path_q)
+    print("✅ Saved weight-quantized dynamic model:", path_q)
 
-# ─────────────────────────── SCRIPT ENTRYPOINT ──────────────────────────────
-if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--train":
-        print("--- Training new model ---")
-        model = train()
+    return (static_model, dynamic_model, quant_model)
+
+# ───────────────────────── MAIN ────────────────────────────────────────────────
+if __name__=="__main__":
+    if len(sys.argv)>1 and sys.argv[1]=="--train":
+        print("–––– TRAINING ––––")
+        _, dynamic_model, quant_model = train()
     else:
-        model_path = os.path.join(OUT_DIR, "piezo2mic_resnet_trained.keras")
-        if not os.path.exists(model_path):
-            print(f"Model not found at {model_path}. Please train one first using:")
-            print(f"python {sys.argv[0]} --train")
+        dpath = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+        qpath = os.path.join(OUT_DIR, QUANT_MODEL_FILENAME)
+        if not os.path.exists(dpath) or not os.path.exists(qpath):
+            print("Dynamic model not found. run: python piezo2mic.py --train")
             sys.exit(1)
-        print(f"--- Loading existing model from {model_path} ---")
-        model = tf.keras.models.load_model(model_path, compile=False)
+        print("Loading dynamic model:", dpath)
+        print("Loading quantized model:", qpath)
+        dynamic_model = tf.keras.models.load_model(dpath, compile=False)
+        quant_model   = tf.keras.models.load_model(qpath, compile=False)
 
-    # Build an inference-specific model with a dynamic time axis
-    print("\nBuilding inference model with dynamic input shape...")
-    inf_model = build_resnet(dynamic_time=True)
-    inf_model.set_weights(model.get_weights())
-    inf_model_path = os.path.join(OUT_DIR, "piezo2mic_resnet_dynamic.keras")
-    inf_model.save(inf_model_path)
-    print("✅ Inference model saved to:", inf_model_path)
-
-    # Generate a demo audio file to test the model
-    print("\nGenerating demo audio file...")
+    # ───────── DEMO ──────────────────────────────────────────────────────────────
+    print("\nGenerating demo…")
     FRAMES = DEMO_SEC * SR
-    piezo_path, mic_path = pairs[0]
-    
-    x_long, _ = sf.read(piezo_path, frames=FRAMES, dtype='float32', always_2d=True)
-    y_ref, _ = sf.read(mic_path, frames=FRAMES, dtype='float32', always_2d=True)
-    
-    x_long = x_long - np.mean(x_long)
-    x_in = x_long[np.newaxis, ...] # Add batch dimension -> (1, T, 1)
-    
-    print("Running inference on demo file...")
-    y_pred = inf_model.predict(x_in, batch_size=1)[0, :, 0] # Remove batch/channel dims
+    pth_src, pth_tgt = pairs[0]
+    x_long,_ = sf.read(pth_src, frames=FRAMES, dtype='float32', always_2d=True)
+    y_ref,_  = sf.read(pth_tgt, frames=FRAMES, dtype='float32', always_2d=True)
+    x_long   = x_long - np.mean(x_long)
+    x_in     = x_long[np.newaxis,...]
 
-    sf.write(os.path.join(OUT_DIR, "demo_input_piezo.wav"), x_long, SR)
-    sf.write(os.path.join(OUT_DIR, "demo_output_predicted.wav"), y_pred, SR)
-    sf.write(os.path.join(OUT_DIR, "demo_reference_mic.wav"), y_ref, SR)
-    print("✅ Wrote demo files to", OUT_DIR)
+    print("Running inference…")
+    y_pred_dynamic = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
+    y_pred_quant = quant_model.predict(x_in, batch_size=1)[0,:,0]
 
+    sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),      x_long, SR)
+    sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),    y_ref,   SR)
+    
+    sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"), y_pred_dynamic,  SR)
+    sf.write(os.path.join(OUT_DIR,"demo_output_pred_quant.wav"), y_pred_quant,  SR)
+    print("✅ Demo files in", OUT_DIR)

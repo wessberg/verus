@@ -12,8 +12,12 @@
 #include "tensorflow/lite/model.h"
 #include "tensorflow/lite/delegates/xnnpack/xnnpack_delegate.h"
 
-// Must match your training SEG_LEN = 8192*2 = 16384
-static constexpr int SEG_LEN = 8192 * 2;
+static constexpr int FILTERS = 32;
+static constexpr int KERNEL_SIZE = 63;
+static constexpr int MAX_SUPPORTED_BLOCK_SIZE = 2048;
+static constexpr int DILATIONS[] = {1, 2, 4, 8, 16, 32, 64}; // 7 dilations
+static constexpr int RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * (DILATIONS[0] + DILATIONS[1] + DILATIONS[2] + DILATIONS[3] + DILATIONS[4] + DILATIONS[5] + DILATIONS[6]);
+static constexpr int SEG_LEN = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE;
 
 std::atomic<bool> gStopFlag(false);
 void signalHandler(int) { gStopFlag = true; }
