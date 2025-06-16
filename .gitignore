@@ -1,3 +1,6 @@
+.DS_Store
 input/
 out/
 .DS_Store
+cpp/lib/
+cpp/build/
