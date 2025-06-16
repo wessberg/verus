@@ -1,0 +1,74 @@
+/* Copyright 2015 The OpenXLA Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include "xla/stream_executor/kernel_spec.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <utility>
+
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
+
+namespace stream_executor {
+
+MultiKernelLoaderSpec MultiKernelLoaderSpec::CreateInProcessSymbolSpec(
+    void *symbol, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return MultiKernelLoaderSpec{InProcessSymbol{symbol}, std::move(kernel_name),
+                               arity, kernel_args_packing};
+}
+
+MultiKernelLoaderSpec MultiKernelLoaderSpec::CreateCudaCubinInMemorySpec(
+    absl::Span<const uint8_t> cubin_bytes, std::string kernel_name,
+    size_t arity, KernelArgsPacking kernel_args_packing) {
+  return MultiKernelLoaderSpec{CudaCubinInMemory{cubin_bytes},
+                               std::move(kernel_name), arity,
+                               kernel_args_packing};
+}
+
+MultiKernelLoaderSpec MultiKernelLoaderSpec::CreateCudaPtxInMemorySpec(
+    absl::string_view ptx, std::string kernel_name, size_t arity,
+    KernelArgsPacking kernel_args_packing) {
+  return MultiKernelLoaderSpec{CudaPtxInMemory{ptx}, std::move(kernel_name),
+                               arity, kernel_args_packing};
+}
+
+MultiKernelLoaderSpec *MultiKernelLoaderSpec::AddInProcessSymbol(
+    void *symbol, absl::string_view kernel_name) {
+  payload_ = InProcessSymbol{symbol};
+  kernel_name_ = std::string{kernel_name};
+  return this;
+}
+
+MultiKernelLoaderSpec *MultiKernelLoaderSpec::AddCudaCubinInMemory(
+    absl::Span<const uint8_t> cubin_bytes, absl::string_view kernel_name) {
+  payload_ = CudaCubinInMemory{cubin_bytes};
+  kernel_name_ = std::string{kernel_name};
+  return this;
+}
+
+MultiKernelLoaderSpec *MultiKernelLoaderSpec::AddCudaPtxInMemory(
+    absl::string_view ptx, absl::string_view kernel_name) {
+  payload_ = CudaPtxInMemory{ptx};
+  kernel_name_ = std::string{kernel_name};
+  return this;
+}
+
+MultiKernelLoaderSpec::MultiKernelLoaderSpec(
+    size_t arity, KernelArgsPacking kernel_args_packing)
+    : arity_(arity), kernel_args_packing_(std::move(kernel_args_packing)) {}
+}  // namespace stream_executor
