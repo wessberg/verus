@@ -9,8 +9,8 @@ from sklearn.model_selection import train_test_split
 
 FILTERS      = 32
 KERNEL_SIZE  = 63
-MAX_SUPPORTED_BLOCK_SIZE = 2048
-DILATIONS    = (1,2,4,8,16,32,64)  # 7 dilations
+MAX_SUPPORTED_BLOCK_SIZE = 512
+DILATIONS    = (1,2,4,8,16,32)
 RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 SR           = 48000
 SEG_LEN      = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE
