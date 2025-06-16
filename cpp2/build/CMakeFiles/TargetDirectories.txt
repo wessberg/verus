@@ -1,3 +1,0 @@
-/Users/ideanote/Developer/tf-audio-experiment/cpp2/build/CMakeFiles/stream_audio_cpp.dir
-/Users/ideanote/Developer/tf-audio-experiment/cpp2/build/CMakeFiles/edit_cache.dir
-/Users/ideanote/Developer/tf-audio-experiment/cpp2/build/CMakeFiles/rebuild_cache.dir
