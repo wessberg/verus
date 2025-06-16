@@ -67,40 +67,57 @@ def combined_loss(y_true, y_pred):
     #return 0.8 * l1_loss + 0.2 * stft_loss
 
 # ───────────────────── MODEL ARCHITECTURE ───────────────────────────────────
-def build_resnet(filters=32, kernel_size=63, dilations=(1, 2, 4, 8, 16, 32, 64), dynamic_time=False):
+def build_resnet(filters=32,
+                        kernel_size=63,
+                        dilations=(1,2,4,8,16,32,64),
+                        dynamic_time=False):
     """
-    Builds a WaveNet-like residual model with dilated separable convolutions.
-    This architecture has a large receptive field with relatively few parameters.
+    A version of your ResNet that is *strictly causal*: at time t
+    the network only ever looks at inputs <= t, so there is never
+    any right-edge zero padding to pollute your sliding window.
     """
-    # Use None for the time dimension to allow for variable-length input during inference
     T = None if dynamic_time else SEG_LEN
-    inp = tf.keras.Input(shape=(T, 1), name="piezo_in")
-    
-    # Initial 1x1 convolution to expand to the desired number of channels (filters)
-    x = tf.keras.layers.Conv1D(filters, 1, padding='same', name="init_pw")(inp)
-    
-    # Stack of dilated residual blocks
+    inp = tf.keras.Input(shape=(T,1), name="piezo_in")
+
+    # initial 1×1 projection (no change to receptive field)
+    x = tf.keras.layers.Conv1D(filters, 1,
+                               padding='same',
+                               name="init_pw")(inp)
+
+    # build each dilated block with explicit causal padding
     for idx, d in enumerate(dilations):
         res = x
-        # SeparableConv1D is more efficient than a standard Conv1D
+        # compute how many zeros to pad on the left so that
+        # a dilated conv of width K only sees real samples to the right.
+        pad_amt = (kernel_size - 1) * d
+
+        # left-only zero pad
+        x = tf.keras.layers.ZeroPadding1D((pad_amt, 0),
+                                          name=f"pad_{idx}")(x)
+
+        # now a “valid” dilated separable conv of the same kernel_size
         x = tf.keras.layers.SeparableConv1D(
-                filters, kernel_size,
-                dilation_rate=d,
-                padding='same',
-                activation='relu',
-                name=f"sep_{idx}"
+                filters       = filters,
+                kernel_size   = kernel_size,
+                dilation_rate = d,
+                padding       = 'valid',      # we already padded
+                activation    = 'relu',
+                name          = f"sep_{idx}"
             )(x)
-        # 1x1 convolution at the end of the block
-        x = tf.keras.layers.Conv1D(filters, 1, padding='same', name=f"pw_{idx}")(x)
-        # Residual connection
+
+        # 1×1 projection—still no RF change, so can use “same”
+        x = tf.keras.layers.Conv1D(filters, 1,
+                                   padding='same',
+                                   name=f"pw_{idx}")(x)
+
+        # residual add
         x = tf.keras.layers.Add(name=f"res_add_{idx}")([x, res])
-        
-    # Final 1x1 convolution to collapse back to a single audio channel
-    x = tf.keras.layers.Conv1D(1, 1, padding='same', name="final_pw")(x)
-    # Final residual connection back to the original input signal
+
+    # final 1×1 collapse + global residual
+    x = tf.keras.layers.Conv1D(1,1,padding='same',name="final_pw")(x)
     out = tf.keras.layers.Add(name="res_out")([x, inp])
-    
-    return tf.keras.Model(inp, out, name="piezo2mic_resnet")
+
+    return tf.keras.Model(inp, out, name="piezo2mic_resnet_causal")
 
 # ───────────────────── MAIN TRAINING FUNCTION ────────────────────────────────
 def train():

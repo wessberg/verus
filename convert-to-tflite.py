@@ -26,10 +26,10 @@ import tensorflow as tf
 DEFAULT_MODEL_PATH = os.path.join("./out", "piezo2mic_resnet_dynamic.keras")
 OUT_DIR    = "./out"
 SRC_DIR    = "./input/source"  # Calibration source .wav files
-NUM_CALIB  = 200                # Increase coverage for calibration
+NUM_CALIB  = 1000                # Increase coverage for calibration
 SEG_LEN    = 8192 * 2           # Must match training segment length
 WINDOW_LEN = SEG_LEN            # Streaming window size
-OFFSET_PAD = 512                # Extra for filter settling
+OFFSET_PAD = 0                  # Only needed when padding='same', but not for 'causal'.
 SEED       = 1234
 
 # ───────────────────────── ARG PARSING ─────────────────────────
@@ -62,32 +62,35 @@ model.summary()
 # ───────────────────────── REPRESENTATIVE DATA GEN ─────────────────────────
 def representative_data_gen():
     """
-    Yields float32 windows of shape (1, WINDOW_LEN, 1)
-    with the same preprocessing (mean removal) used at training.
+    Yields float32 windows of shape (1, SEG_LEN, 1)
+    drawn at random from your source files, mean‐normalized.
     """
     files = glob.glob(os.path.join(args.src_dir, "*_source.wav"))
     if not files:
         raise RuntimeError(f"No .wav files in {args.src_dir}")
     random.shuffle(files)
     count = min(len(files), args.num_calib)
-    print(f"Using {count} files for calibration...")
-    for i in range(count):
-        path = files[i]
+    print(f"Using {count} files for calibration…")
+    for path in files[:count]:
         info = sf.info(path)
-        read_len = args.seg_len + OFFSET_PAD
-        start = random.randint(0, max(0, info.frames - read_len))
-        data, _ = sf.read(path, start=start, frames=read_len, dtype='float32')
-        # force mono if needed
-        if data.ndim > 1:
-            data = np.mean(data, axis=1)
-        # trim settle region
-        data = data[OFFSET_PAD:]
-        # consistent preprocessing: mean removal
-        data = data - np.mean(data)
-        # take last WINDOW_LEN samples
-        window = data[-args.seg_len:]
-        inp = window.reshape(1, args.seg_len, 1)
-        yield [inp]
+        # load the entire file or a big chunk
+        audio, _ = sf.read(path, dtype='float32')
+        # mono
+        if audio.ndim > 1:
+            audio = np.mean(audio, axis=1)
+        L = len(audio)
+        if L < args.seg_len:
+            # pad front/back if too short
+            pad = args.seg_len - L
+            audio = np.pad(audio, (pad//2, pad - pad//2), mode='constant')
+            L = len(audio)
+        # pick a random start so we don't always calibrate on beginnings
+        start = random.randint(0, L - args.seg_len)
+        window = audio[start:start + args.seg_len]
+        # remove any DC
+        window = window - np.mean(window)
+        # reshape to (1, SEG_LEN, 1)
+        yield [window.reshape(1, args.seg_len, 1)]
 
 # ─────────────────── CONVERT FLOAT32 ─────────────────────────
 print("\n1) Converting float32 TFLite...")
