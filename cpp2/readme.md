@@ -2,16 +2,8 @@
 
 mkdir build
 cd build
-cmake .. \      
-  -DTFLITE_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib \
-  -DTFLITE_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.dylib \
-  -DFLATBUFFERS_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native" -DTFLITE_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DTFLITE_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.dylib -DFLATBUFFERS_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/cnpy/build/libcnpy.dylib
 cmake --build .
-
-# BUILD BENCHMARK
-
-cd tensorflow-master
-bazel-7.6.1 build -c opt tensorflow/lite/tools/benchmark:benchmark_model
 
 # RUN
 
@@ -32,14 +24,10 @@ cd build
 
 --list-devices: List available audio devices and exit.
 
-cmake --build . && ./stream_audio_cpp --model ../model/piezo2mic_fp32.tflite --input-device 3 --output-device 3 --blocksize 8096 --buffer 0
+### Run TFLIte streamer
 
-# RUN BENCHMARK
+cmake --build . && ./stream_audio_tflite_cpp --model ../../out/piezo2mic_int8.tflite --input-device 2 --output-device 2 --blocksize 256
 
+### Run non-TFLite streamer
 
-./lib/tensorflow-master/bazel-bin/tensorflow/lite/tools/benchmark/benchmark_model \
-  --graph=./model/piezo2mic_fp32.tflite \
-  --num_threads=1 \
-  --warmup_runs=5 \
-  --num_runs=50 \
-  --use_xnnpack=true
+cmake --build . && ./stream_audio_cpp --weights-dir ../../out/weights --in-dev 2 --out-dev 2 --blocksize 256

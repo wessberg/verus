@@ -15,7 +15,7 @@ RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 SR           = 48000
 SEG_LEN      = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE
 BATCH_SIZE   = 32
-EPOCHS       = 20
+EPOCHS       = 1
 PATIENCE     = 3
 SHUFFLE_BUF  = 1000
 SRC_DIR      = "./input/source"
@@ -197,6 +197,44 @@ def train():
     path_q   = os.path.join(OUT_DIR, QUANT_MODEL_FILENAME)
     quant_model.save(path_q)
     print("✅ Saved weight-quantized dynamic model:", path_q)
+    
+    # Export layer weights into .npy files
+    weights_dir = os.path.join(OUT_DIR, "weights")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    # 1×1 Init PW
+    w0, b0 = dynamic_model.get_layer("init_pw").get_weights()
+    
+    np.save(os.path.join(weights_dir, "init_pw_w.npy"), w0.astype(np.float32))
+    np.save(os.path.join(weights_dir, "init_pw_b.npy"), b0.astype(np.float32))
+
+    # Depthwise + PW for each residual block
+    for idx, d in enumerate(DILATIONS):
+        sep = dynamic_model.get_layer(f"sep_{idx}")
+        pw  = dynamic_model.get_layer(f"pw_{idx}")
+
+        # sep is the tf.keras.layers.SeparableConv1D
+        # get_weights() returns [depthwise_kernel, pointwise_kernel, bias]
+        dw_w, pw_w, pw_b = sep.get_weights()
+
+        # save the depthwise kernel for your StatefulDepthwiseDilated1D
+        np.save(os.path.join(weights_dir, f"dw{idx}_w.npy"), dw_w.astype(np.float32))
+
+        # save the internal pointwise (and its bias) as a separate 1×1 conv
+        np.save(os.path.join(weights_dir, f"pwsep{idx}_w.npy"), pw_w.astype(np.float32))
+        np.save(os.path.join(weights_dir, f"pwsep{idx}_b.npy"), pw_b.astype(np.float32))
+        
+        pw = dynamic_model.get_layer(f"pw_{idx}")
+        pw_w2, pw_b2 = pw.get_weights()
+        np.save(os.path.join(weights_dir, f"pw{idx}_w.npy"), pw_w2.astype(np.float32))
+        np.save(os.path.join(weights_dir, f"pw{idx}_b.npy"), pw_b2.astype(np.float32))
+
+    # final 1×1
+    wf, bf = dynamic_model.get_layer("final_pw").get_weights()
+    path_final_pw_w = os.path.join(weights_dir, "final_pw_w.npy")
+    path_final_pw_b = os.path.join(weights_dir, "final_pw_b.npy")
+    np.save(path_final_pw_w, wf.astype(np.float32))
+    np.save(path_final_pw_b, bf.astype(np.float32))
 
     return (static_model, dynamic_model, quant_model)
 
