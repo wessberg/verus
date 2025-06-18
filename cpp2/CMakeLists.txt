@@ -8,6 +8,21 @@ project(StreamAudioCpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Release flags: optimization + new Accelerate CBLAS headers
+set(CMAKE_CXX_FLAGS_RELEASE
+    # old flags
+    #-O3 -march=native
+
+    # new flags for Apple Silicon specifically
+    "-O3 -march=armv8-a"
+)
+
+# These are also for Apple Silicon specifically
+add_compile_definitions(
+    ACCELERATE_NEW_LAPACK
+    ACCELERATE_LAPACK_ILP64
+)
+
 # --- Dependency Configuration ---
 
 # 1. PortAudio (via pkg-config)
@@ -40,7 +55,6 @@ add_executable(stream_audio_tflite_cpp src/main-tflite.cpp)
 # Include directories for the compiler
 target_include_directories(stream_audio_cpp PRIVATE
     "${PORTAUDIO_INCLUDE_DIRS}"
-    "${TFLITE_INCLUDE_DIR}"
     "${FLATBUFFERS_INCLUDE_DIR}"
     "${CNPY_INCLUDE_DIR}"
 )
@@ -65,8 +79,10 @@ target_link_libraries(stream_audio_cpp PRIVATE
     # PORTAUDIO_LIBRARIES usually resolves to just the library name (e.g., "portaudio")
     # which target_link_directories helps the linker find.
     "${PORTAUDIO_LIBRARIES}"
-    "${TFLITE_LIBRARY}"
     "${CNPY_LIBRARY}"
+
+    # This is for Apple Silicon specifically
+     "-framework Accelerate"
 )
 
 target_link_libraries(stream_audio_tflite_cpp PRIVATE

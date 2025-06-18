@@ -1,21 +1,27 @@
-# piezo2mic_qweight.py
-import os, glob, random, sys
+import os, glob, random, sys, logging, re
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
+from tflite import (
+    Model,
+    TensorType,
+    BuiltinOperator
+)
 from sklearn.model_selection import train_test_split
+from collections import defaultdict
+
 
 # ───────────────────────── PARAMETERS ─────────────────────────────────────────
 
 FILTERS      = 32
-KERNEL_SIZE  = 63
-MAX_SUPPORTED_BLOCK_SIZE = 512
+KERNEL_SIZE  = 31
 DILATIONS    = (1,2,4,8,16,32)
 RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
+TRAIN_BLOCK_SIZE = 4096
 SR           = 48000
-SEG_LEN      = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE
+SEG_LEN      = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE   = 32
-EPOCHS       = 1
+EPOCHS       = 15
 PATIENCE     = 3
 SHUFFLE_BUF  = 1000
 SRC_DIR      = "./input/source"
@@ -111,6 +117,136 @@ def quantize_weights_inplace(model):
         w_dq = q.astype(np.float32) * scale + w_min
         new_vars.append(w_dq)
     model.set_weights(new_vars)
+    
+def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations):
+    """
+    tflite_model_buf : bytes  ← tflite_model = converter.convert()
+    outdir            : str    ← where to write .npy + _quant.txt
+    dilations         : tuple  ← your (1,2,4,8,16,32)
+    """
+    os.makedirs(outdir, exist_ok=True)
+
+    # ── load flatbuffer ─────────────────────────────────────────────
+    model = Model.GetRootAsModel(tflite_model_buf, 0)
+    subg  = model.Subgraphs(0)   # type: _SubGraph
+
+    # ── build opcode → builtin mapping ─────────────────────────────
+    opcodes = {}
+    for i in range(model.OperatorCodesLength()):
+        oc = model.OperatorCodes(i)
+        opcodes[i] = oc.BuiltinCode()
+
+    # ── helper to read a tensor’s raw buffer + quant params ─────────
+    def load_tensor(tidx):
+        t = subg.Tensors(tidx)           # type: _Tensor
+        b = model.Buffers(t.Buffer())    # type: _Buffer
+        raw = b.DataAsNumpy()            # view of bytes
+
+        # pick numpy dtype
+        ty = t.Type()
+        if   ty == TensorType.INT8:   dt = np.int8
+        elif ty == TensorType.INT32:  dt = np.int32
+        else:
+            raise ValueError(f"unexpected tensor type {ty}")
+
+        arr = np.frombuffer(raw, dtype=dt).reshape(t.ShapeAsNumpy())
+
+        # pull quant params
+        qp = t.Quantization()
+        scales      = [qp.Scale(i)      for i in range(qp.ScaleLength())]
+        zero_points = [qp.ZeroPoint(i)  for i in range(qp.ZeroPointLength())]
+        qmat = np.stack([scales, zero_points], axis=1)
+
+        return arr, qmat
+
+    sep_counter   = 0   # counts DEPTHWISE_CONV_2D → dw0..dw5
+    conv2_counter = 0   # counts all CONV_2D → init,pwsep,pw,final
+
+    # ── walk the operators in topo order ────────────────────────────
+    for oi in range(subg.OperatorsLength()):
+        op   = subg.Operators(oi)
+        code = opcodes[op.OpcodeIndex()]
+
+        # 1) depthwise halves of your SeparableConv1Ds
+        if code == BuiltinOperator.DEPTHWISE_CONV_2D:
+            # inputs: [in, filter, bias]  (bias is usually zero-vector or absent)
+            w_idx = op.Inputs(1)
+            b_idx = op.Inputs(2) if op.InputsLength() > 2 else None
+
+            # save w
+            w_arr, w_q = load_tensor(w_idx)
+            fn = os.path.join(outdir, f"dw{sep_counter}_w_int8.npy")
+            np.save(fn, w_arr)
+            np.savetxt(fn.replace(".npy","_quant.txt"), w_q,
+                       fmt="%g", delimiter=",",
+                       header="scale,zero_point", comments="")
+
+            # save bias if present
+            if b_idx is not None:
+                b_arr, b_q = load_tensor(b_idx)
+                fn = os.path.join(outdir, f"dw{sep_counter}_b_int32.npy")
+                np.save(fn, b_arr)
+                np.savetxt(fn.replace(".npy","_quant.txt"), b_q,
+                           fmt="%g", delimiter=",",
+                           header="scale,zero_point", comments="")
+
+            print(f"→ depthwise dw{sep_counter}")
+            sep_counter += 1
+            continue
+
+        # 2) all the 1×1 convs: init_pw, the pointwise half of each sep,
+        #    the residual pw_i, and your final_pw
+        if code == BuiltinOperator.CONV_2D:
+            w_idx, b_idx = op.Inputs(1), op.Inputs(2)
+            conv2_counter += 1
+            cnt = conv2_counter
+            N   = len(dilations)
+
+            # decide tag by counting pattern:
+            #   conv2_counter == 1           → init_pw
+            #   conv2_counter == 2*(N+1)     → final_pw
+            #   otherwise evens               → pwsep[i]
+            #             odds (>1)          → pw[i]
+            if cnt == 1:
+                tag = "init_pw"
+            elif cnt == 2*(N+1):
+                tag = "final_pw"
+            elif cnt % 2 == 0:
+                i = cnt//2 - 1
+                tag = f"pwsep{i}"
+            else:
+                i = (cnt - 3)//2
+                tag = f"pw{i}"
+
+            # weight
+            w_arr, w_q = load_tensor(w_idx)
+            fn = os.path.join(outdir, f"{tag}_w_int8.npy")
+            np.save(fn, w_arr)
+            np.savetxt(fn.replace(".npy","_quant.txt"), w_q,
+                       fmt="%g", delimiter=",",
+                       header="scale,zero_point", comments="")
+
+            # bias
+            b_arr, b_q = load_tensor(b_idx)
+            fn = os.path.join(outdir, f"{tag}_b_int32.npy")
+            np.save(fn, b_arr)
+            np.savetxt(fn.replace(".npy","_quant.txt"), b_q,
+                       fmt="%g", delimiter=",",
+                       header="scale,zero_point", comments="")
+
+            print(f"→ conv2d #{cnt} → {tag}")
+            continue
+
+        # skip everything else
+        continue
+
+    # ── sanity checks ───────────────────────────────────────────────
+    assert sep_counter   == len(dilations),   f"got {sep_counter} depthwise_conv2d ops, expected {len(dilations)}"
+    # init + 2*N convs (pwsep & pw) + final = 1 + 2*N + 1 = 2*(N+1)
+    assert conv2_counter == 2*(len(dilations)+1), f"got {conv2_counter} conv2d ops, expected {2*(len(dilations)+1)}"
+
+    print("✅ saved all int8 kernels + int32 biases in", outdir)
+
 
 # ───────────────────────── TRAINING ────────────────────────────────────────────
 def train():
@@ -151,6 +287,36 @@ def train():
             x = x - np.mean(x)
             y = y - np.mean(y)
             yield x, y
+            
+    # 2) create a representative dataset generator
+    def representative_data_gen():
+        """Yields 100 random segments of shape (1, SEG_LEN, 1) from your source files."""
+        for _ in range(100):
+            # pick a random example
+            i = random.randrange(len(pairs))
+            src_path = pairs[i][0]
+            dur      = train_durs[i]
+
+            # pick a random offset so we can read SEG_LEN frames
+            offset = random.randrange(max(dur - SEG_LEN, 1))
+
+            # read exactly SEG_LEN frames from the source (piezo) file
+            x, _ = sf.read(src_path,
+                        start=offset,
+                        frames=SEG_LEN,
+                        dtype="float32",
+                        always_2d=True)
+
+            # if we’re too short (EOF), pad with zeros
+            if x.shape[0] < SEG_LEN:
+                pad_amt = SEG_LEN - x.shape[0]
+                x = np.pad(x, ((0, pad_amt), (0, 0)))
+
+            # mean‑remove, reshape to (1, SEG_LEN, 1)
+            x = x - np.mean(x, axis=0, keepdims=True)
+            x = x.reshape(1, SEG_LEN, 1)
+
+            yield [x]
 
     sig = tf.TensorSpec((SEG_LEN,1),tf.float32)
     train_ds = tf.data.Dataset.from_generator(
@@ -235,6 +401,27 @@ def train():
     path_final_pw_b = os.path.join(weights_dir, "final_pw_b.npy")
     np.save(path_final_pw_w, wf.astype(np.float32))
     np.save(path_final_pw_b, bf.astype(np.float32))
+    
+    # Now produce a TFLite INT8 model
+    int8_weights_dir = os.path.join(OUT_DIR, "int8_weights")
+    os.makedirs(int8_weights_dir, exist_ok=True)
+    
+    # 3) convert to TFLite with full INT8 quantization
+    print("\n≈ Converting dynamic model to TFLite INT8 model for INT8 weight extraction")
+    converter = tf.lite.TFLiteConverter.from_keras_model(static_model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_data_gen
+    # ensure full integer (no float ops)
+    converter.target_spec.supported_ops = [
+        tf.lite.OpsSet.TFLITE_BUILTINS_INT8,    # plus their int8 versions
+    ]
+    
+    # set I/O to int8
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+    extract_and_save_int8_weights(tflite_model, int8_weights_dir, DILATIONS)
 
     return (static_model, dynamic_model, quant_model)
 

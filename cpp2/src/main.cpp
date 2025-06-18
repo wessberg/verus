@@ -6,6 +6,9 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <sstream>
+#include <cstdint>
 #include <csignal>
 #include <cstring>
 #include <cassert>
@@ -13,20 +16,24 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <portaudio.h>
+#include <stdexcept>
 #include "cnpy.h"
+#include <Accelerate/Accelerate.h>  // For cblas_sgemm
 
 // ───────────────────────── PARAMETERS ─────────────────────────
 static constexpr int FILTERS   = 32;
-static constexpr int KERNEL    = 63;
+static constexpr int KERNEL    = 31;
 static constexpr std::array<int,6> DILATIONS = {1,2,4,8,16,32};
 static constexpr int NUM_BLOCKS = (int)DILATIONS.size();
-static constexpr int MAX_HOP    = 512;
+static constexpr int MAX_HOP    = 64;
 static constexpr int RECEPTIVE_FIELD =
   1 + (KERNEL - 1) * (1+2+4+8+16+32);
 
 // ───────────────────────── GLOBAL FLAGS ───────────────────────
 std::atomic<bool> gStopFlag(false);
+
 std::atomic<bool> bypassFlag(false);
+bool             gUseInt8   = false;
 void signalHandler(int){ gStopFlag = true; }
 
 // ───────────────────────── RING BUFFER ────────────────────────
@@ -71,41 +78,36 @@ struct RingBuffer {
 };
 
 // Bundles in/out rings + temp vector for callback
-struct Shared {
-  RingBuffer in, out;
-  std::vector<float> tempOut;
-  Shared(size_t cap): in(cap), out(cap){}
-};
+struct Shared { RingBuffer in, out; std::vector<float> tempOut; Shared(size_t cap): in(cap), out(cap){} };
 
 // ───────────────────────── STREAMING CONV KERNELS ─────────────────────
 // 1×1 pointwise conv
 struct P1D {
   int inC, outC;
-  std::vector<float> W, b;  // W: outC*inC,  b:outC
+  std::vector<float> W;    // W: inC*outC row-major
+  std::vector<float> b;
 
   P1D(){}
-  P1D(int _inC,int _outC,
-      std::vector<float>&& _W,
-      std::vector<float>&& _b)
-    : inC(_inC), outC(_outC), W(std::move(_W)), b(std::move(_b))
-  {
-    assert((int)W.size() == inC*outC);
-    assert((int)b.size() == outC);
-  }
+  P1D(int _inC,int _outC, std::vector<float>&& _W, std::vector<float>&& _b)
+    : inC(_inC), outC(_outC), W(std::move(_W)), b(std::move(_b)){}
 
-  // in:  hop×inC  row-major
-  // out: hop×outC row-major
   void run(const float* in, float* out, int hop) const {
-    for(int t=0; t<hop; t++){
-      const float* inp = in  + t*inC;
-      float*       outp= out + t*outC;
-      for(int oc=0; oc<outC; oc++){
-        float acc = b[oc];
-        const float* wrow = &W[oc*inC];
-        for(int ic=0; ic<inC; ic++)
-          acc += wrow[ic]*inp[ic];
-        outp[oc] = acc;
-      }
+    // C = A*B + broadcast(b)
+    // A: hop x inC, B: inC x outC, C: hop x outC
+    cblas_sgemm(
+      CblasRowMajor, CblasNoTrans, CblasNoTrans,
+      hop, outC, inC,
+      1.f,
+      in, inC,
+      W.data(), outC,
+      0.f,
+      out, outC
+    );
+    // add bias
+    for(int t=0;t<hop;++t){
+      float* row = out + t*outC;
+      for(int oc=0;oc<outC;++oc)
+        row[oc] += b[oc];
     }
   }
 };
@@ -163,21 +165,18 @@ static P1D init_pw, final_pw;
 static std::array<D1D,NUM_BLOCKS> sep_conv;
 static std::array<P1D,NUM_BLOCKS> pw_sep, pw2;
 
-static P1D loadPW(const std::string &wfile,
-                  const std::string &bfile){
+static P1D loadPW(const std::string &wfile, const std::string &bfile){
   auto Wn = cnpy::npy_load(wfile);
-  // shape [1,inC,outC]
-  int inC  = (int)Wn.shape[1],
-      outC = (int)Wn.shape[2];
+  int inC = Wn.shape[1], outC = Wn.shape[2];
+
   const float* rawW = Wn.data<float>();
-  std::vector<float> W(outC*inC);
-  // Keras stores [inC,outC], we want W[outC*inC + inC]
-  for(int oc=0;oc<outC;oc++)
-    for(int ic=0;ic<inC;ic++)
-      W[oc*inC + ic] = rawW[ic*outC + oc];
+  // store as inC*outC row-major
+  std::vector<float> W(inC*outC);
+  for(int ic=0;ic<inC;++ic)
+    for(int oc=0;oc<outC;++oc)
+      W[ic*outC + oc] = rawW[ic*outC + oc];
   auto Bn = cnpy::npy_load(bfile);
-  const float* rawB = Bn.data<float>();
-  std::vector<float> B(rawB, rawB+outC);
+  std::vector<float> B(Bn.data<float>(), Bn.data<float>()+outC);
   return P1D(inC,outC, std::move(W), std::move(B));
 }
 
@@ -186,6 +185,7 @@ static D1D loadDW(const std::string &wfile, int dilation){
   // shape is [K,C,1]
   int K_ = (int)Wn.shape[0],
       C_ = (int)Wn.shape[1];
+
   const float* rawW = Wn.data<float>();
 
   // Keras/TFLite conv1d is actually a *cross-correlation* (no kernel‐flip),
@@ -207,7 +207,30 @@ static D1D loadDW(const std::string &wfile, int dilation){
              std::move(B));
 }
 
-static void loadAll(const std::string &dir){
+// ----------------------------------------------------------------
+// helper: parse a two-column "scale,zero_point" text file
+// ----------------------------------------------------------------
+static void parseQuantFile(const std::string &fname,
+                           std::vector<float> &scales,
+                           std::vector<int>   &zps)
+{
+  std::ifstream ifs(fname);
+  if(!ifs){ std::cerr<<"ERROR: can't open "<<fname<<"\n"; std::exit(1);}
+  std::string line;
+  // skip header
+  std::getline(ifs,line);
+  while(std::getline(ifs,line)){
+    if(line.empty()) continue;
+    std::stringstream ss(line);
+    std::string s0,s1;
+    std::getline(ss,s0,',');
+    std::getline(ss,s1,',');
+    scales.push_back(std::stof(s0));
+    zps   .push_back(std::stoi(s1));
+  }
+}
+
+static void loadAllFp32(const std::string &dir){
   init_pw  = loadPW(dir+"/init_pw_w.npy",  dir+"/init_pw_b.npy");
   final_pw = loadPW(dir+"/final_pw_w.npy", dir+"/final_pw_b.npy");
   for(int i=0;i<NUM_BLOCKS;i++){
@@ -226,83 +249,195 @@ static void loadAll(const std::string &dir){
   }
 }
 
+// ───────────────────────── INT8→FLOAT WEIGHT LOADER ──────────────────────
+static P1D loadPWQuant(const std::string &base) {
+  auto Wn = cnpy::npy_load(base + "_w_int8.npy");
+  auto Bn = cnpy::npy_load(base + "_b_int32.npy");
+
+  std::vector<float> wscale;
+  std::vector<int>   wzp;
+  std::vector<float> bscale;
+  std::vector<int>   bzp;
+  parseQuantFile(base + "_w_int8_quant.txt", wscale, wzp);
+  parseQuantFile(base + "_b_int32_quant.txt", bscale, bzp);
+
+  // TFLite packs 1×1 conv in [outC,1,1,inC]
+  const auto &shape = Wn.shape;
+  int outC, inC;
+  if (shape.size() == 4 && shape[1] == 1 && shape[2] == 1) {
+    outC = int(shape[0]);
+    inC  = int(shape[3]);
+  } else if (shape.size() == 2) {
+    // if you pre-flattened to [inC,outC]
+    inC  = int(shape[0]);
+    outC = int(shape[1]);
+  } else {
+    throw std::runtime_error("loadPWQuant: unexpected weight shape");
+  }
+
+  size_t N       = size_t(inC) * size_t(outC);
+  auto   rawW8   = Wn.data<int8_t>();
+  std::vector<float> W(N);
+
+  // Dequant + reshape to (inC × outC)
+  if (wscale.size() == 1) {
+    float S = wscale[0]; int Z = wzp[0];
+    for (int oc = 0; oc < outC; ++oc) {
+      for (int ic = 0; ic < inC; ++ic) {
+        int raw_idx = oc*inC + ic;        // NHWC layout
+        int dst_idx = ic*outC + oc;       // row-major
+        W[dst_idx] = (float(rawW8[raw_idx]) - Z)*S;
+      }
+    }
+  } else {
+    for (int oc = 0; oc < outC; ++oc) {
+      float S = wscale[oc]; int Z = wzp[oc];
+      for (int ic = 0; ic < inC; ++ic) {
+        int raw_idx = oc*inC + ic;
+        int dst_idx = ic*outC + oc;
+        W[dst_idx] = (float(rawW8[raw_idx]) - Z)*S;
+      }
+    }
+  }
+
+  // Dequant bias
+  auto rawB32 = Bn.data<int32_t>();
+  std::vector<float> B(outC);
+  if (bscale.size() == 1) {
+    float S = bscale[0]; int Z = bzp[0];
+    for (int oc = 0; oc < outC; ++oc) {
+      B[oc] = (float(rawB32[oc]) - Z)*S;
+    }
+  } else {
+    for (int oc = 0; oc < outC; ++oc) {
+      B[oc] = (float(rawB32[oc]) - bzp[oc])*bscale[oc];
+    }
+  }
+
+  return P1D(inC, outC, std::move(W), std::move(B));
+}
+
+
+static D1D loadDWQuant(const std::string &wf,
+                       const std::string &qf,
+                       int dilation)
+{
+  auto Wn = cnpy::npy_load(wf);
+  std::vector<float> scale;
+  std::vector<int>   zp;
+  parseQuantFile(qf, scale, zp);
+
+  // TFLite depthwise is [1,1,K,inC]
+  const auto &shape = Wn.shape;
+  int K, C;
+  if (shape.size() == 4 && shape[0] == 1 && shape[1] == 1) {
+    K = int(shape[2]);
+    C = int(shape[3]);
+  } else if (shape.size() == 2) {
+    // if you flattened to [K,C]
+    K = int(shape[0]);
+    C = int(shape[1]);
+  } else {
+    throw std::runtime_error("loadDWQuant: unexpected weight shape");
+  }
+
+  size_t N        = size_t(K)*size_t(C);
+  auto rawW8      = Wn.data<int8_t>();
+  std::vector<float> W(N);
+
+  // Dequant + conv-flip
+  if (scale.size() == 1) {
+    float S = scale[0]; int Z = zp[0];
+    for (int k = 0; k < K; ++k) {
+      for (int c = 0; c < C; ++c) {
+        int raw_idx = k*C + c;
+        int dst_idx = (K-1-k)*C + c;
+        W[dst_idx] = (float(rawW8[raw_idx]) - Z)*S;
+      }
+    }
+  } else {
+    for (int c = 0; c < C; ++c) {
+      float S = scale[c]; int Z = zp[c];
+      for (int k = 0; k < K; ++k) {
+        int raw_idx = k*C + c;
+        int dst_idx = (K-1-k)*C + c;
+        W[dst_idx] = (float(rawW8[raw_idx]) - Z)*S;
+      }
+    }
+  }
+
+  // no bias in depthwise
+  std::vector<float> B(C, 0.0f);
+  return D1D(C, K, dilation, std::move(W), std::move(B));
+}
+
+static void loadAllInt8(const std::string &dir){
+  init_pw  = loadPWQuant(dir+"/init_pw");
+  final_pw = loadPWQuant(dir+"/final_pw");
+  for(int i=0;i<NUM_BLOCKS;i++){
+    sep_conv[i] = loadDWQuant(
+                     dir+"/dw"+std::to_string(i)+"_w_int8.npy",
+                     dir+"/dw"+std::to_string(i)+"_w_int8_quant.txt",
+                     DILATIONS[i]
+                   );
+    pw_sep[i] = loadPWQuant(dir+"/pwsep"+std::to_string(i));
+    pw2  [i] = loadPWQuant(dir+"/pw"   +std::to_string(i));
+  }
+}
+
 // ───────────────────────── STREAMING THREAD ──────────────────────────
-void inferenceThread(Shared* sh, int hop){
+void inferenceThread(Shared* sh, int hop) {
+  // 1) Compute receptive‐field (RF) and segment‐length = RF + hop
+  const int RF      = RECEPTIVE_FIELD;  
+  const int SEG_LEN = RF + hop;
 
-  // 1) Build a little "warm-up" buffer the same size TFLite uses:
-  static constexpr int RF = RECEPTIVE_FIELD;                   // 3907
-  static constexpr int SEG_LEN = RECEPTIVE_FIELD + MAX_HOP;    // = RF + hop
-
-  // 2) Wait until we've seen a full SEG_LEN samples
+  // 2) One‐time “warm‐up”: wait until we have SEG_LEN samples in
   while (!gStopFlag && sh->in.available() < (size_t)SEG_LEN) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (gStopFlag) return;
 
-  // 3) Grab that entire window
+  // 3) Pop them all into a warm buffer
   std::vector<float> warm(SEG_LEN);
   sh->in.pop(warm.data(), SEG_LEN);
 
-  // 4) Run it once through your conv-chain *just* to fill the D1D buffers.
-  //    You don't need to keep the output.  But you do need to push the
-  //    last 'RF' samples back into the ring so that the steady-state
-  //    loop picks up the right context.
-  //
-  //    Here is a quick example:
+  // 4) Run that entire window through the conv‐chain JUST to fill
+  //    your D1D buffers.  We discard the output, but keep state.
   {
-    // a) feed 'warm' into your init_pw to get buf0:
-    std::vector<float> buf0(SEG_LEN*FILTERS);
+    // a) initial 1×1
+    std::vector<float> buf0(SEG_LEN * FILTERS);
     init_pw.run(warm.data(), buf0.data(), SEG_LEN);
 
-    // b) run through each sep+pw block *in exactly the same broken-in* way
-    //    (copy buf0→res, then loop blocks exactly as below, except:
-    //      • do NOT push any output yet
-    //      • use the same tmp_pw2 trick above to never overwrite your state)
-    //
-    std::vector<float> res(SEG_LEN*FILTERS), sep(SEG_LEN*FILTERS), out2(SEG_LEN*FILTERS);
-
-    // copy into res
-    std::copy(buf0.begin(), buf0.end(), res.begin());
-
-    for (int b = 0; b < NUM_BLOCKS; b++) {
+    // b) each separable‐res block
+    std::vector<float> res(buf0), sep(SEG_LEN*FILTERS), out2(SEG_LEN*FILTERS);
+    for (int b = 0; b < NUM_BLOCKS; ++b) {
       sep_conv[b].run(res.data(), sep.data(), SEG_LEN);
       pw_sep[b].run(sep.data(), out2.data(), SEG_LEN);
-      // relu
-      for (int i = 0; i < SEG_LEN*FILTERS; i++)
+      // ReLU
+      for (int i = 0; i < SEG_LEN*FILTERS; ++i)
         if (out2[i] < 0.0f) out2[i] = 0.0f;
-
-      // safe pw2 into temp
+      // safe‐in‐place 1×1 → tmp
       std::vector<float> tmp_pw2(SEG_LEN*FILTERS);
       pw2[b].run(out2.data(), tmp_pw2.data(), SEG_LEN);
-
       // residual add
-      for (int i = 0; i < SEG_LEN*FILTERS; i++)
+      for (int i = 0; i < SEG_LEN*FILTERS; ++i)
         tmp_pw2[i] += res[i];
-
-      // swap
       res.swap(tmp_pw2);
     }
 
-    // final 1×1 + global skip
+    // c) final 1×1 + global skip
     std::vector<float> final_out(SEG_LEN);
     final_pw.run(res.data(), final_out.data(), SEG_LEN);
-    for (int i = 0; i < SEG_LEN; i++)
+    for (int i = 0; i < SEG_LEN; ++i)
       final_out[i] += warm[i];
-    // … discard final_out …
+    // → drop final_out
   }
 
-  // 5) Now push *only* the LAST 'SEG_LEN - RF' samples back so that
-  //    your steady-state loop will see the same buffer that TFLite
-  //    sees on its first real Invoke().
-  //
-  //    SEG_LEN - RF == MAX_HOP == hop, so:
+  // 5) Now push back *only* the last hop samples so that the
+  //    steady‐state loop has the correct tail‐context
   sh->in.push(warm.data() + RF, hop);
 
-  // 6) Now you can enter your existing hop-by-hop loop below,
-  //    and you will *never* under-run and every invocation will
-  //    have a full RF of true context behind it.
-
-  // per-hop scratch
+  // 6) Steady‐state: process hop‐sized blocks forever
   std::vector<float> in_hop(hop),
                      buf0(hop*FILTERS),
                      res(hop*FILTERS),
@@ -310,50 +445,41 @@ void inferenceThread(Shared* sh, int hop){
                      out2(hop*FILTERS),
                      final_out(hop);
 
-  while(!gStopFlag){
-    // wait for at least hop samples
-    while(!gStopFlag && sh->in.available() < (size_t)hop)
+  while (!gStopFlag) {
+    // a) wait for hop samples
+    while (!gStopFlag && sh->in.available() < (size_t)hop)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if(gStopFlag) break;
+    if (gStopFlag) break;
 
-    // read hop
+    // b) pop
     size_t got = sh->in.pop(in_hop.data(), hop);
-    if(got < (size_t)hop)
+    if (got < (size_t)hop)
       std::fill(in_hop.begin()+got, in_hop.end(), 0.0f);
 
-    // 1×1 init
+    // c) init 1×1
     init_pw.run(in_hop.data(), buf0.data(), hop);
 
-    // 6 residual sep+pw blocks
+    // d) sep‐res blocks
     std::copy(buf0.begin(), buf0.end(), res.begin());
-    for(int b=0;b<NUM_BLOCKS;b++){
+    for (int b = 0; b < NUM_BLOCKS; ++b) {
       sep_conv[b].run(res.data(), sep.data(), hop);
       pw_sep[b].run(sep.data(), out2.data(), hop);
-      // relu
-      for(int i=0;i<hop*FILTERS;i++)
-        if(out2[i]<0.0f) out2[i]=0.0f;
-      
-          // … after your pw_sep + ReLU …
-
-      // --- “safe in-place” pw2 via a little temporary ---
+      for (int i = 0; i < hop*FILTERS; ++i)
+        if (out2[i] < 0.0f) out2[i] = 0.0f;
+      // safe pw2
       std::vector<float> tmp_pw2(hop*FILTERS);
       pw2[b].run(out2.data(), tmp_pw2.data(), hop);
-
-      // residual add
-      for(int i = 0; i < hop*FILTERS; i++)
+      for (int i = 0; i < hop*FILTERS; ++i)
         tmp_pw2[i] += res[i];
-
-      // now swap into 'res' for the next block
       res.swap(tmp_pw2);
-      // reuse out2 as the scratch for the next iteration:
-      // (we don't actually need to clear it; it'll be overwritten)
     }
 
-    // final 1×1 + global skip
+    // e) final 1×1 + skip
     final_pw.run(res.data(), final_out.data(), hop);
-    for(int i=0;i<hop;i++)
+    for (int i = 0; i < hop; ++i)
       final_out[i] += in_hop[i];
 
+    // f) push out
     sh->out.push(final_out.data(), hop);
   }
 }
@@ -434,6 +560,9 @@ int main(int argc, char** argv){
       outDev= atoi(argv[++i]);
     else if (!strcmp(argv[i],"--weights-dir") && i+1<argc)
       wdir  = argv[++i];
+    else if (!strcmp(argv[i],"--int8")) {
+      gUseInt8 = true;
+    }
     else {
       std::cerr<<"Unknown arg: "<<argv[i]<<"\n"; return 1;
     }
@@ -449,8 +578,14 @@ int main(int argc, char** argv){
     return 1;
   }
 
+  // load either FP32 or INT8→float
   std::cout<<"[MAIN] Weights dir: "<<wdir<<"\n";
-  loadAll(wdir);
+  std::cout<<"[MAIN] Model mode: "<<(gUseInt8?"INT8":"FP32")<<"\n";
+  if (gUseInt8){
+    loadAllInt8(wdir);
+  } else{
+    loadAllFp32(wdir);
+  }
   std::cout<<"[MAIN] Loaded weights.\n";
 
   PaError err = Pa_Initialize();
@@ -480,10 +615,12 @@ int main(int argc, char** argv){
   PaStreamParameters op = { outDev,2, paFloat32,
     diOut->defaultLowOutputLatency,nullptr };
 
-  // ring capacity ≥ RECEPTIVE_FIELD + hop
-  size_t cap=1;
-  while(cap < (size_t)(RECEPTIVE_FIELD + blockSize)) cap <<= 1;
-  std::cout<<"[MAIN] RingBuffer cap="<<cap<<" samples\n";
+  // compute the raw minimum capacity: RF + hop
+  size_t needed = RECEPTIVE_FIELD + blockSize;
+
+  // then pick the smallest power‑of‑two ≥ 2×needed
+  size_t cap = 1;
+  while (cap < 2 * needed) cap <<= 1;
 
   Shared shared(cap);
   shared.tempOut.resize(blockSize);

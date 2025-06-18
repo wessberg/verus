@@ -17,7 +17,7 @@
 
 static constexpr int FILTERS = 32;
 static constexpr int KERNEL_SIZE = 63;
-static constexpr int MAX_SUPPORTED_BLOCK_SIZE = 512;
+static constexpr int MAX_SUPPORTED_BLOCK_SIZE = 256;
 static constexpr int DILATIONS[] = {1, 2, 4, 8, 16, 32}; // 7 dilations
 static constexpr int RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * (DILATIONS[0] + DILATIONS[1] + DILATIONS[2] + DILATIONS[3] + DILATIONS[4] + DILATIONS[5]);
 static constexpr int SEG_LEN = RECEPTIVE_FIELD + MAX_SUPPORTED_BLOCK_SIZE;
