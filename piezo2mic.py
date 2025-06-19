@@ -1,266 +1,493 @@
-import os, glob, random, sys, logging, re
+#!/usr/bin/env python3
+"""
+Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
+to the equivalent mic’d signal.
+"""
+import os
+import glob
+import random
+import sys
+import re
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from tflite import (
-    Model,
-    TensorType,
-    BuiltinOperator
-)
+from tflite import Model, TensorType, BuiltinOperator
 from sklearn.model_selection import train_test_split
-from collections import defaultdict
+from tensorflow.keras.utils import register_keras_serializable
 
+# ───────────────────────────── PARAMETERS ─────────────────────────────────────
+FILTERS             = 64
+KERNEL_SIZE         = 51
+DILATIONS           = (1,2,4,8,16,32)
+RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
+TRAIN_BLOCK_SIZE    = 4096
+SR                  = 48000
+SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
+BATCH_SIZE          = 32
+EPOCHS              = 1
+PATIENCE            = 5
+SHUFFLE_BUF         = 1000
 
-# ───────────────────────── PARAMETERS ─────────────────────────────────────────
+SRC_DIR             = "./input/source"
+TGT_DIR             = "./input/target"
+OUT_DIR             = "./out"
+DEMO_SEC            = 60
+DEMO_OFFSET_SEC     = 0
+DEMO_PAIR_INDEX     = 0
 
-FILTERS      = 32
-KERNEL_SIZE  = 31
-DILATIONS    = (1,2,4,8,16,32)
-RECEPTIVE_FIELD = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
-TRAIN_BLOCK_SIZE = 4096
-SR           = 48000
-SEG_LEN      = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
-BATCH_SIZE   = 32
-EPOCHS       = 15
-PATIENCE     = 3
-SHUFFLE_BUF  = 1000
-SRC_DIR      = "./input/source"
-TGT_DIR      = "./input/target"
-OUT_DIR      = "./out"
-DEMO_SEC     = 60 * 2
-
-STATIC_MODEL_BASENAME      = "piezo2mic_resnet"
-DYNAMIC_MODEL_BASENAME     = STATIC_MODEL_BASENAME + "_dynamic"
-QUANT_MODEL_BASENAME       = DYNAMIC_MODEL_BASENAME + "_qweight"
-
-STATIC_MODEL_FILENAME      = STATIC_MODEL_BASENAME + ".keras"
-DYNAMIC_MODEL_FILENAME     = DYNAMIC_MODEL_BASENAME + ".keras"
-QUANT_MODEL_FILENAME       = QUANT_MODEL_BASENAME + ".keras"
+STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
+DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
+SAVE_WEIGHTS = True  # set to True to save layer weights as .npy files
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ───────────────────────── DATA LOADING ────────────────────────────────────────
+# ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
 srcs = sorted(glob.glob(os.path.join(SRC_DIR, "*_source.wav")))
 pairs = []
 for s in srcs:
-    t = s.replace("_source.wav", "_target.wav").replace(SRC_DIR, TGT_DIR)
+    t = s.replace("_source.wav","_target.wav").replace(SRC_DIR, TGT_DIR)
     if os.path.exists(t):
         pairs.append((s,t))
 if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
 
-# ───────────────────────── LOSS FUNCS ─────────────────────────────────────────
-def multi_stft_log_mse(y_true, y_pred):
+@register_keras_serializable()
+def slice_content(x, filters):
+    # returns the first `filters` channels
+    return x[:, :, :filters]
+
+@register_keras_serializable()
+def slice_gate(x, filters):
+    # returns the remaining channels
+    return x[:, :, filters:]
+
+# 1) Pre-emphasis and its L1 loss
+def pre_emphasis(x, μ=0.99):
+    # x: (batch, time, 1)
+    x0 = x[:, :1, :]                             # first sample
+    x1 = x[:, 1:, :] - μ * x[:, :-1, :]          # high-pass residual
+    return tf.concat([x0, x1], axis=1)
+
+def pre_emphasis_loss(y_true, y_pred, μ=0.99):
+    yt = pre_emphasis(y_true, μ)
+    yp = pre_emphasis(y_pred, μ)
+    return tf.reduce_mean(tf.abs(yt - yp))
+
+def band_limited_stft_loss(y_true, y_pred,
+                           fmin=3000.0, fmax=10000.0,
+                           n_fft=512, hop=128):
+    # y_true, y_pred: (B, T, 1)
+    yt = tf.squeeze(y_true, -1)   # (B, T)
+    yp = tf.squeeze(y_pred, -1)
+    # compute a single-resolution STFT
+    S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+    S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+    mag_t = tf.abs(S_t)
+    mag_p = tf.abs(S_p)
+
+    # build a binary mask over freq‐bins
+    freq_bins = tf.shape(mag_t)[-1]
+    freqs = tf.linspace(0.0, SR/2, freq_bins)   # SR is your global sample­rate
+    band_mask = tf.logical_and(freqs >= fmin, freqs <= fmax)
+    band_mask = tf.cast(band_mask, mag_t.dtype)  # shape (freq_bins,)
+    band_mask = band_mask[tf.newaxis, tf.newaxis, :]  # (1,1,F)
+
+    # L1 on magnitudes *only in that band*
+    diff = tf.abs(mag_t - mag_p) * band_mask
+    return tf.reduce_mean(diff)
+
+# 2) Frequency-weighted magnitude STFT loss
+def freq_weighted_stft_loss(y_true, y_pred, α=2.0):
+    yt = tf.squeeze(y_true, -1)   # (B, T)
+    yp = tf.squeeze(y_pred, -1)
+    total = 0.0
+    specs = [(512,128), (1024,256), (2048,512)]
+    for n_fft, hop in specs:
+        S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+        S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+        mag_t = tf.abs(S_t)
+        mag_p = tf.abs(S_p)
+        diff = (tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2
+
+        # build frequency-bin weights (shape 1×1×freq_bins)
+        freq_bins = tf.shape(mag_t)[-1]
+        freqs = tf.linspace(0.0, SR/2, freq_bins)
+        w = tf.reshape((freqs/(SR/2))**α, [1,1,-1])
+
+        total += tf.reduce_mean(diff * w)
+
+    return total / float(len(specs))
+
+
+# 3) Multi-resolution STFT (log-mag + complex) loss
+def multi_res_stft_loss(y_true, y_pred):
     yt = tf.squeeze(y_true, -1)
     yp = tf.squeeze(y_pred, -1)
-    loss = 0.0
-    for n_fft, hop in ((512,128),(1024,256),(2048,512)):
-        S_true = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        S_pred = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        mag_t = tf.abs(S_true); mag_p = tf.abs(S_pred)
-        loss += tf.reduce_mean((tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2)
-    return loss
+    specs = [(256,64), (512,128), (1024,256), (2048,512)]
+    mag_loss = 0.0
+    comp_loss = 0.0
+    for n_fft, hop in specs:
+        S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+        S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+        mag_t = tf.abs(S_t)
+        mag_p = tf.abs(S_p)
+        mag_loss  += tf.reduce_mean((tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2)
+        comp_loss += tf.reduce_mean(
+            (tf.math.real(S_t) - tf.math.real(S_p))**2 +
+            (tf.math.imag(S_t) - tf.math.imag(S_p))**2
+        )
+    N = float(len(specs))
+    return (mag_loss + comp_loss) / N
 
+
+# 4) Gradient (slope) loss
+def gradient_loss(y_true, y_pred):
+    dy_true = y_true[:,1:,:] - y_true[:,:-1,:]
+    dy_pred = y_pred[:,1:,:] - y_pred[:,:-1,:]
+    return tf.reduce_mean(tf.abs(dy_true - dy_pred))
+
+
+# 5) Mel-spectrogram L1 loss
+def mel_loss(y_true, y_pred, n_mels=64, n_fft=1024, hop=256):
+    yt = tf.squeeze(y_true, -1)
+    yp = tf.squeeze(y_pred, -1)
+    # compute linear-freq spectrograms
+    S_t = tf.abs(tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
+    S_p = tf.abs(tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
+
+    # build mel weight matrix
+    num_spec_bins = n_fft//2 + 1
+    mel_w = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=n_mels,
+        num_spectrogram_bins=num_spec_bins,
+        sample_rate=SR,
+        lower_edge_hertz=50.0,
+        upper_edge_hertz=SR/2
+    )
+
+    # project to mel
+    M_t = tf.tensordot(S_t, mel_w, axes=[[2],[0]])  # shape (B, frames, n_mels)
+    M_p = tf.tensordot(S_p, mel_w, axes=[[2],[0]])
+    return tf.reduce_mean(tf.abs(tf.math.log1p(M_t) - tf.math.log1p(M_p)))
+
+
+# 6) Combined loss with tuned weights
 def combined_loss(y_true, y_pred):
-    l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
-    stft = multi_stft_log_mse(y_true, y_pred)
-    return 0.5*l1 + 0.5*stft
+    l1    = tf.reduce_mean(tf.abs(y_true - y_pred))
+    stft  = multi_res_stft_loss(y_true, y_pred)
+    fw    = freq_weighted_stft_loss(y_true, y_pred)
+    grad  = gradient_loss(y_true, y_pred)
+    pre   = pre_emphasis_loss(y_true, y_pred)
+    mel = mel_loss(y_true, y_pred)
+    hf    = band_limited_stft_loss(y_true, y_pred,
+                                   fmin=3000.0, fmax=10000.0,
+                                   n_fft=512, hop=128)
 
-# ───────────────────────── MODEL ARCH ─────────────────────────────────────────
+    # weights must sum to 1 (or you can renormalize)
+    w_l1   = 0.10
+    w_stft = 0.15
+    w_fw   = 0.10
+    w_grad = 0.15
+    w_pre  = 0.15
+    w_mel  = 0.10
+    w_hf   = 0.25   # give the pick‐attack band a big say
+
+    return (
+        w_l1   * l1   +
+        w_stft * stft +
+        w_fw   * fw   +
+        w_grad * grad +
+        w_pre  * pre  +
+        w_mel  * mel  +
+        w_hf   * hf
+    )
+
+# ────────────────────────── MODEL ARCHITECTURE ─────────────────────────────────
+import tensorflow as tf
+
+def build_resnet_gated(filters=FILTERS,
+                       kernel_size=KERNEL_SIZE,
+                       dilations=DILATIONS,
+                       dynamic_time=False):
+    # time-dim None for dynamic, fixed = SEG_LEN for static
+    T = None if dynamic_time else SEG_LEN
+
+    inp = tf.keras.Input(shape=(T,1), name="piezo_in")
+
+    # initial 1×1 projection
+    x = tf.keras.layers.Conv1D(filters,
+                               1,
+                               padding='same',
+                               name="init_pw")(inp)
+
+    # ── Gated ResNet blocks ────────────────────────────────────
+    for idx, d in enumerate(dilations):
+        res = x
+        pad_amt = (kernel_size - 1) * d
+
+        # causal left-pad
+        x = tf.keras.layers.ZeroPadding1D((pad_amt,0),
+                                          name=f"pad_{idx}")(x)
+
+        # separable conv → 2*channels so we can split for gating
+        g = tf.keras.layers.SeparableConv1D(
+                filters * 2,
+                kernel_size,
+                dilation_rate=d,
+                padding='valid',
+                use_bias=True,
+                activation=None,
+                name=f"sep_{idx}"
+            )(x)
+
+        # slice out “content” and “gate” parts        
+        content = tf.keras.layers.Lambda(
+                  slice_content,
+                  arguments={'filters': filters},
+                  name=f"content_{idx}"
+              )(g)
+        gate    = tf.keras.layers.Lambda(
+                    slice_gate,
+                    arguments={'filters': filters},
+                    name=f"gate_{idx}"
+                )(g)
+
+        # gated non-linearity: tanh(content) * sigmoid(gate)
+        c_act = tf.keras.layers.Activation('tanh',
+                                           name=f"tanh_{idx}")(content)
+        g_act = tf.keras.layers.Activation('sigmoid',
+                                           name=f"sigmoid_{idx}")(gate)
+        x = tf.keras.layers.Multiply(name=f"gated_mul_{idx}")([c_act, g_act])
+
+        # 1×1 projection & residual add
+        x = tf.keras.layers.Conv1D(filters,
+                                   1,
+                                   padding='same',
+                                   name=f"pw_{idx}")(x)
+        x = tf.keras.layers.Add(name=f"res_add_{idx}")([x, res])
+
+    # ── final 1×1 conv + identity skip ────────────────────────
+    final = tf.keras.layers.Conv1D(1,
+                                   1,
+                                   padding='same',
+                                   name="final_pw")(x)
+
+    final = tf.keras.layers.Conv1D(1,1,padding='same', name="final_pw")(x)
+    skip  = tf.keras.layers.Conv1D(
+                1,1,use_bias=False,
+                kernel_initializer=tf.keras.initializers.Constant(0.5),
+                name="skip_conv")(inp)
+    main_out = tf.keras.layers.Add(name="res_out")([final, skip])
+
+    # ── (4) tiny HF bypass ─────────────────────────────────
+    # a little 3‐tap conv straight from input -> pick spikes
+    hf = tf.keras.layers.Conv1D(
+            1, 3,
+            padding='same',
+            use_bias=False,
+            kernel_initializer='zeros',   # start with zero so no effect at init
+            name="hf_transient")(inp)
+
+    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
+
+    # ── smooth limiter ────────────────────────────────────
+    out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+
+    return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
+    
+
 def build_resnet(filters=FILTERS,
                  kernel_size=KERNEL_SIZE,
                  dilations=DILATIONS,
                  dynamic_time=False):
-    T = None if dynamic_time else SEG_LEN
+    T   = None if dynamic_time else SEG_LEN
     inp = tf.keras.Input(shape=(T,1), name="piezo_in")
-    x   = tf.keras.layers.Conv1D(filters,1,padding='same',name="init_pw")(inp)
+    x   = tf.keras.layers.Conv1D(filters,
+                                 1,
+                                 padding='same',
+                                 name="init_pw")(inp)
 
+    # causal ResNet blocks (unchanged)
     for idx,d in enumerate(dilations):
-        res    = x
-        pad_amt= (kernel_size-1)*d
-        x      = tf.keras.layers.ZeroPadding1D((pad_amt,0),name=f"pad_{idx}")(x)
-        x      = tf.keras.layers.SeparableConv1D(
-                    filters=filters,
-                    kernel_size=kernel_size,
-                    dilation_rate=d,
-                    padding='valid',
-                    activation='relu',
-                    name=f"sep_{idx}"
-                 )(x)
-        x      = tf.keras.layers.Conv1D(filters,1,padding='same',name=f"pw_{idx}")(x)
-        x      = tf.keras.layers.Add(name=f"res_add_{idx}")([x,res])
+        res     = x
+        pad_amt = (kernel_size-1)*d
+        x       = tf.keras.layers.ZeroPadding1D((pad_amt,0),
+                                                name=f"pad_{idx}")(x)
+        x       = tf.keras.layers.SeparableConv1D(
+                      filters=filters,
+                      kernel_size=kernel_size,
+                      dilation_rate=d,
+                      padding='valid',
+                      activation='relu',
+                      name=f"sep_{idx}"
+                  )(x)
+        x       = tf.keras.layers.Conv1D(filters,
+                                         1,
+                                         padding='same',
+                                         name=f"pw_{idx}")(x)
+        x       = tf.keras.layers.Add(name=f"res_add_{idx}")([x,res])
 
-    x   = tf.keras.layers.Conv1D(1,1,padding='same',name="final_pw")(x)
-    out = tf.keras.layers.Add(name="res_out")([x, inp])
-    return tf.keras.Model(inp,out,name="piezo2mic_resnet_causal")
+    # final 1×1 conv
+    final = tf.keras.layers.Conv1D(1,
+                                   1,
+                                   padding='same',
+                                   name="final_pw")(x)
 
-# ─────────────────── MANUAL WEIGHT-ONLY QUANTIZER ────────────────────────────
-def quantize_weights_inplace(model):
+    # ---- identity-initialised skip path ----
+    # we keep the Conv1D but init it to 1.0 so at training start
+    # it is exactly identity, and only learns a small gain correction.
+    skip  = tf.keras.layers.Conv1D(1,
+                                   1,
+                                   use_bias=False,
+                                   kernel_initializer=tf.keras.initializers.Ones(),
+                                   name="skip_conv")(inp)
+
+    # add the two paths
+    res   = tf.keras.layers.Add(name="res_out")([final, skip])
+
+    # ---- smooth limiter instead of hard clip ----
+    # this guarantees your network output is always in [-1,1]
+    out   = tf.keras.layers.Activation('tanh', name="tanh_out")(res)
+
+    return tf.keras.Model(inputs=inp, outputs=out,
+                          name="piezo2mic_resnet_causal")
+
+def extract_and_save_int8_weights(tflite_model_buf,
+                                  outdir,
+                                  dilations,
+                                  filters,
+                                  hf_kernel_size=3):
     """
-    Per-tensor linear quantization of all float32 weights down to 8-bit levels.
-    We compute min/max of each weight tensor, map to [0..255], round, then
-    dequantize back to float32 (so your saved Keras model still has float32
-    weights but only 256 distinct levels).
-    """
-    new_vars = []
-    for w in model.get_weights():
-        w_min, w_max = w.min(), w.max()
-        if w_max <= w_min:
-            new_vars.append(w)
-            continue
-        scale = (w_max - w_min) / 255.0
-        # map to 0..255
-        q = np.round((w - w_min) / scale).astype(np.uint8)
-        # dequantize
-        w_dq = q.astype(np.float32) * scale + w_min
-        new_vars.append(w_dq)
-    model.set_weights(new_vars)
-    
-def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations):
-    """
-    tflite_model_buf : bytes  ← tflite_model = converter.convert()
-    outdir            : str    ← where to write .npy + _quant.txt
-    dilations         : tuple  ← your (1,2,4,8,16,32)
+    tflite_model_buf  = the bytes from converter.convert()
+    outdir            = path to save files into
+    dilations         = your DILATIONS tuple, e.g. (1,2,4)
+    filters           = your F, e.g. 8
+    hf_kernel_size    = 3 (your tiny HF‐bypass window)
     """
     os.makedirs(outdir, exist_ok=True)
-
-    # ── load flatbuffer ─────────────────────────────────────────────
     model = Model.GetRootAsModel(tflite_model_buf, 0)
-    subg  = model.Subgraphs(0)   # type: _SubGraph
+    subg  = model.Subgraphs(0)
+    op_map = {i: model.OperatorCodes(i).BuiltinCode()
+              for i in range(model.OperatorCodesLength())}
 
-    # ── build opcode → builtin mapping ─────────────────────────────
-    opcodes = {}
-    for i in range(model.OperatorCodesLength()):
-        oc = model.OperatorCodes(i)
-        opcodes[i] = oc.BuiltinCode()
-
-    # ── helper to read a tensor’s raw buffer + quant params ─────────
     def load_tensor(tidx):
-        t = subg.Tensors(tidx)           # type: _Tensor
-        b = model.Buffers(t.Buffer())    # type: _Buffer
-        raw = b.DataAsNumpy()            # view of bytes
-
-        # pick numpy dtype
-        ty = t.Type()
-        if   ty == TensorType.INT8:   dt = np.int8
-        elif ty == TensorType.INT32:  dt = np.int32
-        else:
-            raise ValueError(f"unexpected tensor type {ty}")
-
-        arr = np.frombuffer(raw, dtype=dt).reshape(t.ShapeAsNumpy())
-
-        # pull quant params
+        t = subg.Tensors(tidx)
+        b = model.Buffers(t.Buffer())
+        raw = b.DataAsNumpy()
+        dtype = np.int8 if t.Type()==TensorType.INT8 else np.int32
+        arr = np.frombuffer(raw, dtype=dtype).reshape(t.ShapeAsNumpy())
         qp = t.Quantization()
-        scales      = [qp.Scale(i)      for i in range(qp.ScaleLength())]
-        zero_points = [qp.ZeroPoint(i)  for i in range(qp.ZeroPointLength())]
-        qmat = np.stack([scales, zero_points], axis=1)
+        scales      = [qp.Scale(i)     for i in range(qp.ScaleLength())]
+        zero_points = [qp.ZeroPoint(i) for i in range(qp.ZeroPointLength())]
+        quant_txt   = np.stack([scales, zero_points], axis=1)
+        return arr, quant_txt
 
-        return arr, qmat
+    sep_ctr    = 0
+    pwsep_ctr  = 0
+    pw_ctr     = 0
 
-    sep_counter   = 0   # counts DEPTHWISE_CONV_2D → dw0..dw5
-    conv2_counter = 0   # counts all CONV_2D → init,pwsep,pw,final
-
-    # ── walk the operators in topo order ────────────────────────────
     for oi in range(subg.OperatorsLength()):
         op   = subg.Operators(oi)
-        code = opcodes[op.OpcodeIndex()]
+        code = op_map[op.OpcodeIndex()]
 
-        # 1) depthwise halves of your SeparableConv1Ds
+        # ─────────────────── depthwise (SeparableConv1D) ──────────────────
         if code == BuiltinOperator.DEPTHWISE_CONV_2D:
-            # inputs: [in, filter, bias]  (bias is usually zero-vector or absent)
-            w_idx = op.Inputs(1)
-            b_idx = op.Inputs(2) if op.InputsLength() > 2 else None
+            w_i = op.Inputs(1)
+            b_i = op.InputsLength()>2 and op.Inputs(2)
+            tag = f"dw{sep_ctr}"
+            sep_ctr += 1
 
-            # save w
-            w_arr, w_q = load_tensor(w_idx)
-            fn = os.path.join(outdir, f"dw{sep_counter}_w_int8.npy")
-            np.save(fn, w_arr)
-            np.savetxt(fn.replace(".npy","_quant.txt"), w_q,
-                       fmt="%g", delimiter=",",
-                       header="scale,zero_point", comments="")
+            w_arr, w_q = load_tensor(w_i)
+            np.save(f"{outdir}/{tag}_w_int8.npy",        w_arr)
+            np.savetxt(f"{outdir}/{tag}_w_int8_quant.txt",
+                       w_q, fmt="%g", header="scale,zero_point", comments="")
 
-            # save bias if present
-            if b_idx is not None:
-                b_arr, b_q = load_tensor(b_idx)
-                fn = os.path.join(outdir, f"dw{sep_counter}_b_int32.npy")
-                np.save(fn, b_arr)
-                np.savetxt(fn.replace(".npy","_quant.txt"), b_q,
-                           fmt="%g", delimiter=",",
-                           header="scale,zero_point", comments="")
-
-            print(f"→ depthwise dw{sep_counter}")
-            sep_counter += 1
+            if b_i:
+                b_arr, b_q = load_tensor(b_i)
+                np.save(f"{outdir}/{tag}_b_int32.npy",    b_arr)
+                np.savetxt(f"{outdir}/{tag}_b_int32_quant.txt",
+                           b_q, fmt="%g", header="scale,zero_point", comments="")
             continue
 
-        # 2) all the 1×1 convs: init_pw, the pointwise half of each sep,
-        #    the residual pw_i, and your final_pw
+        # ─────────────────── all 1×1 convs + HF bypass ──────────────────
         if code == BuiltinOperator.CONV_2D:
-            w_idx, b_idx = op.Inputs(1), op.Inputs(2)
-            conv2_counter += 1
-            cnt = conv2_counter
-            N   = len(dilations)
+            w_i, b_i     = op.Inputs(1), op.Inputs(2)
+            w_arr, w_q   = load_tensor(w_i)
+            b_arr, b_q   = load_tensor(b_i)
+            W              = w_arr.size
+            B              = b_arr.size
 
-            # decide tag by counting pattern:
-            #   conv2_counter == 1           → init_pw
-            #   conv2_counter == 2*(N+1)     → final_pw
-            #   otherwise evens               → pwsep[i]
-            #             odds (>1)          → pw[i]
-            if cnt == 1:
-                tag = "init_pw"
-            elif cnt == 2*(N+1):
-                tag = "final_pw"
-            elif cnt % 2 == 0:
-                i = cnt//2 - 1
-                tag = f"pwsep{i}"
+            # 1) tiny HF‐transient: ONLY 3 weights
+            if W == hf_kernel_size:
+                tag = "hf_transient"
+
+            # 2) skip_conv     : ONLY 1 weight, 1 bias
+            elif W == 1 and B == 1:
+                tag = "skip_conv"
+
+            # 3) init_pw / final_pw : EXACTLY F weights
+            elif W == filters:
+                # outC = B
+                if B == filters:
+                    tag = "init_pw"
+                elif B == 1:
+                    tag = "final_pw"
+                else:
+                    raise RuntimeError(
+                      f"Found {W} weights but bias‐length={B} is neither 1 nor {filters}")
+
+            # 4) pwsep blocks : F×2F weights, 2F biases
+            elif W == filters*(2*filters) and B == (2*filters):
+                tag = f"pwsep{pwsep_ctr}"
+                pwsep_ctr += 1
+
+            # 5) pw blocks    : F×F weights, F biases
+            elif W == filters*filters and B == filters:
+                tag = f"pw{pw_ctr}"
+                pw_ctr += 1
+
             else:
-                i = (cnt - 3)//2
-                tag = f"pw{i}"
+                raise RuntimeError(f"Unexpected 1×1‐Conv shape: {w_arr.shape}, bias‐len={B}")
 
-            # weight
-            w_arr, w_q = load_tensor(w_idx)
-            fn = os.path.join(outdir, f"{tag}_w_int8.npy")
-            np.save(fn, w_arr)
-            np.savetxt(fn.replace(".npy","_quant.txt"), w_q,
-                       fmt="%g", delimiter=",",
-                       header="scale,zero_point", comments="")
+            # write‐out weight + quant
+            fnw = os.path.join(outdir, f"{tag}_w_int8.npy")
+            np.save(fnw, w_arr)
+            np.savetxt(fnw.replace(".npy","_quant.txt"),
+                       w_q, fmt="%g", header="scale,zero_point", comments="")
 
-            # bias
-            b_arr, b_q = load_tensor(b_idx)
-            fn = os.path.join(outdir, f"{tag}_b_int32.npy")
-            np.save(fn, b_arr)
-            np.savetxt(fn.replace(".npy","_quant.txt"), b_q,
-                       fmt="%g", delimiter=",",
-                       header="scale,zero_point", comments="")
+            # write‐out bias + quant
+            fnb = os.path.join(outdir, f"{tag}_b_int32.npy")
+            np.save(fnb, b_arr)
+            np.savetxt(fnb.replace(".npy","_quant.txt"),
+                       b_q, fmt="%g", header="scale,zero_point", comments="")
 
-            print(f"→ conv2d #{cnt} → {tag}")
             continue
 
-        # skip everything else
-        continue
-
-    # ── sanity checks ───────────────────────────────────────────────
-    assert sep_counter   == len(dilations),   f"got {sep_counter} depthwise_conv2d ops, expected {len(dilations)}"
-    # init + 2*N convs (pwsep & pw) + final = 1 + 2*N + 1 = 2*(N+1)
-    assert conv2_counter == 2*(len(dilations)+1), f"got {conv2_counter} conv2d ops, expected {2*(len(dilations)+1)}"
+    # final sanity checks
+    assert sep_ctr   == len(dilations), \
+           f"got {sep_ctr} depthwise ops, expected {len(dilations)}"
+    assert pwsep_ctr == len(dilations), \
+           f"got {pwsep_ctr} pwsep ops, expected {len(dilations)}"
+    assert pw_ctr    == len(dilations), \
+           f"got {pw_ctr} pw ops, expected {len(dilations)}"
 
     print("✅ saved all int8 kernels + int32 biases in", outdir)
 
-
-# ───────────────────────── TRAINING ────────────────────────────────────────────
+# ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
     # split train/val
-    n  = len(pairs)
-    idx= list(range(n))
+    n = len(pairs)
+    idx = list(range(n))
     if n>=2:
-        tr_i,va_i = train_test_split(idx,test_size=0.1,random_state=42)
+        tr_i,va_i = train_test_split(idx, test_size=0.1, random_state=42)
     else:
-        tr_i=va_i=idx
+        tr_i = va_i = idx
     train_pairs = [pairs[i] for i in tr_i]
     val_pairs   = [pairs[i] for i in va_i]
     train_durs  = [sf.info(s).frames for s,_ in train_pairs]
-    val_durs    = [sf.info(s).frames for s,_ in val_pairs]
+    val_durs    = [sf.info(s).frames for _,t in val_pairs]
 
     def approx_steps(durs):
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
@@ -269,68 +496,49 @@ def train():
     validation_steps = max(approx_steps(val_durs),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
-    # data generator
+    # data generator (no per-segment mean removal)
     def segment_generator(pairs_list, durs_list):
         while True:
-            i       = random.randrange(len(pairs_list))
-            sp,tp   = pairs_list[i]
-            dur     = durs_list[i]
-            offset  = random.randrange(max(dur-SEG_LEN,1))
-            x,_     = sf.read(sp, start=offset, frames=SEG_LEN,
-                              dtype='float32',always_2d=True)
-            y,_     = sf.read(tp, start=offset, frames=SEG_LEN,
-                              dtype='float32',always_2d=True)
+            i      = random.randrange(len(pairs_list))
+            sp,tp  = pairs_list[i]
+            dur    = durs_list[i]
+            offset = random.randrange(max(dur-SEG_LEN,1))
+            x,_    = sf.read(sp, start=offset, frames=SEG_LEN,
+                             dtype='float32', always_2d=True)
+            y,_    = sf.read(tp, start=offset, frames=SEG_LEN,
+                             dtype='float32', always_2d=True)
             if x.shape[0]<SEG_LEN:
-                pad=SEG_LEN-x.shape[0]
-                x=np.pad(x,((0,pad),(0,0)))
-                y=np.pad(y,((0,pad),(0,0)))
-            x = x - np.mean(x)
-            y = y - np.mean(y)
+                pad = SEG_LEN - x.shape[0]
+                x = np.pad(x,((0,pad),(0,0)))
+                y = np.pad(y,((0,pad),(0,0)))
             yield x, y
-            
-    # 2) create a representative dataset generator
+
+    # representative dataset for full-integer quant
     def representative_data_gen():
-        """Yields 100 random segments of shape (1, SEG_LEN, 1) from your source files."""
         for _ in range(100):
-            # pick a random example
-            i = random.randrange(len(pairs))
-            src_path = pairs[i][0]
+            i        = random.randrange(len(train_pairs))
+            src_path = train_pairs[i][0]
             dur      = train_durs[i]
+            offset   = random.randrange(max(dur-SEG_LEN,1))
+            x,_      = sf.read(src_path, start=offset, frames=SEG_LEN,
+                               dtype="float32", always_2d=True)
+            if x.shape[0]<SEG_LEN:
+                x = np.pad(x,((0,SEG_LEN-x.shape[0]),(0,0)))
+            yield [x.reshape(1,SEG_LEN,1)]
 
-            # pick a random offset so we can read SEG_LEN frames
-            offset = random.randrange(max(dur - SEG_LEN, 1))
-
-            # read exactly SEG_LEN frames from the source (piezo) file
-            x, _ = sf.read(src_path,
-                        start=offset,
-                        frames=SEG_LEN,
-                        dtype="float32",
-                        always_2d=True)
-
-            # if we’re too short (EOF), pad with zeros
-            if x.shape[0] < SEG_LEN:
-                pad_amt = SEG_LEN - x.shape[0]
-                x = np.pad(x, ((0, pad_amt), (0, 0)))
-
-            # mean‑remove, reshape to (1, SEG_LEN, 1)
-            x = x - np.mean(x, axis=0, keepdims=True)
-            x = x.reshape(1, SEG_LEN, 1)
-
-            yield [x]
-
-    sig = tf.TensorSpec((SEG_LEN,1),tf.float32)
+    sig = tf.TensorSpec((SEG_LEN,1), tf.float32)
     train_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_pairs,train_durs),
-        output_signature=(sig,sig)
+        lambda: segment_generator(train_pairs, train_durs),
+        output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     val_ds   = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_pairs,val_durs),
-        output_signature=(sig,sig)
+        lambda: segment_generator(val_pairs, val_durs),
+        output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
-    # 1) Full-window FP32
+    # 1) train FP32 static
     print("\n≈ Training FP32 model")
-    static_model = build_resnet(dynamic_time=False)
+    static_model = build_resnet_gated(dynamic_time=False)
     static_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
                          loss=combined_loss, metrics=['mae'])
     static_model.summary()
@@ -347,116 +555,116 @@ def train():
     static_model.save(path_static)
     print("✅ Saved FP32 static model:", path_static)
 
-    # 2) Dynamic FP32
+    # 2) build + save FP32 dynamic
     print("\n≈ Building + saving FP32 dynamic-time model")
-    dynamic_model = build_resnet(dynamic_time=True)
+    dynamic_model = build_resnet_gated(dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
     path_dyn = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
     dynamic_model.save(path_dyn)
     print("✅ Saved FP32 dynamic model:", path_dyn)
-
-    # 3) Manual weight-only quantize
-    print("\n≈ Quantizing weights (8-bit) in dynamic model")
-    quant_model = tf.keras.models.clone_model(dynamic_model)
-    quant_model.set_weights(dynamic_model.get_weights())
-    quantize_weights_inplace(quant_model)
-    path_q   = os.path.join(OUT_DIR, QUANT_MODEL_FILENAME)
-    quant_model.save(path_q)
-    print("✅ Saved weight-quantized dynamic model:", path_q)
     
-    # Export layer weights into .npy files
-    weights_dir = os.path.join(OUT_DIR, "weights")
-    os.makedirs(weights_dir, exist_ok=True)
+    if (SAVE_WEIGHTS):
+        # 4) export layer weights (.npy)
+        weights_dir = os.path.join(OUT_DIR,"weights")
+        os.makedirs(weights_dir, exist_ok=True)
 
-    # 1×1 Init PW
-    w0, b0 = dynamic_model.get_layer("init_pw").get_weights()
-    
-    np.save(os.path.join(weights_dir, "init_pw_w.npy"), w0.astype(np.float32))
-    np.save(os.path.join(weights_dir, "init_pw_b.npy"), b0.astype(np.float32))
 
-    # Depthwise + PW for each residual block
-    for idx, d in enumerate(DILATIONS):
-        sep = dynamic_model.get_layer(f"sep_{idx}")
-        pw  = dynamic_model.get_layer(f"pw_{idx}")
+        # init_pw
+        w0,b0 = dynamic_model.get_layer("init_pw").get_weights()
+        np.save(os.path.join(weights_dir,"init_pw_w.npy"), w0.astype(np.float32))
+        np.save(os.path.join(weights_dir,"init_pw_b.npy"), b0.astype(np.float32))
 
-        # sep is the tf.keras.layers.SeparableConv1D
-        # get_weights() returns [depthwise_kernel, pointwise_kernel, bias]
-        dw_w, pw_w, pw_b = sep.get_weights()
+        # depthwise + pwsep + pw per block
+        for idx,_ in enumerate(DILATIONS):
+            sep = dynamic_model.get_layer(f"sep_{idx}")
+            dw, pw_w1, pw_b1 = sep.get_weights()
+            np.save(os.path.join(weights_dir,f"dw{idx}_w.npy"),   dw.astype(np.float32))
+            np.save(os.path.join(weights_dir,f"pwsep{idx}_w.npy"),pw_w1.astype(np.float32))
+            np.save(os.path.join(weights_dir,f"pwsep{idx}_b.npy"),pw_b1.astype(np.float32))
 
-        # save the depthwise kernel for your StatefulDepthwiseDilated1D
-        np.save(os.path.join(weights_dir, f"dw{idx}_w.npy"), dw_w.astype(np.float32))
+            pw = dynamic_model.get_layer(f"pw_{idx}")
+            w2,b2 = pw.get_weights()
+            np.save(os.path.join(weights_dir,f"pw{idx}_w.npy"),   w2.astype(np.float32))
+            np.save(os.path.join(weights_dir,f"pw{idx}_b.npy"),   b2.astype(np.float32))
 
-        # save the internal pointwise (and its bias) as a separate 1×1 conv
-        np.save(os.path.join(weights_dir, f"pwsep{idx}_w.npy"), pw_w.astype(np.float32))
-        np.save(os.path.join(weights_dir, f"pwsep{idx}_b.npy"), pw_b.astype(np.float32))
+        # final_pw
+        wf,bf = dynamic_model.get_layer("final_pw").get_weights()
+        np.save(os.path.join(weights_dir,"final_pw_w.npy"), wf.astype(np.float32))
+        np.save(os.path.join(weights_dir,"final_pw_b.npy"), bf.astype(np.float32))
+
+        # skip_conv
+        sw = dynamic_model.get_layer("skip_conv").get_weights()[0]
+        np.save(os.path.join(weights_dir,"skip_conv_w.npy"), sw.astype(np.float32))
+
+        # ── hf_transient (3-tap bypass) ──────────────────────────────
+        hf_kernel = dynamic_model.get_layer("hf_transient").get_weights()[0]
+        # hf_kernel.shape == (3,1,1)  i.e. (kernel_size, in_channels, out_channels)
+        # we only need it as a (K, C) matrix, so drop the last dimension:
+        hf_kernel = hf_kernel[:,:,0]       # now shape is (3,1)
+        np.save(os.path.join(weights_dir,"hf_transient_w.npy"),
+                hf_kernel.astype(np.float32))
         
-        pw = dynamic_model.get_layer(f"pw_{idx}")
-        pw_w2, pw_b2 = pw.get_weights()
-        np.save(os.path.join(weights_dir, f"pw{idx}_w.npy"), pw_w2.astype(np.float32))
-        np.save(os.path.join(weights_dir, f"pw{idx}_b.npy"), pw_b2.astype(np.float32))
 
-    # final 1×1
-    wf, bf = dynamic_model.get_layer("final_pw").get_weights()
-    path_final_pw_w = os.path.join(weights_dir, "final_pw_w.npy")
-    path_final_pw_b = os.path.join(weights_dir, "final_pw_b.npy")
-    np.save(path_final_pw_w, wf.astype(np.float32))
-    np.save(path_final_pw_b, bf.astype(np.float32))
-    
-    # Now produce a TFLite INT8 model
-    int8_weights_dir = os.path.join(OUT_DIR, "int8_weights")
-    os.makedirs(int8_weights_dir, exist_ok=True)
-    
-    # 3) convert to TFLite with full INT8 quantization
-    print("\n≈ Converting dynamic model to TFLite INT8 model for INT8 weight extraction")
-    converter = tf.lite.TFLiteConverter.from_keras_model(static_model)
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-    converter.representative_dataset = representative_data_gen
-    # ensure full integer (no float ops)
-    converter.target_spec.supported_ops = [
-        tf.lite.OpsSet.TFLITE_BUILTINS_INT8,    # plus their int8 versions
-    ]
-    
-    # set I/O to int8
-    converter.inference_input_type = tf.int8
-    converter.inference_output_type = tf.int8
+        # 5) convert + extract int8 TFLite
+        print("\n≈ Converting dynamic model to TFLite INT8 model for weight extraction")
+        converter = tf.lite.TFLiteConverter.from_keras_model(static_model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        converter.representative_dataset = representative_data_gen
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type  = tf.int8
+        converter.inference_output_type = tf.int8
+        tflite_model = converter.convert()
+        extract_and_save_int8_weights(
+            tflite_model,
+            os.path.join(OUT_DIR,"int8_weights"),
+            dilations=DILATIONS,
+            filters=FILTERS
+        )
 
-    tflite_model = converter.convert()
-    extract_and_save_int8_weights(tflite_model, int8_weights_dir, DILATIONS)
+    return static_model, dynamic_model
 
-    return (static_model, dynamic_model, quant_model)
-
-# ───────────────────────── MAIN ────────────────────────────────────────────────
+# ─────────────────────────────── MAIN / DEMO ──────────────────────────────────
 if __name__=="__main__":
     if len(sys.argv)>1 and sys.argv[1]=="--train":
-        print("–––– TRAINING ––––")
-        _, dynamic_model, quant_model = train()
+        static_model, dynamic_model = train()
     else:
         dpath = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
-        qpath = os.path.join(OUT_DIR, QUANT_MODEL_FILENAME)
-        if not os.path.exists(dpath) or not os.path.exists(qpath):
+        if not os.path.exists(dpath):
             print("Dynamic model not found. run: python piezo2mic.py --train")
             sys.exit(1)
-        print("Loading dynamic model:", dpath)
-        print("Loading quantized model:", qpath)
-        dynamic_model = tf.keras.models.load_model(dpath, compile=False)
-        quant_model   = tf.keras.models.load_model(qpath, compile=False)
+        dynamic_model = tf.keras.models.load_model(
+                dpath,
+                compile=False,
+                custom_objects={
+                    'slice_content': slice_content,
+                    'slice_gate':    slice_gate
+        })
 
-    # ───────── DEMO ──────────────────────────────────────────────────────────────
+    # DEMO
     print("\nGenerating demo…")
-    FRAMES = DEMO_SEC * SR
-    pth_src, pth_tgt = pairs[0]
-    x_long,_ = sf.read(pth_src, frames=FRAMES, dtype='float32', always_2d=True)
-    y_ref,_  = sf.read(pth_tgt, frames=FRAMES, dtype='float32', always_2d=True)
-    x_long   = x_long - np.mean(x_long)
-    x_in     = x_long[np.newaxis,...]
+    FRAMES      = DEMO_SEC * SR
+    START_FRAME = DEMO_OFFSET_SEC * SR
+    pth_src, pth_tgt = pairs[DEMO_PAIR_INDEX]
 
+    x_long,_ = sf.read(pth_src,
+                       start=START_FRAME,
+                       frames=FRAMES,
+                       dtype='float32',
+                       always_2d=True)
+    y_ref,_  = sf.read(pth_tgt,
+                       start=START_FRAME,
+                       frames=FRAMES,
+                       dtype='float32',
+                       always_2d=True)
+
+    x_in = x_long[np.newaxis,...]
     print("Running inference…")
-    y_pred_dynamic = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
-    y_pred_quant = quant_model.predict(x_in, batch_size=1)[0,:,0]
+    y_pred_dyn = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
 
-    sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),      x_long, SR)
-    sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),    y_ref,   SR)
-    
-    sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"), y_pred_dynamic,  SR)
-    sf.write(os.path.join(OUT_DIR,"demo_output_pred_quant.wav"), y_pred_quant,  SR)
+    sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),
+             x_long, SR, subtype='FLOAT')
+    sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),
+             y_ref, SR, subtype='FLOAT')
+    sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"),
+             y_pred_dyn, SR, subtype='FLOAT')
     print("✅ Demo files in", OUT_DIR)

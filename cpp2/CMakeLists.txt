@@ -13,8 +13,12 @@ set(CMAKE_CXX_FLAGS_RELEASE
     # old flags
     #-O3 -march=native
 
-    # new flags for Apple Silicon specifically
-    "-O3 -march=armv8-a"
+    
+    # Best for ARMv8-A, such Cortex-A
+    #"-O3 -ffast-math -march=armv8-a"
+
+    # For Apple Silicon
+    "-O3 -ffast-math -march=native"
 )
 
 # These are also for Apple Silicon specifically
@@ -48,7 +52,6 @@ message(STATUS "Using CNPY include path: ${CNPY_INCLUDE_DIR}")
 
 # Add executable
 add_executable(stream_audio_cpp src/main.cpp)
-add_executable(stream_audio_tflite_cpp src/main-tflite.cpp)
 
 # --- Linking and Include Directories ---
 
@@ -59,18 +62,8 @@ target_include_directories(stream_audio_cpp PRIVATE
     "${CNPY_INCLUDE_DIR}"
 )
 
-target_include_directories(stream_audio_tflite_cpp PRIVATE
-    "${PORTAUDIO_INCLUDE_DIRS}"
-    "${TFLITE_INCLUDE_DIR}"
-    "${FLATBUFFERS_INCLUDE_DIR}"
-)
-
 # Explicitly tell the linker where to search for libraries
 target_link_directories(stream_audio_cpp PRIVATE 
-    "${PORTAUDIO_LIBRARY_DIRS}"
-)
-
-target_link_directories(stream_audio_tflite_cpp PRIVATE 
     "${PORTAUDIO_LIBRARY_DIRS}"
 )
 
@@ -85,20 +78,8 @@ target_link_libraries(stream_audio_cpp PRIVATE
      "-framework Accelerate"
 )
 
-target_link_libraries(stream_audio_tflite_cpp PRIVATE
-    # PORTAUDIO_LIBRARIES usually resolves to just the library name (e.g., "portaudio")
-    # which target_link_directories helps the linker find.
-    "${PORTAUDIO_LIBRARIES}"
-    "${TFLITE_LIBRARY}"
-)
-
 # On Linux/macOS, you might need to link pthread and dl
 if (UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(stream_audio_cpp PRIVATE Threads::Threads dl)
-endif()
-
-if (UNIX)
-    find_package(Threads REQUIRED)
-    target_link_libraries(stream_audio_tflite_cpp PRIVATE Threads::Threads dl)
 endif()

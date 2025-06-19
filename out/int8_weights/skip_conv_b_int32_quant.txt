@@ -1,0 +1,2 @@
+scale,zero_point
+1.17795e-05 0
