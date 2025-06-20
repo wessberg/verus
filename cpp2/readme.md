@@ -3,7 +3,7 @@
 mkdir build
 cd build
 
-cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native" -DTFLITE_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DTFLITE_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.dylib -DFLATBUFFERS_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/cnpy/build/libcnpy.dylib
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native" -DTFLITE_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DTFLITE_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.dylib -DFLATBUFFERS_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib -DCNPY_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/cnpy/build/libcnpy.dylib -DPORTAUDIO_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/portaudio/include -DPORTAUDIO_LIBRARY=/usr/local/lib/libportaudio.dylib
 cmake --build .
 
 # RUN
@@ -24,8 +24,8 @@ cmake --build .
 
 #### FP32
 
-cmake --build . && ./stream_audio_cpp --weights-dir ../../out/weights --in-dev 2 --out-dev 2 --blocksize 64
+cmake --build . && ./stream_audio_cpp --weights-dir ../../out/weights --input-device 3 --output-device 3
 
 #### INT8
 
-cmake --build . && ./stream_audio_cpp --weights-dir ../../out/int8_weights --in-dev 3 --out-dev 3 --blocksize 64 --int8
+cmake --build . && ./stream_audio_cpp --weights-dir ../../out/int8_weights --input-device 3 --output-device 3 --int8

@@ -7,7 +7,6 @@ import os
 import glob
 import random
 import sys
-import re
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -16,24 +15,25 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-FILTERS             = 48
-KERNEL_SIZE         = 51
-DILATIONS           = (1,2,4,8,16,32)
+FILTERS             = 44
+KERNEL_SIZE         = 41
+DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-EPOCHS              = 14
+EPOCHS              = 10
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
 SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
-DEMO_SEC            = 60
+
+DEMO_SEC            = 60 * 2
 DEMO_OFFSET_SEC     = 0
-DEMO_PAIR_INDEX     = 6
+DEMO_PAIR_INDEX     = 0
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
@@ -205,8 +205,6 @@ def combined_loss(y_true, y_pred):
     )
 
 # ────────────────────────── MODEL ARCHITECTURE ─────────────────────────────────
-import tensorflow as tf
-
 def build_resnet_gated(filters=FILTERS,
                        kernel_size=KERNEL_SIZE,
                        dilations=DILATIONS,

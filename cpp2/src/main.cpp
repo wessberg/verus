@@ -15,19 +15,37 @@
 #include <fcntl.h>
 #include <cmath>
 #include <sys/stat.h>
-#include <portaudio.h>
 #include "cnpy.h"
 #include <pthread/qos.h>
 #include <Accelerate/Accelerate.h> // for cblas_sgemm
+#include <portaudio.h>
+#ifdef __APPLE__
+  #include <sched.h>          // for SCHED_FIFO
+  #include "pa_mac_core.h"    // PortAudio CoreAudio stream‐info
+  #include <CoreAudio/CoreAudio.h>
+  #include <CoreFoundation/CoreFoundation.h>
+#endif
+
+
+
+
+
+
+
+
+
+
+
+
 
 // ───────────────────────── PARAMETERS ─────────────────────────
-static constexpr int FILTERS        = 48;
-static constexpr int KERNEL         = 51;
-static constexpr std::array<int,6> DILATIONS     = {1,2,4,8,16,32};
+static constexpr int FILTERS        = 44;
+static constexpr int KERNEL         = 41;
+static constexpr std::array<int,4> DILATIONS     = {1,2,4,8};
 static constexpr int NUM_BLOCKS     = (int)DILATIONS.size();
-static constexpr int MAX_HOP        = 16;
+static constexpr int MAX_HOP        = 15;
 static constexpr int RECEPTIVE_FIELD=
-    1 + (KERNEL-1)*(1+2+4+8+16+32);
+    1 + (KERNEL-1)*(1+2+4+8);
 
 // ───────────────────────── GLOBAL FLAGS ───────────────────────
 std::atomic<bool> gStopFlag(false), bypassFlag(false);
@@ -76,29 +94,51 @@ struct Shared {
 struct P1D {
   int inC, outC;
   std::vector<float> W, b;
-  P1D(): inC(0), outC(0) {}
-  P1D(int _inC,int _outC,
-      std::vector<float>&&_W,
-      std::vector<float>&&_b)
+
+  P1D() : inC(0), outC(0) {}
+  P1D(int _inC, int _outC,
+      std::vector<float>&& _W,
+      std::vector<float>&& _b)
     : inC(_inC), outC(_outC),
       W(std::move(_W)),
       b(std::move(_b))
   {}
+
+  //
+  // in:  hop × inC   (row‐major, stride=1 between elements in a row)
+  // W:   inC × outC (row‐major, stride=1)
+  // out: hop × outC (row‐major, stride=1)
+  //
   void run(const float *in, float *out, int hop) const {
-    cblas_sgemm(
-      CblasRowMajor,
-      CblasNoTrans, CblasNoTrans,
-      hop, outC, inC,
-      1.f,
-      in, inC,
-      W.data(), outC,
-      0.f,
-      out, outC
+    // 1) out = in (MxP) × W (PxN)
+    //    where M = hop, P = inC, N = outC
+    //
+    //    vDSP_mmul(A, IA, B, IB, C, IC, M, N, P)
+    //      IA, IB, IC = stride between elements in each ROW
+    //
+    vDSP_mmul(
+      in,        /* A       */ 1,     /* IA = 1 since row‐major contiguous */
+      W.data(),  /* B       */ 1,     /* IB = 1 */
+      out,       /* C       */ 1,     /* IC = 1 */
+      hop,       /* M = rows of A and C */
+      outC,      /* N = cols of B and C */
+      inC        /* P = cols of A, rows of B */
     );
-    for(int t=0;t<hop;t++){
-      float *row = out + t*outC;
-      for(int oc=0;oc<outC;oc++)
-        row[oc] += b[oc];
+
+    // 2) add bias b[oc] to each column oc in 'out'
+    //
+    for(int oc = 0; oc < outC; ++oc) {
+      float bias = b[oc];
+      // vDSP_vsadd(A, IA, &bias, C, IC, N)
+      //   adds scalar (&bias) to each of N elements of A, stride IA, writes to C stride IC
+      vDSP_vsadd(
+        out + oc,   /* A       start at element (0,oc) */
+        outC,       /* IA      to jump from one row to next you skip outC elems */
+        &bias,      /* B       pointer to scalar to add */
+        out + oc,   /* C       in‐place writeback */
+        outC,       /* IC      same stride */
+        hop         /* N       # of rows = hop */
+      );
     }
   }
 };
@@ -464,40 +504,47 @@ static void loadAllInt8(const std::string &dir){
 }
 
 // ───────────────────────── STREAMING THREAD ─────────────────────────
-void inferenceThread(Shared *sh, int hop){
-    // (7) raise to USER_INTERACTIVE on macOS
+void inferenceThread(Shared *sh, int hop) {
+    // 1) boost QoS on macOS
     #if defined(__APPLE__)
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+      // 1) bump to real‐time “audio” QoS if available
+      #ifdef QOS_CLASS_AUDIO
+        pthread_set_qos_class_self_np(QOS_CLASS_AUDIO, 0);
+      #else
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+      #endif
+
+      // 2) also try to grab an SCHED_FIFO real‐time thread priority
+      struct sched_param sp;
+      sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+      if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0){
+        std::cerr<<"[inferenceThread] WARNING: pthread_setschedparam(SCHED_FIFO) failed\n";
+      }
     #endif
 
-    const int RF      = RECEPTIVE_FIELD;
-    const int SEG    = RF + hop;
-    const int F      = FILTERS;
-    const int OC     = 2*F;
+    const int RF  = RECEPTIVE_FIELD;
+    const int SEG = RF + hop;
+    const int F   = FILTERS;
+    const int OC  = 2 * F;
 
-    // — pre-allocated “real-time” buffers —
+    // ─── pre‐allocated buffers ────────────────────────────────────────
     std::vector<float> warm(SEG),
-                       buf0(SEG*F),
-                       res (SEG*F),
-                       sep (SEG*F),
-                       tmp (SEG*F),
-                       pwsep(SEG*OC),
-                       gated(SEG*F),
-                       finalW(SEG),
-                       skipW(SEG),
-                       hfW  (SEG);
+                       buf0(SEG*F), res(SEG*F),
+                       sep(SEG*F), tmp(SEG*F),
+                       pwsep(SEG*OC), gated(SEG*F),
+                       finalW(SEG), skipW(SEG), hfW(SEG);
 
     std::vector<float> in_hop(hop),
-                       buf1  (hop*F),
-                       res1  (hop*F),
-                       sep1  (hop*F),
-                       tmp1  (hop*F),
+                       buf1(hop*F), res1(hop*F),
+                       sep1(hop*F), tmp1(hop*F),
                        gated1(hop*F),
-                       finalH(hop),
-                       skipH (hop),
-                       hfH   (hop);
+                       finalH(hop), skipH(hop), hfH(hop);
 
-    // — warm-up: spin until we have SEG frames in the ring —
+    // ─── temps for gating vectorization ───────────────────────────────
+    std::vector<float> tanhC(F), halfY(F), tanhY(F);
+    const float half = 0.5f, one = 1.0f;
+
+    // ─── warm‐up: fill “SEG” frames ───────────────────────────────────
     while(!gStopFlag && sh->in.available() < (size_t)SEG)
         std::this_thread::yield();
     if(gStopFlag) return;
@@ -507,49 +554,59 @@ void inferenceThread(Shared *sh, int hop){
     init_pw.run(warm.data(), buf0.data(), SEG);
     std::copy(buf0.begin(), buf0.end(), res.begin());
 
-    // b) gated dilated blocks
-    for(int b = 0; b < NUM_BLOCKS; ++b){
+    // b) gated dilated blocks (warm‐up)
+    for(int b = 0; b < NUM_BLOCKS; ++b) {
         sep_conv[b].run(res.data(), sep.data(), SEG);
-        pw_sep[b].run(sep.data(), pwsep.data(), SEG);
+        pw_sep [b].run(sep.data(), pwsep.data(), SEG);
 
-        // gating non-linearity (scalar)
-        for(int t = 0; t < SEG; ++t){
-            float *s = pwsep.data() + t*OC;
-            float *g = gated.data() + t*F;
-            for(int c=0; c<F; ++c){
-                float x = s[c], y = s[c+F];
-                g[c] = std::tanh(x) * (1.f/(1.f + std::exp(-y)));
-            }
+        // → vectorized gating:
+        for(int t = 0; t < SEG; ++t) {
+            const float *s    = pwsep.data() + t*OC;
+            const float *cont = s;        // first F
+            const float *gate = s + F;    // next  F
+            float       *gOut = gated.data() + t*F;
+
+            // 1) tanh(content) → tanhC
+            vvtanhf(tanhC.data(), cont, &F);
+
+            // 2) halfY = gate * 0.5
+            vDSP_vsmul(gate, 1, &half, halfY.data(), 1, F);
+
+            // 3) tanhY = tanh(halfY)
+            vvtanhf(tanhY.data(), halfY.data(), &F);
+
+            // 4) sigmoid = (tanhY + 1)*0.5  in‐place on tanhY
+            vDSP_vsmsa(tanhY.data(), 1, &half, &half, tanhY.data(), 1, F);
+
+            // 5) gated = tanhC * sigmoid
+            vDSP_vmul(tanhC.data(), 1, tanhY.data(), 1, gOut,    1, F);
         }
 
+        // 1×1 projection and residual combine
         pw2[b].run(gated.data(), tmp.data(), SEG);
-
-        // residual
-        for(int i=0; i < SEG*F; ++i)
-            tmp[i] += res[i];
-        res.swap(tmp);
+        // tmp += res   →  vectorized
+        vDSP_vadd(tmp.data(), 1, res.data(), 1, res.data(), 1, SEG*F);
     }
 
-    // c) final 1×1
-    final_pw.run(res.data(), finalW.data(), SEG);
-    // d) skip & hf
-    skip_pw.run(warm.data(), skipW.data(), SEG);
-    hf_conv.run(warm.data(),    hfW.data(), SEG);
+    // c) final 1×1 + skip + hf + merge + tanh
+    final_pw.run(res.data(),  finalW.data(), SEG);
+    skip_pw .run(warm.data(), skipW.data(), SEG);
+    hf_conv .run(warm.data(),    hfW.data(), SEG);
 
-    // e) merge + tanh (vectorized)
-    // finalW += skipW; finalW += hfW; finalW += warm; finalW = tanh(finalW);
-    vDSP_vadd(finalW.data(),1, skipW.data(),1, finalW.data(),1, SEG);
-    vDSP_vadd(finalW.data(),1, hfW  .data(),1, finalW.data(),1, SEG);
-    vDSP_vadd(finalW.data(),1, warm .data(),1, finalW.data(),1, SEG);
-    int N = SEG;
-    vvtanhf(finalW.data(), finalW.data(), &N);
+    // finalW += skipW; finalW += hfW; finalW += warm
+    vDSP_vadd(finalW.data(), 1, skipW.data(), 1, finalW.data(), 1, SEG);
+    vDSP_vadd(finalW.data(), 1, hfW.  data(), 1, finalW.data(), 1, SEG);
+    vDSP_vadd(finalW.data(), 1, warm. data(), 1, finalW.data(), 1, SEG);
 
-    // f) push overlap frames back
-    sh->in.push(warm.data()+RF, hop);
+    int Nseg = SEG;
+    vvtanhf(finalW.data(), finalW.data(), &Nseg);
 
-    // — steady-state loop —
-    while(!gStopFlag){
-        // (4) spin-wait for next hop
+    // push the overlap back for steady‐state
+    sh->in.push(warm.data() + RF, hop);
+
+    // ─── steady‐state processing ──────────────────────────────────────
+    while(!gStopFlag) {
+        // wait for next hop
         while(!gStopFlag && sh->in.available() < (size_t)hop)
             std::this_thread::yield();
         if(gStopFlag) break;
@@ -558,41 +615,45 @@ void inferenceThread(Shared *sh, int hop){
         if(got < (size_t)hop)
             std::fill(in_hop.begin()+got, in_hop.end(), 0.f);
 
-        // a) init
+        // a) init 1×1
         init_pw.run(in_hop.data(), buf1.data(), hop);
         std::copy(buf1.begin(), buf1.end(), res1.begin());
 
-        // b) gated blocks
-        for(int b=0; b<NUM_BLOCKS; ++b){
+        // b) gated dilated blocks (hop)
+        for(int b = 0; b < NUM_BLOCKS; ++b) {
             sep_conv[b].run(res1.data(), sep1.data(), hop);
-            pw_sep[b].run(sep1.data(), pwsep.data(), hop);
+            pw_sep [b].run(sep1.data(), pwsep.data(), hop);
 
-            for(int t=0; t<hop; ++t){
-                float *s = pwsep.data() + t*OC;
-                float *g = gated1.data()+ t*F;
-                for(int c=0; c<F; ++c){
-                    float x = s[c], y = s[c+F];
-                    g[c] = std::tanh(x) * (1.f/(1.f + std::exp(-y)));
-                }
+            // vectorized gating
+            for(int t = 0; t < hop; ++t) {
+                const float *s    = pwsep.data() + t*OC;
+                const float *cont = s;
+                const float *gate = s + F;
+                float       *gOut= gated1.data() + t*F;
+
+                vvtanhf(tanhC.data(), cont, &F);
+                vDSP_vsmul(gate, 1, &half, halfY.data(), 1, F);
+                vvtanhf(tanhY.data(), halfY.data(), &F);
+                vDSP_vsmsa(tanhY.data(), 1, &half, &half, tanhY.data(), 1, F);
+                vDSP_vmul(tanhC.data(), 1, tanhY.data(), 1, gOut,      1, F);
             }
 
             pw2[b].run(gated1.data(), tmp1.data(), hop);
-            for(int i=0; i < hop*F; ++i) tmp1[i] += res1[i];
-            res1.swap(tmp1);
+            // tmp1 += res1   → vectorized
+            vDSP_vadd(tmp1.data(), 1, res1.data(), 1, res1.data(), 1, hop*F);
         }
 
-        // c) final + skip + hf
+        // c) final + skip + hf + merge + tanh (hop)
         final_pw.run(res1.data(), finalH.data(), hop);
-        skip_pw.run(in_hop.data(), skipH.data(), hop);
-        hf_conv.run(in_hop.data(),    hfH.data(), hop);
+        skip_pw .run(in_hop.data(), skipH.data(), hop);
+        hf_conv .run(in_hop.data(),   hfH.data(), hop);
 
-        // d) merge + tanh vectorized
-        vDSP_vadd(finalH.data(),1, skipH.data(),1, finalH.data(),1, hop);
-        vDSP_vadd(finalH.data(),1, hfH  .data(),1, finalH.data(),1, hop);
-        N = hop;
-        vvtanhf(finalH.data(), finalH.data(), &N);
+        vDSP_vadd(finalH.data(), 1, skipH.data(), 1, finalH.data(), 1, hop);
+        vDSP_vadd(finalH.data(), 1, hfH.data(),   1, finalH.data(), 1, hop);
+        int Nhop = hop;
+        vvtanhf(finalH.data(), finalH.data(), &Nhop);
 
-        // e) push to audio‐out ring
+        // d) push to audio‐out ring
         sh->out.push(finalH.data(), hop);
     }
 }
@@ -638,25 +699,72 @@ static int paCallback(const void *inputBuffer,
 }
 
 // ───────────────────────── DEVICE LIST ────────────────────────────
-static void listDevices(){
-  Pa_Initialize();
-  int n = Pa_GetDeviceCount();
+
+struct DeviceInfo {
+    int devId;
+    std::string name;
+    int maxInputChannels;
+    int maxOutputChannels;
+    double defaultSampleRate;
+};
+
+static std::vector<DeviceInfo> getDevices() {
+    PaError err = Pa_Initialize();
+    if (err != paNoError) {
+        std::cerr << "Pa_Initialize failed: " << Pa_GetErrorText(err) << "\n";
+        std::exit(1);
+    }
+
+    int n = Pa_GetDeviceCount();
+    if (n < 0) {
+        std::cerr << "Pa_GetDeviceCount failed: " << Pa_GetErrorText(n) << "\n";
+        Pa_Terminate();
+        std::exit(1);
+    }
+
+    std::vector<DeviceInfo> devices;
+    devices.reserve(n);
+
+    for (int i = 0; i < n; ++i) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (!info) {
+            std::cerr << "Pa_GetDeviceInfo failed for device " << i << "\n";
+            continue;
+        }
+        DeviceInfo d;
+        d.devId = i;
+        d.name = info->name ? info->name : "";
+        d.maxInputChannels  = info->maxInputChannels;
+        d.maxOutputChannels = info->maxOutputChannels;
+        d.defaultSampleRate = info->defaultSampleRate;
+        devices.push_back(d);
+    }
+
+    Pa_Terminate();
+    return devices;
+}
+
+static void listDevices(const std::vector<DeviceInfo> &devices) {
+  int n = (int)devices.size();
+
   std::cout<<"PortAudio devices:\n";
   for(int i=0;i<n;i++){
-    auto *d = Pa_GetDeviceInfo(i);
-    std::cout<<" ["<<i<<"] "<<d->name
-             <<" in="<<d->maxInputChannels
-             <<" out="<<d->maxOutputChannels
-             <<" sr="<<d->defaultSampleRate<<"\n";
+    const auto &d = devices[i];
+    std::cout<<"  "<<i<<": "<<d.name
+             <<" (inputs: "<<d.maxInputChannels
+             <<", outputs: "<<d.maxOutputChannels
+             <<", sampleRate: "<<d.defaultSampleRate<<")\n";
   }
-  Pa_Terminate();
+
   std::exit(0);
 }
 
 // ───────────────────────────── MAIN ──────────────────────────────
 int main(int argc, char **argv){
     int  blockSize = MAX_HOP;
-    int  inDev = -1, outDev = -1;
+    int  portAudioInputDeviceId = -1, portAudioOutputDeviceId = -1;
+    DeviceInfo portAudioIputDevice, portAudioOutputDevice;
+
     bool listDev = false;
     std::string wdir = ".";
 
@@ -664,10 +772,10 @@ int main(int argc, char **argv){
         if(!strcmp(argv[i],"--list-devices"))      listDev = true;
         else if(!strcmp(argv[i],"--blocksize") && i+1<argc)
                                                   blockSize = atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--in-dev") && i+1<argc)
-                                                  inDev = atoi(argv[++i]);
-        else if(!strcmp(argv[i],"--out-dev") && i+1<argc)
-                                                  outDev = atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--input-device") && i+1<argc)
+                                                  portAudioInputDeviceId = atoi(argv[++i]);
+        else if(!strcmp(argv[i],"--output-device") && i+1<argc)
+                                                  portAudioOutputDeviceId = atoi(argv[++i]);
         else if(!strcmp(argv[i],"--weights-dir") && i+1<argc)
                                                   wdir = argv[++i];
         else if(!strcmp(argv[i],"--int8"))         gUseInt8 = true;
@@ -677,11 +785,39 @@ int main(int argc, char **argv){
         }
     }
 
-    if(listDev) listDevices();
-    if(inDev<0||outDev<0){
-        std::cerr<<"Error: --in-dev and --out-dev required\n";
-        listDevices();
+    auto devices = getDevices();
+
+    if(listDev) {
+      listDevices(devices);
     }
+
+    if(portAudioInputDeviceId < 0 || portAudioOutputDeviceId < 0){
+        std::cerr<<"Error: --input-device and --output-device required\n";
+        listDevices(devices);
+    }
+
+    // Find and assign the matching devices
+    for(const auto &d:devices){
+        if(d.devId == portAudioInputDeviceId) {
+            portAudioIputDevice = d;
+        }
+        if(d.devId == portAudioOutputDeviceId) {
+            portAudioOutputDevice = d;
+        }
+    }
+
+    if (portAudioIputDevice.devId < 0) {
+        std::cerr<<"Error: input device ID "<<portAudioInputDeviceId
+                 <<" not found\n";
+        listDevices(devices);
+    }
+
+    if (portAudioOutputDevice.devId < 0) {
+        std::cerr<<"Error: output device ID "<<portAudioOutputDeviceId
+                 <<" not found\n";
+        listDevices(devices);
+    }
+
     if(blockSize > MAX_HOP){
         std::cerr<<"Error: --blocksize ≤ "<<MAX_HOP<<"\n";
         return 1;
@@ -693,42 +829,180 @@ int main(int argc, char **argv){
     else          loadAllFp32(wdir);
     std::cout<<"[MAIN] Loaded weights.\n";
 
+    #ifdef __APPLE__
+      //---------------------------------------------------------------------
+      // On macOS we must poke the HAL buffer‐size property ourselves.
+      // This forces the device to use exactly `blockSize` frames.
+      //---------------------------------------------------------------------
+      auto setMacHARDWareBufferSize = [&](bool isInput){
+        AudioObjectID coreAudioDeviceID = 0;
+
+        AudioObjectPropertyAddress rangeAddr = {
+          kAudioDevicePropertyBufferFrameSizeRange,
+          kAudioObjectPropertyScopeGlobal,
+          kAudioObjectPropertyElementMain
+        };
+
+        // 1) Get the list of all AudioDeviceIDs
+        AudioObjectPropertyAddress propAddr = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 dataSize = 0;
+        OSStatus deviceErr = AudioObjectGetPropertyDataSize(
+            kAudioObjectSystemObject,
+            &propAddr,
+            0, nullptr,
+            &dataSize
+        );
+        if (deviceErr) {
+            std::cerr << "Error getting device data size: " << deviceErr << "\n";
+        }
+
+        int deviceCount = dataSize / sizeof(AudioDeviceID);
+        std::vector<AudioDeviceID> devices(deviceCount);
+        deviceErr = AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &propAddr,
+            0, nullptr,
+            &dataSize,
+            devices.data()
+        );
+        if (deviceErr) {
+            std::cerr << "Error getting device list: " << deviceErr << "\n";
+        }
+
+        // Find the CoreAudio device that matches the input/output device
+        for (auto devID : devices) {
+            DeviceInfo portAudioDevice = isInput
+                ? portAudioIputDevice
+                : portAudioOutputDevice;
+                
+            AudioObjectPropertyAddress addr = {
+                isInput
+                    ? kAudioDevicePropertyStreams
+                    : kAudioDevicePropertyStreams,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 size = sizeof(AudioObjectID);
+            OSStatus err = AudioObjectGetPropertyData(
+                devID, &addr, 0, nullptr, &size, &coreAudioDeviceID
+            );
+            if (err == noErr) {
+
+              AudioObjectPropertyAddress nameAddr = {
+                  kAudioObjectPropertyName,
+                  kAudioObjectPropertyScopeGlobal,
+                  kAudioObjectPropertyElementMain
+              };
+              CFStringRef cfName = nullptr;
+
+              UInt32 nSize = sizeof(cfName);
+              err = AudioObjectGetPropertyData(
+                  devID,
+                  &nameAddr,
+                  0, nullptr,
+                  &nSize,
+                  &cfName
+              );
+              if (err == noErr && cfName) {
+                  char nameBuf[256] = {0};
+                  CFStringGetCString(cfName, nameBuf, sizeof(nameBuf), kCFStringEncodingUTF8);
+                  CFRelease(cfName);
+                  std::string nameStr(nameBuf);
+
+                  if (nameStr == portAudioDevice.name) {
+                      coreAudioDeviceID = devID;
+                      break;
+                  }
+              }
+            }
+        }
+
+        // Print the input/output device IDs
+        std::cerr << "[MAIN] Matching CoreAudio "
+                  << (isInput ? "input" : "output")
+                  << " device ID: " << coreAudioDeviceID << "\n";
+
+        UInt32 propSize = sizeof(AudioValueRange);
+        AudioValueRange range = {0,0};
+
+        if (AudioObjectGetPropertyData(
+              coreAudioDeviceID,
+              &rangeAddr,
+              0, nullptr,
+              &propSize,
+              &range) == noErr)
+        {
+          std::cerr << "[MAIN] Device buffer-size range = "
+                    << (unsigned)range.mMinimum
+                    << " – "
+                    << (unsigned)range.mMaximum
+                    << " frames\n";
+        }
+
+         // 3) Set its buffer frame size (must be done BEFORE opening streams)
+        UInt32 newBufferSize = blockSize;
+        AudioObjectPropertyAddress bufAddr = {
+            kAudioDevicePropertyBufferFrameSize,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        deviceErr = AudioObjectSetPropertyData(
+            coreAudioDeviceID,
+            &bufAddr,
+            0, nullptr,
+            sizeof(newBufferSize),
+            &newBufferSize
+        );
+        if (deviceErr) {
+            std::cerr << "Error setting buffer size: " << deviceErr << "\n";
+        }
+
+        // 4) Verify
+        UInt32 actualSize = 0;
+        UInt32 asize = sizeof(actualSize);
+        deviceErr = AudioObjectGetPropertyData(
+            coreAudioDeviceID,
+            &bufAddr,
+            0, nullptr,
+            &asize,
+            &actualSize
+        );
+        if (deviceErr) {
+            std::cerr << "Error reading back buffer size: " << deviceErr << "\n";
+        }
+        std::cout << "[MAIN] HAL buffer size is now: " << actualSize << " frames\n";
+      };
+      // set both input and output
+      setMacHARDWareBufferSize(true);
+      setMacHARDWareBufferSize(false);
+    #endif
+
     PaError err = Pa_Initialize();
     if(err!=paNoError){
         std::cerr<<"Pa_Initialize failed: "<<Pa_GetErrorText(err)<<"\n";
         return 1;
     }
 
-    auto *diIn  = Pa_GetDeviceInfo(inDev);
-    auto *diOut = Pa_GetDeviceInfo(outDev);
-    if(!diIn||!diOut){
-        std::cerr<<"Bad device index\n";
-        Pa_Terminate();
-        return 1;
-    }
+    auto *diIn  = Pa_GetDeviceInfo(portAudioInputDeviceId);
+    auto *diOut = Pa_GetDeviceInfo(portAudioOutputDeviceId);
 
-    std::cout<<"[MAIN] In ["<<inDev<<"]  "<<diIn->name
+    std::cout<<"[MAIN] In ["<<portAudioInputDeviceId<<"]  "<<diIn->name
              <<"  chIn="<<diIn->maxInputChannels
              <<"  sr="<<diIn->defaultSampleRate<<"\n";
-    std::cout<<"[MAIN] Out["<<outDev<<"]  "<<diOut->name
+    std::cout<<"[MAIN] Out["<<portAudioOutputDeviceId<<"]  "<<diOut->name
              <<"  chOut="<<diOut->maxOutputChannels
              <<"  sr="<<diOut->defaultSampleRate<<"\n";
 
     int sampleRate = (int)std::lround(diIn->defaultSampleRate);
+
+    double wantLatencySecs = double(blockSize) / sampleRate;
+
     std::cout<<"[MAIN] blockSize="<<blockSize
              <<"  RF="<<RECEPTIVE_FIELD<<"\n";
-
-    std::cout
-      << "[DEVICE] LowInputLatency = "  << diIn -> defaultLowInputLatency
-      << " s\n"
-      << "[DEVICE] LowOutputLatency = " << diOut-> defaultLowOutputLatency
-      << " s\n"
-      << "[DEVICE] HighInputLatency = " 
-      << diIn -> defaultHighInputLatency
-      << " s\n"
-      << "[DEVICE] HighOutputLatency = "
-      << diOut-> defaultHighOutputLatency
-      << " s\n";
 
     // (2) allocate a big ring to absorb jitter
     size_t cap = 1<<14; // 16384 frames (~340 ms @48 kHz)
@@ -737,12 +1011,12 @@ int main(int argc, char **argv){
 
     // (1) request low-latency I/O
     PaStreamParameters ip = {
-        inDev, 1, paFloat32,
-        diIn->defaultLowInputLatency, nullptr
+        portAudioInputDeviceId, 1, paFloat32,
+        wantLatencySecs, nullptr
     };
     PaStreamParameters op = {
-        outDev, 2, paFloat32,
-        diOut->defaultLowOutputLatency, nullptr
+        portAudioOutputDeviceId, 2, paFloat32,
+        wantLatencySecs, nullptr
     };
 
     // non-blocking stdin for bypass toggle
@@ -776,10 +1050,14 @@ int main(int argc, char **argv){
     });
 
     PaStream *stream = nullptr;
+
     err = Pa_OpenStream(&stream,
-                       &ip, &op,
-                       sampleRate, blockSize,
-                       paNoFlag, paCallback, &shared);
+                   &ip, &op,
+                   sampleRate,
+                   (unsigned long)blockSize,   // ← directly request blockSize
+                   paNoFlag,
+                   paCallback,
+                   &shared);
     if(err!=paNoError){
       std::cerr<<"Pa_OpenStream failed: "<<Pa_GetErrorText(err)<<"\n";
       Pa_Terminate();
@@ -794,6 +1072,14 @@ int main(int argc, char **argv){
     }
 
     std::cout<<"[MAIN] Streaming… 'b'=bypass, Ctrl-C=quit\n";
+
+    auto *info = Pa_GetStreamInfo(stream);
+    std::cerr<<"Actual I/O buffer = "
+            << (int)std::round(info->inputLatency * sampleRate)
+            <<" frames in, "
+            << (int)std::round(info->outputLatency * sampleRate)
+            <<" frames out\n";
+
     while(!gStopFlag) Pa_Sleep(100);
 
     std::cout<<"[MAIN] Stopping…\n";
