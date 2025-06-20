@@ -16,7 +16,7 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-FILTERS             = 64
+FILTERS             = 48
 KERNEL_SIZE         = 51
 DILATIONS           = (1,2,4,8,16,32)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
@@ -24,7 +24,7 @@ TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-EPOCHS              = 1
+EPOCHS              = 14
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
@@ -33,7 +33,7 @@ TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
 DEMO_SEC            = 60
 DEMO_OFFSET_SEC     = 0
-DEMO_PAIR_INDEX     = 0
+DEMO_PAIR_INDEX     = 6
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"

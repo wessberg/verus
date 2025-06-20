@@ -21,11 +21,11 @@
 #include <Accelerate/Accelerate.h> // for cblas_sgemm
 
 // ───────────────────────── PARAMETERS ─────────────────────────
-static constexpr int FILTERS        = 64;
+static constexpr int FILTERS        = 48;
 static constexpr int KERNEL         = 51;
 static constexpr std::array<int,6> DILATIONS     = {1,2,4,8,16,32};
 static constexpr int NUM_BLOCKS     = (int)DILATIONS.size();
-static constexpr int MAX_HOP        = 64;
+static constexpr int MAX_HOP        = 16;
 static constexpr int RECEPTIVE_FIELD=
     1 + (KERNEL-1)*(1+2+4+8+16+32);
 
@@ -717,6 +717,18 @@ int main(int argc, char **argv){
     int sampleRate = (int)std::lround(diIn->defaultSampleRate);
     std::cout<<"[MAIN] blockSize="<<blockSize
              <<"  RF="<<RECEPTIVE_FIELD<<"\n";
+
+    std::cout
+      << "[DEVICE] LowInputLatency = "  << diIn -> defaultLowInputLatency
+      << " s\n"
+      << "[DEVICE] LowOutputLatency = " << diOut-> defaultLowOutputLatency
+      << " s\n"
+      << "[DEVICE] HighInputLatency = " 
+      << diIn -> defaultHighInputLatency
+      << " s\n"
+      << "[DEVICE] HighOutputLatency = "
+      << diOut-> defaultHighOutputLatency
+      << " s\n";
 
     // (2) allocate a big ring to absorb jitter
     size_t cap = 1<<14; // 16384 frames (~340 ms @48 kHz)
