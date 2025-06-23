@@ -24,8 +24,8 @@ from tensorflow.keras.constraints import Constraint
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 FILTERS             = 64
-KERNEL_SIZE         = 50 #25
-DILATIONS           = (1,2,4,8,16,32) #(1,2,4,8)
+KERNEL_SIZE         = 25
+DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -45,7 +45,7 @@ SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
 
-DEMO_SEC            = 60 * 2
+DEMO_SEC            = 60
 DEMO_OFFSET_SEC     = 0
 DEMO_PAIR_INDEX     = 0
 
