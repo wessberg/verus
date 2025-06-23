@@ -27,8 +27,8 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 HF_BYPASS_FILTERS   = 11
 
-PHASE_1_EPOCHS      = 1 # 3
-PHASE_2_EPOCHS      = 1 # 50
+PHASE_1_EPOCHS      = 3
+PHASE_2_EPOCHS      = 50
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
