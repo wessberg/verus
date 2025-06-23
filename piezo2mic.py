@@ -7,6 +7,11 @@ import os
 import glob
 import random
 import sys
+import platform
+import threading
+import signal
+import shutil
+import subprocess
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -15,6 +20,30 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard
 from tensorflow.keras.constraints import Constraint
+
+INTERVAL = 10  # seconds
+
+def find_rocm_smi():
+    """Find amd-smi or rocm-smi binary in PATH."""
+    for name in ("amd-smi", "rocm-smi"):
+        path = shutil.which(name)
+        if path:
+            return name
+    return None
+
+def keep_alive(smi_cmd):
+    """Invoke each subcommand once."""
+    for sub in [
+    "metric",
+    "process"
+]:
+        cmd = [smi_cmd, sub]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            print(f"Running: {' '.join(cmd)}")
+        except subprocess.CalledProcessError:
+            print(f"Command failed: {' '.join(cmd)}")
+
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 FILTERS             = 64
@@ -30,8 +59,8 @@ TRANSIENT_LAYER_CONV_SIZE_1 = 16
 TRANSIENT_LAYER_CONV_SIZE_2 = 8
 TRANSIENT_LAYER_HF_BYPASS_KERNEL_SIZE = 15
 
-PHASE_1_EPOCHS      = 1 #3
-PHASE_2_EPOCHS      = 1 #50
+PHASE_1_EPOCHS      = 3
+PHASE_2_EPOCHS      = 50
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
@@ -484,7 +513,7 @@ def extract_and_save_int8_weights(tflite_model_buf,
             sep_ctr += 1
 
             w_arr, w_q = load_tensor(w_i)
-            np.save(f"{outdir}/{tag}_w_int8.npy",        w_arr)
+            np.save(f"{outdir}/{tag}_w_int8.npy", w_arr)
             np.savetxt(f"{outdir}/{tag}_w_int8_quant.txt",
                        w_q, fmt="%g", header="scale,zero_point", comments="")
 
@@ -814,6 +843,23 @@ def train():
 
 # ─────────────────────────────── MAIN / DEMO ──────────────────────────────────
 if __name__=="__main__":
+
+     # 1) Set up and start the ROCm keep‑alive thread
+    if platform.system() == "Linux":
+        smi = find_rocm_smi()
+        if smi:
+            stop_evt = threading.Event()
+            ka_thread = threading.Thread(
+                target=keep_alive,
+                args=(smi, stop_evt),
+                daemon=True
+            )
+            ka_thread.start()
+            # Ensure clean shutdown on exit signals:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, lambda *args: stop_evt.set())
+    
+    
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         static_model, dynamic_model = train()
     else:
