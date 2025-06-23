@@ -69,15 +69,23 @@ print(f"Found {len(pairs)} pairs.")
 
 @register_keras_serializable()
 class ZeroSum(Constraint):
-    def __init__(self, K=HF_BYPASS_KERNEL_SIZE):
-        self.K = K
+    """
+    Constrain a (K, in_ch, out_ch) kernel so that
+    sum_{i=0..K-1} w[i,:,:] == 0  (i.e. pure high-pass).
+    """
+    def __init__(self):
+        # no hyper-parameters
+        super().__init__()
+
     def __call__(self, w):
-        s = tf.reduce_sum(w, axis=0, keepdims=True)
-        return w - s / float(self.K)
-    
+        # Compute the mean over the time-axis (axis=0)
+        # and subtract it from each tap.
+        mean = tf.reduce_mean(w, axis=0, keepdims=True)
+        return w - mean
+
     def get_config(self):
-        # return the args needed to rebuild this object
-        return {'K': self.K}
+        # Must return a JSON-serializable dict
+        return {}
 
 def transient_bypass(inp, main_out):
     # 1) tiny non-linear sub-net on the raw piezo
