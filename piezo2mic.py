@@ -55,9 +55,7 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-TRANSIENT_LAYER_CONV_SIZE_1 = 16
-TRANSIENT_LAYER_CONV_SIZE_2 = 8
-TRANSIENT_LAYER_HF_BYPASS_KERNEL_SIZE = 15
+HF_BYPASS_KERNEL_SIZE = 15
 
 PHASE_1_EPOCHS      = 3
 PHASE_2_EPOCHS      = 50
@@ -101,23 +99,15 @@ print(f"Found {len(pairs)} pairs.")
 
 @register_keras_serializable()
 class ZeroSum(Constraint):
-    """
-    Constrain a (K, in_ch, out_ch) kernel so that
-    sum_{i=0..K-1} w[i,:,:] == 0  (i.e. pure high-pass).
-    """
-    def __init__(self):
-        # no hyper-parameters
-        super().__init__()
-
+    def __init__(self, K):
+        self.K = K
     def __call__(self, w):
-        # Compute the mean over the time-axis (axis=0)
-        # and subtract it from each tap.
-        mean = tf.reduce_mean(w, axis=0, keepdims=True)
-        return w - mean
-
+        s = tf.reduce_sum(w, axis=0, keepdims=True)
+        return w - s / float(self.K)
+    
     def get_config(self):
-        # Must return a JSON-serializable dict
-        return {}
+        # return the args needed to rebuild this object
+        return {'K': self.K}
     
 # ——— absolute‐value layer — no Python lambdas ———
 @register_keras_serializable()
@@ -149,51 +139,6 @@ class Diff1D(tf.keras.layers.Layer):
         return tf.pad(d, [[0,0],[1,0],[0,0]])
     def get_config(self):
         return super().get_config()
-
-
-def transient_bypass(inp, main_out):
-    # 1) small non-linear “sub-net”
-    t = tf.keras.layers.Conv1D(TRANSIENT_LAYER_CONV_SIZE_1,3,
-                      padding='causal',
-                      activation='relu',
-                      name='trans_net1')(inp)
-    t = tf.keras.layers.Conv1D(TRANSIENT_LAYER_CONV_SIZE_2,3,
-                      padding='causal',
-                      activation='relu',
-                      name='trans_net2')(t)
-
-    # 2) zero-sum causal FIR filter
-    hf = tf.keras.layers.Conv1D(1,TRANSIENT_LAYER_HF_BYPASS_KERNEL_SIZE,
-                       padding='causal',
-                       use_bias=False,
-                       kernel_initializer='zeros',
-                       kernel_constraint=ZeroSum(),
-                       name='hf_transient')(t)
-
-    # 3) 1-sample causal derivative: d[t] = x[t] – x[t–1]
-    deriv = Diff1D(name='derivative')(inp)
-
-    # 4) smooth the abs-derivative into an onset envelope
-    ad = AbsLayer(name='derivative_abs')(deriv)
-    # 5-tap causal moving-avg: pad left 4, then VALID pool
-    env = tf.keras.layers.ZeroPadding1D((4,0), name='env_pad')(ad)
-    env = tf.keras.layers.AveragePooling1D(
-        pool_size=5,
-        strides=1,
-        padding='valid',
-        name='env_smooth'
-    )(env)
-
-    # 5) threshold & sharpen into [0…1]
-    env = EnvScaleLayer(name='env_scale')(env)
-    gate = tf.keras.layers.Activation('sigmoid', name='hf_gate_sigmoid')(env)
-    # no extra pad needed: length(env)==length(hf)==length(main_out)
-
-    # 6) apply gate & merge
-    hf_g = tf.keras.layers.Multiply(name='hf_gate')([hf, gate])
-    merged = tf.keras.layers.Add(name='add_hf')([main_out, hf_g])
-    out    = tf.keras.layers.Activation('tanh', name='tanh_out')(merged)
-    return out
 
 @register_keras_serializable()
 def l1_metric(y_true, y_pred):
@@ -452,27 +397,25 @@ def build_resnet_gated(filters=FILTERS,
     #         kernel_initializer='zeros',   # start with zero so no effect at init
     #         name="hf_transient")(inp)
     
-    # in your model builder:
-    # hf = tf.keras.layers.Conv1D(
-    #     filters=1,
-    #     kernel_size=HF_BYPASS_KERNEL_SIZE,
-    #     padding='causal',
-    #     use_bias=False,
-    #     kernel_initializer='zeros', 
-    #     kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
-    #     name='hf_transient'
-    # )(inp)
+    hf = tf.keras.layers.Conv1D(
+        filters=1,
+        kernel_size=HF_BYPASS_KERNEL_SIZE,
+        padding='causal',
+        use_bias=False,
+        kernel_initializer='zeros', 
+        kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
+        name='hf_transient'
+    )(inp)
 
     # ── smooth limiter ────────────────────────────────────
-    #merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
-    #out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
-    
-    out = transient_bypass(inp, main_out)
+    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
+    out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
     
     # ── linear output (no tanh soft-clip) ─────────────────
     #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
 
     return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
+
 
 def extract_and_save_int8_weights(tflite_model_buf,
                                   outdir,
@@ -513,7 +456,7 @@ def extract_and_save_int8_weights(tflite_model_buf,
             sep_ctr += 1
 
             w_arr, w_q = load_tensor(w_i)
-            np.save(f"{outdir}/{tag}_w_int8.npy", w_arr)
+            np.save(f"{outdir}/{tag}_w_int8.npy",        w_arr)
             np.savetxt(f"{outdir}/{tag}_w_int8_quant.txt",
                        w_q, fmt="%g", header="scale,zero_point", comments="")
 
@@ -526,36 +469,15 @@ def extract_and_save_int8_weights(tflite_model_buf,
 
         # ─────────────────── all 1×1 convs + HF bypass ──────────────────
         if code == BuiltinOperator.CONV_2D:
+            w_i, b_i     = op.Inputs(1), op.Inputs(2)
+            w_arr, w_q   = load_tensor(w_i)
+            b_arr, b_q   = load_tensor(b_i)
             W              = w_arr.size
             B              = b_arr.size
 
-            w_arr, w_q = load_tensor(op.Inputs(1))
-            # bias may or may not exist
-            has_bias   = op.InputsLength()>2
-            if has_bias:
-                b_arr, b_q = load_tensor(op.Inputs(2))
-            else:
-                b_arr = np.zeros(0, dtype=np.int32)
-                b_q   = np.zeros((0,2), dtype=np.int32)
-
-            W = w_arr.size
-            B = b_arr.size
-
-            # 1) your new transient nets
-            if tuple(w_arr.shape) == (3,1,TRANSIENT_LAYER_CONV_SIZE_1) and B == TRANSIENT_LAYER_CONV_SIZE_1:
-                tag = 'trans_net1'
-            elif tuple(w_arr.shape) == (3,TRANSIENT_LAYER_CONV_SIZE_1,TRANSIENT_LAYER_CONV_SIZE_2) and B == TRANSIENT_LAYER_CONV_SIZE_2:
-                tag = 'trans_net2'
-
-            # 2) your new derivative conv (2 taps, no bias)
-            elif tuple(w_arr.shape) == (2,1,1) and B==0:
-                tag = 'derivative'
-
-            # 3) your existing hf_transient (HF_BYPASS_KERNEL_SIZE taps)
-            elif tuple(w_arr.shape)[0] == TRANSIENT_LAYER_HF_BYPASS_KERNEL_SIZE \
-                and w_arr.shape[2]==1 \
-                and B==0:
-                tag = 'hf_transient'
+            # 1) tiny HF‐transient: ONLY 3 weights
+            if W == HF_BYPASS_KERNEL_SIZE:
+                tag = "hf_transient"
 
             # 2) skip_conv     : ONLY 1 weight, 1 bias
             elif W == 1 and B == 1:
