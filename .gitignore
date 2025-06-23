@@ -1,6 +1,8 @@
 .DS_Store
 input/
 out/*.wav
+tb/*
+logs/*
 .DS_Store
 cpp/lib/
 cpp/build/

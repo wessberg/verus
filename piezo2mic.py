@@ -13,33 +13,44 @@ import tensorflow as tf
 from tflite import Model, TensorType, BuiltinOperator
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
+from tensorflow.keras.callbacks import TensorBoard
+from tensorflow.keras.constraints import Constraint
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-FILTERS             = 44
-KERNEL_SIZE         = 41
+FILTERS             = 64
+KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-EPOCHS              = 10
+EPOCHS              = 50
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
+
+CHUNK_SEC           = 15
 
 SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
 
-DEMO_SEC            = 60 * 2
+DEMO_SEC            = 60 * 3
 DEMO_OFFSET_SEC     = 0
-DEMO_PAIR_INDEX     = 0
+DEMO_PAIR_INDEX     = 4
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
 SAVE_WEIGHTS = True  # set to True to save layer weights as .npy files
 
 os.makedirs(OUT_DIR, exist_ok=True)
+
+phase1_weights = dict(w_l1=0.10, w_stft=0.15, w_fw=0.10,
+                      w_grad=0.15, w_pre=0.15, w_mel=0.10,
+                      w_hf=0.25)
+phase2_weights = dict(w_l1=0.15, w_stft=0.15, w_fw=0.10,
+                      w_grad=0.15, w_pre=0.15, w_mel=0.15,
+                      w_hf=0.15)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
@@ -52,6 +63,45 @@ for s in srcs:
 if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
+
+@register_keras_serializable()
+class ZeroSum(Constraint):
+    def __call__(self, w):
+        # w shape = (kernel_size, in_ch, out_ch)
+        s = tf.reduce_sum(w, axis=0, keepdims=True)
+        return w - s / tf.cast(tf.shape(w)[0], w.dtype)
+
+
+@register_keras_serializable()
+def l1_metric(y_true, y_pred):
+    return tf.reduce_mean(tf.abs(y_true - y_pred))
+
+@register_keras_serializable()
+def stft_metric(y_true, y_pred):
+    return multi_res_stft_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def fw_metric(y_true, y_pred):
+    return freq_weighted_stft_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def grad_metric(y_true, y_pred):
+    return gradient_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def pre_metric(y_true, y_pred):
+    return pre_emphasis_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def mel_metric(y_true, y_pred):
+    return mel_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def hf_metric(y_true, y_pred):
+    # exactly your 3–10 kHz band penaliser
+    return band_limited_stft_loss(y_true, y_pred,
+                                  fmin=3000.0, fmax=10000.0,
+                                  n_fft=512, hop=128)
 
 @register_keras_serializable()
 def slice_content(x, filters):
@@ -99,7 +149,7 @@ def band_limited_stft_loss(y_true, y_pred,
     return tf.reduce_mean(diff)
 
 # 2) Frequency-weighted magnitude STFT loss
-def freq_weighted_stft_loss(y_true, y_pred, α=2.0):
+def freq_weighted_stft_loss(y_true, y_pred, α=1.5):
     yt = tf.squeeze(y_true, -1)   # (B, T)
     yp = tf.squeeze(y_pred, -1)
     total = 0.0
@@ -172,37 +222,29 @@ def mel_loss(y_true, y_pred, n_mels=64, n_fft=1024, hop=256):
     M_p = tf.tensordot(S_p, mel_w, axes=[[2],[0]])
     return tf.reduce_mean(tf.abs(tf.math.log1p(M_t) - tf.math.log1p(M_p)))
 
-
-# 6) Combined loss with tuned weights
-def combined_loss(y_true, y_pred):
-    l1    = tf.reduce_mean(tf.abs(y_true - y_pred))
-    stft  = multi_res_stft_loss(y_true, y_pred)
-    fw    = freq_weighted_stft_loss(y_true, y_pred)
-    grad  = gradient_loss(y_true, y_pred)
-    pre   = pre_emphasis_loss(y_true, y_pred)
-    mel = mel_loss(y_true, y_pred)
-    hf    = band_limited_stft_loss(y_true, y_pred,
-                                   fmin=3000.0, fmax=10000.0,
-                                   n_fft=512, hop=128)
-
-    # weights must sum to 1 (or you can renormalize)
-    w_l1   = 0.10
-    w_stft = 0.15
-    w_fw   = 0.10
-    w_grad = 0.15
-    w_pre  = 0.15
-    w_mel  = 0.10
-    w_hf   = 0.25   # give the pick‐attack band a big say
-
-    return (
-        w_l1   * l1   +
-        w_stft * stft +
-        w_fw   * fw   +
-        w_grad * grad +
-        w_pre  * pre  +
-        w_mel  * mel  +
-        w_hf   * hf
-    )
+# ——— factory that captures your weight‐set in a closure ———
+def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf):
+    @register_keras_serializable()
+    def _loss(y_true, y_pred):
+        l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
+        stft = multi_res_stft_loss(y_true, y_pred)
+        fw   = freq_weighted_stft_loss(y_true, y_pred)
+        grad = gradient_loss(y_true, y_pred)
+        pre  = pre_emphasis_loss(y_true, y_pred)
+        mel  = mel_loss(y_true, y_pred)
+        hf   = band_limited_stft_loss(y_true, y_pred,
+                                      fmin=3000.0, fmax=10000.0,
+                                      n_fft=512, hop=128)
+        return (
+          w_l1   * l1   +
+          w_stft * stft +
+          w_fw   * fw   +
+          w_grad * grad +
+          w_pre  * pre  +
+          w_mel  * mel  +
+          w_hf   * hf
+        )
+    return _loss
 
 # ────────────────────────── MODEL ARCHITECTURE ─────────────────────────────────
 def build_resnet_gated(filters=FILTERS,
@@ -272,91 +314,45 @@ def build_resnet_gated(filters=FILTERS,
                                    padding='same',
                                    name="final_pw")(x)
 
-    final = tf.keras.layers.Conv1D(1,1,padding='same', name="final_pw")(x)
     skip  = tf.keras.layers.Conv1D(
                 1,1,use_bias=False,
-                kernel_initializer=tf.keras.initializers.Constant(0.5),
+                kernel_initializer=tf.keras.initializers.Ones(),
                 name="skip_conv")(inp)
     main_out = tf.keras.layers.Add(name="res_out")([final, skip])
 
     # ── (4) tiny HF bypass ─────────────────────────────────
-    # a little 3‐tap conv straight from input -> pick spikes
+    # a little 5‐tap conv straight from input -> pick spikes
+    # hf = tf.keras.layers.Conv1D(
+    #         1, 5,
+    #         padding='same',
+    #         use_bias=False,
+    #         kernel_initializer='zeros',   # start with zero so no effect at init
+    #         name="hf_transient")(inp)
+    
     hf = tf.keras.layers.Conv1D(
-            1, 3,
-            padding='same',
-            use_bias=False,
-            kernel_initializer='zeros',   # start with zero so no effect at init
-            name="hf_transient")(inp)
-
-    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
+        filters=1,
+        kernel_size=7,
+        padding='causal',         # ← strictly causal: no lookahead
+        use_bias=False,
+        kernel_initializer='zeros',
+        kernel_constraint=ZeroSum(),
+        name="hf_transient"
+    )(inp)
 
     # ── smooth limiter ────────────────────────────────────
+    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
     out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+    
+    # ── linear output (no tanh soft-clip) ─────────────────
+    #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
 
     return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
-    
-
-def build_resnet(filters=FILTERS,
-                 kernel_size=KERNEL_SIZE,
-                 dilations=DILATIONS,
-                 dynamic_time=False):
-    T   = None if dynamic_time else SEG_LEN
-    inp = tf.keras.Input(shape=(T,1), name="piezo_in")
-    x   = tf.keras.layers.Conv1D(filters,
-                                 1,
-                                 padding='same',
-                                 name="init_pw")(inp)
-
-    # causal ResNet blocks (unchanged)
-    for idx,d in enumerate(dilations):
-        res     = x
-        pad_amt = (kernel_size-1)*d
-        x       = tf.keras.layers.ZeroPadding1D((pad_amt,0),
-                                                name=f"pad_{idx}")(x)
-        x       = tf.keras.layers.SeparableConv1D(
-                      filters=filters,
-                      kernel_size=kernel_size,
-                      dilation_rate=d,
-                      padding='valid',
-                      activation='relu',
-                      name=f"sep_{idx}"
-                  )(x)
-        x       = tf.keras.layers.Conv1D(filters,
-                                         1,
-                                         padding='same',
-                                         name=f"pw_{idx}")(x)
-        x       = tf.keras.layers.Add(name=f"res_add_{idx}")([x,res])
-
-    # final 1×1 conv
-    final = tf.keras.layers.Conv1D(1,
-                                   1,
-                                   padding='same',
-                                   name="final_pw")(x)
-
-    # ---- identity-initialised skip path ----
-    # we keep the Conv1D but init it to 1.0 so at training start
-    # it is exactly identity, and only learns a small gain correction.
-    skip  = tf.keras.layers.Conv1D(1,
-                                   1,
-                                   use_bias=False,
-                                   kernel_initializer=tf.keras.initializers.Ones(),
-                                   name="skip_conv")(inp)
-
-    # add the two paths
-    res   = tf.keras.layers.Add(name="res_out")([final, skip])
-
-    # ---- smooth limiter instead of hard clip ----
-    # this guarantees your network output is always in [-1,1]
-    out   = tf.keras.layers.Activation('tanh', name="tanh_out")(res)
-
-    return tf.keras.Model(inputs=inp, outputs=out,
-                          name="piezo2mic_resnet_causal")
 
 def extract_and_save_int8_weights(tflite_model_buf,
                                   outdir,
                                   dilations,
                                   filters,
-                                  hf_kernel_size=3):
+                                  hf_kernel_size=5):
     """
     tflite_model_buf  = the bytes from converter.convert()
     outdir            = path to save files into
@@ -475,17 +471,41 @@ def extract_and_save_int8_weights(tflite_model_buf,
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
-    # split train/val
-    n = len(pairs)
-    idx = list(range(n))
-    if n>=2:
-        tr_i,va_i = train_test_split(idx, test_size=0.1, random_state=42)
+        # ────────────────────────── CHUNK‐BASED SPLIT ──────────────────────────────
+    chunk_len = CHUNK_SEC * SR
+    chunks = []
+    for src_path, tgt_path in pairs:
+        info     = sf.info(src_path)
+        total    = info.frames
+        n_full   = total // chunk_len
+
+        # full 15s chunks
+        for i in range(n_full):
+            start = i * chunk_len
+            chunks.append((src_path, tgt_path, start, chunk_len))
+
+        # optional last partial chunk (only if it's at least one training window long)
+        rem = total - n_full * chunk_len
+        if rem >= SEG_LEN:
+            start = n_full * chunk_len
+            chunks.append((src_path, tgt_path, start, rem))
+
+    print(f"Generated {len(chunks)} chunks from {len(pairs)} files")
+
+    idx_chunks = list(range(len(chunks)))
+    if len(chunks) >= 2:
+        tr_i, va_i = train_test_split(idx_chunks,
+                                      test_size=0.1,
+                                      random_state=42)
     else:
-        tr_i = va_i = idx
-    train_pairs = [pairs[i] for i in tr_i]
-    val_pairs   = [pairs[i] for i in va_i]
-    train_durs  = [sf.info(s).frames for s,_ in train_pairs]
-    val_durs    = [sf.info(s).frames for _,t in val_pairs]
+        tr_i = va_i = idx_chunks
+
+    train_chunks = [chunks[i] for i in tr_i]
+    val_chunks   = [chunks[i] for i in va_i]
+
+    # durations in frames of each chunk, used to compute approx steps
+    train_durs = [dur for (_,_,_,dur) in train_chunks]
+    val_durs   = [dur for (_,_,_,dur) in val_chunks]
 
     def approx_steps(durs):
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
@@ -495,60 +515,120 @@ def train():
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     # data generator (no per-segment mean removal)
-    def segment_generator(pairs_list, durs_list):
+    def segment_generator(chunk_list):
         while True:
-            i      = random.randrange(len(pairs_list))
-            sp,tp  = pairs_list[i]
-            dur    = durs_list[i]
-            offset = random.randrange(max(dur-SEG_LEN,1))
-            x,_    = sf.read(sp, start=offset, frames=SEG_LEN,
-                             dtype='float32', always_2d=True)
-            y,_    = sf.read(tp, start=offset, frames=SEG_LEN,
-                             dtype='float32', always_2d=True)
-            if x.shape[0]<SEG_LEN:
+            # pick one 30 s chunk
+            src_path, tgt_path, chunk_start, chunk_dur = random.choice(chunk_list)
+
+            # pick a random SEG_LEN‐long window inside that chunk
+            max_offset = max(chunk_dur - SEG_LEN, 1)
+            offset     = random.randrange(max_offset)
+            read_start = chunk_start + offset
+
+            x, _ = sf.read(src_path,
+                           start=read_start,
+                           frames=SEG_LEN,
+                           dtype='float32',
+                           always_2d=True)
+            y, _ = sf.read(tgt_path,
+                           start=read_start,
+                           frames=SEG_LEN,
+                           dtype='float32',
+                           always_2d=True)
+
+            # pad if we hit EOF
+            if x.shape[0] < SEG_LEN:
                 pad = SEG_LEN - x.shape[0]
-                x = np.pad(x,((0,pad),(0,0)))
-                y = np.pad(y,((0,pad),(0,0)))
+                x = np.pad(x, ((0,pad),(0,0)))
+                y = np.pad(y, ((0,pad),(0,0)))
+
             yield x, y
 
     # representative dataset for full-integer quant
     def representative_data_gen():
         for _ in range(100):
-            i        = random.randrange(len(train_pairs))
-            src_path = train_pairs[i][0]
-            dur      = train_durs[i]
-            offset   = random.randrange(max(dur-SEG_LEN,1))
-            x,_      = sf.read(src_path, start=offset, frames=SEG_LEN,
-                               dtype="float32", always_2d=True)
-            if x.shape[0]<SEG_LEN:
-                x = np.pad(x,((0,SEG_LEN-x.shape[0]),(0,0)))
-            yield [x.reshape(1,SEG_LEN,1)]
+            src_path, _, chunk_start, chunk_dur = random.choice(train_chunks)
+            max_offset = max(chunk_dur - SEG_LEN, 1)
+            offset     = random.randrange(max_offset)
+            read_start = chunk_start + offset
+
+            x, _ = sf.read(src_path,
+                           start=read_start,
+                           frames=SEG_LEN,
+                           dtype='float32',
+                           always_2d=True)
+            if x.shape[0] < SEG_LEN:
+                pad = SEG_LEN - x.shape[0]
+                x = np.pad(x, ((0,pad),(0,0)))
+            yield [x.reshape(1, SEG_LEN, 1)]
 
     sig = tf.TensorSpec((SEG_LEN,1), tf.float32)
+
     train_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_pairs, train_durs),
+        lambda: segment_generator(train_chunks),
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-    val_ds   = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_pairs, val_durs),
+    val_ds = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_chunks),
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+    
+    es = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                          patience=PATIENCE,
+                                          restore_best_weights=True)
 
     # 1) train FP32 static
     print("\n≈ Training FP32 model")
     static_model = build_resnet_gated(dynamic_time=False)
-    static_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
-                         loss=combined_loss, metrics=['mae'])
+
+    # ——— PHASE 1: high‐hf for first 3 epochs ———
+    static_model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss=make_combined_loss(**phase1_weights),
+        metrics=[ 'mae',
+                l1_metric,
+                stft_metric,
+                fw_metric,
+                grad_metric,
+                pre_metric,
+                mel_metric,
+                hf_metric ]
+    )
+    
     static_model.summary()
-    es = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                          patience=PATIENCE,
-                                          restore_best_weights=True)
-    static_model.fit(train_ds,
-                     epochs=EPOCHS,
-                     steps_per_epoch=steps_per_epoch,
-                     validation_data=val_ds,
-                     validation_steps=validation_steps,
-                     callbacks=[es])
+    
+    static_model.fit(
+        train_ds,
+        epochs=3,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_ds,
+        validation_steps=validation_steps,
+        callbacks=[ es, TensorBoard(log_dir="./logs") ]
+    )
+
+    # ——— PHASE 2: flatter weighting for the rest ———
+    static_model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-4),   # you might also drop LR
+        loss=make_combined_loss(**phase2_weights),
+        metrics=[ 'mae',
+                l1_metric,
+                stft_metric,
+                fw_metric,
+                grad_metric,
+                pre_metric,
+                mel_metric,
+                hf_metric ]
+    )
+    static_model.fit(
+        train_ds,
+        initial_epoch=3,
+        epochs=EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_ds,
+        validation_steps=validation_steps,
+        callbacks=[ es, TensorBoard(log_dir="./tb") ]
+    )
+
     path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
     static_model.save(path_static)
     print("✅ Saved FP32 static model:", path_static)

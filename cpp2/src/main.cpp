@@ -26,21 +26,9 @@
   #include <CoreFoundation/CoreFoundation.h>
 #endif
 
-
-
-
-
-
-
-
-
-
-
-
-
 // ───────────────────────── PARAMETERS ─────────────────────────
-static constexpr int FILTERS        = 44;
-static constexpr int KERNEL         = 41;
+static constexpr int FILTERS        = 64;
+static constexpr int KERNEL         = 25;
 static constexpr std::array<int,4> DILATIONS     = {1,2,4,8};
 static constexpr int NUM_BLOCKS     = (int)DILATIONS.size();
 static constexpr int MAX_HOP        = 15;
@@ -51,6 +39,11 @@ static constexpr int RECEPTIVE_FIELD=
 std::atomic<bool> gStopFlag(false), bypassFlag(false);
 bool gUseInt8 = false;
 void signalHandler(int){ gStopFlag = true; }
+
+// latency measurement (seconds)
+static double gIOInputLatencySec  = 0.0;
+static double gIOOutputLatencySec = 0.0;
+static int PROCESSING_LOGGING_WAIT_SEC = 2;
 
 // ───────────────────────── RING BUFFER ────────────────────────
 struct RingBuffer {
@@ -504,7 +497,7 @@ static void loadAllInt8(const std::string &dir){
 }
 
 // ───────────────────────── STREAMING THREAD ─────────────────────────
-void inferenceThread(Shared *sh, int hop) {
+void inferenceThread(Shared *sh, int hop, int sampleRate) {
     // 1) boost QoS on macOS
     #if defined(__APPLE__)
       // 1) bump to real‐time “audio” QoS if available
@@ -614,6 +607,9 @@ void inferenceThread(Shared *sh, int hop) {
         size_t got = sh->in.pop(in_hop.data(), hop);
         if(got < (size_t)hop)
             std::fill(in_hop.begin()+got, in_hop.end(), 0.f);
+          
+        // ─── start timing this hop’s processing ─────────────────
+        auto __t_proc_start = std::chrono::steady_clock::now();
 
         // a) init 1×1
         init_pw.run(in_hop.data(), buf1.data(), hop);
@@ -655,6 +651,39 @@ void inferenceThread(Shared *sh, int hop) {
 
         // d) push to audio‐out ring
         sh->out.push(finalH.data(), hop);
+
+        // ─── end timing & rolling‐average log every PROCESSING_LOGGING_WAIT_SEC s ───────────
+        {
+          auto __t_proc_end = std::chrono::steady_clock::now();
+          double proc_ms = std::chrono::duration<double,std::milli>(
+                             __t_proc_end - __t_proc_start
+                           ).count();
+          // accumulate
+          static auto   __last_report = __t_proc_end;
+          static double __sum_proc_ms = 0.0;
+          static size_t __cnt        = 0;
+          __sum_proc_ms += proc_ms;
+          ++__cnt;
+          // every PROCESSING_LOGGING_WAIT_SEC seconds, print average
+          if(__t_proc_end - __last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
+            double avg_proc = __sum_proc_ms / double(__cnt);
+            double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
+
+            double rf_ms    = double(RECEPTIVE_FIELD) * 1000.0 / double(sampleRate);
+            double total_ms = avg_proc + io_ms + rf_ms;
+
+            std::cerr
+              << "[inferenceThread] "
+              << "Processing = " << avg_proc    << " ms, "
+              << "I/O = "        << io_ms       << " ms, "
+              << "RF = "         << rf_ms       << " ms, "
+              << "Total = "      << total_ms    << " ms\n";
+
+            __last_report  = __t_proc_end;
+            __sum_proc_ms  = 0.0;
+            __cnt          = 0;
+          }
+        }
     }
 }
 
@@ -1030,7 +1059,7 @@ int main(int argc, char **argv){
     std::signal(SIGINT, signalHandler);
 
     // spawn the real-time inference thread
-    std::thread infThread([&](){ inferenceThread(&shared, blockSize); });
+    std::thread infThread([&](){ inferenceThread(&shared, blockSize, sampleRate); });
     // spawn keyboard thread for bypass
     std::thread kbThread([&](){
       while(!gStopFlag){
@@ -1074,11 +1103,17 @@ int main(int argc, char **argv){
     std::cout<<"[MAIN] Streaming… 'b'=bypass, Ctrl-C=quit\n";
 
     auto *info = Pa_GetStreamInfo(stream);
-    std::cerr<<"Actual I/O buffer = "
-            << (int)std::round(info->inputLatency * sampleRate)
+    // capture actual I/O latencies
+    gIOInputLatencySec  = info->inputLatency;
+    gIOOutputLatencySec = info->outputLatency;
+    std::cerr<<"[MAIN] Actual I/O buffer = "
+            << (int)std::round(gIOInputLatencySec  * sampleRate)
             <<" frames in, "
-            << (int)std::round(info->outputLatency * sampleRate)
+            << (int)std::round(gIOOutputLatencySec * sampleRate)
             <<" frames out\n";
+    std::cerr<<"[MAIN] Total I/O latency = "
+            << (gIOInputLatencySec + gIOOutputLatencySec)*1000.0
+            <<" ms\n";
 
     while(!gStopFlag) Pa_Sleep(100);
 
