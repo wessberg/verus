@@ -4,6 +4,8 @@ Train a causal ResNet to map an acoustic‐guitar piezo pickup signal
 to the equivalent mic’d signal.
 """
 import os
+os.environ["TF_CUDNN_WORKSPACE_LIMIT_IN_MB"] = "15192"
+
 import glob
 import random
 import sys
