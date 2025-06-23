@@ -21,34 +21,11 @@ from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard
 from tensorflow.keras.constraints import Constraint
 
-INTERVAL = 10  # seconds
-
-def find_rocm_smi():
-    """Find amd-smi or rocm-smi binary in PATH."""
-    for name in ("amd-smi", "rocm-smi"):
-        path = shutil.which(name)
-        if path:
-            return name
-    return None
-
-def keep_alive(smi_cmd):
-    """Invoke each subcommand once."""
-    for sub in [
-    "metric",
-    "process"
-]:
-        cmd = [smi_cmd, sub]
-        try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            print(f"Running: {' '.join(cmd)}")
-        except subprocess.CalledProcessError:
-            print(f"Command failed: {' '.join(cmd)}")
-
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 FILTERS             = 64
-KERNEL_SIZE         = 25
-DILATIONS           = (1,2,4,8)
+KERNEL_SIZE         = 50 #25
+DILATIONS           = (1,2,4,8,16,32) #(1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -764,24 +741,7 @@ def train():
     return static_model, dynamic_model
 
 # ─────────────────────────────── MAIN / DEMO ──────────────────────────────────
-if __name__=="__main__":
-
-     # 1) Set up and start the ROCm keep‑alive thread
-    if platform.system() == "Linux":
-        smi = find_rocm_smi()
-        if smi:
-            stop_evt = threading.Event()
-            ka_thread = threading.Thread(
-                target=keep_alive,
-                args=(smi, stop_evt),
-                daemon=True
-            )
-            ka_thread.start()
-            # Ensure clean shutdown on exit signals:
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                signal.signal(sig, lambda *args: stop_evt.set())
-    
-    
+if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         static_model, dynamic_model = train()
     else:
