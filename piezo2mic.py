@@ -38,9 +38,9 @@ SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
 
-DEMO_SEC            = 60 * 3
+DEMO_SEC            = 60 * 2
 DEMO_OFFSET_SEC     = 0
-DEMO_PAIR_INDEX     = 4
+DEMO_PAIR_INDEX     = 0
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
@@ -69,11 +69,15 @@ print(f"Found {len(pairs)} pairs.")
 
 @register_keras_serializable()
 class ZeroSum(Constraint):
-    def __init__(self, K):    # store the kernel‐length as a Python int
+    def __init__(self, K=HF_BYPASS_KERNEL_SIZE):
         self.K = K
     def __call__(self, w):
         s = tf.reduce_sum(w, axis=0, keepdims=True)
         return w - s / float(self.K)
+    
+    def get_config(self):
+        # return the args needed to rebuild this object
+        return {'K': self.K}
 
 
 @register_keras_serializable()
@@ -334,15 +338,46 @@ def build_resnet_gated(filters=FILTERS,
     #         name="hf_transient")(inp)
     
     # in your model builder:
-    hf = tf.keras.layers.Conv1D(
-        filters=1,
-        kernel_size=HF_BYPASS_KERNEL_SIZE,
-        padding='causal',
-        use_bias=False,
-        kernel_initializer='zeros', 
-        kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
-        name='hf_transient'
-    )(inp)
+    # hf = tf.keras.layers.Conv1D(
+    #     filters=1,
+    #     kernel_size=HF_BYPASS_KERNEL_SIZE,
+    #     padding='causal',
+    #     use_bias=False,
+    #     kernel_initializer='zeros', 
+    #     kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
+    #     name='hf_transient'
+    # )(inp)
+    
+    x = inp   # or the output of your last ResNet block
+
+    # two tiny non-linear layers:
+    t = tf.keras.layers.Conv1D(16, 3,
+                            padding='causal',
+                            activation='relu',
+                            name='trans_net1')(inp)
+    t = tf.keras.layers.Conv1D( 8, 3,
+                            padding='causal',
+                            activation='relu',
+                            name='trans_net2')(t)
+
+    # then a causal, zero-sum FIR to shape the spectrum:
+    hf = tf.keras.layers.Conv1D(1, 7,
+                                padding='causal',
+                                use_bias=False,
+                                kernel_constraint=ZeroSum(),
+                                kernel_initializer='zeros',
+                                name='hf_transient')(t)
+    
+    # 5-tap causal average of the absolute derivative
+    d  = inp[:,1:,:] - inp[:,:-1,:]
+    env = tf.keras.layers.ZeroPadding1D((4,0))(tf.abs(d))
+    env = tf.keras.layers.AveragePooling1D(
+            pool_size=5, strides=1, padding='valid'
+        )(env)   # now shape = (B, T, 1)
+    gate = tf.keras.layers.Activation('sigmoid')(
+            (env - 1e-3) * 200.0
+        )        # threshold & sharpen
+    hf = tf.keras.layers.Multiply(name='hf_gate')([hf, gate])
 
     # ── smooth limiter ────────────────────────────────────
     merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
