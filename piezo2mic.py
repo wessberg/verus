@@ -25,7 +25,10 @@ TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-EPOCHS              = 50
+HF_BYPASS_FILTERS   = 11
+
+PHASE_1_EPOCHS      = 1 # 3
+PHASE_2_EPOCHS      = 1 # 50
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
@@ -66,10 +69,11 @@ print(f"Found {len(pairs)} pairs.")
 
 @register_keras_serializable()
 class ZeroSum(Constraint):
+    def __init__(self, K):    # store the kernel‐length as a Python int
+        self.K = K
     def __call__(self, w):
-        # w shape = (kernel_size, in_ch, out_ch)
         s = tf.reduce_sum(w, axis=0, keepdims=True)
-        return w - s / tf.cast(tf.shape(w)[0], w.dtype)
+        return w - s / float(self.K)
 
 
 @register_keras_serializable()
@@ -329,14 +333,15 @@ def build_resnet_gated(filters=FILTERS,
     #         kernel_initializer='zeros',   # start with zero so no effect at init
     #         name="hf_transient")(inp)
     
+    # in your model builder:
     hf = tf.keras.layers.Conv1D(
         filters=1,
-        kernel_size=7,
-        padding='causal',         # ← strictly causal: no lookahead
+        kernel_size=HF_BYPASS_FILTERS,
+        padding='causal',
         use_bias=False,
-        kernel_initializer='zeros',
-        kernel_constraint=ZeroSum(),
-        name="hf_transient"
+        kernel_initializer='zeros', 
+        kernel_constraint=ZeroSum(HF_BYPASS_FILTERS),
+        name='hf_transient'
     )(inp)
 
     # ── smooth limiter ────────────────────────────────────
@@ -599,7 +604,7 @@ def train():
     
     static_model.fit(
         train_ds,
-        epochs=3,
+        epochs=PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
@@ -621,8 +626,8 @@ def train():
     )
     static_model.fit(
         train_ds,
-        initial_epoch=3,
-        epochs=EPOCHS,
+        initial_epoch=PHASE_1_EPOCHS,
+        epochs=PHASE_2_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
