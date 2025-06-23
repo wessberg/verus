@@ -79,6 +79,55 @@ class ZeroSum(Constraint):
         # return the args needed to rebuild this object
         return {'K': self.K}
 
+def transient_bypass(inp, main_out):
+    # 1) tiny non-linear sub-net on the raw piezo
+    t = tf.keras.layers.Conv1D(16, 3,
+                      padding='causal',
+                      activation='relu',
+                      name='trans_net1')(inp)
+    t = tf.keras.layers.Conv1D(8,  3,
+                      padding='causal',
+                      activation='relu',
+                      name='trans_net2')(t)
+
+    # 2) causal, zero-sum FIR to shape the spectrum
+    hf = tf.keras.layers.Conv1D(1, 7,
+                       padding='causal',
+                       use_bias=False,
+                       kernel_initializer='zeros',
+                       kernel_constraint=ZeroSum(),
+                       name='hf_transient')(t)
+
+    # 3) build a 1-sample causal derivative: d[t] = x[t] - x[t-1]
+    diff = tf.keras.layers.Lambda(lambda x: x[:,1:,:] - x[:,:-1,:],
+                         name='derivative')(inp)
+    #    absolute value
+    absdiff = tf.keras.layers.Lambda(lambda x: tf.abs(x),
+                            name='derivative_abs')(diff)
+
+    # 4) smooth it with a 5-tap causal average to get an “onset envelope”
+    #    pad front so we stay causal
+    env = tf.keras.layers.ZeroPadding1D((4,0), name='env_pad')(absdiff)
+    env = tf.keras.layers.AveragePooling1D(pool_size=5,
+                                  strides=1,
+                                  padding='valid',
+                                  name='env_smooth')(env)
+
+    # 5) threshold & steepen into a gate
+    env = tf.keras.layers.Lambda(lambda x: (x - 1e-3)*200.0,
+                        name='env_scale')(env)
+    gate = tf.keras.layers.Activation('sigmoid', name='hf_gate_sigmoid')(env)
+
+    # 6) pad that gate back up to full length T so it lines up with hf & main_out
+    gate = tf.keras.layers.ZeroPadding1D((1,0), name='gate_pad')(gate)
+
+    # 7) apply gate to our FIR-shaper  
+    hf_gated = tf.keras.layers.Multiply(name='hf_gate')([hf, gate])
+
+    # 8) merge + final smooth limiter  
+    merged = tf.keras.layers.Add(name='add_hf')([main_out, hf_gated])
+    out    = tf.keras.layers.Activation('tanh', name='tanh_out')(merged)
+    return out
 
 @register_keras_serializable()
 def l1_metric(y_true, y_pred):
@@ -347,41 +396,12 @@ def build_resnet_gated(filters=FILTERS,
     #     kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
     #     name='hf_transient'
     # )(inp)
-    
-    x = inp   # or the output of your last ResNet block
-
-    # two tiny non-linear layers:
-    t = tf.keras.layers.Conv1D(16, 3,
-                            padding='causal',
-                            activation='relu',
-                            name='trans_net1')(inp)
-    t = tf.keras.layers.Conv1D( 8, 3,
-                            padding='causal',
-                            activation='relu',
-                            name='trans_net2')(t)
-
-    # then a causal, zero-sum FIR to shape the spectrum:
-    hf = tf.keras.layers.Conv1D(1, 7,
-                                padding='causal',
-                                use_bias=False,
-                                kernel_constraint=ZeroSum(),
-                                kernel_initializer='zeros',
-                                name='hf_transient')(t)
-    
-    # 5-tap causal average of the absolute derivative
-    d  = inp[:,1:,:] - inp[:,:-1,:]
-    env = tf.keras.layers.ZeroPadding1D((4,0))(tf.abs(d))
-    env = tf.keras.layers.AveragePooling1D(
-            pool_size=5, strides=1, padding='valid'
-        )(env)   # now shape = (B, T, 1)
-    gate = tf.keras.layers.Activation('sigmoid')(
-            (env - 1e-3) * 200.0
-        )        # threshold & sharpen
-    hf = tf.keras.layers.Multiply(name='hf_gate')([hf, gate])
 
     # ── smooth limiter ────────────────────────────────────
-    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
-    out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+    #merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
+    #out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+    
+    out = transient_bypass(inp, main_out)
     
     # ── linear output (no tanh soft-clip) ─────────────────
     #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
