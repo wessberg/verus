@@ -51,16 +51,30 @@ DEMO_PAIR_INDEX     = 0
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
-SAVE_WEIGHTS = True  # set to True to save layer weights as .npy files
+SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-phase1_weights = dict(w_l1=0.10, w_stft=0.15, w_fw=0.10,
-                      w_grad=0.15, w_pre=0.15, w_mel=0.10,
-                      w_hf=0.25)
-phase2_weights = dict(w_l1=0.15, w_stft=0.15, w_fw=0.10,
-                      w_grad=0.15, w_pre=0.15, w_mel=0.15,
-                      w_hf=0.15)
+phase1_weights = dict(
+    w_l1   = 0.07,   # absolute waveform
+    w_stft = 0.10,   # multi-res STFT
+    w_fw   = 0.07,   # freq-weighted STFT
+    w_grad = 0.10,   # slope loss
+    w_pre  = 0.10,   # pre-emphasis
+    w_mel  = 0.06,   # mel spectrogram
+    w_hf   = 0.25,   # 3–10 kHz band
+    w_tr   = 0.25    # NEW: transient (fast-attack) loss
+)
+phase2_weights = dict(
+    w_l1   = 0.15,
+    w_stft = 0.15,
+    w_fw   = 0.10,
+    w_grad = 0.15,
+    w_pre  = 0.15,
+    w_mel  = 0.15,
+    w_hf   = 0.10,   # still some HF, but lower
+    w_tr   = 0.05    # small transient term
+)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
@@ -86,7 +100,20 @@ class ZeroSum(Constraint):
         # return the args needed to rebuild this object
         return {'K': self.K}
     
-# ——— absolute‐value layer — no Python lambdas ———
+
+@register_keras_serializable()
+def transient_loss(y_true, y_pred,
+                  threshold=1e-3, slope=2000.0):
+    # 1D first difference
+    dy_t = y_true[:,1:,:] - y_true[:,:-1,:]
+    dy_p = y_pred[:,1:,:] - y_pred[:,:-1,:]
+    # soft mask where |dy_t| > threshold
+    mask = tf.sigmoid((tf.abs(dy_t) - threshold) * slope)
+    err  = tf.abs(dy_t - dy_p) * mask
+    # pad back to full length
+    err = tf.pad(err, [[0,0],[1,0],[0,0]])
+    return tf.reduce_mean(err)
+
 @register_keras_serializable()
 class AbsLayer(tf.keras.layers.Layer):
     def call(self, inputs):
@@ -220,7 +247,16 @@ def freq_weighted_stft_loss(y_true, y_pred, α=1.5):
 def multi_res_stft_loss(y_true, y_pred):
     yt = tf.squeeze(y_true, -1)
     yp = tf.squeeze(y_pred, -1)
-    specs = [(256,64), (512,128), (1024,256), (2048,512)]
+    
+    specs = [
+      (  64,  16),   # 1.3 ms frames
+      ( 128,  32),   # 2.7 ms frames
+      ( 256,  64),   # 5.3 ms frames
+      ( 512, 128),   # 10.7 ms frames
+      (1024, 256),   # 21.3 ms frames
+      (2048, 512),   # 42.7 ms frames
+    ]
+    
     mag_loss = 0.0
     comp_loss = 0.0
     for n_fft, hop in specs:
@@ -268,7 +304,7 @@ def mel_loss(y_true, y_pred, n_mels=64, n_fft=1024, hop=256):
     return tf.reduce_mean(tf.abs(tf.math.log1p(M_t) - tf.math.log1p(M_p)))
 
 # ——— factory that captures your weight‐set in a closure ———
-def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf):
+def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr):
     @register_keras_serializable()
     def _loss(y_true, y_pred):
         l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
@@ -280,6 +316,8 @@ def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf):
         hf   = band_limited_stft_loss(y_true, y_pred,
                                       fmin=3000.0, fmax=10000.0,
                                       n_fft=512, hop=128)
+        tr   = transient_loss(y_true, y_pred)
+
         return (
           w_l1   * l1   +
           w_stft * stft +
@@ -287,7 +325,8 @@ def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf):
           w_grad * grad +
           w_pre  * pre  +
           w_mel  * mel  +
-          w_hf   * hf
+          w_hf   * hf   +
+          w_tr   * tr
         )
     return _loss
 
@@ -386,7 +425,8 @@ def build_resnet_gated(filters=FILTERS,
 
     # ── smooth limiter ────────────────────────────────────
     merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
-    out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+    #out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
+    out = merged
     
     # ── linear output (no tanh soft-clip) ─────────────────
     #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
