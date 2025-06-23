@@ -25,7 +25,7 @@ TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-HF_BYPASS_FILTERS   = 11
+HF_BYPASS_KERNEL_SIZE   = 11
 
 PHASE_1_EPOCHS      = 3
 PHASE_2_EPOCHS      = 50
@@ -336,11 +336,11 @@ def build_resnet_gated(filters=FILTERS,
     # in your model builder:
     hf = tf.keras.layers.Conv1D(
         filters=1,
-        kernel_size=HF_BYPASS_FILTERS,
+        kernel_size=HF_BYPASS_KERNEL_SIZE,
         padding='causal',
         use_bias=False,
         kernel_initializer='zeros', 
-        kernel_constraint=ZeroSum(HF_BYPASS_FILTERS),
+        kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
         name='hf_transient'
     )(inp)
 
@@ -357,14 +357,8 @@ def extract_and_save_int8_weights(tflite_model_buf,
                                   outdir,
                                   dilations,
                                   filters,
-                                  hf_kernel_size=5):
-    """
-    tflite_model_buf  = the bytes from converter.convert()
-    outdir            = path to save files into
-    dilations         = your DILATIONS tuple, e.g. (1,2,4)
-    filters           = your F, e.g. 8
-    hf_kernel_size    = 3 (your tiny HF‐bypass window)
-    """
+                                  hf_kernel_size=HF_BYPASS_KERNEL_SIZE):
+
     os.makedirs(outdir, exist_ok=True)
     model = Model.GetRootAsModel(tflite_model_buf, 0)
     subg  = model.Subgraphs(0)
