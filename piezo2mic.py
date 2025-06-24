@@ -9,11 +9,6 @@ os.environ["TF_CUDNN_WORKSPACE_LIMIT_IN_MB"] = "15192"
 import glob
 import random
 import sys
-import platform
-import threading
-import signal
-import shutil
-import subprocess
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -34,9 +29,9 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-HF_BYPASS_KERNEL_SIZE = 31
+HF_BYPASS_KERNEL_SIZE = 61
 
-PHASE_1_EPOCHS      = 3
+PHASE_1_EPOCHS      = 5
 PHASE_2_EPOCHS      = 50
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
@@ -61,21 +56,22 @@ phase1_weights = dict(
     w_l1   = 0.07,   # absolute waveform
     w_stft = 0.10,   # multi-res STFT
     w_fw   = 0.07,   # freq-weighted STFT
-    w_grad = 0.10,   # slope loss
+    w_grad = 1.0,   # slope loss
     w_pre  = 0.90,   # pre-emphasis
     w_mel  = 0.10,   # mel spectrogram
     w_hf   = 3.50,   # 3–10 kHz band
-    w_tr   = 80.0    # NEW: transient (fast-attack) loss
+    w_tr   = 100.0    # NEW: transient (fast-attack) loss
 )
+
 phase2_weights = dict(
     w_l1   = 0.15,
     w_stft = 0.15,
     w_fw   = 0.10,
-    w_grad = 0.15,
+    w_grad = 0.35,
     w_pre  = 0.15,
     w_mel  = 0.15,
     w_hf   = 0.10,   # still some HF, but lower
-    w_tr   = 10.0    # small transient term
+    w_tr   = 20.0    # small transient term
 )
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
