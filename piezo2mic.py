@@ -31,8 +31,8 @@ BATCH_SIZE          = 32
 
 HF_BYPASS_KERNEL_SIZE = 61
 
-PHASE_1_EPOCHS      = 5
-PHASE_2_EPOCHS      = 50
+PHASE_1_EPOCHS      = 2
+PHASE_2_EPOCHS      = 2
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
@@ -53,26 +53,48 @@ SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 os.makedirs(OUT_DIR, exist_ok=True)
 
 phase1_weights = dict(
-    w_l1   = 0.07,   # absolute waveform
-    w_stft = 0.10,   # multi-res STFT
-    w_fw   = 0.07,   # freq-weighted STFT
-    w_grad = 1.0,   # slope loss
-    w_pre  = 0.90,   # pre-emphasis
-    w_mel  = 0.10,   # mel spectrogram
-    w_hf   = 3.50,   # 3–10 kHz band
-    w_tr   = 100.0    # NEW: transient (fast-attack) loss
+    w_l1   = 10000.0,   # absolute waveform
+    w_stft = 0.0,   # multi-res STFT
+    w_fw   = 0.0,   # freq-weighted STFT
+    w_grad = 0.0,   # slope loss
+    w_pre  = 0.0,   # pre-emphasis
+    w_mel  = 0.0,   # mel spectrogram
+    w_hf   = 0.0,   # 3–10 kHz band
+    w_tr   = 0.0    # NEW: transient (fast-attack) loss
 )
 
 phase2_weights = dict(
-    w_l1   = 0.15,
-    w_stft = 0.15,
-    w_fw   = 0.10,
-    w_grad = 0.35,
-    w_pre  = 0.15,
-    w_mel  = 0.15,
-    w_hf   = 0.10,   # still some HF, but lower
-    w_tr   = 20.0    # small transient term
+    w_l1   = 10000.0,   # absolute waveform
+    w_stft = 0.0,   # multi-res STFT
+    w_fw   = 0.0,   # freq-weighted STFT
+    w_grad = 0.0,   # slope loss
+    w_pre  = 0.0,   # pre-emphasis
+    w_mel  = 0.0,   # mel spectrogram
+    w_hf   = 0.0,   # 3–10 kHz band
+    w_tr   = 0.0    # NEW: transient (fast-attack) loss
 )
+
+# phase1_weights = dict(
+#     w_l1   = 0.07,   # absolute waveform
+#     w_stft = 0.10,   # multi-res STFT
+#     w_fw   = 0.07,   # freq-weighted STFT
+#     w_grad = 1.0,   # slope loss
+#     w_pre  = 0.90,   # pre-emphasis
+#     w_mel  = 0.10,   # mel spectrogram
+#     w_hf   = 3.50,   # 3–10 kHz band
+#     w_tr   = 100.0    # NEW: transient (fast-attack) loss
+# )
+
+# phase2_weights = dict(
+#     w_l1   = 0.15,
+#     w_stft = 0.15,
+#     w_fw   = 0.10,
+#     w_grad = 0.35,
+#     w_pre  = 0.15,
+#     w_mel  = 0.15,
+#     w_hf   = 0.10,   # still some HF, but lower
+#     w_tr   = 20.0    # small transient term
+# )
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
@@ -794,31 +816,31 @@ if __name__=="__main__":
                      'slice_gate':    slice_gate
         })
 
-    # DEMO
-    print("\nGenerating demo…")
-    FRAMES      = DEMO_SEC * SR
-    START_FRAME = DEMO_OFFSET_SEC * SR
-    pth_src, pth_tgt = pairs[DEMO_PAIR_INDEX]
+        # DEMO
+        print("\nGenerating demo…")
+        FRAMES      = DEMO_SEC * SR
+        START_FRAME = DEMO_OFFSET_SEC * SR
+        pth_src, pth_tgt = pairs[DEMO_PAIR_INDEX]
 
-    x_long,_ = sf.read(pth_src,
-                       start=START_FRAME,
-                       frames=FRAMES,
-                       dtype='float32',
-                       always_2d=True)
-    y_ref,_  = sf.read(pth_tgt,
-                       start=START_FRAME,
-                       frames=FRAMES,
-                       dtype='float32',
-                       always_2d=True)
+        x_long,_ = sf.read(pth_src,
+                        start=START_FRAME,
+                        frames=FRAMES,
+                        dtype='float32',
+                        always_2d=True)
+        y_ref,_  = sf.read(pth_tgt,
+                        start=START_FRAME,
+                        frames=FRAMES,
+                        dtype='float32',
+                        always_2d=True)
 
-    x_in = x_long[np.newaxis,...]
-    print("Running inference…")
-    y_pred_dyn = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
+        x_in = x_long[np.newaxis,...]
+        print("Running inference…")
+        y_pred_dyn = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
 
-    sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),
-             x_long, SR, subtype='FLOAT')
-    sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),
-             y_ref, SR, subtype='FLOAT')
-    sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"),
-             y_pred_dyn, SR, subtype='FLOAT')
-    print("✅ Demo files in", OUT_DIR)
+        sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),
+                x_long, SR, subtype='FLOAT')
+        sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),
+                y_ref, SR, subtype='FLOAT')
+        sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"),
+                y_pred_dyn, SR, subtype='FLOAT')
+        print("✅ Demo files in", OUT_DIR)
