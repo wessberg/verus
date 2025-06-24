@@ -36,9 +36,9 @@ HF_FMAX             = 15000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 2
-PHASE_2_EPOCHS      = 1
-PHASE_3_EPOCHS      = 10
+PHASE_1_EPOCHS      = 30
+PHASE_2_EPOCHS      = 15
+PHASE_3_EPOCHS      = 100
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
