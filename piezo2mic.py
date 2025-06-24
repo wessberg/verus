@@ -53,25 +53,25 @@ SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 os.makedirs(OUT_DIR, exist_ok=True)
 
 phase1_weights = dict(
-    w_l1   = 10000.0,   # absolute waveform
+    w_l1   = 100.0,   # absolute waveform
     w_stft = 0.0,   # multi-res STFT
     w_fw   = 0.0,   # freq-weighted STFT
     w_grad = 0.0,   # slope loss
     w_pre  = 0.0,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 0.0,   # 3–10 kHz band
-    w_tr   = 0.0    # NEW: transient (fast-attack) loss
+    w_hf   = 50.0,   # 3–10 kHz band
+    w_tr   = 100.0    # NEW: transient (fast-attack) loss
 )
 
 phase2_weights = dict(
-    w_l1   = 10000.0,   # absolute waveform
+    w_l1   = 100.0,   # absolute waveform
     w_stft = 0.0,   # multi-res STFT
     w_fw   = 0.0,   # freq-weighted STFT
     w_grad = 0.0,   # slope loss
     w_pre  = 0.0,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 0.0,   # 3–10 kHz band
-    w_tr   = 0.0    # NEW: transient (fast-attack) loss
+    w_hf   = 50.0,   # 3–10 kHz band
+    w_tr   = 100.0    # NEW: transient (fast-attack) loss
 )
 
 # phase1_weights = dict(
@@ -180,7 +180,7 @@ def mel_metric(y_true, y_pred):
 def hf_metric(y_true, y_pred):
     # exactly your 3–10 kHz band penaliser
     return band_limited_stft_loss(y_true, y_pred,
-                                  fmin=3000.0, fmax=10000.0,
+                                  fmin=5000.0, fmax=15000.0,
                                   n_fft=512, hop=128)
     
 @register_keras_serializable()
