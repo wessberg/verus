@@ -29,7 +29,7 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-HF_KERNEL_SIZE      = 61
+HF_KERNEL_SIZE      = 3
 HF_FMIN             = 3000.0
 HF_FMAX             = 15000.0
 HF_N_FFT            = 512
@@ -57,25 +57,25 @@ SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 os.makedirs(OUT_DIR, exist_ok=True)
 
 phase1_weights = dict(
-    w_l1   = 0.0,   # absolute waveform
-    w_stft = 0.0,   # multi-res STFT
-    w_fw   = 0.0,   # freq-weighted STFT
-    w_grad = 0.0,   # slope loss
-    w_pre  = 0.0,   # pre-emphasis
+    w_l1   = 0.1,   # absolute waveform
+    w_stft = 0.05,   # multi-res STFT
+    w_fw   = 0.05,   # freq-weighted STFT
+    w_grad = 1.0,   # slope loss
+    w_pre  = 0.5,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 1.0,   # HF_FMIN–HF_FMAX kHz band
-    w_tr   = 0.0    # NEW: transient (fast-attack) loss
+    w_hf   = 5.0,   # HF_FMIN–HF_FMAX kHz band
+    w_tr   = 150.0    # NEW: transient (fast-attack) loss
 )
 
 phase2_weights = dict(
-    w_l1   = 0.0,   # absolute waveform
-    w_stft = 0.0,   # multi-res STFT
-    w_fw   = 0.0,   # freq-weighted STFT
-    w_grad = 0.0,   # slope loss
-    w_pre  = 0.0,   # pre-emphasis
+    w_l1   = 0.2,   # absolute waveform
+    w_stft = 0.1,   # multi-res STFT
+    w_fw   = 0.1,   # freq-weighted STFT
+    w_grad = 0.5,   # slope loss
+    w_pre  = 0.2,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 1.0,   # 3–15 kHz band
-    w_tr   = 0.0    # NEW: transient (fast-attack) loss
+    w_hf   = 1.0,   # HF_FMIN–HF_FMAX kHz band
+    w_tr   = 15.0    # NEW: transient (fast-attack) loss
 )
 
 # phase1_weights = dict(
@@ -85,7 +85,7 @@ phase2_weights = dict(
 #     w_grad = 1.0,   # slope loss
 #     w_pre  = 0.90,   # pre-emphasis
 #     w_mel  = 0.10,   # mel spectrogram
-#     w_hf   = 3.50,   # 3–10 kHz band
+#     w_hf   = 3.50,   # HF_FMIN–HF_FMAX kHz band
 #     w_tr   = 100.0    # NEW: transient (fast-attack) loss
 # )
 
@@ -96,8 +96,8 @@ phase2_weights = dict(
 #     w_grad = 0.35,
 #     w_pre  = 0.15,
 #     w_mel  = 0.15,
-#     w_hf   = 0.10,   # still some HF, but lower
-#     w_tr   = 20.0    # small transient term
+#     w_hf   = 0.10,
+#     w_tr   = 20.0
 # )
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
