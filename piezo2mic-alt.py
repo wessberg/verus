@@ -13,7 +13,7 @@ import numpy as np
 import soundfile as sf
 import tensorflow as tf
 from tensorflow.keras import Input, Model
-from tensorflow.keras.layers import Conv1D, ZeroPadding1D, Add, UpSampling1D, Lambda
+from tensorflow.keras.layers import Conv1D, ZeroPadding1D, Add, UpSampling1D, Lambda, Layer
 from tensorflow.keras.initializers import Constant
 from tensorflow.keras.constraints import Constraint
 from sklearn.model_selection import train_test_split
@@ -29,6 +29,27 @@ def compute_rf(kernel_size, dilations):
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 DECIM_FACTOR     = 8     # downsample 48 k → 6 k
+
+# ————————————————————————————————————————————————————————————
+# DESIGN A LINEAR-PHASE LOW-PASS FOR DECIMATION/INTERP
+# ————————————————————————————————————————————————————————————
+# cutoff at 1/(2*DECIM_FACTOR) of original Nyquist
+f_c = 1.0 / (2 * DECIM_FACTOR)
+# number of FIR taps (odd → exact linear phase)
+DECIM_TAPS = 63
+n = np.arange(DECIM_TAPS, dtype=np.float32)
+n0 = (DECIM_TAPS - 1) / 2.0
+# ideal sinc
+h_lp = np.sinc(2 * f_c * (n - n0))
+# scale by cutoff
+h_lp *= 2 * f_c
+# window to control sidelobes
+h_lp *= np.hamming(DECIM_TAPS)
+# normalize DC gain = 1
+h_lp /= np.sum(h_lp)
+# reshape for Conv1D kernel: (kernel_size, in_channels, out_channels)
+h_lp = h_lp.reshape((DECIM_TAPS, 1, 1)).astype(np.float32)
+# ————————————————————————————————————————————————————————————
 
 # — fine branch @48 kHz (∼7.5 ms RF)
 FINE_FILTERS     = 64
@@ -112,6 +133,26 @@ for s in srcs:
 if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
+
+@register_keras_serializable()
+class ResamplePoly(Layer):
+    """A small wrapper around tf.signal.resample_poly that is properly serializable."""
+    def __init__(self, up=1, down=1, **kwargs):
+        super().__init__(**kwargs)
+        self.up = up
+        self.down = down
+
+    def call(self, inputs):
+        # inputs: (batch, time, channels)
+        return tf.signal.resample_poly(inputs,
+                                       up=self.up,
+                                       down=self.down,
+                                       axis=1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"up": self.up, "down": self.down})
+        return cfg
 
 @register_keras_serializable()
 class DynamicCrop(tf.keras.layers.Layer):
@@ -358,63 +399,76 @@ def build_multirate_resnet(dynamic_time: bool=False):
     T = None if dynamic_time else SEG_LEN
     piezo_in = Input(shape=(T,1), name="piezo_in")
 
-    # ─── fine branch @48 kHz ──────────────────────────────────
+    # ─── fine branch @48 kHz ─────────────────────────────────────
     x = Conv1D(FINE_FILTERS, 1, padding='same', name="fine_init")(piezo_in)
     for i, d in enumerate(FINE_DILATIONS):
         res = x
         pad = (FINE_KERNEL - 1) * d
         x   = ZeroPadding1D((pad,0), name=f"fine_pad_{i}")(x)
-        x   = SeparableConv1D(FINE_FILTERS,
-                              FINE_KERNEL,
-                              dilation_rate=d,
-                              padding='valid',
-                              activation='relu',
-                              name=f"fine_sep_{i}"
-                             )(x)
+        x   = SeparableConv1D(
+                 FINE_FILTERS,
+                 FINE_KERNEL,
+                 dilation_rate=d,
+                 padding='valid',
+                 activation='relu',
+                 name=f"fine_sep_{i}"
+             )(x)
         x   = Add(name=f"fine_res_{i}")([x, res])
+    # final 1×1 to get single‐channel
     fine_out = Conv1D(1, 1, padding='same', name="fine_out")(x)
 
-    # ─── coarse branch @6 kHz ─────────────────────────────────
-    # 1) decimate
-    decim = Conv1D(1,
-                   DECIM_FACTOR,
-                   strides=DECIM_FACTOR,
-                   padding='causal',
-                   use_bias=False,
-                   trainable=False,
-                   kernel_initializer=tf.keras.initializers.Constant(1.0/DECIM_FACTOR),
-                   name="decim")(piezo_in)
+    # ─── coarse branch @6 kHz with true FIR polyphase ─────────────────
+    # 1) DECIMATE by 8 using our FIR
+    decim = Conv1D(
+        filters=1,
+        kernel_size=DECIM_TAPS,
+        strides=DECIM_FACTOR,
+        padding='same',         # zero‐phase align
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=Constant(h_lp),
+        name="coarse_decim_fir"
+    )(piezo_in)
 
-    # 2) small‐channel TCN
+    # 2) small TCN @6 kHz (exactly as your existing code)
     y = Conv1D(COARSE_FILTERS, 1, padding='same', name="coarse_init")(decim)
     for i, d in enumerate(COARSE_DILATIONS):
         res = y
         pad = (COARSE_KERNEL - 1) * d
         y   = ZeroPadding1D((pad,0), name=f"coarse_pad_{i}")(y)
-        y   = SeparableConv1D(COARSE_FILTERS,
-                              COARSE_KERNEL,
-                              dilation_rate=d,
-                              padding='valid',
-                              activation='relu',
-                              name=f"coarse_sep_{i}"
-                             )(y)
+        y   = SeparableConv1D(
+                 COARSE_FILTERS,
+                 COARSE_KERNEL,
+                 dilation_rate=d,
+                 padding='valid',
+                 activation='relu',
+                 name=f"coarse_sep_{i}"
+             )(y)
         y   = Add(name=f"coarse_res_{i}")([y, res])
     y = Conv1D(1,1,padding='same',name="coarse_out")(y)
 
-    # 3) upsample + smooth + crop to SEG_LEN
-    y = UpSampling1D(DECIM_FACTOR, name="coarse_up")(y)
-    y = Conv1D(1,3,padding='causal',name="coarse_smooth")(y)
-    
+    # 3) UPSAMPLE + RECONSTRUCT with same FIR
+    y = UpSampling1D(DECIM_FACTOR, name="coarse_upsample_nn")(y)
+    y = Conv1D(
+        filters=1,
+        kernel_size=DECIM_TAPS,
+        padding='same',
+        use_bias=False,
+        trainable=False,
+        kernel_initializer=Constant(h_lp),
+        name="coarse_interp_fir"
+    )(y)
+
+    # 4) crop the tiny extra tail so lengths match
     if not dynamic_time:
-        # static model: we know SEG_LEN, so crop away the pre‐computed EXTRA_COARSE
         if EXTRA_COARSE > 0:
             y = Cropping1D((0, EXTRA_COARSE), name="coarse_crop")(y)
     else:
         y = DynamicCrop(name="coarse_crop_dynamic")([y, piezo_in])
 
-    # ─── merge + HF bypass ───────────────────────────────────
+    # ─── MERGE + tiny HF bypass ──────────────────────────────────────
     merged = Add(name="merge")([fine_out, y])
-    hf = tf.keras.layers.Conv1D(
+    hf = Conv1D(
         filters=1,
         kernel_size=HF_KERNEL,
         padding='causal',

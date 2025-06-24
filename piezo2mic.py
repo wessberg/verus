@@ -17,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard
 from tensorflow.keras.constraints import Constraint
+from tensorflow.keras import regularizers
 
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
@@ -29,14 +30,20 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-HF_KERNEL_SIZE      = 3
+HF_KERNEL_SIZE      = 11
 HF_FMIN             = 3000.0
 HF_FMAX             = 15000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 1
+PHASE_1_EPOCHS      = 2
 PHASE_2_EPOCHS      = 1
+PHASE_3_EPOCHS      = 10
+
+PHASE_1_LR          = 1e-3
+PHASE_2_LR          = 1e-4
+PHASE_3_LR          = 1e-2
+
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
@@ -56,27 +63,44 @@ SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
-phase1_weights = dict(
-    w_l1   = 0.1,   # absolute waveform
-    w_stft = 0.05,   # multi-res STFT
-    w_fw   = 0.05,   # freq-weighted STFT
-    w_grad = 1.0,   # slope loss
-    w_pre  = 0.5,   # pre-emphasis
-    w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 5.0,   # HF_FMIN–HF_FMAX kHz band
-    w_tr   = 150.0    # NEW: transient (fast-attack) loss
-)
+# ─── phase1_weights: get your tone & broad HF in place ───────────────────────
+phase1_weights = {
+    'w_l1'  : 0.10,    # small time-domain anchor
+    'w_stft': 0.05,    # low-res STFT for coarse shape
+    'w_fw'  : 0.05,    # freq-weighted STFT for spectral tilt
+    'w_grad': 1.00,    # slope loss to boost overall edges
+    'w_pre' : 0.50,    # pre-emphasis to push HF
+    'w_mel' : 0.00,    # skip mel for now
+    'w_hf'  : 5.00,    # 3–15 kHz band penalty
+    'w_tr'  :150.00,   # full transient (both sides)
+    'w_hw'  : 0.00     # half-wave only later
+}
 
-phase2_weights = dict(
-    w_l1   = 0.2,   # absolute waveform
-    w_stft = 0.1,   # multi-res STFT
-    w_fw   = 0.1,   # freq-weighted STFT
-    w_grad = 0.5,   # slope loss
-    w_pre  = 0.2,   # pre-emphasis
-    w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 1.0,   # HF_FMIN–HF_FMAX kHz band
-    w_tr   = 15.0    # NEW: transient (fast-attack) loss
-)
+# ─── phase2_weights: tighten HF and refine attack shape ────────────────────
+phase2_weights = {
+    'w_l1'  : 0.20,    # a bit more time-domain anchoring
+    'w_stft': 0.10,    # small multi-res STFT
+    'w_fw'  : 0.10,    # small freq-weighted
+    'w_grad': 0.50,    # moderate slope
+    'w_pre' : 0.20,    # mild pre-emphasis
+    'w_mel' : 0.00,    # still skip mel
+    'w_hf'  : 1.00,    # lighter HF band
+    'w_tr'  :15.00,    # softer full transient
+    'w_hw'  : 0.00     # half-wave only in phase3
+}
+
+# ─── phase3_weights: freeze all but bypass, sculpt the positive spike ─────
+phase3_weights = {
+    'w_l1'  : 0.00,
+    'w_stft': 0.00,
+    'w_fw'  : 0.00,
+    'w_grad': 0.00,
+    'w_pre' : 0.00,
+    'w_mel' : 0.00,
+    'w_hf'  :10.00,     # heavy HF band to force residual
+    'w_tr'  :200.00,    # strong full transient
+    'w_hw'  :100.00     # strong half-wave (positive-only) loss
+}
 
 # phase1_weights = dict(
 #     w_l1   = 0.07,   # absolute waveform
@@ -111,6 +135,27 @@ for s in srcs:
 if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
+
+@register_keras_serializable()
+def half_wave_loss(y_true, y_pred, threshold=0.0):
+    # only punish positive-going slopes (the actual pick spike)
+    dy_t   = y_true[:,1:,:] - y_true[:,:-1,:]
+    dy_p   = y_pred[:,1:,:] - y_pred[:,:-1,:]
+    pos_t  = tf.nn.relu(dy_t - threshold)
+    pos_p  = tf.nn.relu(dy_p - threshold)
+    return tf.reduce_mean(tf.abs(pos_t - pos_p))
+
+@register_keras_serializable()
+class HFGainLayer(tf.keras.layers.Layer):
+    def build(self, input_shape):
+        # a single scalar gain
+        self.gamma = self.add_weight(
+            name='hf_gain', shape=(), initializer='ones', trainable=True)
+        super().build(input_shape)
+    def call(self, x):
+        return x * self.gamma
+    def get_config(self):
+        return super().get_config()
 
 
 @register_keras_serializable()
@@ -189,6 +234,11 @@ def hf_metric(y_true, y_pred):
 def tf_metric(y_true, y_pred):
     # a simple TF metric that returns the mean of the absolute difference
     return transient_loss(y_true, y_pred)
+
+@register_keras_serializable()
+def hw_metric(y_true, y_pred):
+    # a simple TF metric that returns the mean of the absolute difference
+    return half_wave_loss(y_true, y_pred)
 
 @register_keras_serializable()
 def slice_content(x, filters):
@@ -317,7 +367,7 @@ def mel_loss(y_true, y_pred, n_mels=64, n_fft=1024, hop=256):
     return tf.reduce_mean(tf.abs(tf.math.log1p(M_t) - tf.math.log1p(M_p)))
 
 # ——— factory that captures your weight‐set in a closure ———
-def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr):
+def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr, w_hw):
     @register_keras_serializable()
     def _loss(y_true, y_pred):
         l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
@@ -328,6 +378,7 @@ def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr):
         mel  = mel_loss(y_true, y_pred)
         hf   = band_limited_stft_loss(y_true, y_pred)
         tr   = transient_loss(y_true, y_pred)
+        hw    = half_wave_loss(y_true, y_pred)
 
         return (
           w_l1   * l1   +
@@ -337,7 +388,8 @@ def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr):
           w_pre  * pre  +
           w_mel  * mel  +
           w_hf   * hf   +
-          w_tr   * tr
+          w_tr   * tr   +
+        w_hw   * hw
         )
     return _loss
 
@@ -424,19 +476,34 @@ def build_resnet_gated(filters=FILTERS,
     #         kernel_initializer='zeros',   # start with zero so no effect at init
     #         name="hf_transient")(inp)
     
+    # hf = tf.keras.layers.Conv1D(
+    #     filters=1,
+    #     kernel_size=HF_KERNEL_SIZE,
+    #     padding='causal',
+    #     use_bias=False,
+    #     kernel_initializer='zeros',
+    #     name='hf_transient'
+    # )(inp)
+    
+     # ── (4) tiny HF bypass on the *derivative* ───────────────────────────────
+    dx       = Diff1D(name="diff1d_in")(inp)
+    abs_dx   = AbsLayer(name="abs_dx")(dx)
+    env_gate = EnvScaleLayer(shift=1e-3, slope=200.0, name="env_scale")(abs_dx)
+    # the bypass conv itself has an L1 kernel-regularizer to force sparsity
     hf = tf.keras.layers.Conv1D(
-        filters=1,
-        kernel_size=HF_KERNEL_SIZE,
-        padding='causal',
-        use_bias=False,
-        kernel_initializer='zeros',
-        name='hf_transient'
-    )(inp)
+            filters=1,
+            kernel_size=HF_KERNEL_SIZE,
+            padding='causal',
+            use_bias=False,
+            kernel_initializer='zeros',
+            kernel_regularizer=regularizers.l1(1e-3),
+            name='hf_transient'
+        )(env_gate)
+    # trainable scalar gain so the optimizer can “turn up” the click
+    hf = HFGainLayer(name="hf_gain")(hf)
 
-    # ── smooth limiter ────────────────────────────────────
     merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
-    #out = tf.keras.layers.Activation('tanh', name="tanh_out")(merged)
-    out = merged
+    out    = merged
     
     # ── linear output (no tanh soft-clip) ─────────────────
     #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
@@ -604,33 +671,34 @@ def train():
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     # data generator (no per-segment mean removal)
-    def segment_generator(chunk_list):
+    def attack_segment_generator(chunk_list):
         while True:
-            # pick one 30 s chunk
-            src_path, tgt_path, chunk_start, chunk_dur = random.choice(chunk_list)
+            # 50% of the time pick the window with the biggest derivative
+            if random.random() < 0.5:
+                best = None
+                best_dy = -1.0
+                # sample 5 random windows, keep the max-dy one
+                for _ in range(5):
+                    src, tgt, cstart, cdur = random.choice(chunk_list)
+                    max_off = max(cdur - SEG_LEN, 1)
+                    off     = random.randrange(max_off)
+                    x, _    = sf.read(src, start=cstart+off, frames=SEG_LEN, dtype='float32', always_2d=True)
+                    dmax    = np.max(np.abs(np.diff(x[:,0])))
+                    if dmax > best_dy:
+                        best_dy = dmax
+                        best = (src, tgt, cstart+off)
+                src_path, tgt_path, read_start = best
+            else:
+                src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
+                max_off = max(cdur - SEG_LEN, 1)
+                read_start = cstart + random.randrange(max_off)
 
-            # pick a random SEG_LEN‐long window inside that chunk
-            max_offset = max(chunk_dur - SEG_LEN, 1)
-            offset     = random.randrange(max_offset)
-            read_start = chunk_start + offset
-
-            x, _ = sf.read(src_path,
-                           start=read_start,
-                           frames=SEG_LEN,
-                           dtype='float32',
-                           always_2d=True)
-            y, _ = sf.read(tgt_path,
-                           start=read_start,
-                           frames=SEG_LEN,
-                           dtype='float32',
-                           always_2d=True)
-
-            # pad if we hit EOF
+            x, _ = sf.read(src_path, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+            y, _ = sf.read(tgt_path, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
             if x.shape[0] < SEG_LEN:
                 pad = SEG_LEN - x.shape[0]
                 x = np.pad(x, ((0,pad),(0,0)))
                 y = np.pad(y, ((0,pad),(0,0)))
-
             yield x, y
 
     # representative dataset for full-integer quant
@@ -654,11 +722,11 @@ def train():
     sig = tf.TensorSpec((SEG_LEN,1), tf.float32)
 
     train_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_chunks),
+        lambda: attack_segment_generator(train_chunks),
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     val_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_chunks),
+        lambda: attack_segment_generator(val_chunks),
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     
@@ -670,9 +738,8 @@ def train():
     print("\n≈ Training FP32 model")
     static_model = build_resnet_gated(dynamic_time=False)
 
-    # ——— PHASE 1: high‐hf for first 3 epochs ———
     static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
+        optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
         loss=make_combined_loss(**phase1_weights),
         metrics=[ 'mae',
                 l1_metric,
@@ -682,7 +749,8 @@ def train():
                 pre_metric,
                 mel_metric,
                 hf_metric,
-                tf_metric
+                tf_metric,
+                hw_metric
         ]
     )
     
@@ -697,9 +765,8 @@ def train():
         callbacks=[ es, TensorBoard(log_dir="./logs") ]
     )
 
-    # ——— PHASE 2: flatter weighting for the rest ———
     static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),   # you might also drop LR
+        optimizer=tf.keras.optimizers.Adam(PHASE_2_LR),   # you might also drop LR
         loss=make_combined_loss(**phase2_weights),
         metrics=[ 'mae',
                 l1_metric,
@@ -709,7 +776,8 @@ def train():
                 pre_metric,
                 mel_metric,
                 hf_metric,
-                tf_metric
+                tf_metric,
+                hw_metric
         ]
     )
     static_model.fit(
@@ -720,6 +788,27 @@ def train():
         validation_data=val_ds,
         validation_steps=validation_steps,
         callbacks=[ es, TensorBoard(log_dir="./tb") ]
+    )
+    
+    # 1) freeze
+    for layer in static_model.layers:
+        layer.trainable = (layer.name in ['hf_transient','hf_gain'])
+    # 2) re-compile with only the bypass-focused losses
+    static_model.compile(
+        optimizer=tf.keras.optimizers.Adam(PHASE_3_LR),
+        loss=make_combined_loss(**phase3_weights),
+        metrics=[ hf_metric, tf_metric, half_wave_loss ]
+    )
+    # 3) build a dataloader that oversamples attack windows
+    train_ds = tf.data.Dataset.from_generator(
+        lambda: attack_segment_generator(train_chunks),
+        output_signature=(sig, sig)
+    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    # 4) fine-tune just the bypass for ~10 epochs
+    static_model.fit(
+        train_ds,
+        epochs=PHASE_3_EPOCHS,
+        steps_per_epoch=100
     )
 
     path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
