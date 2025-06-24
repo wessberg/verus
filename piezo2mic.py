@@ -732,9 +732,9 @@ def train():
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     
-    es1 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                          patience=PHASE_1_LR_PATIENCE,
-                                          restore_best_weights=True)
+    # es1 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+    #                                       patience=PHASE_1_LR_PATIENCE,
+    #                                       restore_best_weights=True)
 
     # 1) train FP32 static
     print("\n≈ Training FP32 model")
@@ -764,7 +764,10 @@ def train():
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
-        callbacks=[ es1, TensorBoard(log_dir="./logs") ]
+        callbacks=[
+            # es1,
+            TensorBoard(log_dir="./logs")
+        ]
     )
     
     es2 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
@@ -788,7 +791,8 @@ def train():
     )
     static_model.fit(
         train_ds,
-        epochs=PHASE_2_EPOCHS,
+        initial_epoch=PHASE_1_EPOCHS,
+        epochs=PHASE_1_EPOCHS + PHASE_2_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
