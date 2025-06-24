@@ -29,14 +29,18 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-HF_BYPASS_KERNEL_SIZE = 61
+HF_KERNEL_SIZE      = 61
+HF_FMIN             = 3000.0
+HF_FMAX             = 15000.0
+HF_N_FFT            = 512
+HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 2
-PHASE_2_EPOCHS      = 2
+PHASE_1_EPOCHS      = 1
+PHASE_2_EPOCHS      = 1
 PATIENCE            = 5
 SHUFFLE_BUF         = 1000
 
-CHUNK_SEC           = 15
+CHUNK_SEC           = 5
 
 SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
@@ -53,25 +57,25 @@ SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
 os.makedirs(OUT_DIR, exist_ok=True)
 
 phase1_weights = dict(
-    w_l1   = 100.0,   # absolute waveform
+    w_l1   = 0.0,   # absolute waveform
     w_stft = 0.0,   # multi-res STFT
     w_fw   = 0.0,   # freq-weighted STFT
     w_grad = 0.0,   # slope loss
     w_pre  = 0.0,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 50.0,   # 3–10 kHz band
-    w_tr   = 100.0    # NEW: transient (fast-attack) loss
+    w_hf   = 1.0,   # HF_FMIN–HF_FMAX kHz band
+    w_tr   = 0.0    # NEW: transient (fast-attack) loss
 )
 
 phase2_weights = dict(
-    w_l1   = 100.0,   # absolute waveform
+    w_l1   = 0.0,   # absolute waveform
     w_stft = 0.0,   # multi-res STFT
     w_fw   = 0.0,   # freq-weighted STFT
     w_grad = 0.0,   # slope loss
     w_pre  = 0.0,   # pre-emphasis
     w_mel  = 0.0,   # mel spectrogram
-    w_hf   = 50.0,   # 3–10 kHz band
-    w_tr   = 100.0    # NEW: transient (fast-attack) loss
+    w_hf   = 1.0,   # 3–15 kHz band
+    w_tr   = 0.0    # NEW: transient (fast-attack) loss
 )
 
 # phase1_weights = dict(
@@ -179,9 +183,7 @@ def mel_metric(y_true, y_pred):
 @register_keras_serializable()
 def hf_metric(y_true, y_pred):
     # exactly your 3–10 kHz band penaliser
-    return band_limited_stft_loss(y_true, y_pred,
-                                  fmin=5000.0, fmax=15000.0,
-                                  n_fft=512, hop=128)
+    return band_limited_stft_loss(y_true, y_pred)
     
 @register_keras_serializable()
 def tf_metric(y_true, y_pred):
@@ -210,22 +212,20 @@ def pre_emphasis_loss(y_true, y_pred, μ=0.99):
     yp = pre_emphasis(y_pred, μ)
     return tf.reduce_mean(tf.abs(yt - yp))
 
-def band_limited_stft_loss(y_true, y_pred,
-                           fmin=3000.0, fmax=10000.0,
-                           n_fft=512, hop=128):
+def band_limited_stft_loss(y_true, y_pred):
     # y_true, y_pred: (B, T, 1)
     yt = tf.squeeze(y_true, -1)   # (B, T)
     yp = tf.squeeze(y_pred, -1)
     # compute a single-resolution STFT
-    S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-    S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+    S_t = tf.signal.stft(yt, frame_length=HF_N_FFT, frame_step=HF_HOP, fft_length=HF_N_FFT)
+    S_p = tf.signal.stft(yp, frame_length=HF_N_FFT, frame_step=HF_HOP, fft_length=HF_N_FFT)
     mag_t = tf.abs(S_t)
     mag_p = tf.abs(S_p)
 
     # build a binary mask over freq‐bins
     freq_bins = tf.shape(mag_t)[-1]
     freqs = tf.linspace(0.0, SR/2, freq_bins)   # SR is your global sample­rate
-    band_mask = tf.logical_and(freqs >= fmin, freqs <= fmax)
+    band_mask = tf.logical_and(freqs >= HF_FMIN, freqs <= HF_FMAX)
     band_mask = tf.cast(band_mask, mag_t.dtype)  # shape (freq_bins,)
     band_mask = band_mask[tf.newaxis, tf.newaxis, :]  # (1,1,F)
 
@@ -326,9 +326,7 @@ def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr):
         grad = gradient_loss(y_true, y_pred)
         pre  = pre_emphasis_loss(y_true, y_pred)
         mel  = mel_loss(y_true, y_pred)
-        hf   = band_limited_stft_loss(y_true, y_pred,
-                                      fmin=3000.0, fmax=10000.0,
-                                      n_fft=512, hop=128)
+        hf   = band_limited_stft_loss(y_true, y_pred)
         tr   = transient_loss(y_true, y_pred)
 
         return (
@@ -428,7 +426,7 @@ def build_resnet_gated(filters=FILTERS,
     
     hf = tf.keras.layers.Conv1D(
         filters=1,
-        kernel_size=HF_BYPASS_KERNEL_SIZE,
+        kernel_size=HF_KERNEL_SIZE,
         padding='causal',
         use_bias=False,
         kernel_initializer='zeros',
@@ -505,7 +503,7 @@ def extract_and_save_int8_weights(tflite_model_buf,
             B              = b_arr.size
 
             # 1) tiny HF‐transient: ONLY 3 weights
-            if W == HF_BYPASS_KERNEL_SIZE:
+            if W == HF_KERNEL_SIZE:
                 tag = "hf_transient"
 
             # 2) skip_conv     : ONLY 1 weight, 1 bias
@@ -586,8 +584,8 @@ def train():
     idx_chunks = list(range(len(chunks)))
     if len(chunks) >= 2:
         tr_i, va_i = train_test_split(idx_chunks,
-                                      test_size=0.1,
-                                      random_state=42)
+                                      test_size=0.2,
+                                      random_state=69)
     else:
         tr_i = va_i = idx_chunks
 
