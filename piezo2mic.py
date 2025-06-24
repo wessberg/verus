@@ -36,7 +36,7 @@ HF_FMAX             = 15000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 30
+PHASE_1_EPOCHS      = 15
 PHASE_2_EPOCHS      = 15
 PHASE_3_EPOCHS      = 100
 
@@ -44,7 +44,9 @@ PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
 PHASE_3_LR          = 1e-2
 
-PATIENCE            = 5
+PHASE_1_LR_PATIENCE = 5
+PHASE_2_LR_PATIENCE = 3
+PHASE_3_LR_PATIENCE = 10
 SHUFFLE_BUF         = 1000
 
 CHUNK_SEC           = 5
@@ -80,12 +82,12 @@ phase1_weights = {
 phase2_weights = {
     'w_l1'  : 0.20,    # a bit more time-domain anchoring
     'w_stft': 0.10,    # small multi-res STFT
-    'w_fw'  : 0.10,    # small freq-weighted
-    'w_grad': 0.50,    # moderate slope
-    'w_pre' : 0.20,    # mild pre-emphasis
+    'w_fw'  : 0.20,    # small freq-weighted
+    'w_grad': 0.00,    # moderate slope
+    'w_pre' : 0.80,    # mild pre-emphasis
     'w_mel' : 0.00,    # still skip mel
-    'w_hf'  : 1.00,    # lighter HF band
-    'w_tr'  :15.00,    # softer full transient
+    'w_hf'  : 2.00,    # lighter HF band
+    'w_tr'  :10.00,    # softer full transient
     'w_hw'  : 0.00     # half-wave only in phase3
 }
 
@@ -150,7 +152,7 @@ class HFGainLayer(tf.keras.layers.Layer):
     def build(self, input_shape):
         # a single scalar gain
         self.gamma = self.add_weight(
-            name='hf_gain', shape=(), initializer='ones', trainable=True)
+            name='hf_gain', shape=(), initializer=tf.keras.initializers.Constant(20.0), trainable=True)
         super().build(input_shape)
     def call(self, x):
         return x * self.gamma
@@ -730,8 +732,8 @@ def train():
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     
-    es = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                          patience=PATIENCE,
+    es1 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                          patience=PHASE_1_LR_PATIENCE,
                                           restore_best_weights=True)
 
     # 1) train FP32 static
@@ -762,8 +764,12 @@ def train():
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
-        callbacks=[ es, TensorBoard(log_dir="./logs") ]
+        callbacks=[ es1, TensorBoard(log_dir="./logs") ]
     )
+    
+    es2 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
+                                          patience=PHASE_2_LR_PATIENCE,
+                                          restore_best_weights=True)
 
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_2_LR),   # you might also drop LR
@@ -782,12 +788,11 @@ def train():
     )
     static_model.fit(
         train_ds,
-        initial_epoch=PHASE_1_EPOCHS,
         epochs=PHASE_2_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
-        callbacks=[ es, TensorBoard(log_dir="./tb") ]
+        callbacks=[ es2, TensorBoard(log_dir="./tb") ]
     )
     
     # 1) freeze
@@ -804,11 +809,18 @@ def train():
         lambda: attack_segment_generator(train_chunks),
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-    # 4) fine-tune just the bypass for ~10 epochs
+
+    es3 = tf.keras.callbacks.EarlyStopping(
+        monitor='half_wave_loss',
+        mode='min',
+        patience=PHASE_3_LR_PATIENCE,
+        restore_best_weights=True
+    )
     static_model.fit(
         train_ds,
         epochs=PHASE_3_EPOCHS,
-        steps_per_epoch=100
+        steps_per_epoch=200,
+        callbacks=[ es3 ],
     )
 
     path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
