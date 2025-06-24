@@ -34,7 +34,7 @@ SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
-HF_BYPASS_KERNEL_SIZE = 15
+HF_BYPASS_KERNEL_SIZE = 31
 
 PHASE_1_EPOCHS      = 3
 PHASE_2_EPOCHS      = 50
@@ -47,7 +47,7 @@ SRC_DIR             = "./input/source"
 TGT_DIR             = "./input/target"
 OUT_DIR             = "./out"
 
-DEMO_SEC            = 60
+DEMO_SEC            = 60 * 2
 DEMO_OFFSET_SEC     = 0
 DEMO_PAIR_INDEX     = 0
 
@@ -62,10 +62,10 @@ phase1_weights = dict(
     w_stft = 0.10,   # multi-res STFT
     w_fw   = 0.07,   # freq-weighted STFT
     w_grad = 0.10,   # slope loss
-    w_pre  = 0.10,   # pre-emphasis
-    w_mel  = 0.06,   # mel spectrogram
-    w_hf   = 0.25,   # 3–10 kHz band
-    w_tr   = 0.25    # NEW: transient (fast-attack) loss
+    w_pre  = 0.90,   # pre-emphasis
+    w_mel  = 0.10,   # mel spectrogram
+    w_hf   = 3.50,   # 3–10 kHz band
+    w_tr   = 80.0    # NEW: transient (fast-attack) loss
 )
 phase2_weights = dict(
     w_l1   = 0.15,
@@ -75,7 +75,7 @@ phase2_weights = dict(
     w_pre  = 0.15,
     w_mel  = 0.15,
     w_hf   = 0.10,   # still some HF, but lower
-    w_tr   = 0.05    # small transient term
+    w_tr   = 10.0    # small transient term
 )
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
@@ -90,18 +90,6 @@ if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
 
-@register_keras_serializable()
-class ZeroSum(Constraint):
-    def __init__(self, K):
-        self.K = K
-    def __call__(self, w):
-        s = tf.reduce_sum(w, axis=0, keepdims=True)
-        return w - s / float(self.K)
-    
-    def get_config(self):
-        # return the args needed to rebuild this object
-        return {'K': self.K}
-    
 
 @register_keras_serializable()
 def transient_loss(y_true, y_pred,
@@ -176,6 +164,11 @@ def hf_metric(y_true, y_pred):
     return band_limited_stft_loss(y_true, y_pred,
                                   fmin=3000.0, fmax=10000.0,
                                   n_fft=512, hop=128)
+    
+@register_keras_serializable()
+def tf_metric(y_true, y_pred):
+    # a simple TF metric that returns the mean of the absolute difference
+    return transient_loss(y_true, y_pred)
 
 @register_keras_serializable()
 def slice_content(x, filters):
@@ -420,8 +413,7 @@ def build_resnet_gated(filters=FILTERS,
         kernel_size=HF_BYPASS_KERNEL_SIZE,
         padding='causal',
         use_bias=False,
-        kernel_initializer='zeros', 
-        kernel_constraint=ZeroSum(HF_BYPASS_KERNEL_SIZE),
+        kernel_initializer='zeros',
         name='hf_transient'
     )(inp)
 
@@ -673,7 +665,9 @@ def train():
                 grad_metric,
                 pre_metric,
                 mel_metric,
-                hf_metric ]
+                hf_metric,
+                tf_metric
+        ]
     )
     
     static_model.summary()
@@ -698,7 +692,9 @@ def train():
                 grad_metric,
                 pre_metric,
                 mel_metric,
-                hf_metric ]
+                hf_metric,
+                tf_metric
+        ]
     )
     static_model.fit(
         train_ds,
@@ -795,7 +791,6 @@ if __name__=="__main__":
                 dpath,
                 compile=False,
                 custom_objects={
-                     'ZeroSum': ZeroSum,
                      'AbsLayer': AbsLayer,
                      'Diff1D': Diff1D,
                      'EnvScaleLayer': EnvScaleLayer,
