@@ -1,5 +1,7 @@
 .DS_Store
 input/
+input2/
+input3/
 out/*.wav
 out-alt/
 out-gemini/

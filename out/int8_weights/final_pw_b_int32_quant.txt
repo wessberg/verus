@@ -1,2 +1,0 @@
-scale,zero_point
-5.15236e-06 0

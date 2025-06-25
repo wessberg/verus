@@ -138,6 +138,80 @@ if not pairs:
     print("Error: no _source/_target pairs found"); sys.exit(1)
 print(f"Found {len(pairs)} pairs.")
 
+def attack_segment_generator(chunk_list,
+                             pick_prob=0.8,
+                             N=10):
+    """
+    Exactly your training generator:
+      — with probability `pick_prob` does a best‐of‐N pick‐attack draw
+      — otherwise uniform random window
+    Yields (x_window, y_window) pairs of shape (SEG_LEN,1).
+    """
+    while True:
+        if random.random() < pick_prob:
+            best = None
+            best_dy = -1.0
+            for _ in range(N):
+                src, tgt, cstart, cdur = random.choice(chunk_list)
+                max_off = max(cdur - SEG_LEN, 1)
+                off     = random.randrange(max_off)
+                x, _    = sf.read(src,
+                                  start=cstart+off,
+                                  frames=SEG_LEN,
+                                  dtype='float32',
+                                  always_2d=True)
+                if x.shape[0] < SEG_LEN:
+                    pad = SEG_LEN - x.shape[0]
+                    x   = np.pad(x, ((0,pad),(0,0)))
+                dmax = np.max(np.abs(np.diff(x[:,0])))
+                if dmax > best_dy:
+                    best_dy = dmax
+                    best    = (src, tgt, cstart+off)
+            src_path, tgt_path, read_start = best
+        else:
+            src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
+            max_off = max(cdur - SEG_LEN, 1)
+            read_start = cstart + random.randrange(max_off)
+
+        x, _ = sf.read(src_path,
+                       start=read_start,
+                       frames=SEG_LEN,
+                       dtype='float32',
+                       always_2d=True)
+        if x.shape[0] < SEG_LEN:
+            pad = SEG_LEN - x.shape[0]
+            x   = np.pad(x, ((0,pad),(0,0)))
+        y, _ = sf.read(tgt_path,
+                       start=read_start,
+                       frames=SEG_LEN,
+                       dtype='float32',
+                       always_2d=True)
+        yield x, y
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dump_generator_picks(chunks,
+                         n_windows     = 1000,
+                         pick_prob     = 0.8,
+                         scan_size     = 10):
+    """
+    Pull `n_windows` from attack_segment_generator (with same pick_prob, scan_size),
+    concatenate their *source* signals end‐to‐end, and write to out_path.
+    """
+    gen = attack_segment_generator(chunks,
+                                   pick_prob=pick_prob,
+                                   N=scan_size)
+    out_path = os.path.join(OUT_DIR, "attack_picks.wav")
+    collected = []
+    for i in range(n_windows):
+        x, _ = next(gen)
+        # x is (SEG_LEN,1), mono channel:
+        collected.append(x[:,0])
+        if (i+1) % 100 == 0:
+            print(f"  … grabbed {i+1}/{n_windows} windows")
+    out = np.concatenate(collected, axis=0)
+    sf.write(out_path, out, SR, subtype='PCM_24')
+    print(f"Wrote {n_windows} windows → {out_path}  ({out.shape[0]/SR:.1f}s)")
+
 @register_keras_serializable()
 def half_wave_loss(y_true, y_pred, threshold=0.0):
     # only punish positive-going slopes (the actual pick spike)
@@ -525,6 +599,35 @@ def build_resnet_gated(filters=FILTERS,
 
     return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
 
+def dump_pick_windows(chunks,
+                      n_windows=100,
+                      scan_size=10):
+    out_path = os.path.join(OUT_DIR, "attack_examples.wav")
+    collected = []
+    for i in range(n_windows):
+        best_x = None
+        best_d = -1.0
+        for _ in range(scan_size):
+            src, tgt, cstart, cdur = random.choice(chunks)
+            max_off = max(cdur - SEG_LEN, 1)
+            off = random.randrange(max_off)
+            x, _ = sf.read(src,
+                           start=cstart+off,
+                           frames=SEG_LEN,
+                           dtype='float32',
+                           always_2d=True)
+            if x.shape[0] < SEG_LEN:
+                pad = SEG_LEN - x.shape[0]
+                x = np.pad(x, ((0,pad),(0,0)))
+            d = np.max(np.abs(np.diff(x[:,0])))
+            if d > best_d:
+                best_d = d
+                best_x = x[:,0]
+        collected.append(best_x)
+    out = np.concatenate(collected, axis=0)
+    sf.write(out_path, out, SR, subtype='PCM_24')
+    print(f"Wrote {n_windows} pick-windows ({out.shape[0]/SR:.1f}s) → {out_path}")
+
 
 def extract_and_save_int8_weights(tflite_model_buf,
                                   outdir,
@@ -640,26 +743,24 @@ def extract_and_save_int8_weights(tflite_model_buf,
 
     print("✅ saved all int8 kernels + int32 biases in", outdir)
 
+def build_chunks():
+    chunks = []
+    chunk_len = CHUNK_SEC * SR
+    for src, tgt in pairs:
+        info = sf.info(src)
+        total = info.frames
+        n_full = total // chunk_len
+        for i in range(n_full):
+            chunks.append((src,tgt, i*chunk_len, chunk_len))
+        rem = total - n_full*chunk_len
+        if rem >= SEG_LEN:
+            chunks.append((src,tgt, n_full*chunk_len, rem))
+    return chunks
+
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
         # ────────────────────────── CHUNK‐BASED SPLIT ──────────────────────────────
-    chunk_len = CHUNK_SEC * SR
-    chunks = []
-    for src_path, tgt_path in pairs:
-        info     = sf.info(src_path)
-        total    = info.frames
-        n_full   = total // chunk_len
-
-        # full 15s chunks
-        for i in range(n_full):
-            start = i * chunk_len
-            chunks.append((src_path, tgt_path, start, chunk_len))
-
-        # optional last partial chunk (only if it's at least one training window long)
-        rem = total - n_full * chunk_len
-        if rem >= SEG_LEN:
-            start = n_full * chunk_len
-            chunks.append((src_path, tgt_path, start, rem))
+    chunks = build_chunks()
 
     print(f"Generated {len(chunks)} chunks from {len(pairs)} files")
 
@@ -713,33 +814,6 @@ def train():
                 x = np.pad(x, ((0,pad),(0,0)))
                 y = np.pad(y, ((0,pad),(0,0)))
 
-            yield x, y
-
-    def attack_segment_generator(chunk_list, pick_prob=0.8, N=10):
-        while True:
-            if random.random() < pick_prob:
-                # scan N random windows for the biggest slope
-                best = None; best_dy = -1.0
-                for _ in range(N):
-                    src, tgt, cstart, cdur = random.choice(chunk_list)
-                    off = random.randrange(max(cdur-SEG_LEN,1))
-                    x,_ = sf.read(src,start=cstart+off,frames=SEG_LEN,always_2d=True)
-                    dmax = np.max(np.abs(np.diff(x[:,0])))
-                    if dmax>best_dy:
-                        best_dy, best = dmax,(src,tgt,cstart+off)
-                src_path, tgt_path, read_start = best
-            else:
-                src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
-                read_start = cstart + random.randrange(max(cdur-SEG_LEN,1))
-
-            x,_ = sf.read(src_path,  start=read_start,
-                        frames=SEG_LEN, dtype='float32',always_2d=True)
-            y,_ = sf.read(tgt_path,  start=read_start,
-                        frames=SEG_LEN, dtype='float32',always_2d=True)
-            if x.shape[0]<SEG_LEN:
-                pad = SEG_LEN - x.shape[0]
-                x = np.pad(x,((0,pad),(0,0)))
-                y = np.pad(y,((0,pad),(0,0)))
             yield x, y
 
     # representative dataset for full-integer quant
@@ -942,6 +1016,10 @@ def train():
 if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         static_model, dynamic_model = train()
+    elif (len(sys.argv)>1 and sys.argv[1]=="--pick-attack-examples"):
+        # ── pick attack examples ───────────────────────────────────────────────
+        print("Picking attack examples…")
+        dump_generator_picks(build_chunks())
     else:
         dpath = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(dpath):
