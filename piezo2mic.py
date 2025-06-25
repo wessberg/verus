@@ -67,12 +67,12 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ─── phase1_weights: get your tone & broad HF in place ───────────────────────
 phase1_weights = {
-    'w_l1'  : 0.10,    # small time-domain anchor
+    'w_l1'  : 0.20,    # small time-domain anchor
     'w_stft': 0.05,    # low-res STFT for coarse shape
     'w_fw'  : 0.05,    # freq-weighted STFT for spectral tilt
-    'w_grad': 1.00,    # slope loss to boost overall edges
-    'w_pre' : 0.50,    # pre-emphasis to push HF
-    'w_mel' : 0.00,    # skip mel for now
+    'w_grad': 0.50,    # slope loss to boost overall edges
+    'w_pre' : 0.30,    # pre-emphasis to push HF
+    'w_mel' : 0.10,    # skip mel for now
     'w_hf'  : 5.00,    # 3–15 kHz band penalty
     'w_tr'  :150.00,   # full transient (both sides)
     'w_hw'  : 0.00     # half-wave only later
@@ -80,12 +80,12 @@ phase1_weights = {
 
 # ─── phase2_weights: tighten HF and refine attack shape ────────────────────
 phase2_weights = {
-    'w_l1'  : 0.20,    # a bit more time-domain anchoring
+    'w_l1'  : 0.30,    # a bit more time-domain anchoring
     'w_stft': 0.10,    # small multi-res STFT
     'w_fw'  : 0.20,    # small freq-weighted
     'w_grad': 0.00,    # moderate slope
-    'w_pre' : 0.80,    # mild pre-emphasis
-    'w_mel' : 0.00,    # still skip mel
+    'w_pre' : 0.40,    # mild pre-emphasis
+    'w_mel' : 0.10,    # still skip mel
     'w_hf'  : 2.00,    # lighter HF band
     'w_tr'  :10.00,    # softer full transient
     'w_hw'  : 0.00     # half-wave only in phase3
@@ -152,7 +152,7 @@ class HFGainLayer(tf.keras.layers.Layer):
     def build(self, input_shape):
         # a single scalar gain
         self.gamma = self.add_weight(
-            name='hf_gain', shape=(), initializer=tf.keras.initializers.Constant(20.0), trainable=True)
+            name='hf_gain', shape=(), initializer=tf.keras.initializers.Constant(30.0), trainable=True)
         super().build(input_shape)
     def call(self, x):
         return x * self.gamma
@@ -492,7 +492,7 @@ def build_resnet_gated(filters=FILTERS,
     abs_dx   = AbsLayer(name="abs_dx")(dx)
     env_gate = EnvScaleLayer(shift=1e-3, slope=200.0, name="env_scale")(abs_dx)
     # the bypass conv itself has an L1 kernel-regularizer to force sparsity
-    hf = tf.keras.layers.Conv1D(
+    hf_transient = tf.keras.layers.Conv1D(
             filters=1,
             kernel_size=HF_KERNEL_SIZE,
             padding='causal',
@@ -502,9 +502,22 @@ def build_resnet_gated(filters=FILTERS,
             name='hf_transient'
         )(env_gate)
     # trainable scalar gain so the optimizer can “turn up” the click
-    hf = HFGainLayer(name="hf_gain")(hf)
+    hf_transient = HFGainLayer(name="hf_gain")(hf_transient)
+    
+    # after hf_transient & hf_gain…
+    hf_air = tf.keras.layers.Conv1D(
+        1, 31, padding='causal', use_bias=False,
+        kernel_initializer='zeros',
+        kernel_regularizer=regularizers.l1(1e-3),
+        name='hf_air'
+    )(inp)
+    hf_air = tf.keras.layers.Dense(
+        1, use_bias=False,
+        kernel_initializer=tf.keras.initializers.Constant(5.0),
+        name='air_gain'
+   )(hf_air)
 
-    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf])
+    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf_transient, hf_air])
     out    = merged
     
     # ── linear output (no tanh soft-clip) ─────────────────
@@ -671,36 +684,62 @@ def train():
     steps_per_epoch  = max(approx_steps(train_durs),1)
     validation_steps = max(approx_steps(val_durs),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
-
-    # data generator (no per-segment mean removal)
-    def attack_segment_generator(chunk_list):
+    
+    def segment_generator(chunk_list):
+        """Yields random SEG_LEN windows (piezo→mic) with uniform probability."""
         while True:
-            # 50% of the time pick the window with the biggest derivative
-            if random.random() < 0.5:
-                best = None
-                best_dy = -1.0
-                # sample 5 random windows, keep the max-dy one
-                for _ in range(5):
-                    src, tgt, cstart, cdur = random.choice(chunk_list)
-                    max_off = max(cdur - SEG_LEN, 1)
-                    off     = random.randrange(max_off)
-                    x, _    = sf.read(src, start=cstart+off, frames=SEG_LEN, dtype='float32', always_2d=True)
-                    dmax    = np.max(np.abs(np.diff(x[:,0])))
-                    if dmax > best_dy:
-                        best_dy = dmax
-                        best = (src, tgt, cstart+off)
-                src_path, tgt_path, read_start = best
-            else:
-                src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
-                max_off = max(cdur - SEG_LEN, 1)
-                read_start = cstart + random.randrange(max_off)
+            # pick a random 5s chunk
+            src_path, tgt_path, chunk_start, chunk_dur = random.choice(chunk_list)
+            # pick a random offset inside that chunk
+            max_offset = max(chunk_dur - SEG_LEN, 1)
+            offset     = random.randrange(max_offset)
+            read_start = chunk_start + offset
 
-            x, _ = sf.read(src_path, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
-            y, _ = sf.read(tgt_path, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+            # read piezo + mic
+            x, _ = sf.read(src_path,
+                        start=read_start,
+                        frames=SEG_LEN,
+                        dtype='float32',
+                        always_2d=True)
+            y, _ = sf.read(tgt_path,
+                        start=read_start,
+                        frames=SEG_LEN,
+                        dtype='float32',
+                        always_2d=True)
+
+            # pad to full length if EOF
             if x.shape[0] < SEG_LEN:
                 pad = SEG_LEN - x.shape[0]
                 x = np.pad(x, ((0,pad),(0,0)))
                 y = np.pad(y, ((0,pad),(0,0)))
+
+            yield x, y
+
+    def attack_segment_generator(chunk_list, pick_prob=0.8, N=10):
+        while True:
+            if random.random() < pick_prob:
+                # scan N random windows for the biggest slope
+                best = None; best_dy = -1.0
+                for _ in range(N):
+                    src, tgt, cstart, cdur = random.choice(chunk_list)
+                    off = random.randrange(max(cdur-SEG_LEN,1))
+                    x,_ = sf.read(src,start=cstart+off,frames=SEG_LEN,always_2d=True)
+                    dmax = np.max(np.abs(np.diff(x[:,0])))
+                    if dmax>best_dy:
+                        best_dy, best = dmax,(src,tgt,cstart+off)
+                src_path, tgt_path, read_start = best
+            else:
+                src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
+                read_start = cstart + random.randrange(max(cdur-SEG_LEN,1))
+
+            x,_ = sf.read(src_path,  start=read_start,
+                        frames=SEG_LEN, dtype='float32',always_2d=True)
+            y,_ = sf.read(tgt_path,  start=read_start,
+                        frames=SEG_LEN, dtype='float32',always_2d=True)
+            if x.shape[0]<SEG_LEN:
+                pad = SEG_LEN - x.shape[0]
+                x = np.pad(x,((0,pad),(0,0)))
+                y = np.pad(y,((0,pad),(0,0)))
             yield x, y
 
     # representative dataset for full-integer quant
@@ -728,7 +767,7 @@ def train():
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     val_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(val_chunks),
+        lambda: segment_generator(val_chunks),
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     
@@ -801,16 +840,16 @@ def train():
     
     # 1) freeze
     for layer in static_model.layers:
-        layer.trainable = (layer.name in ['hf_transient','hf_gain'])
+        layer.trainable = (layer.name in ['hf_transient','hf_gain', 'hf_air', "air_gain"])
     # 2) re-compile with only the bypass-focused losses
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_3_LR),
         loss=make_combined_loss(**phase3_weights),
         metrics=[ hf_metric, tf_metric, half_wave_loss ]
     )
-    # 3) build a dataloader that oversamples attack windows
+    # 3) build a dataloader that oversamples attack windows - 100% hit rate of picked windows
     train_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(train_chunks),
+        lambda: attack_segment_generator(train_chunks, pick_prob=1.0),
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 

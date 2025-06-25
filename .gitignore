@@ -1,6 +1,8 @@
 .DS_Store
 input/
 out/*.wav
+out-alt/
+out-gemini/
 tb/*
 logs/*
 .DS_Store
