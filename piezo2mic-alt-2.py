@@ -37,7 +37,7 @@ HF_HOP              = 128
 PHASE_1_EPOCHS      = 1 #15
 PHASE_2_EPOCHS      = 1 #15
 PHASE_3_EPOCHS      = 1 #100
-DEBUG_STEPS = False
+DEBUG_STEPS         = True
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
@@ -73,7 +73,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 
 # ─── phase1_weights: get your tone & broad HF in place ──────────────
 phase1_weights = {
-    'w_l1'  : 0.20,
+    'w_l1'  : 0.50,
     'w_stft': 0.05,
     'w_fw'  : 0.05,
     'w_grad': 0.50,
@@ -247,15 +247,51 @@ def half_wave_loss(y_true, y_pred, threshold=0.0):
     return tf.reduce_mean(tf.abs(pos_t - pos_p))
 
 @register_keras_serializable()
-class HFGainLayer(tf.keras.layers.Layer):
-    def build(self, input_shape):
-        self.gamma = self.add_weight(
-            name='hf_gain', shape=(), initializer=tf.keras.initializers.Constant(30.0), trainable=True)
-        super().build(input_shape)
+class EnvGate(tf.keras.layers.Layer):
+    """Sigmoidal gating [0..1] from |dx| to a soft pick‐mask."""
+    def __init__(self, shift=20e-3, slope=800.0, **kwargs):
+        super().__init__(**kwargs)
+        self.shift = shift
+        self.slope = slope
+
     def call(self, x):
-        return x * self.gamma
+        # x is abs(dx)
+        return tf.sigmoid((x - self.shift) * self.slope)
+
     def get_config(self):
-        return super().get_config()
+        cfg = super().get_config()
+        cfg.update({"shift": self.shift, "slope": self.slope})
+        return cfg
+
+@register_keras_serializable()
+class HFGainLayer(tf.keras.layers.Layer):
+    """
+    A positive, bounded scalar gain γ = clip(exp(log_γ), 0, max_gain).
+    You can initialize init_gain>1.0 or at inference do layer.log_gamma.assign(...)
+    """
+    def __init__(self, init_gain=1.0, max_gain=20.0, **kwargs):
+        super().__init__(**kwargs)
+        self.init_gain = init_gain
+        self.max_gain  = max_gain
+
+    def build(self, input_shape):
+        # trainable log‐gamma
+        self.log_gamma = self.add_weight(
+            name="log_gamma",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(np.log(self.init_gain)),
+            trainable=True)
+        super().build(input_shape)
+
+    def call(self, x):
+        gamma = tf.clip_by_value(tf.exp(self.log_gamma), 0.0, self.max_gain)
+        return x * gamma
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"init_gain": self.init_gain,
+                    "max_gain":  self.max_gain})
+        return cfg
 
 @register_keras_serializable()
 def transient_loss(y_true, y_pred,
@@ -439,17 +475,34 @@ def build_resnet_gated(filters=FILTERS, kernel_size=KERNEL_SIZE,
                 kernel_initializer=tf.keras.initializers.Ones(),
                 name="skip_conv")(inp)
     main_out = tf.keras.layers.Add(name="res_out")([final,skip])
-    # HF bypass
-    dx       = Diff1D(name="diff1d_in")(inp)
-    abs_dx   = AbsLayer(name="abs_dx")(dx)
-    env_gate = EnvScaleLayer(shift=1e-3,slope=200.0,name="env_scale")(abs_dx)
+    
+    # 1) compute first‐difference
+    dx     = Diff1D(name="diff1d_in")(inp)
+    # 2) absolute slope
+    abs_dx = AbsLayer(name="abs_dx")(dx)
+
+    # 3) a smooth [0..1] gate around each pick transient
+    gate = EnvGate(shift=20e-3, slope=800.0, name="env_gate")(abs_dx)
+
+    # 4) small bypass‐filter that only “sees” that gate
     hf_transient = tf.keras.layers.Conv1D(
-        1, HF_KERNEL_SIZE, padding='causal', use_bias=False,
+        filters=1,
+        kernel_size=HF_KERNEL_SIZE,
+        padding='causal',
+        use_bias=False,
         kernel_initializer='zeros',
         kernel_regularizer=regularizers.l1(1e-3),
         name='hf_transient'
-    )(env_gate)
-    hf_transient = HFGainLayer(name="hf_gain")(hf_transient)
+    )(gate)
+
+    # 5) trainable, bounded scalar gain on that bypass
+    hf_transient = HFGainLayer(
+        init_gain=1.0,    # start at unity
+        max_gain=20.0,    # never exceed ×20
+        name="hf_gain"
+    )(hf_transient)
+
+    # 6) your “air” bypass unchanged
     hf_air = tf.keras.layers.Conv1D(
         1, 31, padding='causal', use_bias=False,
         kernel_initializer='zeros',
@@ -461,8 +514,12 @@ def build_resnet_gated(filters=FILTERS, kernel_size=KERNEL_SIZE,
         kernel_initializer=tf.keras.initializers.Constant(5.0),
         name='air_gain'
     )(hf_air)
-    merged = tf.keras.layers.Add(name="add_hf")([main_out,hf_transient,hf_air])
-    return tf.keras.Model(inp, merged, name="piezo2mic_resnet_gated")
+
+    # 7) merge
+    out = tf.keras.layers.Add(name="add_hf")([main_out,
+                                            hf_transient,
+                                            hf_air])
+    return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     os.makedirs(outdir, exist_ok=True)
@@ -554,7 +611,7 @@ def train():
     # 3) compute steps
     def approx_steps(durs):
         if (DEBUG_STEPS):
-            return 10
+            return 500
         
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
 
