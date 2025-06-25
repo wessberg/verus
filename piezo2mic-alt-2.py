@@ -35,19 +35,19 @@ HF_N_FFT            = 512
 HF_HOP              = 128
 
 PHASE_1_EPOCHS      = 5
-PHASE_2_EPOCHS      = 5
-PHASE_3_EPOCHS      = 100
-DEBUG_STEPS         = False
+PHASE_2_EPOCHS      = 20
+PHASE_3_EPOCHS      = 20
+DEBUG_STEPS         = True
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
 PHASE_3_LR          = 1e-2
 
 PHASE_1_LR_PATIENCE = 5
-PHASE_2_LR_PATIENCE = 3
+PHASE_2_LR_PATIENCE = 7
 PHASE_3_LR_PATIENCE = 10
 
-PHASE_1_PICK_RATIO = 0.1  # 10% pick‐attack
+PHASE_1_PICK_RATIO = 0.3  # 30% pick‐attack
 PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
 PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
 
@@ -85,12 +85,12 @@ phase1_weights = {
 }
 # ─── phase2_weights: tighten HF and refine attack shape ─────────────
 phase2_weights = {
-    'w_l1'  : 0.30,
-    'w_stft': 0.10,
+    'w_l1'  : 1.00,
+    'w_stft': 0.50,
     'w_fw'  : 0.20,
     'w_grad': 0.00,
-    'w_pre' : 0.40,
-    'w_mel' : 0.10,
+    'w_pre' : 0.10,
+    'w_mel' : 0.20,
     'w_hf'  : 2.00,
     'w_tr'  :10.00,
     'w_hw'  : 0.00
@@ -650,6 +650,11 @@ def train():
         lambda: segment_generator(val_chunks),
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+    
+    es1 = EarlyStopping(monitor='val_tf_metric',
+                        mode='min',
+                        patience=PHASE_2_LR_PATIENCE,
+                        restore_best_weights=True)
 
     print("\n≈ Training Phase 1")
     static_model = build_resnet_gated(dynamic_time=False)
@@ -661,14 +666,17 @@ def train():
                  pre_metric, mel_metric, hf_metric, tf_metric, hw_metric]
     )
     static_model.summary()
-    static_model.fit(
+    history1 = static_model.fit(
         train_ds_1,
         epochs=PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
-        callbacks=[TensorBoard(log_dir="./logs")]
+        callbacks=[es1, TensorBoard(log_dir="./logs")]
     )
+    
+    # how many epochs did we actually train?
+    phase1_trained_epochs = len(history1.history["loss"])
 
     # ── PHASE 2: 50/50 uniform vs pick-attacks ─────────────────────────────
     train_ds_2 = tf.data.Dataset.from_generator(
@@ -679,7 +687,8 @@ def train():
         output_signature=(sig, sig)
     ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
-    es2 = EarlyStopping(monitor='val_loss',
+    es2 = EarlyStopping(monitor='val_l1_metric',
+                        mode="min",
                         patience=PHASE_2_LR_PATIENCE,
                         restore_best_weights=True)
 
@@ -693,8 +702,8 @@ def train():
     print("\n≈ Training Phase 2")
     static_model.fit(
         train_ds_2,
-        initial_epoch=PHASE_1_EPOCHS,
-        epochs=PHASE_1_EPOCHS + PHASE_2_EPOCHS,
+        initial_epoch=phase1_trained_epochs,
+        epochs=phase1_trained_epochs + PHASE_2_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
