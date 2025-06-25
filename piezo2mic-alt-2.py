@@ -34,10 +34,10 @@ HF_FMAX             = 15000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 1 #15
-PHASE_2_EPOCHS      = 1 #15
-PHASE_3_EPOCHS      = 1 #100
-DEBUG_STEPS         = True
+PHASE_1_EPOCHS      = 5
+PHASE_2_EPOCHS      = 5
+PHASE_3_EPOCHS      = 100
+DEBUG_STEPS         = False
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
@@ -595,7 +595,7 @@ def train():
     pick_chunks   = build_chunks(picked_pairs)
     finger_chunks = build_chunks(finger_pairs)
     all_chunks    = pick_chunks + finger_chunks
-    print(f"Generated {len(all_chunks)} chunks from {len(all_chunks)} total files")
+    print(f"Generated {len(all_chunks)} chunks")
 
     # 2) split train/val on all_chunks
     idx = list(range(len(all_chunks)))
