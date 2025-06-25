@@ -19,7 +19,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
 from tensorflow.keras import regularizers
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-FILTERS             = 64
+FILTERS             = 72
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
@@ -37,7 +37,7 @@ HF_HOP              = 128
 PHASE_1_EPOCHS      = 5
 PHASE_2_EPOCHS      = 20
 PHASE_3_EPOCHS      = 20
-DEBUG_STEPS         = True
+DEBUG_STEPS         = False
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
@@ -85,8 +85,8 @@ phase1_weights = {
 }
 # ─── phase2_weights: tighten HF and refine attack shape ─────────────
 phase2_weights = {
-    'w_l1'  : 1.00,
-    'w_stft': 0.50,
+    'w_l1'  : 2.50,
+    'w_stft': 1.50,
     'w_fw'  : 0.20,
     'w_grad': 0.00,
     'w_pre' : 0.10,
@@ -662,8 +662,7 @@ def train():
         optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
         loss=make_combined_loss(**phase1_weights),
         metrics=['mae',
-                 l1_metric, stft_metric, fw_metric, grad_metric,
-                 pre_metric, mel_metric, hf_metric, tf_metric, hw_metric]
+                 tf_metric]
     )
     static_model.summary()
     history1 = static_model.fit(
@@ -696,8 +695,7 @@ def train():
         optimizer=tf.keras.optimizers.Adam(PHASE_2_LR),
         loss=make_combined_loss(**phase2_weights),
         metrics=['mae',
-                 l1_metric, stft_metric, fw_metric, grad_metric,
-                 pre_metric, mel_metric, hf_metric, tf_metric, hw_metric]
+                 l1_metric]
     )
     print("\n≈ Training Phase 2")
     static_model.fit(
@@ -730,7 +728,7 @@ def train():
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_3_LR),
         loss=make_combined_loss(**phase3_weights),
-        metrics=[hf_metric, tf_metric, half_wave_loss]
+        metrics=[half_wave_loss]
     )
     print("\n≈ Training Phase 3")
     static_model.fit(
