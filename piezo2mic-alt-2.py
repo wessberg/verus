@@ -34,9 +34,9 @@ HF_FMAX             = 10000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
-PHASE_1_EPOCHS      = 5
-PHASE_2_EPOCHS      = 20
-PHASE_3_EPOCHS      = 20
+PHASE_1_EPOCHS      = 10
+PHASE_2_EPOCHS      = 25
+PHASE_3_EPOCHS      = 50
 DEBUG_STEPS         = False
 
 PHASE_1_LR          = 1e-3
@@ -653,8 +653,7 @@ def train():
     
     es1 = EarlyStopping(monitor='val_tf_metric',
                         mode='min',
-                        patience=PHASE_2_LR_PATIENCE,
-                        restore_best_weights=True)
+                        patience=PHASE_2_LR_PATIENCE)
 
     print("\n≈ Training Phase 1")
     static_model = build_resnet_gated(dynamic_time=False)
@@ -688,8 +687,7 @@ def train():
 
     es2 = EarlyStopping(monitor='val_l1_metric',
                         mode="min",
-                        patience=PHASE_2_LR_PATIENCE,
-                        restore_best_weights=True)
+                        patience=PHASE_2_LR_PATIENCE)
 
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_2_LR),
@@ -722,8 +720,7 @@ def train():
 
     es3 = EarlyStopping(monitor='half_wave_loss',
                         mode='min',
-                        patience=PHASE_3_LR_PATIENCE,
-                        restore_best_weights=True)
+                        patience=PHASE_3_LR_PATIENCE)
 
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_3_LR),
