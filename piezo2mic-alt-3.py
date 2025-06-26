@@ -47,7 +47,7 @@ PHASE_1_LR_PATIENCE = 5
 PHASE_2_LR_PATIENCE = 7
 PHASE_3_LR_PATIENCE = 10
 
-PHASE_1_PICK_RATIO = 0.3  # 30% pick‐attack
+PHASE_1_PICK_RATIO = 1.0  # 30% pick‐attack
 PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
 PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
 
@@ -376,9 +376,6 @@ def train():
 
     # 3) compute steps
     def approx_steps(durs):
-        if (DEBUG):
-            return 100
-        
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
 
     train_durs = [dur for (_,_,_,dur) in train_chunks]
