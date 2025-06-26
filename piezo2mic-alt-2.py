@@ -29,8 +29,8 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 
 HF_KERNEL_SIZE      = 11
-HF_FMIN             = 3000.0
-HF_FMAX             = 15000.0
+HF_FMIN             = 2000.0
+HF_FMAX             = 10000.0
 HF_N_FFT            = 512
 HF_HOP              = 128
 
@@ -91,7 +91,7 @@ phase2_weights = {
     'w_grad': 0.00,
     'w_pre' : 0.10,
     'w_mel' : 0.20,
-    'w_hf'  : 2.00,
+    'w_hf'  : 5.00,
     'w_tr'  :10.00,
     'w_hw'  : 0.00
 }
@@ -506,7 +506,7 @@ def build_resnet_gated(filters=FILTERS, kernel_size=KERNEL_SIZE,
     hf_air = tf.keras.layers.Conv1D(
         1, 31, padding='causal', use_bias=False,
         kernel_initializer='zeros',
-        kernel_regularizer=regularizers.l1(1e-3),
+        kernel_regularizer=regularizers.l1(1e-4),
         name='hf_air'
     )(inp)
     hf_air = tf.keras.layers.Dense(
