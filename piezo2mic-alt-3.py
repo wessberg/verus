@@ -398,7 +398,7 @@ def train():
                 x = np.pad(x, ((0,SEG_LEN-x.shape[0]),(0,0)))
             yield [x.reshape(1,SEG_LEN,1)]
 
-    # --- PHASE 1 ---
+    # --- PHASE 1 --- 
     uniform_ds_1 = tf.data.Dataset.from_generator(
         lambda: segment_generator(train_chunks),
         output_signature=(sig, sig)
