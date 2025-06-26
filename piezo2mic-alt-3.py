@@ -20,7 +20,7 @@ from tensorflow.keras import regularizers
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 DEBUG               = False
-FILTERS             = 32
+FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
@@ -47,7 +47,7 @@ PHASE_1_LR_PATIENCE = 5
 PHASE_2_LR_PATIENCE = 7
 PHASE_3_LR_PATIENCE = 10
 
-PHASE_1_PICK_RATIO = 1.0  # 30% pick‐attack
+PHASE_1_PICK_RATIO = 0.3  # 30% pick‐attack
 PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
 PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
 
