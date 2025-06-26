@@ -145,42 +145,40 @@ def build_chunks(pairs_list):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
-def attack_segment_generator(uniform_chunks,
-                             pick_chunks,
-                             pick_prob=0.2,
-                             N=10):
+def pick_segment_generator(pick_chunks, context_pre=1024):
     """
-    With probability `pick_prob` do best-of-N scan on `pick_chunks`,
-    otherwise uniform random on `uniform_chunks`.
-    Yields (x_window, y_window) of shape (SEG_LEN,1).
+    Randomly pick a chunk *and* a random attack offset inside it,
+    then center the window roughly on that point (with a little pre-context).
     """
     while True:
-        if random.random() < pick_prob:
-            # best-of-N from pick_chunks
-            best, best_d = None, -1.0
-            for _ in range(N):
-                src,tgt,cstart,cdur = random.choice(pick_chunks)
-                off = random.randrange(max(cdur-SEG_LEN,1))
-                x,_ = sf.read(src, start=cstart+off, frames=SEG_LEN,
-                              dtype='float32', always_2d=True)
-                if x.shape[0] < SEG_LEN:
-                    x = np.pad(x, ((0,SEG_LEN-x.shape[0]),(0,0)))
-                d = np.max(np.abs(np.diff(x[:,0])))
-                if d > best_d:
-                    best_d, best = d, (src,tgt,cstart+off)
-            src_path,tgt_path,read_start = best
+        src,tgt,cstart,cdur = random.choice(pick_chunks)
+        # read a bit more to find a decent transient position
+        rsamp, _ = sf.read(src, start=cstart, frames=cdur,
+                           dtype='float32', always_2d=True)
+        mono = rsamp[:,0]
+        # simple onset proxy: wherever abs(diff) > median*3
+        diffs = np.abs(np.diff(mono))
+        thresh = np.median(diffs)*3
+        candidates = np.where(diffs > thresh)[0]
+        if len(candidates)==0:
+            # no big spike found → just uniform
+            off = random.randint(0, max(cdur-SEG_LEN, 0))
         else:
-            # uniform random from all_chunks
-            src_path,tgt_path,cstart,cdur = random.choice(uniform_chunks)
-            off = random.randrange(max(cdur-SEG_LEN,1))
-            read_start = cstart + off
+            # pick one onset at random
+            pick_idx = random.choice(candidates)
+            # center our SEG_LEN window so the pick is ~1/4 in
+            off = pick_idx - context_pre
+            off = max(0, min(off, cdur-SEG_LEN))
+        read_start = cstart + off
 
-        x,_ = sf.read(src_path, start=read_start, frames=SEG_LEN,
+        x,_ = sf.read(src, start=read_start, frames=SEG_LEN,
+                      dtype='float32', always_2d=True)
+        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN,
                       dtype='float32', always_2d=True)
         if x.shape[0] < SEG_LEN:
-            x = np.pad(x, ((0,SEG_LEN-x.shape[0]),(0,0)))
-        y,_ = sf.read(tgt_path, start=read_start, frames=SEG_LEN,
-                      dtype='float32', always_2d=True)
+            pad = SEG_LEN - x.shape[0]
+            x = np.pad(x, ((0,pad),(0,0)))
+            y = np.pad(y, ((0,pad),(0,0)))
         yield x, y
 
 def segment_generator(chunk_list):
@@ -400,19 +398,33 @@ def train():
                 x = np.pad(x, ((0,SEG_LEN-x.shape[0]),(0,0)))
             yield [x.reshape(1,SEG_LEN,1)]
 
-    # ── PHASE 1: mostly uniform windows so the net learns the broad tone ──
-    train_ds_1 = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(all_chunks,
-                                         train_pick_chunks,
-                                         pick_prob=PHASE_1_PICK_RATIO,
-                                         N=10),
+    # --- PHASE 1 ---
+    uniform_ds_1 = tf.data.Dataset.from_generator(
+        lambda: segment_generator(train_chunks),
         output_signature=(sig, sig)
-    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+    )
 
-    val_ds = tf.data.Dataset.from_generator(
+    pick_ds_1 = tf.data.Dataset.from_generator(
+        lambda: pick_segment_generator(train_pick_chunks),
+        output_signature=(sig, sig)
+    )
+    
+    train_ds_1 = tf.data.Dataset.sample_from_datasets(
+        [uniform_ds_1, pick_ds_1],
+        weights=[1.0-PHASE_2_PICK_RATIO, PHASE_2_PICK_RATIO]
+    )
+
+    train_ds_1 = train_ds_1.shuffle(SHUFFLE_BUF) \
+                    .batch(BATCH_SIZE) \
+                    .repeat() \
+                    .prefetch(tf.data.AUTOTUNE)
+    
+    
+    val_ds_1 = tf.data.Dataset.from_generator(
         lambda: segment_generator(val_chunks),
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+
     
     es1 = EarlyStopping(monitor='val_mae',
                         mode='min',
@@ -423,7 +435,7 @@ def train():
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
         loss=waveform_l1_loss,
-        metrics=[tf.keras.metrics.MeanAbsoluteError(name='mae')]
+        metrics=["mae"]
     )
     static_model.summary()
     history1 = static_model.fit(
@@ -431,7 +443,7 @@ def train():
         # if debug, then 1, else PHASE_1_EPOCHS
         epochs=1 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
+        validation_data=val_ds_1,
         validation_steps=validation_steps,
         callbacks=[es1, TensorBoard(log_dir="./logs")]
     )
