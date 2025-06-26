@@ -3,8 +3,8 @@ input/
 input2/
 input3/
 out/*.wav
-out-alt/
-out-alt-3/
+out-alt/*.wav
+out-alt-3/*.wav
 out-gemini/
 tb/*
 logs/*

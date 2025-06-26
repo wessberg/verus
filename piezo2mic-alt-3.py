@@ -19,6 +19,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
 from tensorflow.keras import regularizers
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
+DEBUG               = False
 FILTERS             = 32
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
@@ -37,7 +38,6 @@ HF_HOP              = 128
 PHASE_1_EPOCHS      = 50
 PHASE_2_EPOCHS      = 1
 PHASE_3_EPOCHS      = 1
-DEBUG_STEPS         = False
 
 PHASE_1_LR          = 1e-3
 PHASE_2_LR          = 1e-4
@@ -376,8 +376,8 @@ def train():
 
     # 3) compute steps
     def approx_steps(durs):
-        if (DEBUG_STEPS):
-            return 500
+        if (DEBUG):
+            return 100
         
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
 
@@ -417,9 +417,9 @@ def train():
         output_signature=(sig, sig)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
     
-    es1 = EarlyStopping(monitor='val_tf_metric',
+    es1 = EarlyStopping(monitor='val_mae',
                         mode='min',
-                        patience=PHASE_2_LR_PATIENCE)
+                        patience=PHASE_1_LR_PATIENCE)
 
     print("\n≈ Training Phase 1")
     static_model = build_model(dynamic_time=False)
@@ -431,7 +431,8 @@ def train():
     static_model.summary()
     history1 = static_model.fit(
         train_ds_1,
-        epochs=PHASE_1_EPOCHS,
+        # if debug, then 1, else PHASE_1_EPOCHS
+        epochs=1 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
