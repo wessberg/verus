@@ -411,7 +411,7 @@ def train():
     
     train_ds_1 = tf.data.Dataset.sample_from_datasets(
         [uniform_ds_1, pick_ds_1],
-        weights=[1.0-PHASE_2_PICK_RATIO, PHASE_2_PICK_RATIO]
+        weights=[1.0-PHASE_1_PICK_RATIO, PHASE_1_PICK_RATIO]
     )
 
     train_ds_1 = train_ds_1.shuffle(SHUFFLE_BUF) \
