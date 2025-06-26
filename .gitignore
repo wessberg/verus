@@ -4,6 +4,7 @@ input2/
 input3/
 out/*.wav
 out-alt/
+out-alt-3/
 out-gemini/
 tb/*
 logs/*
