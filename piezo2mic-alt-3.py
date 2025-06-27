@@ -17,7 +17,14 @@ from tflite import Model, TensorType, BuiltinOperator
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
-from tensorflow.keras import regularizers
+
+from tensorflow.keras.layers import (
+    Input, Conv1D, SeparableConv1D, ZeroPadding1D,
+    Activation, Multiply, Add, Lambda
+)
+from tensorflow.keras.models import Model
+
+tf.keras.config.enable_unsafe_deserialization()
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 DEBUG               = False
@@ -219,106 +226,103 @@ def generate_demo (model, prediction_name="demo_prediction", only_prediction=Fal
 def l1_metric(y_true, y_pred):
     return tf.reduce_mean(tf.abs(y_true - y_pred))
 
+@register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
     return tf.reduce_mean(tf.abs(y_true - y_pred))
 
+# ─── helper functions ─────────────────────────────────────────────────────────
+
+@register_keras_serializable()
+def get_piezo(x):
+    # take channel 0 (piezo)
+    return x[:, :, 0:1]
+
+@register_keras_serializable()
+def get_style(x):
+    # take channel 1 (0.0 or 1.0)
+    return x[:, :, 1:2]
+
+@register_keras_serializable()
+def invert_style(x):
+    return 1.0 - x
+
+# you already have these, but make sure they are @register_keras_serializable
 @register_keras_serializable()
 def slice_content(x, filters):
     return x[:, :, :filters]
+
 @register_keras_serializable()
 def slice_gate(x, filters):
     return x[:, :, filters:]
 
-def build_model(filters=FILTERS,
-                kernel_size=KERNEL_SIZE,
-                dilations=DILATIONS,
+
+def build_model(filters=64,
+                kernel_size=25,
+                dilations=(1,2,4,8),
                 dynamic_time=False):
-    # time‐axis length
+    # T = None ⇒ variable‐length for TFLite/dynamic
     T = None if dynamic_time else SEG_LEN
 
-    # single Input: (T,2)  →  [:,:,0] piezo, [:,:,1] style flag
-    inp = tf.keras.Input(shape=(T,2), name="piezo_and_style")
+    # Input: (batch, time, 2)  →  [piezo_waveform, style_flag]
+    inp = Input(shape=(T,2), name="piezo_and_style")
 
-    # split off the piezo channel for all convolutions + skip
-    piezo = tf.keras.layers.Lambda(lambda z: z[:, :, :1], name="take_piezo")(inp)
-    style = tf.keras.layers.Lambda(lambda z: z[:, :, 1:2], name="take_style")(inp)
-      # style is shape (batch, T, 1) but constant along T
+    # split off real waveform vs style bit
+    piezo = Lambda(get_piezo, name="take_piezo")(inp)    # (b, T, 1)
+    style = Lambda(get_style, name="take_style")(inp)    # (b, T, 1)
 
-    # ---- Body of your ResNet ----
-    x = tf.keras.layers.Conv1D(filters, 1,
-               padding='same',
-               name="init_pw")(piezo)
+    # initial 1×1 projection
+    x = Conv1D(filters, 1, padding="same", name="init_pw")(piezo)
 
+    # the residual stack
     for idx, d in enumerate(dilations):
         res = x
         pad = (kernel_size - 1) * d
-        x   = tf.keras.layers.ZeroPadding1D((pad,0),
-                     name=f"pad_{idx}")(x)
+        x   = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
 
-        g   = tf.keras.layers.SeparableConv1D(
-                  filters*2,
-                  kernel_size,
-                  dilation_rate=d,
-                  padding='valid',
-                  name=f"sep_{idx}"
-              )(x)
+        g = SeparableConv1D(
+            filters*2,
+            kernel_size,
+            dilation_rate=d,
+            padding="valid",
+            name=f"sep_{idx}"
+        )(x)
 
-        content = tf.keras.layers.Lambda(lambda z: z[..., :filters],
-                            name=f"slice_content_{idx}")(g)
-        gate    = tf.keras.layers.Lambda(lambda z: z[..., filters:],
-                            name=f"slice_gate_{idx}")(g)
+        c = Lambda(slice_content,
+                   arguments={"filters":filters},
+                   name=f"slice_content_{idx}")(g)
+        g_ = Lambda(slice_gate,
+                    arguments={"filters":filters},
+                    name=f"slice_gate_{idx}")(g)
 
-        c_act = tf.keras.layers.Activation('tanh',
-                          name=f"tanh_{idx}")(content)
-        g_act = tf.keras.layers.Activation('sigmoid',
-                          name=f"sigmoid_{idx}")(gate)
-        x     = tf.keras.layers.Multiply(
-                          name=f"gated_mul_{idx}")([c_act, g_act])
+        c_act = Activation("tanh",    name=f"tanh_{idx}")(c)
+        g_act = Activation("sigmoid", name=f"sigmoid_{idx}")(g_)
+        x     = Multiply(name=f"gated_mul_{idx}")([c_act, g_act])
 
-        x     = tf.keras.layers.Conv1D(filters,1,
-                          padding='same',
-                          name=f"pw_{idx}")(x)
-        x     = tf.keras.layers.Add(name=f"res_add_{idx}")([x, res])
+        x     = Conv1D(filters,1,
+                       padding="same",
+                       name=f"pw_{idx}")(x)
+        x     = Add(name=f"res_add_{idx}")([x, res])
 
-    # ---- TWO FINAL HEADS ----
-    main_pick   = tf.keras.layers.Conv1D(1,1,
-                          padding='same',
-                          name="final_pick")(x)
-    main_finger = tf.keras.layers.Conv1D(1,1,
-                          padding='same',
-                          name="final_finger")(x)
+    # ─── two separate 1×1 “heads” ────────────────────────────────────────────────
+    main_pick   = Conv1D(1,1,padding="same", name="final_pick")(x)
+    main_finger = Conv1D(1,1,padding="same", name="final_finger")(x)
 
-    # reduce the T‐axis of style down to (batch,1)
-    style_scalar = tf.keras.layers.Lambda(
-        lambda z: tf.reduce_mean(z, axis=1, keepdims=False),
-        name="style_scalar")(style)
+    # gate them with the style bit
+    pick_contrib   = Multiply(name="pick_contrib")([style, main_pick])
+    finger_coef    = Lambda(invert_style, name="invert_style")(style)
+    finger_contrib = Multiply(name="finger_contrib")([finger_coef,
+                                                     main_finger])
+    mixed_main     = Add(name="mix_main")([pick_contrib, finger_contrib])
 
-    # reshape to (batch,1,1) then tile to (batch,T,1)
-    style_b = tf.keras.layers.Lambda(
-        lambda z, t: tf.tile(tf.reshape(z, [-1,1,1]), [1,t,1]),
-        name="style_broad",
-        arguments={'t': SEG_LEN}
-    )(style_scalar)
+    # skip on the raw piezo
+    skip = Conv1D(1,1,
+                  use_bias=False,
+                  kernel_initializer="ones",
+                  name="skip_conv")(piezo)
 
-    # gate the two heads
-    pick_contrib   = tf.keras.layers.Multiply(name="pick_contrib")(
-                        [style_b, main_pick])
-    finger_contrib = tf.keras.layers.Multiply(name="finger_contrib")(
-                        [tf.keras.layers.Lambda(lambda z: 1-z)(style_b),
-                         main_finger])
+    out = Add(name="res_out")([mixed_main, skip])
 
-    mixed_main = tf.keras.layers.Add(name="mix_main")(
-                    [pick_contrib, finger_contrib])
-
-    # skip path still on the RAW piezo
-    skip = tf.keras.layers.Conv1D(1,1,
-               use_bias=False,
-               kernel_initializer='ones',
-               name="skip_conv")(piezo)
-
-    out = tf.keras.layers.Add(name="res_out")([mixed_main, skip])
-
-    return tf.keras.Model(inp, out, name="piezo2mic_two_head")
+    return Model(inp, out, name="piezo2mic_twohead")
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     # (unchanged)
