@@ -5,8 +5,6 @@ to the equivalent mic’d signal, with pick‐attack oversampling ramp,
 and a 2nd “style” channel so one model can handle finger vs pick.
 """
 import os
-os.environ["TF_CUDNN_WORKSPACE_LIMIT_IN_MB"] = "15192"
-
 import glob
 import random
 import sys
@@ -20,14 +18,12 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
-    Activation, Multiply, Add, Lambda
+    Activation, Multiply, Add, Lambda, Dense
 )
-from tensorflow.keras.models import Model
 
-tf.keras.config.enable_unsafe_deserialization()
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-DEBUG               = False
+DEBUG               = True
 FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
@@ -36,6 +32,7 @@ TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
+EMBED_DIM           = 16  # for style embedding
 
 HF_KERNEL_SIZE      = 11
 HF_FMIN             = 2000.0
@@ -55,8 +52,13 @@ PHASE_1_LR_PATIENCE = 5
 #PHASE_2_LR_PATIENCE = 7
 #PHASE_3_LR_PATIENCE = 10
 
-PHASE_1_PICK_RATIO = 0.3  # 30% only pick‐attack
-PHASE_1_FINGER_RATIO = 0.3  # 30% only finger-attack
+PHASE_1_PICK_RATIO = 0.2  # 30% only pick‐attack
+PHASE_1_FINGER_RATIO = 0.2  # 30% only finger-attack
+
+
+# Inverse sampling weights for loss balance
+W_PICK_LOSS   = 1.0 / PHASE_1_PICK_RATIO
+W_FINGER_LOSS = 1.0 / PHASE_1_FINGER_RATIO
 
 #PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
 #PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
@@ -118,104 +120,62 @@ def build_chunks(pairs_list):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
+# --- Generators ---
 def pick_segment_generator(pick_chunks, context_pre=1024):
-    """
-    Randomly pick a chunk *and* a random attack offset inside it,
-    then center the window roughly on that point (with a little pre-context).
-    Always style=1.0.
-    """
     while True:
         src,tgt,cstart,cdur = random.choice(pick_chunks)
-        # read a bit more to find an onset
-        rsamp, _ = sf.read(src, start=cstart, frames=cdur,
-                           dtype='float32', always_2d=True)
-        mono = rsamp[:,0]
-        diffs = np.abs(np.diff(mono))
-        thresh = np.median(diffs)*3
-        candidates = np.where(diffs > thresh)[0]
-        if len(candidates)==0:
-            off = random.randint(0, max(cdur-SEG_LEN, 0))
-        else:
-            pick_idx = random.choice(candidates)
-            off = pick_idx - context_pre
-            off = max(0, min(off, cdur-SEG_LEN))
-        read_start = cstart + off
-
-        x,_ = sf.read(src, start=read_start, frames=SEG_LEN,
-                      dtype='float32', always_2d=True)
-        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN,
-                      dtype='float32', always_2d=True)
-        if x.shape[0] < SEG_LEN:
-            pad = SEG_LEN - x.shape[0]
-            x = np.pad(x, ((0,pad),(0,0)))
-            y = np.pad(y, ((0,pad),(0,0)))
-
-        # --- ADD STYLE CHANNEL (=1.0 for pick) ---
-        style_chan = np.ones((SEG_LEN,1), dtype='float32')
-        x = np.concatenate([x, style_chan], axis=-1)  # now (SEG_LEN,2)
-        yield x, y
-        
-def finger_segment_generator(finger_chunks, context_pre=1024):
-    """
-    Find finger-pluck onsets in finger_chunks (same idea as pick_segment_generator),
-    center your window on that point, style=0.0.
-    """
-    while True:
-        src, tgt, cstart, cdur = random.choice(finger_chunks)
-        rsamp, _ = sf.read(src, start=cstart, frames=cdur,
-                           dtype='float32', always_2d=True)
-        mono = rsamp[:,0]
-        diffs = np.abs(np.diff(mono))
-        thresh = np.median(diffs)*3
-        candidates = np.where(diffs>thresh)[0]
-
+        rsamp,_ = sf.read(src, start=cstart, frames=cdur, dtype='float32', always_2d=True)
+        mono = rsamp[:,0]; diffs = np.abs(np.diff(mono))
+        thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
         if len(candidates)==0:
             off = random.randint(0, max(cdur-SEG_LEN,0))
         else:
             idx = random.choice(candidates)
-            off = idx - context_pre
-            off = max(0, min(off, cdur-SEG_LEN))
-
+            off = max(0, min(idx-context_pre, cdur-SEG_LEN))
         read_start = cstart + off
-        x, _ = sf.read(src, start=read_start, frames=SEG_LEN,
-                       dtype='float32', always_2d=True)
-        y, _ = sf.read(tgt, start=read_start, frames=SEG_LEN,
-                       dtype='float32', always_2d=True)
+        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
         if x.shape[0]<SEG_LEN:
-            p = SEG_LEN-x.shape[0]
-            x = np.pad(x, ((0,p),(0,0)));  y = np.pad(y, ((0,p),(0,0)))
+            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
+        # style channel
+        style = np.ones((SEG_LEN,1),dtype='float32')
+        x = np.concatenate([x,style],axis=-1)
+        yield x,y
 
-        # style=0 for finger
+def finger_segment_generator(finger_chunks, context_pre=1024):
+    while True:
+        src,tgt,cstart,cdur = random.choice(finger_chunks)
+        rsamp,_ = sf.read(src, start=cstart, frames=cdur, dtype='float32', always_2d=True)
+        mono = rsamp[:,0]; diffs = np.abs(np.diff(mono))
+        thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
+        if len(candidates)==0:
+            off = random.randint(0, max(cdur-SEG_LEN,0))
+        else:
+            idx = random.choice(candidates)
+            off = max(0, min(idx-context_pre, cdur-SEG_LEN))
+        read_start = cstart + off
+        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        if x.shape[0]<SEG_LEN:
+            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
         style = np.zeros((SEG_LEN,1),dtype='float32')
-        x = np.concatenate([x, style], axis=-1)
-        yield x, y
+        x = np.concatenate([x,style],axis=-1)
+        yield x,y
 
 def segment_generator(chunk_list):
-    """
-    Uniform random windows from chunk_list.
-    Style=1.0 if src in PICK_SRC_DIR else 0.0
-    """
     while True:
-        src_path,tgt_path,cstart,cdur = random.choice(chunk_list)
+        src,tgt,cstart,cdur = random.choice(chunk_list)
         off = random.randrange(max(cdur-SEG_LEN,1))
-        read_start = cstart + off
-        x,_ = sf.read(src_path, start=read_start, frames=SEG_LEN,
-                      dtype='float32', always_2d=True)
-        y,_ = sf.read(tgt_path, start=read_start, frames=SEG_LEN,
-                      dtype='float32', always_2d=True)
-        if x.shape[0] < SEG_LEN:
-            pad = SEG_LEN - x.shape[0]
-            x = np.pad(x, ((0,pad),(0,0)))
-            y = np.pad(y, ((0,pad),(0,0)))
+        read_start = cstart+off
+        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        if x.shape[0]<SEG_LEN:
+            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
+        style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
+        style = np.full((SEG_LEN,1),style_flag,dtype='float32')
+        x = np.concatenate([x,style],axis=-1)
+        yield x,y
 
-        # --- COMPUTE STYLE FLAG ---
-        if src_path.startswith(PICK_SRC_DIR):
-            style = 1.0
-        else:
-            style = 0.0
-        style_chan = np.full((SEG_LEN,1), style, dtype='float32')
-        x = np.concatenate([x, style_chan], axis=-1)  # (SEG_LEN,2)
-        yield x, y
         
 def generate_demo (model, prediction_name="demo_prediction", only_prediction=False):
     print("\nGenerating demo…")
@@ -260,10 +220,6 @@ def generate_demo (model, prediction_name="demo_prediction", only_prediction=Fal
     print(f"✅ Demo saved to {prediction_filepath}")
 
 @register_keras_serializable()
-def l1_metric(y_true, y_pred):
-    return tf.reduce_mean(tf.abs(y_true - y_pred))
-
-@register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
     return tf.reduce_mean(tf.abs(y_true - y_pred))
 
@@ -289,6 +245,17 @@ def slice_content(x, filters):
     return x[:, :, :filters]
 
 @register_keras_serializable()
+def extract_style_scalar(x):
+    # x has shape (batch, T, 1) → we grab the first time‐step value
+    # but keep the last dim so output is (batch, 1)
+    return x[:, 0:1, 0:1]       # now shape (batch, 1)
+
+@register_keras_serializable()
+def expand_time_axis(x):
+    # x has shape (batch, features) → we want (batch, 1, features)
+    return tf.expand_dims(x, axis=1)
+
+@register_keras_serializable()
 def slice_gate(x, filters):
     return x[:, :, filters:]
 
@@ -296,6 +263,16 @@ def slice_gate(x, filters):
 def slice_piezo(x):
     # Takes channel 0 of a (batch, time, 2) tensor
     return x[:, :, 0:1]
+
+@register_keras_serializable()
+def slice_film_gamma(x, filters):
+    # x shape: (batch, T, 2*filters) → return (batch, T, filters)
+    return x[:, :, :filters]
+
+@register_keras_serializable()
+def slice_film_beta(x, filters):
+    # x shape: (batch, T, 2*filters) → return (batch, T, filters)
+    return x[:, :, filters:]
 
 @register_keras_serializable()
 def slice_style(x):
@@ -308,64 +285,59 @@ def invert(x):
 
 
 def build_model(dynamic_time=False):
-    # dynamic_time → variable T
     T = None if dynamic_time else SEG_LEN
-
-    # Input is now (batch, T, 2): [piezo_waveform, style_flag]
     inp = Input(shape=(T,2), name="piezo_plus_style")
-
-    # Slice out style (we will still use piezo alone for skip)
-    style = Lambda(slice_style, name="take_style")(inp)
-    piezo = Lambda(slice_piezo,  name="take_piezo")(inp)
-
-    # *** FEED BOTH CHANNELS INTO THE ENTIRE STACK ***
+    style = Lambda(slice_style, name="take_style")(inp)                   # (batch, T, 1)
+    piezo = Lambda(slice_piezo, name="take_piezo")(inp)
+    # derive scalar style flag
+    style_scalar = Lambda(extract_style_scalar, name="style_scalar")(style)  # (batch,)
+    # style embedding
+    style_embed = Dense(EMBED_DIM, activation='linear', name="style_embed")(style_scalar)
+    # initial 1x1 projection on both channels
     x = Conv1D(FILTERS, 1, padding='same', name="init_pw")(inp)
 
     for idx, d in enumerate(DILATIONS):
         res = x
         pad = (KERNEL_SIZE - 1) * d
-        x   = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
-        g   = SeparableConv1D(
-                  FILTERS * 2,
-                  KERNEL_SIZE,
-                  dilation_rate=d,
-                  padding='valid',
-                  name=f"sep_{idx}"
-              )(x)
-
-        c = Lambda(slice_content,
-                   arguments={'filters':FILTERS},
+        x = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
+        g = SeparableConv1D(FILTERS*2, KERNEL_SIZE, dilation_rate=d,
+                            padding='valid', name=f"sep_{idx}")(x)
+        c = Lambda(slice_content, arguments={'filters':FILTERS},
                    name=f"slice_content_{idx}")(g)
-        g2= Lambda(slice_gate,
-                   arguments={'filters':FILTERS},
-                   name=f"slice_gate_{idx}")(g)
-
+        g2 = Lambda(slice_gate, arguments={'filters':FILTERS},
+                    name=f"slice_gate_{idx}")(g)
         x = Multiply(name=f"gated_mul_{idx}")([
-                Activation('tanh',    name=f"tanh_{idx}")(c),
+                Activation('tanh', name=f"tanh_{idx}")(c),
                 Activation('sigmoid', name=f"sigmoid_{idx}")(g2)
             ])
         x = Conv1D(FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
+        # FiLM modulation
 
-    # ─── TWO FINAL 1×1‐HEADS ─────────────────────────────────────────────────────
+        film_params = Dense(FILTERS*2, name=f"film_dense_{idx}")(style_embed)
+        gamma = Lambda(slice_film_gamma,
+                    arguments={'filters': FILTERS},
+                    name=f"film_gamma_{idx}")(film_params)
+        beta  = Lambda(slice_film_beta,
+                    arguments={'filters': FILTERS},
+                    name=f"film_beta_{idx}")(film_params)
+
+        x = Add(name=f"film_apply_{idx}")([
+            Multiply(name=f"film_scale_{idx}")([x, gamma]),
+            beta
+        ])
+
     main_pick   = Conv1D(1,1,padding='same',name="final_pick")(x)
     main_finger = Conv1D(1,1,padding='same',name="final_finger")(x)
-
-    # Gate them by the style flag
     pick_c   = Multiply(name="pick_contrib")([style, main_pick])
     finger_c = Multiply(name="finger_contrib")([
-                     Lambda(invert, name="invert_style")(style),
-                     main_finger])
+        Lambda(invert, name="invert_style")(style), main_finger])
     mixed    = Add(name="mix_main")([pick_c, finger_c])
-
-    # SKIP path only on the raw piezo
-    skip = Conv1D(1,1,
-                  use_bias=False,
-                  kernel_initializer='ones',
-                  name="skip_conv")(piezo)
-
+    skip     = Conv1D(1,1,use_bias=False,
+                      kernel_initializer='ones',
+                      name="skip_conv")(piezo)
     out = Add(name="res_out")([mixed, skip])
-    return Model(inp, out, name="piezo2mic_conditional")
+    return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     # (unchanged)
@@ -438,87 +410,78 @@ def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
-    # 1) build chunk lists
     pick_chunks   = build_chunks(picked_pairs)
     finger_chunks = build_chunks(finger_pairs)
     all_chunks    = pick_chunks + finger_chunks
     print(f"Generated {len(all_chunks)} chunks")
 
-    # 2) split train/val on all_chunks
+    # train/val split
     idx = list(range(len(all_chunks)))
-    if len(idx) > 1:
+
+    if len(idx)>1:
         tr_i, va_i = train_test_split(idx, test_size=0.2, random_state=69)
     else:
-        tr_i = va_i = idx
-    train_chunks = [all_chunks[i] for i in tr_i]
-    val_chunks   = [all_chunks[i] for i in va_i]
-    train_pick_chunks = [c for c in train_chunks if c in pick_chunks]
-    train_finger_chunks = [c for c in train_chunks if c in finger_chunks]
+        raise RuntimeError("Not enough data to split into train/val sets.")
 
-    # 3) compute steps
+    train_chunks  = [all_chunks[i] for i in tr_i]
+    val_chunks    = [all_chunks[i] for i in va_i]
+    train_pick_chunks   = [c for c in train_chunks if c in pick_chunks]
+    train_finger_chunks = [c for c in train_chunks if c in finger_chunks]
+    val_pick_chunks     = [c for c in val_chunks   if c in pick_chunks]
+    val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
+
     def approx_steps(durs):
         return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
-
     train_durs = [dur for (_,_,_,dur) in train_chunks]
-    val_durs   = [dur   for (_,_,_,dur) in val_chunks]
+    val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
     validation_steps = max(approx_steps(val_durs),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
-    # --- REPRESENTATIVE DATA FOR INT8 (also 2-channel) ---
-    def representative_data_gen():
-        for _ in range(100):
-            src,tgt,cstart,cdur = random.choice(train_chunks)
-            off = random.randrange(max(cdur-SEG_LEN,1))
-            read_start = cstart + off
-            x,_ = sf.read(src, start=read_start, frames=SEG_LEN,
-                        dtype='float32', always_2d=True)
-            if x.shape[0] < SEG_LEN:
-                x = np.pad(x, ((0,SEG_LEN-x.shape[0]),(0,0)))
-            # style flag:
-            style = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
-            style_chan = np.full((SEG_LEN,1), style, dtype='float32')
-            x = np.concatenate([x, style_chan], axis=-1)  # (SEG_LEN,2)
-            yield [x.reshape(1,SEG_LEN,2)]
-
-    # --- PHASE 1 --- 
+    # datasets
     sig_x = tf.TensorSpec((SEG_LEN,2), tf.float32)
     sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
-
     uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_chunks),
-        output_signature=(sig_x, sig_y)
+        lambda: segment_generator(train_chunks), output_signature=(sig_x,sig_y)
     )
     pick_ds    = tf.data.Dataset.from_generator(
-        lambda: pick_segment_generator(train_pick_chunks),
-        output_signature=(sig_x, sig_y)
+        lambda: pick_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
     )
     finger_ds  = tf.data.Dataset.from_generator(
-        lambda: finger_segment_generator(train_finger_chunks),
-        output_signature=(sig_x, sig_y)
+        lambda: finger_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
     )
 
-    # now you have 3 streams: 
-    #   w_pick + w_finger + w_uniform = 1.0
-    w_pick_1   = PHASE_1_PICK_RATIO        # e.g. 0.3
-    w_finger_1 = PHASE_1_FINGER_RATIO      # e.g. 0.3  
-    w_uniform_1 = 1.0 - w_pick_1 - w_finger_1   # e.g. 0.4
-
+    w_picked_1 = PHASE_1_PICK_RATIO
+    w_fingerpicked_1 = PHASE_1_FINGER_RATIO
+    w_uniform_1 = 1.0 - w_picked_1 - w_fingerpicked_1
     train_ds_1 = tf.data.Dataset.sample_from_datasets(
-        [uniform_ds, pick_ds, finger_ds],
-        weights=[w_uniform_1, w_pick_1, w_finger_1]
-    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+        [uniform_ds, pick_ds, finger_ds], weights=[w_uniform_1, w_picked_1, w_fingerpicked_1]
+    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE)
 
-    val_ds_1 = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_chunks),
-        output_signature=(sig_x, sig_y)
+    # sample-weight map for loss
+    def add_sw(x, y):
+        # get style flag per example: 1 for pick, 0 for finger
+        style_flag = tf.squeeze(x[:, 0, 1])           # (batch,)
+        sw = style_flag * W_PICK_LOSS \
+           + (1.0 - style_flag) * W_FINGER_LOSS      # (batch,)
+        # reshape to (batch, 1, 1) to match y shape (batch, T, 1)
+        sw = tf.reshape(sw, (-1, 1, 1))
+        return x, y, sw
+
+    train_ds_1 = train_ds_1.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+
+    # validation streams
+    val_uniform_ds_1 = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_chunks), output_signature=(sig_x,sig_y)
+    ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+    val_pick_ds_1    = tf.data.Dataset.from_generator(
+        lambda: pick_segment_generator(val_pick_chunks), output_signature=(sig_x,sig_y)
+    ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
+    val_finger_ds_1  = tf.data.Dataset.from_generator(
+        lambda: finger_segment_generator(val_finger_chunks), output_signature=(sig_x,sig_y)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
-    es1 = EarlyStopping(monitor='val_mae',
-                        mode='min',
-                        patience=PHASE_1_LR_PATIENCE)
-
-    print("\n≈ Training Phase 1")
+    # compile & train
     static_model = build_model(dynamic_time=False)
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
@@ -526,14 +489,21 @@ def train():
         metrics=["mae"]
     )
     static_model.summary()
+    es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE)
     history1 = static_model.fit(
         train_ds_1,
         epochs=1 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds_1,
+        validation_data=val_uniform_ds_1,
         validation_steps=validation_steps,
         callbacks=[es1, TensorBoard(log_dir="./logs")]
     )
+
+    # style-specific evaluation
+    print("\nEvaluating pick style on val set:")
+    static_model.evaluate(val_pick_ds_1, steps=validation_steps)
+    print("\nEvaluating finger style on val set:")
+    static_model.evaluate(val_finger_ds_1, steps=validation_steps)
     
     phase1_trained_epochs = len(history1.history["loss"])
 
@@ -566,11 +536,7 @@ if __name__=="__main__":
             sys.exit(1)
         dynamic_model = tf.keras.models.load_model(
             dpath,
-            compile=False,
-            custom_objects={
-                 'slice_content': slice_content,
-                 'slice_gate':    slice_gate
-            }
+            compile=False
         )
         
         generate_demo(dynamic_model)
