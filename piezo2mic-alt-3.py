@@ -23,7 +23,7 @@ from tensorflow.keras.layers import (
 
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-DEBUG               = True
+DEBUG               = False
 FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
