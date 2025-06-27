@@ -61,14 +61,6 @@ PHASE_1_LR_PATIENCE = 5
 #PHASE_2_LR_PATIENCE = 7
 #PHASE_3_LR_PATIENCE = 10
 
-PHASE_1_PICK_RATIO = 0.2  # 30% only pick‐attack
-PHASE_1_FINGER_RATIO = 0.2  # 30% only finger-attack
-
-
-
-#PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
-#PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
-
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
@@ -112,25 +104,6 @@ audio_cache = {}
 for (src,tgt) in all_pairs:
     audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
     audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
-    
-
-num_picked = len(picked_pairs)
-num_finger = len(finger_pairs)
-total_pairs = num_picked + num_finger
-
-# Prevent division by zero if one class is missing
-if total_pairs == 0 or num_picked == 0 or num_finger == 0:
-    print("Warning: Data for one or both styles is missing. Using equal weights.")
-    W_PICK_LOSS   = 1.0
-    W_FINGER_LOSS = 1.0
-else:
-    # Calculate weights as the inverse of the class ratio
-    # The weight for a class is total_samples / num_samples_in_class
-    W_PICK_LOSS   = total_pairs / num_picked
-    W_FINGER_LOSS = total_pairs / num_finger
-    print("Calculated Loss Weights:")
-    print(f"  └─ Picked:   {W_PICK_LOSS:.2f} (data ratio: {num_picked/total_pairs:.2%})")
-    print(f"  └─ Finger: {W_FINGER_LOSS:.2f} (data ratio: {num_finger/total_pairs:.2%})")
 
 def build_chunks(pairs_list):
     """
@@ -149,6 +122,11 @@ def build_chunks(pairs_list):
         if rem >= SEG_LEN:
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
+
+pick_chunks   = build_chunks(picked_pairs)
+finger_chunks = build_chunks(finger_pairs)
+all_chunks    = pick_chunks + finger_chunks
+print(f"Generated {len(all_chunks)} chunks")
 
 # --- Generators ---
 def pick_segment_generator(pick_chunks, context_pre=1024):
@@ -323,23 +301,26 @@ def mean_hf_metric(y_true, y_pred):
 # ──────────────────────────────────────────────────────────────────────────────
 @register_keras_serializable()
 def add_sw(x, y):
-    # x: (batch, T, 2)  →  x[...,0] = piezo,  x[...,1] = style flag (0 or 1)
-    piezo = x[...,0]                      # (batch, T)
-    style = x[...,1]                      # (batch, T), constant per example
-    # base, constant per example, for pick vs finger
-    base  = style * W_PICK_LOSS + (1.0-style) * W_FINGER_LOSS
-    base  = tf.expand_dims(base, axis=1)  # (batch, 1)
+    # x: (batch, T, 2) → x[...,0]=piezo, x[...,1]=style flag (0 or 1)
+    piezo = x[..., 0]          # → (batch, T)
+    style = x[..., 1]          # → (batch, T), constant per example
 
-    # compute ∣Δx∣ and normalize per-example
-    Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])                        # (batch, T-1)
-    Δ = tf.pad(Δ, [[0,0],[1,0]])                                   # (batch, T)
-    m  = tf.reduce_max(Δ, axis=1, keepdims=True)                  # (batch,1)
-    m  = tf.maximum(m, 1e-6)                                       # avoid div0
-    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)                           # (batch, T)
+    # base factor per example (still shape (batch,))
+    # (you had 1.0*style + 1.0*(1-style) → that’s just all ones,
+    #  but here’s the pattern if you ever want differing weights)
+    base_scalar = tf.reduce_max(style, axis=1)  # (batch,)
 
-    # final sample-weight map
-    sw = base * wn                                                # (batch, T)
-    sw = tf.expand_dims(sw, axis=-1)                              # (batch, T, 1)
+    # compute |Δx| → (batch, T)
+    Δ = tf.abs(piezo[:, 1:] - piezo[:, :-1])
+    Δ = tf.pad(Δ, [[0,0], [1,0]])
+    m = tf.reduce_max(Δ, axis=1, keepdims=True)    # (batch,1)
+    m = tf.maximum(m, 1e-6)                        # avoid div0
+    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)            # (batch, T)
+
+    # build final sample‐weight map of shape (batch, T, 1)
+    sw = base_scalar[:, None] * wn                  # (batch, T)
+    sw = tf.expand_dims(sw, axis=-1)                # (batch, T, 1)
+
     return x, y, sw
 
 # ─── helper functions ─────────────────────────────────────────────────────────
@@ -464,10 +445,6 @@ def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
-    pick_chunks   = build_chunks(picked_pairs)
-    finger_chunks = build_chunks(finger_pairs)
-    all_chunks    = pick_chunks + finger_chunks
-    print(f"Generated {len(all_chunks)} chunks")
 
     # train/val split
     idx = list(range(len(all_chunks)))
@@ -496,9 +473,7 @@ def train():
     # datasets
     sig_x = tf.TensorSpec((SEG_LEN,2), tf.float32)
     sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
-    uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_chunks), output_signature=(sig_x,sig_y)
-    )
+
     pick_ds    = tf.data.Dataset.from_generator(
         lambda: pick_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
     )
@@ -506,34 +481,15 @@ def train():
         lambda: finger_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
     )
 
-    w_picked_1 = PHASE_1_PICK_RATIO
-    w_fingerpicked_1 = PHASE_1_FINGER_RATIO
-    w_uniform_1 = 1.0 - w_picked_1 - w_fingerpicked_1
     train_ds_1 = tf.data.Dataset.sample_from_datasets(
-        [uniform_ds, pick_ds, finger_ds], weights=[w_uniform_1, w_picked_1, w_fingerpicked_1]
+        [pick_ds, finger_ds], weights=[0.5, 0.5]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
-
-    # sample-weight map for loss
-    def add_sw(x, y):
-        # get style flag per example: 1 for pick, 0 for finger
-        style_flag = tf.squeeze(x[:, 0, 1])           # (batch,)
-        sw = style_flag * W_PICK_LOSS \
-           + (1.0 - style_flag) * W_FINGER_LOSS      # (batch,)
-        # reshape to (batch, 1, 1) to match y shape (batch, T, 1)
-        sw = tf.reshape(sw, (-1, 1, 1))
-        return x, y, sw
 
     train_ds_1 = train_ds_1.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
     val_uniform_ds_1 = tf.data.Dataset.from_generator(
         lambda: segment_generator(val_chunks), output_signature=(sig_x,sig_y)
-    ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-    val_pick_ds_1    = tf.data.Dataset.from_generator(
-        lambda: pick_segment_generator(val_pick_chunks), output_signature=(sig_x,sig_y)
-    ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-    val_finger_ds_1  = tf.data.Dataset.from_generator(
-        lambda: finger_segment_generator(val_finger_chunks), output_signature=(sig_x,sig_y)
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
     # compile & train
