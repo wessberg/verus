@@ -49,7 +49,7 @@ BETA_HF          = 0.4  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
 
 
-PHASE_1_EPOCHS      = 50
+PHASE_1_EPOCHS      = 10
 #PHASE_2_EPOCHS      = 1
 #PHASE_3_EPOCHS      = 1
 
