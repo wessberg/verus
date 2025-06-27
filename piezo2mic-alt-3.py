@@ -488,8 +488,20 @@ def train():
     train_ds_1 = train_ds_1.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
-    val_uniform_ds_1 = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_chunks), output_signature=(sig_x,sig_y)
+    
+    val_pick_ds_1 = tf.data.Dataset.from_generator(
+        lambda: pick_segment_generator(val_pick_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    val_finger_ds_1 = tf.data.Dataset.from_generator(
+        lambda: finger_segment_generator(val_finger_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_ds_1 = tf.data.Dataset.sample_from_datasets(
+        [val_pick_ds_1, val_finger_ds_1],
+        weights=[0.5, 0.5],    # 50/50 pick vs finger
+        seed=SEED
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
     # compile & train
@@ -503,8 +515,9 @@ def train():
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
         loss=combined_loss,
-        metrics=[   "mae",
-                    mean_hf_metric
+        metrics=[
+                "mae",
+                mean_hf_metric
         ]
     )
     static_model.summary()
@@ -513,7 +526,7 @@ def train():
         train_ds_1,
         epochs=3 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_uniform_ds_1,
+        validation_data=val_ds_1,
         validation_steps=validation_steps,
         callbacks=[es1, TensorBoard(log_dir="./logs")]
     )
