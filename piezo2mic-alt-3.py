@@ -33,7 +33,7 @@ tf.random.set_seed(SEED)
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 
-DEBUG               = True
+DEBUG               = False
 FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
@@ -65,9 +65,6 @@ PHASE_1_PICK_RATIO = 0.2  # 30% only pick‐attack
 PHASE_1_FINGER_RATIO = 0.2  # 30% only finger-attack
 
 
-# Inverse sampling weights for loss balance
-W_PICK_LOSS   = 1.0 / PHASE_1_PICK_RATIO
-W_FINGER_LOSS = 1.0 / PHASE_1_FINGER_RATIO
 
 #PHASE_2_PICK_RATIO = 0.5  # 50% pick‐attack
 #PHASE_3_PICK_RATIO = 1.0  # 100% pick‐attack
@@ -115,6 +112,25 @@ audio_cache = {}
 for (src,tgt) in all_pairs:
     audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
     audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+    
+
+num_picked = len(picked_pairs)
+num_finger = len(finger_pairs)
+total_pairs = num_picked + num_finger
+
+# Prevent division by zero if one class is missing
+if total_pairs == 0 or num_picked == 0 or num_finger == 0:
+    print("Warning: Data for one or both styles is missing. Using equal weights.")
+    W_PICK_LOSS   = 1.0
+    W_FINGER_LOSS = 1.0
+else:
+    # Calculate weights as the inverse of the class ratio
+    # The weight for a class is total_samples / num_samples_in_class
+    W_PICK_LOSS   = total_pairs / num_picked
+    W_FINGER_LOSS = total_pairs / num_finger
+    print("Calculated Loss Weights:")
+    print(f"  └─ Picked:   {W_PICK_LOSS:.2f} (data ratio: {num_picked/total_pairs:.2%})")
+    print(f"  └─ Finger: {W_FINGER_LOSS:.2f} (data ratio: {num_finger/total_pairs:.2%})")
 
 def build_chunks(pairs_list):
     """
