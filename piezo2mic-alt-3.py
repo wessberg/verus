@@ -11,7 +11,6 @@ import sys
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from tflite import Model, TensorType, BuiltinOperator
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
@@ -21,9 +20,20 @@ from tensorflow.keras.layers import (
     Activation, Multiply, Add, Lambda, Dense
 )
 
+# Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
+SEED = 69
+os.environ['PYTHONHASHSEED'] = str(SEED)
+os.environ['TF_DETERMINISTIC_OPS']  = '1'      # try to force TF→deterministic kernels
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'     # on some TF versions also needed
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-DEBUG               = False
+
+DEBUG               = True
 FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
@@ -34,8 +44,8 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT = 2.0   # how strongly to up-weight the ∣Δx∣ spikes
-BETA_HF          = 0.5  # scale of the high-pass loss
+ALPHA_TRANSIENT = 1.0   # how strongly to up-weight the ∣Δx∣ spikes
+BETA_HF          = 0.4  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
 
 
@@ -101,6 +111,11 @@ for src in sorted(glob.glob(os.path.join(FINGER_SRC_DIR, "*_source.wav"))):
 print(f"  → {len(picked_pairs)} picked‐attack pairs, {len(finger_pairs)} finger‐picked pairs")
 all_pairs = picked_pairs + finger_pairs
 
+audio_cache = {}
+for (src,tgt) in all_pairs:
+    audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
+    audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+
 def build_chunks(pairs_list):
     """
     Turn a list of (src,tgt) into
@@ -121,21 +136,36 @@ def build_chunks(pairs_list):
 
 # --- Generators ---
 def pick_segment_generator(pick_chunks, context_pre=1024):
+    
     while True:
         src,tgt,cstart,cdur = random.choice(pick_chunks)
-        rsamp,_ = sf.read(src, start=cstart, frames=cdur, dtype='float32', always_2d=True)
-        mono = rsamp[:,0]; diffs = np.abs(np.diff(mono))
-        thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
-        if len(candidates)==0:
-            off = random.randint(0, max(cdur-SEG_LEN,0))
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
+        
+        window = src_wav[cstart : cstart + cdur, 0]
+        diffs = np.abs(np.diff(window))
+        
+        if (diffs.size):
+            thresh = np.median(diffs) * 3.0
+            spikes = np.where(diffs > thresh)[0]
+            
+            if (spikes.size):
+                idx = random.choice(spikes)
+                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
+            else:
+                off = random.randint(0, max(cdur-SEG_LEN, 0))
         else:
-            idx = random.choice(candidates)
-            off = max(0, min(idx-context_pre, cdur-SEG_LEN))
+            off = random.randint(0, max(cdur-SEG_LEN, 0))
+
         read_start = cstart + off
-        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
-        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+        
         if x.shape[0]<SEG_LEN:
-            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
+            p=SEG_LEN - x.shape[0]
+            x=np.pad(x,((0,p),(0,0)))
+            y=np.pad(y,((0,p),(0,0)))
+
         # style channel
         style = np.ones((SEG_LEN,1),dtype='float32')
         x = np.concatenate([x,style],axis=-1)
@@ -144,37 +174,66 @@ def pick_segment_generator(pick_chunks, context_pre=1024):
 def finger_segment_generator(finger_chunks, context_pre=1024):
     while True:
         src,tgt,cstart,cdur = random.choice(finger_chunks)
-        rsamp,_ = sf.read(src, start=cstart, frames=cdur, dtype='float32', always_2d=True)
-        mono = rsamp[:,0]; diffs = np.abs(np.diff(mono))
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
+
+        window = src_wav[cstart : cstart + cdur, 0]
+        diffs = np.abs(np.diff(window))
+        
+        if (diffs.size):
+            thresh = np.median(diffs) * 3.0
+            spikes = np.where(diffs > thresh)[0]
+            if (spikes.size):
+                idx = random.choice(spikes)
+                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
+            else:
+                off = random.randint(0, max(cdur-SEG_LEN, 0))
+        else:
+            off = random.randint(0, max(cdur-SEG_LEN, 0))
+            
+
         thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
         if len(candidates)==0:
             off = random.randint(0, max(cdur-SEG_LEN,0))
         else:
             idx = random.choice(candidates)
             off = max(0, min(idx-context_pre, cdur-SEG_LEN))
+
         read_start = cstart + off
-        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
-        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+
         if x.shape[0]<SEG_LEN:
-            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
+            p=SEG_LEN-x.shape[0]
+            x=np.pad(x,((0,p),(0,0)))
+            y=np.pad(y,((0,p),(0,0)))
+
         style = np.zeros((SEG_LEN,1),dtype='float32')
         x = np.concatenate([x,style],axis=-1)
         yield x,y
 
 def segment_generator(chunk_list):
+    """Uniform random windows, style=1.0 if pick-path else 0.0."""
     while True:
-        src,tgt,cstart,cdur = random.choice(chunk_list)
-        off = random.randrange(max(cdur-SEG_LEN,1))
-        read_start = cstart+off
-        x,_ = sf.read(src, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
-        y,_ = sf.read(tgt, start=read_start, frames=SEG_LEN, dtype='float32', always_2d=True)
-        if x.shape[0]<SEG_LEN:
-            p=SEG_LEN-x.shape[0]; x=np.pad(x,((0,p),(0,0))); y=np.pad(y,((0,p),(0,0)))
-        style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
-        style = np.full((SEG_LEN,1),style_flag,dtype='float32')
-        x = np.concatenate([x,style],axis=-1)
-        yield x,y
+        src, tgt, cstart, cdur = random.choice(chunk_list)
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
 
+        off = random.randrange(max(cdur - SEG_LEN, 1))
+        read_start = cstart + off
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+
+        if x.shape[0] < SEG_LEN:
+            p = SEG_LEN - x.shape[0]
+            x = np.pad(x, ((0,p),(0,0)))
+            y = np.pad(y, ((0,p),(0,0)))
+
+        style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
+        style = np.full((SEG_LEN,1), style_flag, dtype='float32')
+        x = np.concatenate([x, style], axis=-1)
+
+        yield x, y
         
 def generate_demo (model, prediction_name="demo_prediction", only_prediction=False):
     print("\nGenerating demo…")
@@ -398,7 +457,7 @@ def train():
     idx = list(range(len(all_chunks)))
 
     if len(idx)>1:
-        tr_i, va_i = train_test_split(idx, test_size=0.2, random_state=69)
+        tr_i, va_i = train_test_split(idx, test_size=0.2, random_state=SEED)
     else:
         raise RuntimeError("Not enough data to split into train/val sets.")
 
@@ -408,9 +467,10 @@ def train():
     train_finger_chunks = [c for c in train_chunks if c in finger_chunks]
     val_pick_chunks     = [c for c in val_chunks   if c in pick_chunks]
     val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
+    
 
     def approx_steps(durs):
-        return 300 if DEBUG else sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
+        return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
     train_durs = [dur for (_,_,_,dur) in train_chunks]
     val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
@@ -435,7 +495,7 @@ def train():
     w_uniform_1 = 1.0 - w_picked_1 - w_fingerpicked_1
     train_ds_1 = tf.data.Dataset.sample_from_datasets(
         [uniform_ds, pick_ds, finger_ds], weights=[w_uniform_1, w_picked_1, w_fingerpicked_1]
-    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE)
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
 
     # sample-weight map for loss
     def add_sw(x, y):
@@ -479,7 +539,7 @@ def train():
     es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE)
     history1 = static_model.fit(
         train_ds_1,
-        epochs=1 if DEBUG else PHASE_1_EPOCHS,
+        epochs=3 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_uniform_ds_1,
         validation_steps=validation_steps,
@@ -487,10 +547,10 @@ def train():
     )
 
     # style-specific evaluation
-    print("\nEvaluating pick style on val set:")
-    static_model.evaluate(val_pick_ds_1, steps=validation_steps)
-    print("\nEvaluating finger style on val set:")
-    static_model.evaluate(val_finger_ds_1, steps=validation_steps)
+    #print("\nEvaluating pick style on val set:")
+    #static_model.evaluate(val_pick_ds_1, steps=validation_steps)
+    #print("\nEvaluating finger style on val set:")
+    #static_model.evaluate(val_finger_ds_1, steps=validation_steps)
     
     phase1_trained_epochs = len(history1.history["loss"])
 
