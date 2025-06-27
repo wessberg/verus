@@ -44,7 +44,7 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT = 1.0   # how strongly to up-weight the ∣Δx∣ spikes
+ALPHA_TRANSIENT  = 1.0   # how strongly to up-weight the ∣Δx∣ spikes
 BETA_HF          = 0.4  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
 
@@ -488,7 +488,6 @@ def train():
     train_ds_1 = train_ds_1.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
-    
     val_pick_ds_1 = tf.data.Dataset.from_generator(
         lambda: pick_segment_generator(val_pick_chunks),
         output_signature=(sig_x, sig_y)
@@ -500,7 +499,7 @@ def train():
     
     val_ds_1 = tf.data.Dataset.sample_from_datasets(
         [val_pick_ds_1, val_finger_ds_1],
-        weights=[0.5, 0.5],    # 50/50 pick vs finger
+        weights=[0.5, 0.5],
         seed=SEED
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
