@@ -32,13 +32,12 @@ TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
-EMBED_DIM           = 16  # for style embedding
+EMBED_DIM           = 16
 
-HF_KERNEL_SIZE      = 11
-HF_FMIN             = 2000.0
-HF_FMAX             = 10000.0
-HF_N_FFT            = 512
-HF_HOP              = 128
+ALPHA_TRANSIENT = 2.0   # how strongly to up-weight the ∣Δx∣ spikes
+BETA_HF          = 0.5  # scale of the high-pass loss
+HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
+
 
 PHASE_1_EPOCHS      = 50
 #PHASE_2_EPOCHS      = 1
@@ -221,7 +220,52 @@ def generate_demo (model, prediction_name="demo_prediction", only_prediction=Fal
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
-    return tf.reduce_mean(tf.abs(y_true - y_pred))
+    return tf.abs(y_true - y_pred)
+
+@register_keras_serializable()
+def hf_loss(y_true, y_pred):
+    α = HP_PRE_EMPHASIS
+    # 1st‐order high-pass (pre-emphasis):
+    true_hp = y_true[:,1:,:] - α*y_true[:,:-1,:]
+    pred_hp = y_pred[:,1:,:] - α*y_pred[:,:-1,:]
+    true_hp = tf.pad(true_hp, [[0,0],[1,0],[0,0]])
+    pred_hp = tf.pad(pred_hp, [[0,0],[1,0],[0,0]])
+    return tf.abs(true_hp - pred_hp)
+
+@register_keras_serializable()
+def combined_loss(y_true, y_pred):
+    # returns (batch, T, 1)
+    td = waveform_l1_loss(y_true, y_pred)
+    hf = hf_loss(y_true, y_pred)
+    return td + BETA_HF * hf
+
+# 3) A proper named metric instead of a lambda:
+@register_keras_serializable()
+def mean_hf_metric(y_true, y_pred):
+    # This just reduces hf_loss to a scalar
+    return tf.reduce_mean(hf_loss(y_true, y_pred))
+
+# ──────────────────────────────────────────────────────────────────────────────
+@register_keras_serializable()
+def add_sw(x, y):
+    # x: (batch, T, 2)  →  x[...,0] = piezo,  x[...,1] = style flag (0 or 1)
+    piezo = x[...,0]                      # (batch, T)
+    style = x[...,1]                      # (batch, T), constant per example
+    # base, constant per example, for pick vs finger
+    base  = style * W_PICK_LOSS + (1.0-style) * W_FINGER_LOSS
+    base  = tf.expand_dims(base, axis=1)  # (batch, 1)
+
+    # compute ∣Δx∣ and normalize per-example
+    Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])                        # (batch, T-1)
+    Δ = tf.pad(Δ, [[0,0],[1,0]])                                   # (batch, T)
+    m  = tf.reduce_max(Δ, axis=1, keepdims=True)                  # (batch,1)
+    m  = tf.maximum(m, 1e-6)                                       # avoid div0
+    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)                           # (batch, T)
+
+    # final sample-weight map
+    sw = base * wn                                                # (batch, T)
+    sw = tf.expand_dims(sw, axis=-1)                              # (batch, T, 1)
+    return x, y, sw
 
 # ─── helper functions ─────────────────────────────────────────────────────────
 
@@ -340,73 +384,8 @@ def build_model(dynamic_time=False):
     return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
-    # (unchanged)
-    os.makedirs(outdir, exist_ok=True)
-    m    = Model.GetRootAsModel(tflite_model_buf, 0)
-    subg = m.Subgraphs(0)
-    op_map = {i: m.OperatorCodes(i).BuiltinCode()
-              for i in range(m.OperatorCodesLength())}
-    def load_tensor(tidx):
-        t = subg.Tensors(tidx)
-        b = m.Buffers(t.Buffer())
-        raw = b.DataAsNumpy()
-        dtype = np.int8 if t.Type()==TensorType.INT8 else np.int32
-        arr = np.frombuffer(raw, dtype=dtype).reshape(t.ShapeAsNumpy())
-        qp = t.Quantization()
-        scales = [qp.Scale(i)     for i in range(qp.ScaleLength())]
-        zeros  = [qp.ZeroPoint(i) for i in range(qp.ZeroPointLength())]
-        quant  = np.stack([scales, zeros], axis=1)
-        return arr, quant
-
-    sep_ctr=0; pwsep_ctr=0; pw_ctr=0
-    for i in range(subg.OperatorsLength()):
-        op   = subg.Operators(i)
-        code = op_map[op.OpcodeIndex()]
-        if code == BuiltinOperator.DEPTHWISE_CONV_2D:
-            w_i = op.Inputs(1)
-            b_i = op.InputsLength()>2 and op.Inputs(2)
-            tag = f"dw{sep_ctr}"; sep_ctr+=1
-            w_arr,w_q = load_tensor(w_i)
-            np.save(f"{outdir}/{tag}_w_int8.npy", w_arr)
-            np.savetxt(f"{outdir}/{tag}_w_int8_quant.txt",
-                       w_q, fmt="%g", header="scale,zero_point", comments="")
-            if b_i:
-                b_arr,b_q = load_tensor(b_i)
-                np.save(f"{outdir}/{tag}_b_int32.npy", b_arr)
-                np.savetxt(f"{outdir}/{tag}_b_int32_quant.txt",
-                           b_q, fmt="%g", header="scale,zero_point", comments="")
-            continue
-        if code == BuiltinOperator.CONV_2D:
-            w_i,b_i   = op.Inputs(1), op.Inputs(2)
-            w_arr,w_q = load_tensor(w_i)
-            b_arr,b_q = load_tensor(b_i)
-            W, B = w_arr.size, b_arr.size
-            if W==HF_KERNEL_SIZE:
-                tag="hf_transient"
-            elif W==1 and B==1:
-                tag="skip_conv"
-            elif W==filters:
-                tag="init_pw" if B==filters else "final_pw"
-            elif W==filters*(2*filters) and B==(2*filters):
-                tag=f"pwsep{pwsep_ctr}"; pwsep_ctr+=1
-            elif W==filters*filters and B==filters:
-                tag=f"pw{pw_ctr}"; pw_ctr+=1
-            else:
-                raise RuntimeError(f"Unexpected Conv2D shape: W={W},B={B}")
-            fnw=os.path.join(outdir,f"{tag}_w_int8.npy")
-            np.save(fnw, w_arr)
-            np.savetxt(fnw.replace(".npy","_quant.txt"), w_q,
-                       fmt="%g", header="scale,zero_point", comments="")
-            fnb=os.path.join(outdir,f"{tag}_b_int32.npy")
-            np.save(fnb, b_arr)
-            np.savetxt(fnb.replace(".npy","_quant.txt"), b_q,
-                       fmt="%g", header="scale,zero_point", comments="")
-            continue
-
-    assert sep_ctr   == len(dilations)
-    assert pwsep_ctr == len(dilations)
-    assert pw_ctr    == len(dilations)
-    print("✅ saved all int8 kernels + int32 biases in", outdir)
+    # TODO
+    print("TODO")
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
@@ -431,7 +410,7 @@ def train():
     val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
 
     def approx_steps(durs):
-        return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
+        return 300 if DEBUG else sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
     train_durs = [dur for (_,_,_,dur) in train_chunks]
     val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
@@ -487,6 +466,14 @@ def train():
         optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
         loss=waveform_l1_loss,
         metrics=["mae"]
+    )
+    
+    static_model.compile(
+        optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
+        loss=combined_loss,
+        metrics=[   "mae",
+                    mean_hf_metric
+        ]
     )
     static_model.summary()
     es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE)
