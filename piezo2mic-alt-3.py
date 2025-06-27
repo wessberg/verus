@@ -44,8 +44,8 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT  = 1.0   # how strongly to up-weight the ∣Δx∣ spikes
-BETA_HF          = 0.4  # scale of the high-pass loss
+ALPHA_TRANSIENT  = 0.5   # how strongly to up-weight the ∣Δx∣ spikes
+BETA_HF          = 0.25  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
 
 
@@ -520,7 +520,7 @@ def train():
         ]
     )
     static_model.summary()
-    es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE)
+    es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE, restore_best_weights=True)
     history1 = static_model.fit(
         train_ds_1,
         epochs=3 if DEBUG else PHASE_1_EPOCHS,
