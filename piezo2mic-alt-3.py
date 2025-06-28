@@ -44,7 +44,7 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT  = 0.2   # how strongly to up-weight the ∣Δx∣ spikes
+ALPHA_TRANSIENT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
 BETA_HF          = 0.0  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.85 # coefficient for 1-sample 1st-order high-pass
 
@@ -57,7 +57,7 @@ PHASE_1_LR          = 1e-3
 #PHASE_2_LR          = 1e-4
 #PHASE_3_LR          = 1e-2
 
-PHASE_1_LR_PATIENCE = 8
+PHASE_1_LR_PATIENCE = 3
 #PHASE_2_LR_PATIENCE = 7
 #PHASE_3_LR_PATIENCE = 10
 
