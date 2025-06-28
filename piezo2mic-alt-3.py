@@ -46,7 +46,8 @@ EMBED_DIM           = 16
 
 ALPHA_TRANSIENT  = 0.1   # how strongly to up-weight the ∣Δx∣ spikes
 BETA_HF          = 0.05  # scale of the high-pass loss
-HP_PRE_EMPHASIS  = 0.5 # coefficient for 1-sample 1st-order high-pass
+HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
+GAMMA_STFT = 1.0    # weight of the spectral loss
 
 
 PHASE_1_EPOCHS      = 50
@@ -292,11 +293,64 @@ def hf_loss(y_true, y_pred):
     return tf.abs(true_hp - pred_hp)
 
 @register_keras_serializable()
+def multi_scale_stft_loss(y_true, y_pred):
+    """
+    Per-sample, multi-scale L1 loss between |STFT(y_true)| and |STFT(y_pred)|.
+    Returns shape (batch,1,1) so it broadcasts in your combined_loss.
+    """
+    scales = [
+        (512,  128,  512),
+        (1024, 256, 1024),
+        (2048, 512, 2048),
+    ]
+
+    # squeeze off the channel dim → (batch, T)
+    y_true_s = tf.squeeze(y_true, axis=-1)
+    y_pred_s = tf.squeeze(y_pred, axis=-1)
+
+    per_scale_losses = []
+    for n_fft, hop, win in scales:
+        # 1) frame & pad
+        frames_true = tf.signal.frame(y_true_s, frame_length=win,
+                                      frame_step=hop, pad_end=True)
+        frames_pred = tf.signal.frame(y_pred_s, frame_length=win,
+                                      frame_step=hop, pad_end=True)
+
+        # 2) window
+        window = tf.signal.hann_window(win, periodic=True)        # (win,)
+        window = tf.reshape(window, (1,1,win))                    # → (1,1,win)
+        win_true = frames_true * window
+        win_pred = frames_pred * window
+
+        # 3) rFFT  ← here is the change:
+        fft_len = tf.constant([n_fft], dtype=tf.int32)            # MUST be 1-D
+        st_true = tf.signal.rfft(win_true,    fft_length=fft_len)
+        st_pred = tf.signal.rfft(win_pred,    fft_length=fft_len)
+
+        # 4) mag-L1 per frame, then avg over time & freq → (batch,)
+        mag_true = tf.abs(st_true)
+        mag_pred = tf.abs(st_pred)
+        loss_sf  = tf.reduce_mean(
+                       tf.abs(mag_true - mag_pred),
+                       axis=[1,2]
+                   )  # → (batch,)
+        per_scale_losses.append(loss_sf)
+
+    # stack over scales → mean → (batch,)
+    loss_stack = tf.stack(per_scale_losses, axis=0)  # (n_scales, batch)
+    loss_batch = tf.reduce_mean(loss_stack, axis=0)
+
+    return loss_batch[:, None, None]
+
+@register_keras_serializable()
 def combined_loss(y_true, y_pred):
-    # returns (batch, T, 1)
-    td = waveform_l1_loss(y_true, y_pred)
-    hf = hf_loss(y_true, y_pred)
-    return td + BETA_HF * hf
+    td   = waveform_l1_loss(y_true, y_pred)    # (batch, T, 1)
+    hf   = hf_loss(       y_true, y_pred)      # (batch, T, 1)
+    spec = multi_scale_stft_loss(y_true, y_pred)  # (batch, 1, 1)
+
+    return td \
+         + BETA_HF    * hf \
+         + GAMMA_STFT * spec
 
 # 3) A proper named metric instead of a lambda:
 @register_keras_serializable()
@@ -533,7 +587,8 @@ def train():
         loss=combined_loss,
         metrics=[
                 "mae",
-                mean_hf_metric
+                mean_hf_metric,
+                multi_scale_stft_loss
         ]
     )
     static_model.summary()
