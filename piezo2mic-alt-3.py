@@ -13,7 +13,7 @@ import soundfile as sf
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
@@ -44,12 +44,12 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT  = 0.5   # how strongly to up-weight the ∣Δx∣ spikes
-BETA_HF          = 0.25  # scale of the high-pass loss
-HP_PRE_EMPHASIS  = 0.97 # coefficient for 1-sample 1st-order high-pass
+ALPHA_TRANSIENT  = 0.2   # how strongly to up-weight the ∣Δx∣ spikes
+BETA_HF          = 0.0  # scale of the high-pass loss
+HP_PRE_EMPHASIS  = 0.85 # coefficient for 1-sample 1st-order high-pass
 
 
-PHASE_1_EPOCHS      = 10
+PHASE_1_EPOCHS      = 50
 #PHASE_2_EPOCHS      = 1
 #PHASE_3_EPOCHS      = 1
 
@@ -57,19 +57,22 @@ PHASE_1_LR          = 1e-3
 #PHASE_2_LR          = 1e-4
 #PHASE_3_LR          = 1e-2
 
-PHASE_1_LR_PATIENCE = 5
+PHASE_1_LR_PATIENCE = 8
 #PHASE_2_LR_PATIENCE = 7
 #PHASE_3_LR_PATIENCE = 10
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-# ─── your new 4‐dir layout ─────────────────────────────────────────────
 PICK_SRC_DIR   = "./input2/picked/source"
 PICK_TGT_DIR   = "./input2/picked/target"
 FINGER_SRC_DIR = "./input2/fingerpicked/source"
 FINGER_TGT_DIR = "./input2/fingerpicked/target"
+
 OUT_DIR        = "./out-alt-3"
+CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
+MODELS_OUT_DIR = os.path.join(OUT_DIR, "models")
+DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
 
 DEMO_SEC        = 60 * 2
 DEMO_OFFSET_SEC = 0
@@ -80,6 +83,9 @@ DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
 os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(CHECKPOINT_OUT_DIR, exist_ok=True)
+os.makedirs(MODELS_OUT_DIR, exist_ok=True)
+os.makedirs(DEMOS_OUT_DIR, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
@@ -258,12 +264,12 @@ def generate_demo (model, prediction_name="demo_prediction", only_prediction=Fal
     print("Running inference…")
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
     
-    prediction_filepath = os.path.join(OUT_DIR, prediction_name + ".wav")
+    prediction_filepath = os.path.join(DEMOS_OUT_DIR, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
     
     if (not only_prediction):
-        source_filepath = os.path.join(OUT_DIR, "demo_source" +".wav")
-        target_filepath = os.path.join(OUT_DIR, "demo_target" + ".wav")
+        source_filepath = os.path.join(DEMOS_OUT_DIR, "demo_source" +".wav")
+        target_filepath = os.path.join(DEMOS_OUT_DIR, "demo_target" + ".wav")
         sf.write(source_filepath,
              x_long, SR, subtype='FLOAT')
         sf.write(target_filepath,
@@ -301,25 +307,36 @@ def mean_hf_metric(y_true, y_pred):
 # ──────────────────────────────────────────────────────────────────────────────
 @register_keras_serializable()
 def add_sw(x, y):
-    # x: (batch, T, 2) → x[...,0]=piezo, x[...,1]=style flag (0 or 1)
-    piezo = x[..., 0]          # → (batch, T)
-    style = x[..., 1]          # → (batch, T), constant per example
+    # x: (batch, T, 2) → x[...,0]=piezo, x[...,1]=style flag (0=finger,1=pick)
+    piezo = x[...,0]            # (batch, T)
+    style = x[...,1]            # (batch, T)
 
-    # base factor per example (still shape (batch,))
-    # (you had 1.0*style + 1.0*(1-style) → that’s just all ones,
-    #  but here’s the pattern if you ever want differing weights)
-    base_scalar = tf.reduce_max(style, axis=1)  # (batch,)
+    # 1) extract one scalar per example in the batch
+    #    (all time‐samples are identical so max or mean both work)
+    style_flag = tf.reduce_max(style, axis=1)   # (batch,)
 
-    # compute |Δx| → (batch, T)
-    Δ = tf.abs(piezo[:, 1:] - piezo[:, :-1])
-    Δ = tf.pad(Δ, [[0,0], [1,0]])
-    m = tf.reduce_max(Δ, axis=1, keepdims=True)    # (batch,1)
-    m = tf.maximum(m, 1e-6)                        # avoid div0
-    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)            # (batch, T)
+    # 2) define your base weights for each style
+    #    here we set both to 1.0 (i.e. no style-bias), but you can
+    #    make pick_weight != finger_weight if you like.
+    pick_weight   = 1.0
+    finger_weight = 1.0
 
-    # build final sample‐weight map of shape (batch, T, 1)
-    sw = base_scalar[:, None] * wn                  # (batch, T)
-    sw = tf.expand_dims(sw, axis=-1)                # (batch, T, 1)
+    #    this yields a shape (batch,) where finger examples get
+    #    finger_weight, pick examples get pick_weight
+    base_scalar = pick_weight*style_flag + finger_weight*(1.0 - style_flag)
+    #––– if you truly want them *exactly* equal, you can just do:
+    #    base_scalar = tf.ones_like(style_flag)
+
+    # 3) build your transient re-weighting term exactly as before
+    Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])        # (batch, T-1)
+    Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)  # back to (batch, T)
+    m = tf.reduce_max(Δ, axis=1, keepdims=True)   # (batch,1)
+    m = tf.maximum(m, 1e-6)                       # avoid div0
+    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)          # (batch, T)
+
+    # 4) combine them
+    sw = base_scalar[:, None] * wn                # (batch, T)
+    sw = tf.expand_dims(sw, axis=-1)              # (batch, T, 1)
 
     return x, y, sw
 
@@ -520,15 +537,30 @@ def train():
         ]
     )
     static_model.summary()
-    es1 = EarlyStopping(monitor='val_mae', mode='min', patience=PHASE_1_LR_PATIENCE, restore_best_weights=True)
+    
+    # Early stopping callback
+    es1 = EarlyStopping(monitor='val_mae', mode='min', verbose=1, patience=PHASE_1_LR_PATIENCE, restore_best_weights=True)
+    
+    # ModelCheckpoint: save whenever val_loss improves
+    cp1 = ModelCheckpoint(
+        filepath=os.path.join(CHECKPOINT_OUT_DIR,
+                            "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
+        monitor='val_loss',
+        mode='min',
+        save_best_only=True,
+        verbose=1
+    )
+
     history1 = static_model.fit(
         train_ds_1,
         epochs=3 if DEBUG else PHASE_1_EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds_1,
         validation_steps=validation_steps,
-        callbacks=[es1, TensorBoard(log_dir="./logs")]
+        callbacks=[es1, cp1, TensorBoard(log_dir="./logs")]
     )
+    
+    
 
     # style-specific evaluation
     #print("\nEvaluating pick style on val set:")
@@ -539,13 +571,13 @@ def train():
     phase1_trained_epochs = len(history1.history["loss"])
 
     # ── Save FP32 static & dynamic models ──────────────────────────────────
-    path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
+    path_static = os.path.join(MODELS_OUT_DIR, STATIC_MODEL_FILENAME)
     static_model.save(path_static)
     print("✅ Saved FP32 static model:", path_static)
 
     dynamic_model = build_model(dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
-    path_dyn = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+    path_dyn = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
     dynamic_model.save(path_dyn)
     print("✅ Saved FP32 dynamic model:", path_dyn)
 
@@ -561,7 +593,7 @@ if __name__=="__main__":
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         static_model, dynamic_model = train()
     else:
-        dpath = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+        dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(dpath):
             print("Dynamic model not found. run: python piezo2mic.py --train")
             sys.exit(1)
