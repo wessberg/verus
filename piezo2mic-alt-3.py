@@ -49,18 +49,9 @@ BETA_HF          = 0.05  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
 GAMMA_STFT = 1.0    # weight of the spectral loss
 
-
-PHASE_1_EPOCHS      = 50
-#PHASE_2_EPOCHS      = 1
-#PHASE_3_EPOCHS      = 1
-
-PHASE_1_LR          = 1e-3
-#PHASE_2_LR          = 1e-4
-#PHASE_3_LR          = 1e-2
-
-PHASE_1_LR_PATIENCE = 3
-#PHASE_2_LR_PATIENCE = 7
-#PHASE_3_LR_PATIENCE = 10
+EPOCHS      = 10
+LR          = 1e-3
+LR_PATIENCE = 3
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -552,11 +543,11 @@ def train():
         lambda: finger_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
     )
 
-    train_ds_1 = tf.data.Dataset.sample_from_datasets(
+    train_ds = tf.data.Dataset.sample_from_datasets(
         [pick_ds, finger_ds], weights=[0.5, 0.5]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
 
-    train_ds_1 = train_ds_1.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+    train_ds = train_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
     val_pick_ds_1 = tf.data.Dataset.from_generator(
@@ -577,13 +568,13 @@ def train():
     # compile & train
     static_model = build_model(dynamic_time=False)
     static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
+        optimizer=tf.keras.optimizers.Adam(LR),
         loss=waveform_l1_loss,
         metrics=["mae"]
     )
     
     static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
+        optimizer=tf.keras.optimizers.Adam(LR),
         loss=combined_loss,
         metrics=[
                 "mae",
@@ -594,10 +585,10 @@ def train():
     static_model.summary()
     
     # Early stopping callback
-    es1 = EarlyStopping(monitor='val_mae', mode='min', verbose=1, patience=PHASE_1_LR_PATIENCE, restore_best_weights=True)
+    es = EarlyStopping(monitor='val_mae', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     
     # ModelCheckpoint: save whenever val_loss improves
-    cp1 = ModelCheckpoint(
+    cp = ModelCheckpoint(
         filepath=os.path.join(CHECKPOINT_OUT_DIR,
                             "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
         monitor='val_loss',
@@ -606,24 +597,24 @@ def train():
         verbose=1
     )
 
-    history1 = static_model.fit(
-        train_ds_1,
-        epochs=3 if DEBUG else PHASE_1_EPOCHS,
+    history = static_model.fit(
+        train_ds,
+        epochs=3 if DEBUG else EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds_1,
         validation_steps=validation_steps,
-        callbacks=[es1, cp1, TensorBoard(log_dir="./logs")]
+        callbacks=[es, cp, TensorBoard(log_dir="./logs")]
     )
     
     
 
     # style-specific evaluation
-    #print("\nEvaluating pick style on val set:")
-    #static_model.evaluate(val_pick_ds_1, steps=validation_steps)
-    #print("\nEvaluating finger style on val set:")
-    #static_model.evaluate(val_finger_ds_1, steps=validation_steps)
+    print("\nEvaluating pick style on val set:")
+    static_model.evaluate(val_pick_ds_1, steps=validation_steps)
+    print("\nEvaluating finger style on val set:")
+    static_model.evaluate(val_finger_ds_1, steps=validation_steps)
     
-    phase1_trained_epochs = len(history1.history["loss"])
+    trained_epochs = len(history.history["loss"])
 
     # ── Save FP32 static & dynamic models ──────────────────────────────────
     path_static = os.path.join(MODELS_OUT_DIR, STATIC_MODEL_FILENAME)
