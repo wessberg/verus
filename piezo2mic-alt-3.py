@@ -17,7 +17,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoi
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
-    Activation, Multiply, Add, Lambda, Dense
+    Activation, Multiply, Add, Lambda, Dense, SpatialDropout1D
 )
 
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
@@ -36,7 +36,7 @@ tf.random.set_seed(SEED)
 DEBUG               = False
 FILTERS             = 64
 KERNEL_SIZE         = 25
-DILATIONS           = (1,2,4,8)
+DILATIONS           = (1,2,4,8,16)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -44,14 +44,16 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 16
 
-ALPHA_TRANSIENT  = 0.1   # how strongly to up-weight the ∣Δx∣ spikes
-BETA_HF          = 0.05  # scale of the high-pass loss
+TRANSIENT_WEIGHT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
+HF_WEIGHT          = 0.0  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
-GAMMA_STFT = 1.0    # weight of the spectral loss
+STFT_WEIGHT = 1.0    # weight of the spectral loss
+MEL_WEIGHT = 0.1   # weight of the log‐mel‐spectrogram L1 loss
+RMS_ENV_WEIGHT   = 1.0   # weight of the RMS‐envelope L1 loss
 
-EPOCHS      = 10
+EPOCHS      = 50
 LR          = 1e-3
-LR_PATIENCE = 3
+LR_PATIENCE = 5
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -127,7 +129,7 @@ all_chunks    = pick_chunks + finger_chunks
 print(f"Generated {len(all_chunks)} chunks")
 
 # --- Generators ---
-def pick_segment_generator(pick_chunks, context_pre=1024):
+def pick_attack_segment_generator(pick_chunks, context_pre=1024):
     
     while True:
         src,tgt,cstart,cdur = random.choice(pick_chunks)
@@ -163,7 +165,7 @@ def pick_segment_generator(pick_chunks, context_pre=1024):
         x = np.concatenate([x,style],axis=-1)
         yield x,y
 
-def finger_segment_generator(finger_chunks, context_pre=1024):
+def finger_attack_segment_generator(finger_chunks, context_pre=1024):
     while True:
         src,tgt,cstart,cdur = random.choice(finger_chunks)
         src_wav = audio_cache[src]
@@ -334,14 +336,97 @@ def multi_scale_stft_loss(y_true, y_pred):
     return loss_batch[:, None, None]
 
 @register_keras_serializable()
+def log_mel_loss(y_true, y_pred):
+    """
+    Compute L1 between log‐mel‐spectra of y_true and y_pred.
+    Returns shape (batch,1,1).
+    """
+    # parameters
+    n_fft   = 1024
+    hop     = 256
+    win     = 1024
+    n_mels  = 64
+    fmin    = 20.0
+    fmax    = float(SR//2)
+
+    # squeeze off the channel → (batch, T)
+    t   = tf.squeeze(y_true, axis=-1)
+    p   = tf.squeeze(y_pred, axis=-1)
+
+    # STFT magnitudes
+    st_t = tf.signal.stft(t,   frame_length=win, frame_step=hop,
+                          fft_length=n_fft, pad_end=True)
+    st_p = tf.signal.stft(p,   frame_length=win, frame_step=hop,
+                          fft_length=n_fft, pad_end=True)
+    mag_t = tf.abs(st_t)    # (batch, frames, freq_bins)
+    mag_p = tf.abs(st_p)
+
+    # build a (freq_bins × n_mels) mel‐weight matrix
+    fb = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=n_mels,
+        num_spectrogram_bins=n_fft//2+1,
+        sample_rate=SR,
+        lower_edge_hertz=fmin,
+        upper_edge_hertz=fmax
+    )  # shape (freq_bins, n_mels)
+
+    # mel spectrograms → (batch, frames, n_mels)
+    mel_t = tf.tensordot(mag_t, fb,   axes=[[2],[0]])
+    mel_p = tf.tensordot(mag_p, fb,   axes=[[2],[0]])
+
+    # log compress
+    log_t = tf.math.log(mel_t + 1e-6)
+    log_p = tf.math.log(mel_p + 1e-6)
+
+    # L1 & mean over time+mel‐bins → (batch,)
+    mel_diff = tf.reduce_mean(tf.abs(log_t - log_p), axis=[1,2])
+
+    # shape to (batch,1,1)
+    return mel_diff[:,None,None]
+
+
+@register_keras_serializable()
+def rms_env_loss(y_true, y_pred):
+    """
+    Compute L1 between slow RMS envelopes.
+    Returns shape (batch,1,1).
+    """
+    # envelope params
+    env_win  = 1024
+    env_hop  = 512
+
+    # squeeze → (batch, T)
+    t = tf.squeeze(y_true, axis=-1)
+    p = tf.squeeze(y_pred, axis=-1)
+
+    # frame → (batch, frames, env_win)
+    ft   = tf.signal.frame(t, frame_length=env_win,
+                           frame_step=env_hop, pad_end=True)
+    fp   = tf.signal.frame(p, frame_length=env_win,
+                           frame_step=env_hop, pad_end=True)
+
+    # RMS per frame → (batch, frames)
+    rms_t = tf.sqrt(tf.reduce_mean(ft**2, axis=2) + 1e-12)
+    rms_p = tf.sqrt(tf.reduce_mean(fp**2, axis=2) + 1e-12)
+
+    # L1 & mean over frames → (batch,)
+    env_diff = tf.reduce_mean(tf.abs(rms_t - rms_p), axis=1)
+
+    return env_diff[:,None,None]
+
+@register_keras_serializable()
 def combined_loss(y_true, y_pred):
-    td   = waveform_l1_loss(y_true, y_pred)    # (batch, T, 1)
-    hf   = hf_loss(       y_true, y_pred)      # (batch, T, 1)
-    spec = multi_scale_stft_loss(y_true, y_pred)  # (batch, 1, 1)
+    td   = waveform_l1_loss(y_true, y_pred)      # (batch,T,1)
+    hf   = hf_loss(       y_true, y_pred)        # (batch,T,1)
+    spec = multi_scale_stft_loss(y_true, y_pred) # (batch,1,1)
+    mel  = log_mel_loss(  y_true, y_pred)        # (batch,1,1)
+    env  = rms_env_loss(  y_true, y_pred)        # (batch,1,1)
 
     return td \
-         + BETA_HF    * hf \
-         + GAMMA_STFT * spec
+         + HF_WEIGHT    * hf \
+         + STFT_WEIGHT * spec \
+         + MEL_WEIGHT  * mel \
+         + RMS_ENV_WEIGHT    * env
 
 # 3) A proper named metric instead of a lambda:
 @register_keras_serializable()
@@ -377,7 +462,7 @@ def add_sw(x, y):
     Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)  # back to (batch, T)
     m = tf.reduce_max(Δ, axis=1, keepdims=True)   # (batch,1)
     m = tf.maximum(m, 1e-6)                       # avoid div0
-    wn = 1.0 + ALPHA_TRANSIENT * (Δ / m)          # (batch, T)
+    wn = 1.0 + TRANSIENT_WEIGHT * (Δ / m)          # (batch, T)
 
     # 4) combine them
     sw = base_scalar[:, None] * wn                # (batch, T)
@@ -495,10 +580,31 @@ def build_model(dynamic_time=False):
     finger_c = Multiply(name="finger_contrib")([
         Lambda(invert, name="invert_style")(style), main_finger])
     mixed    = Add(name="mix_main")([pick_c, finger_c])
-    skip     = Conv1D(1,1,use_bias=False,
-                      kernel_initializer='ones',
-                      name="skip_conv")(piezo)
+    # 1) 1×1 conv that copies piezo (as before)
+    skip = Conv1D(
+        1, 1,
+        use_bias=False,
+        kernel_initializer='ones',
+        name="skip_conv"
+    )(piezo)
+
+    # 2) trainable scalar on that copy (init to 0.5)
+    skip = Dense(
+        1,
+        use_bias=False,
+        kernel_initializer=tf.keras.initializers.Constant(0.5),
+        name="skip_scale"
+    )(skip)
+
+    # 3) randomly drop the entire skip-channel 50% of the time during training
+    skip = SpatialDropout1D(
+        rate=0.5,
+        name="skip_dropout"
+    )(skip)
+
+
     out = Add(name="res_out")([mixed, skip])
+
     return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
@@ -536,62 +642,75 @@ def train():
     sig_x = tf.TensorSpec((SEG_LEN,2), tf.float32)
     sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
 
-    pick_ds    = tf.data.Dataset.from_generator(
-        lambda: pick_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+    pick_attack_ds    = tf.data.Dataset.from_generator(
+        lambda: pick_attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
     )
-    finger_ds  = tf.data.Dataset.from_generator(
-        lambda: finger_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+    
+    pick_uniform_ds    = tf.data.Dataset.from_generator(
+        lambda: segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+    )
+    
+    finger_attack_ds  = tf.data.Dataset.from_generator(
+        lambda: finger_attack_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+    )
+    
+    finger_uniform_ds  = tf.data.Dataset.from_generator(
+        lambda: segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
     )
 
     train_ds = tf.data.Dataset.sample_from_datasets(
-        [pick_ds, finger_ds], weights=[0.5, 0.5]
+        [pick_attack_ds, pick_uniform_ds, finger_attack_ds, finger_uniform_ds], weights=[0.15, 0.35, 0.15, 0.35]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
 
     train_ds = train_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
-    val_pick_ds_1 = tf.data.Dataset.from_generator(
-        lambda: pick_segment_generator(val_pick_chunks),
-        output_signature=(sig_x, sig_y)
-    )
-    val_finger_ds_1 = tf.data.Dataset.from_generator(
-        lambda: finger_segment_generator(val_finger_chunks),
+    val_pick_attack_ds = tf.data.Dataset.from_generator(
+        lambda: pick_attack_segment_generator(val_pick_chunks),
         output_signature=(sig_x, sig_y)
     )
     
-    val_ds_1 = tf.data.Dataset.sample_from_datasets(
-        [val_pick_ds_1, val_finger_ds_1],
-        weights=[0.5, 0.5],
+    val_pick_uniform_ds = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_pick_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_finger_attack_ds = tf.data.Dataset.from_generator(
+        lambda: finger_attack_segment_generator(val_finger_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_finger_uniform_ds = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_finger_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_ds = tf.data.Dataset.sample_from_datasets(
+        [val_pick_attack_ds, val_pick_uniform_ds, val_finger_attack_ds, val_finger_uniform_ds],
+        weights=[0.15, 0.35, 0.15, 0.35],
         seed=SEED
     ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
 
     # compile & train
     static_model = build_model(dynamic_time=False)
-    static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(LR),
-        loss=waveform_l1_loss,
-        metrics=["mae"]
-    )
     
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(LR),
         loss=combined_loss,
         metrics=[
-                "mae",
-                mean_hf_metric,
-                multi_scale_stft_loss
+                log_mel_loss
         ]
     )
     static_model.summary()
     
     # Early stopping callback
-    es = EarlyStopping(monitor='val_mae', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
+    es = EarlyStopping(monitor='val_log_mel_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     
     # ModelCheckpoint: save whenever val_loss improves
     cp = ModelCheckpoint(
         filepath=os.path.join(CHECKPOINT_OUT_DIR,
                             "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
-        monitor='val_loss',
+        monitor='val_log_mel_loss',
         mode='min',
         save_best_only=True,
         verbose=1
@@ -601,7 +720,7 @@ def train():
         train_ds,
         epochs=3 if DEBUG else EPOCHS,
         steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds_1,
+        validation_data=val_ds,
         validation_steps=validation_steps,
         callbacks=[es, cp, TensorBoard(log_dir="./logs")]
     )
@@ -609,10 +728,10 @@ def train():
     
 
     # style-specific evaluation
-    print("\nEvaluating pick style on val set:")
-    static_model.evaluate(val_pick_ds_1, steps=validation_steps)
-    print("\nEvaluating finger style on val set:")
-    static_model.evaluate(val_finger_ds_1, steps=validation_steps)
+    # print("\nEvaluating pick style on val set:")
+    # static_model.evaluate(val_pick_ds_1, steps=validation_steps)
+    # print("\nEvaluating finger style on val set:")
+    # static_model.evaluate(val_finger_ds_1, steps=validation_steps)
     
     trained_epochs = len(history.history["loss"])
 
@@ -639,13 +758,34 @@ if __name__=="__main__":
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         static_model, dynamic_model = train()
     else:
-        dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(dpath):
-            print("Dynamic model not found. run: python piezo2mic.py --train")
-            sys.exit(1)
-        dynamic_model = tf.keras.models.load_model(
-            dpath,
-            compile=False
-        )
-        
+        # Turn off GPU acceleration for inference, as it is more reliable
+        tf.config.set_visible_devices([], 'GPU')
+
+        if len(sys.argv)>1 and sys.argv[1]=="--use-checkpoint-for-demo":
+            
+            # Load the latest static model from checkpoints
+            checkpoint_files = sorted(glob.glob(os.path.join(CHECKPOINT_OUT_DIR, "*.keras")))
+            if not checkpoint_files:
+                print("No checkpoints found in", CHECKPOINT_OUT_DIR)
+                sys.exit(1)
+            latest_checkpoint = checkpoint_files[-1]
+            print("Loading latest checkpoint:", latest_checkpoint)
+            static_model = tf.keras.models.load_model(
+                latest_checkpoint,
+                compile=False
+            )
+            dynamic_model = build_model(dynamic_time=True)
+            dynamic_model.set_weights(static_model.get_weights())
+        else:
+            dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
+            if not os.path.exists(dpath):
+                print("Dynamic model not found. run: python piezo2mic.py --train")
+                sys.exit(1)
+            dynamic_model = tf.keras.models.load_model(
+                dpath,
+                compile=False
+            )
+            
         generate_demo(dynamic_model)
+        
+        
