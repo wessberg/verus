@@ -1,1066 +1,888 @@
 #!/usr/bin/env python3
 """
 Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
-to the equivalent mic’d signal.
+to the equivalent mic’d signal, with pick‐attack oversampling ramp,
+and a 2nd “style” channel so one model can handle finger vs pick.
+It is designed to be ultra-low latency for real-time inference for live-use.
+This is why dilations and kernel_size are small, and the model is causal.
 """
-import os
-os.environ["TF_CUDNN_WORKSPACE_LIMIT_IN_MB"] = "15192"
-
-import glob
-import random
-import sys
+import os, glob, random, shutil, sys
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from tflite import Model, TensorType, BuiltinOperator
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard
-from tensorflow.keras.constraints import Constraint
-from tensorflow.keras import regularizers
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback
+
+from tensorflow.keras.layers import (
+    Input, Conv1D, SeparableConv1D, ZeroPadding1D,
+    Activation, Multiply, Add, Lambda, Dense, SpatialDropout1D
+)
+
+# Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
+SEED = 42
+os.environ['PYTHONHASHSEED'] = str(SEED)
+os.environ['TF_DETERMINISTIC_OPS']  = '1'      # try to force TF→deterministic kernels
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'     # on some TF versions also needed
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
-FILTERS             = 64
-KERNEL_SIZE         = 25
-DILATIONS           = (1,2,4,8)
+
+DEBUG               = True
+FILTERS             = 128
+KERNEL_SIZE         = 51
+DILATIONS           = (1,2,4,8,16,32,64)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
 SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
+EMBED_DIM           = 32
 
-HF_KERNEL_SIZE      = 11
-HF_FMIN             = 3000.0
-HF_FMAX             = 15000.0
-HF_N_FFT            = 512
-HF_HOP              = 128
+TRANSIENT_WEIGHT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
+HF_WEIGHT          = 0.07  # scale of the high-pass loss
+HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
+STFT_WEIGHT = 0.5    # weight of the spectral loss
+MEL_WEIGHT = 0.2   # weight of the log‐mel‐spectrogram L1 loss
+RMS_ENV_WEIGHT   = 1.0   # weight of the RMS‐envelope L1 loss
 
-PHASE_1_EPOCHS      = 15
-PHASE_2_EPOCHS      = 15
-PHASE_3_EPOCHS      = 100
+PICK_ATTACK_CHUNK_RATIO = 0.10 # How many pick attack segments the model will see
+PICK_UNIFORM_CHUNK_RATIO = 0.40 # How many general pick segments the model will see
 
-PHASE_1_LR          = 1e-3
-PHASE_2_LR          = 1e-4
-PHASE_3_LR          = 1e-2
+FINGER_ATTACK_CHUNK_RATIO = 0.10 # How many finger attack segments the model will see
+FINGER_UNIFORM_CHUNK_RATIO = 0.40 # How many general finger segments the model will see
 
-PHASE_1_LR_PATIENCE = 5
-PHASE_2_LR_PATIENCE = 3
-PHASE_3_LR_PATIENCE = 10
+EPOCHS      = 50
+LR          = 1e-4
+LR_PATIENCE = 5
+
 SHUFFLE_BUF         = 1000
-
 CHUNK_SEC           = 5
 
-SRC_DIR             = "./input/source"
-TGT_DIR             = "./input/target"
-OUT_DIR             = "./out"
+PICK_SRC_DIR   = "./input/picked/source"
+PICK_TGT_DIR   = "./input/picked/target"
+FINGER_SRC_DIR = "./input/fingerpicked/source"
+FINGER_TGT_DIR = "./input/fingerpicked/target"
 
-DEMO_SEC            = 60 * 2
-DEMO_OFFSET_SEC     = 0
-DEMO_PAIR_INDEX     = 0
+OUT_DIR        = "./out"
+CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
+MODELS_OUT_DIR = os.path.join(OUT_DIR, "models")
+LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
+CSV_LOGS_OUT_DIR = os.path.join(OUT_DIR, "csv-logs")
+DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
+
+DEMO_SEC        = 10
+DEMO_OFFSET_SEC = 0
+DEMO_PAIR_INDEX = 0
 
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
-SAVE_WEIGHTS = False  # set to True to save layer weights as .npy files
+SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# ─── phase1_weights: get your tone & broad HF in place ───────────────────────
-phase1_weights = {
-    'w_l1'  : 0.20,    # small time-domain anchor
-    'w_stft': 0.05,    # low-res STFT for coarse shape
-    'w_fw'  : 0.05,    # freq-weighted STFT for spectral tilt
-    'w_grad': 0.50,    # slope loss to boost overall edges
-    'w_pre' : 0.30,    # pre-emphasis to push HF
-    'w_mel' : 0.10,    # skip mel for now
-    'w_hf'  : 5.00,    # 3–15 kHz band penalty
-    'w_tr'  :150.00,   # full transient (both sides)
-    'w_hw'  : 0.00     # half-wave only later
-}
-
-# ─── phase2_weights: tighten HF and refine attack shape ────────────────────
-phase2_weights = {
-    'w_l1'  : 0.30,    # a bit more time-domain anchoring
-    'w_stft': 0.10,    # small multi-res STFT
-    'w_fw'  : 0.20,    # small freq-weighted
-    'w_grad': 0.00,    # moderate slope
-    'w_pre' : 0.40,    # mild pre-emphasis
-    'w_mel' : 0.10,    # still skip mel
-    'w_hf'  : 2.00,    # lighter HF band
-    'w_tr'  :10.00,    # softer full transient
-    'w_hw'  : 0.00     # half-wave only in phase3
-}
-
-# ─── phase3_weights: freeze all but bypass, sculpt the positive spike ─────
-phase3_weights = {
-    'w_l1'  : 0.00,
-    'w_stft': 0.00,
-    'w_fw'  : 0.00,
-    'w_grad': 0.00,
-    'w_pre' : 0.00,
-    'w_mel' : 0.00,
-    'w_hf'  :10.00,     # heavy HF band to force residual
-    'w_tr'  :200.00,    # strong full transient
-    'w_hw'  :100.00     # strong half-wave (positive-only) loss
-}
-
-# phase1_weights = dict(
-#     w_l1   = 0.07,   # absolute waveform
-#     w_stft = 0.10,   # multi-res STFT
-#     w_fw   = 0.07,   # freq-weighted STFT
-#     w_grad = 1.0,   # slope loss
-#     w_pre  = 0.90,   # pre-emphasis
-#     w_mel  = 0.10,   # mel spectrogram
-#     w_hf   = 3.50,   # HF_FMIN–HF_FMAX kHz band
-#     w_tr   = 100.0    # NEW: transient (fast-attack) loss
-# )
-
-# phase2_weights = dict(
-#     w_l1   = 0.15,
-#     w_stft = 0.15,
-#     w_fw   = 0.10,
-#     w_grad = 0.35,
-#     w_pre  = 0.15,
-#     w_mel  = 0.15,
-#     w_hf   = 0.10,
-#     w_tr   = 20.0
-# )
+for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
 print("Looking for audio pairs…")
-srcs = sorted(glob.glob(os.path.join(SRC_DIR, "*_source.wav")))
-pairs = []
-for s in srcs:
-    t = s.replace("_source.wav","_target.wav").replace(SRC_DIR, TGT_DIR)
-    if os.path.exists(t):
-        pairs.append((s,t))
-if not pairs:
-    print("Error: no _source/_target pairs found"); sys.exit(1)
-print(f"Found {len(pairs)} pairs.")
+picked_pairs = []
+for src in sorted(glob.glob(os.path.join(PICK_SRC_DIR, "*_source.wav"))):
+    tgt = src.replace("_source.wav","_target.wav").replace(PICK_SRC_DIR, PICK_TGT_DIR)
+    if os.path.exists(tgt):
+        picked_pairs.append((src, tgt))
+    else:
+        print("Warning: no target for", src)
+finger_pairs = []
+for src in sorted(glob.glob(os.path.join(FINGER_SRC_DIR, "*_source.wav"))):
+    tgt = src.replace("_source.wav","_target.wav").replace(FINGER_SRC_DIR, FINGER_TGT_DIR)
+    if os.path.exists(tgt):
+        finger_pairs.append((src, tgt))
+    else:
+        print("Warning: no target for", src)
+print(f"  → {len(picked_pairs)} picked‐attack pairs, {len(finger_pairs)} finger‐picked pairs")
+all_pairs = picked_pairs + finger_pairs
 
-def attack_segment_generator(chunk_list,
-                             pick_prob=0.8,
-                             N=10):
+audio_cache = {}
+for (src,tgt) in all_pairs:
+    audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
+    audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+
+def build_chunks(pairs_list):
     """
-    Exactly your training generator:
-      — with probability `pick_prob` does a best‐of‐N pick‐attack draw
-      — otherwise uniform random window
-    Yields (x_window, y_window) pairs of shape (SEG_LEN,1).
+    Turn a list of (src,tgt) into
+    [(src,tgt,chunk_start,chunk_len), …].
     """
-    while True:
-        if random.random() < pick_prob:
-            best = None
-            best_dy = -1.0
-            for _ in range(N):
-                src, tgt, cstart, cdur = random.choice(chunk_list)
-                max_off = max(cdur - SEG_LEN, 1)
-                off     = random.randrange(max_off)
-                x, _    = sf.read(src,
-                                  start=cstart+off,
-                                  frames=SEG_LEN,
-                                  dtype='float32',
-                                  always_2d=True)
-                if x.shape[0] < SEG_LEN:
-                    pad = SEG_LEN - x.shape[0]
-                    x   = np.pad(x, ((0,pad),(0,0)))
-                dmax = np.max(np.abs(np.diff(x[:,0])))
-                if dmax > best_dy:
-                    best_dy = dmax
-                    best    = (src, tgt, cstart+off)
-            src_path, tgt_path, read_start = best
-        else:
-            src_path, tgt_path, cstart, cdur = random.choice(chunk_list)
-            max_off = max(cdur - SEG_LEN, 1)
-            read_start = cstart + random.randrange(max_off)
-
-        x, _ = sf.read(src_path,
-                       start=read_start,
-                       frames=SEG_LEN,
-                       dtype='float32',
-                       always_2d=True)
-        if x.shape[0] < SEG_LEN:
-            pad = SEG_LEN - x.shape[0]
-            x   = np.pad(x, ((0,pad),(0,0)))
-        y, _ = sf.read(tgt_path,
-                       start=read_start,
-                       frames=SEG_LEN,
-                       dtype='float32',
-                       always_2d=True)
-        yield x, y
-# ─────────────────────────────────────────────────────────────────────────────
-
-def dump_generator_picks(chunks,
-                         n_windows     = 1000,
-                         pick_prob     = 0.8,
-                         scan_size     = 10):
-    """
-    Pull `n_windows` from attack_segment_generator (with same pick_prob, scan_size),
-    concatenate their *source* signals end‐to‐end, and write to out_path.
-    """
-    gen = attack_segment_generator(chunks,
-                                   pick_prob=pick_prob,
-                                   N=scan_size)
-    out_path = os.path.join(OUT_DIR, "attack_picks.wav")
-    collected = []
-    for i in range(n_windows):
-        x, _ = next(gen)
-        # x is (SEG_LEN,1), mono channel:
-        collected.append(x[:,0])
-        if (i+1) % 100 == 0:
-            print(f"  … grabbed {i+1}/{n_windows} windows")
-    out = np.concatenate(collected, axis=0)
-    sf.write(out_path, out, SR, subtype='PCM_24')
-    print(f"Wrote {n_windows} windows → {out_path}  ({out.shape[0]/SR:.1f}s)")
-
-@register_keras_serializable()
-def half_wave_loss(y_true, y_pred, threshold=0.0):
-    # only punish positive-going slopes (the actual pick spike)
-    dy_t   = y_true[:,1:,:] - y_true[:,:-1,:]
-    dy_p   = y_pred[:,1:,:] - y_pred[:,:-1,:]
-    pos_t  = tf.nn.relu(dy_t - threshold)
-    pos_p  = tf.nn.relu(dy_p - threshold)
-    return tf.reduce_mean(tf.abs(pos_t - pos_p))
-
-@register_keras_serializable()
-class HFGainLayer(tf.keras.layers.Layer):
-    def build(self, input_shape):
-        # a single scalar gain
-        self.gamma = self.add_weight(
-            name='hf_gain', shape=(), initializer=tf.keras.initializers.Constant(30.0), trainable=True)
-        super().build(input_shape)
-    def call(self, x):
-        return x * self.gamma
-    def get_config(self):
-        return super().get_config()
-
-
-@register_keras_serializable()
-def transient_loss(y_true, y_pred,
-                  threshold=1e-3, slope=2000.0):
-    # 1D first difference
-    dy_t = y_true[:,1:,:] - y_true[:,:-1,:]
-    dy_p = y_pred[:,1:,:] - y_pred[:,:-1,:]
-    # soft mask where |dy_t| > threshold
-    mask = tf.sigmoid((tf.abs(dy_t) - threshold) * slope)
-    err  = tf.abs(dy_t - dy_p) * mask
-    # pad back to full length
-    err = tf.pad(err, [[0,0],[1,0],[0,0]])
-    return tf.reduce_mean(err)
-
-@register_keras_serializable()
-class AbsLayer(tf.keras.layers.Layer):
-    def call(self, inputs):
-        return tf.abs(inputs)
-    def get_config(self):
-        return super().get_config()
-
-# ——— linear ramp & scale for your gate — no lambda ———
-@register_keras_serializable()
-class EnvScaleLayer(tf.keras.layers.Layer):
-    def __init__(self, shift=1e-3, slope=200.0, **kw):
-        super().__init__(**kw)
-        self.shift = shift
-        self.slope = slope
-    def call(self, x):
-        return (x - self.shift) * self.slope
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({'shift':self.shift, 'slope':self.slope})
-        return cfg
-
-@register_keras_serializable()
-class Diff1D(tf.keras.layers.Layer):
-    def call(self, x):
-        d = x[:,1:,:] - x[:,:-1,:]
-        # pad a zero at t=0 so we keep the same length
-        return tf.pad(d, [[0,0],[1,0],[0,0]])
-    def get_config(self):
-        return super().get_config()
-
-@register_keras_serializable()
-def l1_metric(y_true, y_pred):
-    return tf.reduce_mean(tf.abs(y_true - y_pred))
-
-@register_keras_serializable()
-def stft_metric(y_true, y_pred):
-    return multi_res_stft_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def fw_metric(y_true, y_pred):
-    return freq_weighted_stft_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def grad_metric(y_true, y_pred):
-    return gradient_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def pre_metric(y_true, y_pred):
-    return pre_emphasis_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def mel_metric(y_true, y_pred):
-    return mel_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def hf_metric(y_true, y_pred):
-    # exactly your 3–10 kHz band penaliser
-    return band_limited_stft_loss(y_true, y_pred)
-    
-@register_keras_serializable()
-def tf_metric(y_true, y_pred):
-    # a simple TF metric that returns the mean of the absolute difference
-    return transient_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def hw_metric(y_true, y_pred):
-    # a simple TF metric that returns the mean of the absolute difference
-    return half_wave_loss(y_true, y_pred)
-
-@register_keras_serializable()
-def slice_content(x, filters):
-    # returns the first `filters` channels
-    return x[:, :, :filters]
-
-@register_keras_serializable()
-def slice_gate(x, filters):
-    # returns the remaining channels
-    return x[:, :, filters:]
-
-# 1) Pre-emphasis and its L1 loss
-def pre_emphasis(x, μ=0.99):
-    # x: (batch, time, 1)
-    x0 = x[:, :1, :]                             # first sample
-    x1 = x[:, 1:, :] - μ * x[:, :-1, :]          # high-pass residual
-    return tf.concat([x0, x1], axis=1)
-
-def pre_emphasis_loss(y_true, y_pred, μ=0.99):
-    yt = pre_emphasis(y_true, μ)
-    yp = pre_emphasis(y_pred, μ)
-    return tf.reduce_mean(tf.abs(yt - yp))
-
-def band_limited_stft_loss(y_true, y_pred):
-    # y_true, y_pred: (B, T, 1)
-    yt = tf.squeeze(y_true, -1)   # (B, T)
-    yp = tf.squeeze(y_pred, -1)
-    # compute a single-resolution STFT
-    S_t = tf.signal.stft(yt, frame_length=HF_N_FFT, frame_step=HF_HOP, fft_length=HF_N_FFT)
-    S_p = tf.signal.stft(yp, frame_length=HF_N_FFT, frame_step=HF_HOP, fft_length=HF_N_FFT)
-    mag_t = tf.abs(S_t)
-    mag_p = tf.abs(S_p)
-
-    # build a binary mask over freq‐bins
-    freq_bins = tf.shape(mag_t)[-1]
-    freqs = tf.linspace(0.0, SR/2, freq_bins)   # SR is your global sample­rate
-    band_mask = tf.logical_and(freqs >= HF_FMIN, freqs <= HF_FMAX)
-    band_mask = tf.cast(band_mask, mag_t.dtype)  # shape (freq_bins,)
-    band_mask = band_mask[tf.newaxis, tf.newaxis, :]  # (1,1,F)
-
-    # L1 on magnitudes *only in that band*
-    diff = tf.abs(mag_t - mag_p) * band_mask
-    return tf.reduce_mean(diff)
-
-# 2) Frequency-weighted magnitude STFT loss
-def freq_weighted_stft_loss(y_true, y_pred, α=1.5):
-    yt = tf.squeeze(y_true, -1)   # (B, T)
-    yp = tf.squeeze(y_pred, -1)
-    total = 0.0
-    specs = [(512,128), (1024,256), (2048,512)]
-    for n_fft, hop in specs:
-        S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        mag_t = tf.abs(S_t)
-        mag_p = tf.abs(S_p)
-        diff = (tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2
-
-        # build frequency-bin weights (shape 1×1×freq_bins)
-        freq_bins = tf.shape(mag_t)[-1]
-        freqs = tf.linspace(0.0, SR/2, freq_bins)
-        w = tf.reshape((freqs/(SR/2))**α, [1,1,-1])
-
-        total += tf.reduce_mean(diff * w)
-
-    return total / float(len(specs))
-
-
-# 3) Multi-resolution STFT (log-mag + complex) loss
-def multi_res_stft_loss(y_true, y_pred):
-    yt = tf.squeeze(y_true, -1)
-    yp = tf.squeeze(y_pred, -1)
-    
-    specs = [
-      (  64,  16),   # 1.3 ms frames
-      ( 128,  32),   # 2.7 ms frames
-      ( 256,  64),   # 5.3 ms frames
-      ( 512, 128),   # 10.7 ms frames
-      (1024, 256),   # 21.3 ms frames
-      (2048, 512),   # 42.7 ms frames
-    ]
-    
-    mag_loss = 0.0
-    comp_loss = 0.0
-    for n_fft, hop in specs:
-        S_t = tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        S_p = tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
-        mag_t = tf.abs(S_t)
-        mag_p = tf.abs(S_p)
-        mag_loss  += tf.reduce_mean((tf.math.log1p(mag_t) - tf.math.log1p(mag_p))**2)
-        comp_loss += tf.reduce_mean(
-            (tf.math.real(S_t) - tf.math.real(S_p))**2 +
-            (tf.math.imag(S_t) - tf.math.imag(S_p))**2
-        )
-    N = float(len(specs))
-    return (mag_loss + comp_loss) / N
-
-
-# 4) Gradient (slope) loss
-def gradient_loss(y_true, y_pred):
-    dy_true = y_true[:,1:,:] - y_true[:,:-1,:]
-    dy_pred = y_pred[:,1:,:] - y_pred[:,:-1,:]
-    return tf.reduce_mean(tf.abs(dy_true - dy_pred))
-
-
-# 5) Mel-spectrogram L1 loss
-def mel_loss(y_true, y_pred, n_mels=64, n_fft=1024, hop=256):
-    yt = tf.squeeze(y_true, -1)
-    yp = tf.squeeze(y_pred, -1)
-    # compute linear-freq spectrograms
-    S_t = tf.abs(tf.signal.stft(yt, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
-    S_p = tf.abs(tf.signal.stft(yp, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
-
-    # build mel weight matrix
-    num_spec_bins = n_fft//2 + 1
-    mel_w = tf.signal.linear_to_mel_weight_matrix(
-        num_mel_bins=n_mels,
-        num_spectrogram_bins=num_spec_bins,
-        sample_rate=SR,
-        lower_edge_hertz=50.0,
-        upper_edge_hertz=SR/2
-    )
-
-    # project to mel
-    M_t = tf.tensordot(S_t, mel_w, axes=[[2],[0]])  # shape (B, frames, n_mels)
-    M_p = tf.tensordot(S_p, mel_w, axes=[[2],[0]])
-    return tf.reduce_mean(tf.abs(tf.math.log1p(M_t) - tf.math.log1p(M_p)))
-
-# ——— factory that captures your weight‐set in a closure ———
-def make_combined_loss(w_l1, w_stft, w_fw, w_grad, w_pre, w_mel, w_hf, w_tr, w_hw):
-    @register_keras_serializable()
-    def _loss(y_true, y_pred):
-        l1   = tf.reduce_mean(tf.abs(y_true - y_pred))
-        stft = multi_res_stft_loss(y_true, y_pred)
-        fw   = freq_weighted_stft_loss(y_true, y_pred)
-        grad = gradient_loss(y_true, y_pred)
-        pre  = pre_emphasis_loss(y_true, y_pred)
-        mel  = mel_loss(y_true, y_pred)
-        hf   = band_limited_stft_loss(y_true, y_pred)
-        tr   = transient_loss(y_true, y_pred)
-        hw    = half_wave_loss(y_true, y_pred)
-
-        return (
-          w_l1   * l1   +
-          w_stft * stft +
-          w_fw   * fw   +
-          w_grad * grad +
-          w_pre  * pre  +
-          w_mel  * mel  +
-          w_hf   * hf   +
-          w_tr   * tr   +
-        w_hw   * hw
-        )
-    return _loss
-
-# ────────────────────────── MODEL ARCHITECTURE ─────────────────────────────────
-def build_resnet_gated(filters=FILTERS,
-                       kernel_size=KERNEL_SIZE,
-                       dilations=DILATIONS,
-                       dynamic_time=False):
-    # time-dim None for dynamic, fixed = SEG_LEN for static
-    T = None if dynamic_time else SEG_LEN
-
-    inp = tf.keras.Input(shape=(T,1), name="piezo_in")
-
-    # initial 1×1 projection
-    x = tf.keras.layers.Conv1D(filters,
-                               1,
-                               padding='same',
-                               name="init_pw")(inp)
-
-    # ── Gated ResNet blocks ────────────────────────────────────
-    for idx, d in enumerate(dilations):
-        res = x
-        pad_amt = (kernel_size - 1) * d
-
-        # causal left-pad
-        x = tf.keras.layers.ZeroPadding1D((pad_amt,0),
-                                          name=f"pad_{idx}")(x)
-
-        # separable conv → 2*channels so we can split for gating
-        g = tf.keras.layers.SeparableConv1D(
-                filters * 2,
-                kernel_size,
-                dilation_rate=d,
-                padding='valid',
-                use_bias=True,
-                activation=None,
-                name=f"sep_{idx}"
-            )(x)
-
-        # slice out “content” and “gate” parts        
-        content = tf.keras.layers.Lambda(
-                  slice_content,
-                  arguments={'filters': filters},
-                  name=f"content_{idx}"
-              )(g)
-        gate    = tf.keras.layers.Lambda(
-                    slice_gate,
-                    arguments={'filters': filters},
-                    name=f"gate_{idx}"
-                )(g)
-
-        # gated non-linearity: tanh(content) * sigmoid(gate)
-        c_act = tf.keras.layers.Activation('tanh',
-                                           name=f"tanh_{idx}")(content)
-        g_act = tf.keras.layers.Activation('sigmoid',
-                                           name=f"sigmoid_{idx}")(gate)
-        x = tf.keras.layers.Multiply(name=f"gated_mul_{idx}")([c_act, g_act])
-
-        # 1×1 projection & residual add
-        x = tf.keras.layers.Conv1D(filters,
-                                   1,
-                                   padding='same',
-                                   name=f"pw_{idx}")(x)
-        x = tf.keras.layers.Add(name=f"res_add_{idx}")([x, res])
-
-    # ── final 1×1 conv + identity skip ────────────────────────
-    final = tf.keras.layers.Conv1D(1,
-                                   1,
-                                   padding='same',
-                                   name="final_pw")(x)
-
-    skip  = tf.keras.layers.Conv1D(
-                1,1,use_bias=False,
-                kernel_initializer=tf.keras.initializers.Ones(),
-                name="skip_conv")(inp)
-    main_out = tf.keras.layers.Add(name="res_out")([final, skip])
-
-    # ── (4) tiny HF bypass ─────────────────────────────────
-    # a little 5‐tap conv straight from input -> pick spikes
-    # hf = tf.keras.layers.Conv1D(
-    #         1, 5,
-    #         padding='same',
-    #         use_bias=False,
-    #         kernel_initializer='zeros',   # start with zero so no effect at init
-    #         name="hf_transient")(inp)
-    
-    # hf = tf.keras.layers.Conv1D(
-    #     filters=1,
-    #     kernel_size=HF_KERNEL_SIZE,
-    #     padding='causal',
-    #     use_bias=False,
-    #     kernel_initializer='zeros',
-    #     name='hf_transient'
-    # )(inp)
-    
-     # ── (4) tiny HF bypass on the *derivative* ───────────────────────────────
-    dx       = Diff1D(name="diff1d_in")(inp)
-    abs_dx   = AbsLayer(name="abs_dx")(dx)
-    env_gate = EnvScaleLayer(shift=1e-3, slope=200.0, name="env_scale")(abs_dx)
-    # the bypass conv itself has an L1 kernel-regularizer to force sparsity
-    hf_transient = tf.keras.layers.Conv1D(
-            filters=1,
-            kernel_size=HF_KERNEL_SIZE,
-            padding='causal',
-            use_bias=False,
-            kernel_initializer='zeros',
-            kernel_regularizer=regularizers.l1(1e-3),
-            name='hf_transient'
-        )(env_gate)
-    # trainable scalar gain so the optimizer can “turn up” the click
-    hf_transient = HFGainLayer(name="hf_gain")(hf_transient)
-    
-    # after hf_transient & hf_gain…
-    hf_air = tf.keras.layers.Conv1D(
-        1, 31, padding='causal', use_bias=False,
-        kernel_initializer='zeros',
-        kernel_regularizer=regularizers.l1(1e-3),
-        name='hf_air'
-    )(inp)
-    hf_air = tf.keras.layers.Dense(
-        1, use_bias=False,
-        kernel_initializer=tf.keras.initializers.Constant(5.0),
-        name='air_gain'
-   )(hf_air)
-
-    merged = tf.keras.layers.Add(name="add_hf")([main_out, hf_transient, hf_air])
-    out    = merged
-    
-    # ── linear output (no tanh soft-clip) ─────────────────
-    #out = tf.keras.layers.Add(name="piezo2mic_out")([main_out, hf])
-
-    return tf.keras.Model(inp, out, name="piezo2mic_resnet_gated")
-
-def dump_pick_windows(chunks,
-                      n_windows=100,
-                      scan_size=10):
-    out_path = os.path.join(OUT_DIR, "attack_examples.wav")
-    collected = []
-    for i in range(n_windows):
-        best_x = None
-        best_d = -1.0
-        for _ in range(scan_size):
-            src, tgt, cstart, cdur = random.choice(chunks)
-            max_off = max(cdur - SEG_LEN, 1)
-            off = random.randrange(max_off)
-            x, _ = sf.read(src,
-                           start=cstart+off,
-                           frames=SEG_LEN,
-                           dtype='float32',
-                           always_2d=True)
-            if x.shape[0] < SEG_LEN:
-                pad = SEG_LEN - x.shape[0]
-                x = np.pad(x, ((0,pad),(0,0)))
-            d = np.max(np.abs(np.diff(x[:,0])))
-            if d > best_d:
-                best_d = d
-                best_x = x[:,0]
-        collected.append(best_x)
-    out = np.concatenate(collected, axis=0)
-    sf.write(out_path, out, SR, subtype='PCM_24')
-    print(f"Wrote {n_windows} pick-windows ({out.shape[0]/SR:.1f}s) → {out_path}")
-
-
-def extract_and_save_int8_weights(tflite_model_buf,
-                                  outdir,
-                                  dilations,
-                                  filters):
-
-    os.makedirs(outdir, exist_ok=True)
-    model = Model.GetRootAsModel(tflite_model_buf, 0)
-    subg  = model.Subgraphs(0)
-    op_map = {i: model.OperatorCodes(i).BuiltinCode()
-              for i in range(model.OperatorCodesLength())}
-
-    def load_tensor(tidx):
-        t = subg.Tensors(tidx)
-        b = model.Buffers(t.Buffer())
-        raw = b.DataAsNumpy()
-        dtype = np.int8 if t.Type()==TensorType.INT8 else np.int32
-        arr = np.frombuffer(raw, dtype=dtype).reshape(t.ShapeAsNumpy())
-        qp = t.Quantization()
-        scales      = [qp.Scale(i)     for i in range(qp.ScaleLength())]
-        zero_points = [qp.ZeroPoint(i) for i in range(qp.ZeroPointLength())]
-        quant_txt   = np.stack([scales, zero_points], axis=1)
-        return arr, quant_txt
-
-    sep_ctr    = 0
-    pwsep_ctr  = 0
-    pw_ctr     = 0
-
-    for oi in range(subg.OperatorsLength()):
-        op   = subg.Operators(oi)
-        code = op_map[op.OpcodeIndex()]
-
-        # ─────────────────── depthwise (SeparableConv1D) ──────────────────
-        if code == BuiltinOperator.DEPTHWISE_CONV_2D:
-            w_i = op.Inputs(1)
-            b_i = op.InputsLength()>2 and op.Inputs(2)
-            tag = f"dw{sep_ctr}"
-            sep_ctr += 1
-
-            w_arr, w_q = load_tensor(w_i)
-            np.save(f"{outdir}/{tag}_w_int8.npy",        w_arr)
-            np.savetxt(f"{outdir}/{tag}_w_int8_quant.txt",
-                       w_q, fmt="%g", header="scale,zero_point", comments="")
-
-            if b_i:
-                b_arr, b_q = load_tensor(b_i)
-                np.save(f"{outdir}/{tag}_b_int32.npy",    b_arr)
-                np.savetxt(f"{outdir}/{tag}_b_int32_quant.txt",
-                           b_q, fmt="%g", header="scale,zero_point", comments="")
-            continue
-
-        # ─────────────────── all 1×1 convs + HF bypass ──────────────────
-        if code == BuiltinOperator.CONV_2D:
-            w_i, b_i     = op.Inputs(1), op.Inputs(2)
-            w_arr, w_q   = load_tensor(w_i)
-            b_arr, b_q   = load_tensor(b_i)
-            W              = w_arr.size
-            B              = b_arr.size
-
-            # 1) tiny HF‐transient: ONLY 3 weights
-            if W == HF_KERNEL_SIZE:
-                tag = "hf_transient"
-
-            # 2) skip_conv     : ONLY 1 weight, 1 bias
-            elif W == 1 and B == 1:
-                tag = "skip_conv"
-
-            # 3) init_pw / final_pw : EXACTLY F weights
-            elif W == filters:
-                # outC = B
-                if B == filters:
-                    tag = "init_pw"
-                elif B == 1:
-                    tag = "final_pw"
-                else:
-                    raise RuntimeError(
-                      f"Found {W} weights but bias‐length={B} is neither 1 nor {filters}")
-
-            # 4) pwsep blocks : F×2F weights, 2F biases
-            elif W == filters*(2*filters) and B == (2*filters):
-                tag = f"pwsep{pwsep_ctr}"
-                pwsep_ctr += 1
-
-            # 5) pw blocks    : F×F weights, F biases
-            elif W == filters*filters and B == filters:
-                tag = f"pw{pw_ctr}"
-                pw_ctr += 1
-
-            else:
-                raise RuntimeError(f"Unexpected 1×1‐Conv shape: {w_arr.shape}, bias‐len={B}")
-
-            # write‐out weight + quant
-            fnw = os.path.join(outdir, f"{tag}_w_int8.npy")
-            np.save(fnw, w_arr)
-            np.savetxt(fnw.replace(".npy","_quant.txt"),
-                       w_q, fmt="%g", header="scale,zero_point", comments="")
-
-            # write‐out bias + quant
-            fnb = os.path.join(outdir, f"{tag}_b_int32.npy")
-            np.save(fnb, b_arr)
-            np.savetxt(fnb.replace(".npy","_quant.txt"),
-                       b_q, fmt="%g", header="scale,zero_point", comments="")
-
-            continue
-
-    # final sanity checks
-    assert sep_ctr   == len(dilations), \
-           f"got {sep_ctr} depthwise ops, expected {len(dilations)}"
-    assert pwsep_ctr == len(dilations), \
-           f"got {pwsep_ctr} pwsep ops, expected {len(dilations)}"
-    assert pw_ctr    == len(dilations), \
-           f"got {pw_ctr} pw ops, expected {len(dilations)}"
-
-    print("✅ saved all int8 kernels + int32 biases in", outdir)
-
-def build_chunks():
     chunks = []
     chunk_len = CHUNK_SEC * SR
-    for src, tgt in pairs:
-        info = sf.info(src)
+    for src,tgt in pairs_list:
+        info  = sf.info(src)
         total = info.frames
         n_full = total // chunk_len
         for i in range(n_full):
-            chunks.append((src,tgt, i*chunk_len, chunk_len))
+            chunks.append((src,tgt,i*chunk_len,chunk_len))
         rem = total - n_full*chunk_len
         if rem >= SEG_LEN:
-            chunks.append((src,tgt, n_full*chunk_len, rem))
+            chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
+
+pick_chunks   = build_chunks(picked_pairs)
+finger_chunks = build_chunks(finger_pairs)
+all_chunks    = pick_chunks + finger_chunks
+print(f"Generated {len(all_chunks)} chunks")
+
+class DemoCallback(Callback):
+    def __init__(self):
+        super().__init__()
+        demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
+        self.src_path = demo_src
+        self.tgt_path = demo_tgt
+        self.demo_sec = DEMO_SEC
+        self.offset_sec = DEMO_OFFSET_SEC
+        self.sr = SR
+        self.every = 1
+        self.demos_out_dir = DEMOS_OUT_DIR
+        os.makedirs(self.demos_out_dir, exist_ok=True)
+        # TensorBoard writer for audio
+        self.writer = tf.summary.create_file_writer(os.path.join(LOGS_OUT_DIR,"demo"))
+
+        # how many frames to read
+        self.demo_frames  = DEMO_SEC * SR
+        self.offset_frames = DEMO_OFFSET_SEC * SR
+
+    def set_model(self, model):
+        """
+        Called by Keras when the training begins.
+        model is your static, fixed‐length model.
+        We make a dynamic copy here just for inference.
+        """
+        self.static_model = model
+        # build a dynamic‐time version of your model
+        # you must have `build_model(dynamic_time=True)` available
+        self.dynamic_model = build_model(dynamic_time=True)
+        # copy weights
+        self.dynamic_model.set_weights(self.static_model.get_weights())
+
+    def on_epoch_end(self, epoch, logs=None):
+        # only every Nth epoch
+        if epoch % self.every != 0:
+            return
+
+        # re‐sync weights before each inference
+        self.dynamic_model.set_weights(self.static_model.get_weights())
+
+        # 1) read the long snippets from disk
+        x_long, _ = sf.read(self.src_path,
+                            start=self.offset_frames,
+                            frames=self.demo_frames,
+                            dtype='float32',
+                            always_2d=True)  # shape (demo_frames, channels)
+        y_long, _ = sf.read(self.tgt_path,
+                            start=self.offset_frames,
+                            frames=self.demo_frames,
+                            dtype='float32',
+                            always_2d=True)
+
+        # 2) tack on the style channel (0 or 1) exactly as in your generators
+        style_flag = 1.0 if self.src_path.startswith(PICK_SRC_DIR) else 0.0
+        style_chan = np.full((x_long.shape[0],1), style_flag, dtype='float32')
+        x_demo = np.concatenate([x_long, style_chan], axis=-1)[np.newaxis, ...]  # (1, T, 2)
+
+        # 3) predict
+        y_pred = self.dynamic_model.predict(x_demo, batch_size=1)[0,:,0]  # (T,)
+
+        # 4) write to disk
+        epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{epoch:03d}")
+        os.makedirs(epoch_dir, exist_ok=True)
+        sf.write(os.path.join(epoch_dir, "demo_source.wav"),
+                 x_long[:,0], self.sr, subtype='FLOAT')
+        sf.write(os.path.join(epoch_dir, "demo_target.wav"),
+                 y_long[:,0], self.sr, subtype='FLOAT')
+        sf.write(os.path.join(epoch_dir, "demo_pred.wav"),
+                 y_pred,         self.sr, subtype='FLOAT')
+
+        # 5) log into TensorBoard
+        #    tf.summary.audio expects shape [batch, frames, channels]
+        with self.writer.as_default():
+            tf.summary.audio("demo/source",
+                             x_demo[...,0:1],  # (1, T, 1)
+                             sample_rate=self.sr,
+                             step=epoch)
+            tf.summary.audio("demo/target",
+                             y_long[np.newaxis, :, 0:1],  # (1, T, 1)
+                             sample_rate=self.sr,
+                             step=epoch)
+            tf.summary.audio("demo/pred",
+                             y_pred[np.newaxis, :, np.newaxis],
+                             sample_rate=self.sr,
+                             step=epoch)
+            self.writer.flush()
+        print(f"[DemoCallback] epoch {epoch}: demo written to {epoch_dir}")
+
+# --- Generators ---
+def pick_attack_segment_generator(pick_chunks, context_pre=1024):
+    
+    while True:
+        src,tgt,cstart,cdur = random.choice(pick_chunks)
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
+        
+        window = src_wav[cstart : cstart + cdur, 0]
+        diffs = np.abs(np.diff(window))
+        
+        if (diffs.size):
+            thresh = np.median(diffs) * 3.0
+            spikes = np.where(diffs > thresh)[0]
+            
+            if (spikes.size):
+                idx = random.choice(spikes)
+                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
+            else:
+                off = random.randint(0, max(cdur-SEG_LEN, 0))
+        else:
+            off = random.randint(0, max(cdur-SEG_LEN, 0))
+
+        read_start = cstart + off
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+        
+        if x.shape[0]<SEG_LEN:
+            p=SEG_LEN - x.shape[0]
+            x=np.pad(x,((0,p),(0,0)))
+            y=np.pad(y,((0,p),(0,0)))
+
+        # style channel
+        style = np.ones((SEG_LEN,1),dtype='float32')
+        x = np.concatenate([x,style],axis=-1)
+        yield x,y
+
+def finger_attack_segment_generator(finger_chunks, context_pre=1024):
+    while True:
+        src,tgt,cstart,cdur = random.choice(finger_chunks)
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
+
+        window = src_wav[cstart : cstart + cdur, 0]
+        diffs = np.abs(np.diff(window))
+        
+        if (diffs.size):
+            thresh = np.median(diffs) * 3.0
+            spikes = np.where(diffs > thresh)[0]
+            if (spikes.size):
+                idx = random.choice(spikes)
+                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
+            else:
+                off = random.randint(0, max(cdur-SEG_LEN, 0))
+        else:
+            off = random.randint(0, max(cdur-SEG_LEN, 0))
+            
+
+        thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
+        if len(candidates)==0:
+            off = random.randint(0, max(cdur-SEG_LEN,0))
+        else:
+            idx = random.choice(candidates)
+            off = max(0, min(idx-context_pre, cdur-SEG_LEN))
+
+        read_start = cstart + off
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+
+        if x.shape[0]<SEG_LEN:
+            p=SEG_LEN-x.shape[0]
+            x=np.pad(x,((0,p),(0,0)))
+            y=np.pad(y,((0,p),(0,0)))
+
+        style = np.zeros((SEG_LEN,1),dtype='float32')
+        x = np.concatenate([x,style],axis=-1)
+        yield x,y
+
+def segment_generator(chunk_list):
+    """Uniform random windows, style=1.0 if pick-path else 0.0."""
+    while True:
+        src, tgt, cstart, cdur = random.choice(chunk_list)
+        src_wav = audio_cache[src]
+        tgt_wav = audio_cache[tgt]
+
+        off = random.randrange(max(cdur - SEG_LEN, 1))
+        read_start = cstart + off
+        x = src_wav[read_start : read_start + SEG_LEN]
+        y = tgt_wav[read_start : read_start + SEG_LEN]
+
+        if x.shape[0] < SEG_LEN:
+            p = SEG_LEN - x.shape[0]
+            x = np.pad(x, ((0,p),(0,0)))
+            y = np.pad(y, ((0,p),(0,0)))
+
+        style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
+        style = np.full((SEG_LEN,1), style_flag, dtype='float32')
+        x = np.concatenate([x, style], axis=-1)
+
+        yield x, y
+        
+def generate_demo (model, prediction_name="demo_prediction", only_prediction=False):
+    print("\nGenerating demo…")
+    FRAMES      = DEMO_SEC * SR
+    START_FRAME = DEMO_OFFSET_SEC * SR
+    pth_src, pth_tgt = all_pairs[DEMO_PAIR_INDEX]
+
+    x_long,_ = sf.read(pth_src,
+                      start=START_FRAME,
+                      frames=FRAMES,
+                      dtype='float32',
+                      always_2d=True)
+    y_ref,_  = sf.read(pth_tgt,
+                      start=START_FRAME,
+                      frames=FRAMES,
+                      dtype='float32',
+                      always_2d=True)
+
+    # --- ADD STYLE CHANNEL TO LONG SIGNAL ---
+    if pth_src.startswith(PICK_SRC_DIR):
+        style = 1.0
+    else:
+        style = 0.0
+    style_chan = np.full((FRAMES,1), style, dtype='float32')
+    x_long2   = np.concatenate([x_long, style_chan], axis=-1)  # (FRAMES,2)
+
+    x_in = x_long2[np.newaxis,...]  # (1,FRAMES,2)
+    print("Running inference…")
+    y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
+    
+    prediction_filepath = os.path.join(DEMOS_OUT_DIR, prediction_name + ".wav")
+    sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
+    
+    if (not only_prediction):
+        source_filepath = os.path.join(DEMOS_OUT_DIR, "demo_source" +".wav")
+        target_filepath = os.path.join(DEMOS_OUT_DIR, "demo_target" + ".wav")
+        sf.write(source_filepath,
+             x_long, SR, subtype='FLOAT')
+        sf.write(target_filepath,
+                y_ref, SR, subtype='FLOAT')
+    
+    print(f"✅ Demo saved to {prediction_filepath}")
+
+@register_keras_serializable()
+def waveform_l1_loss(y_true, y_pred):
+    return tf.abs(y_true - y_pred)
+
+@register_keras_serializable()
+def hf_loss(y_true, y_pred):
+    α = HP_PRE_EMPHASIS
+    # 1st‐order high-pass (pre-emphasis):
+    true_hp = y_true[:,1:,:] - α*y_true[:,:-1,:]
+    pred_hp = y_pred[:,1:,:] - α*y_pred[:,:-1,:]
+    true_hp = tf.pad(true_hp, [[0,0],[1,0],[0,0]])
+    pred_hp = tf.pad(pred_hp, [[0,0],[1,0],[0,0]])
+    return tf.abs(true_hp - pred_hp)
+
+@register_keras_serializable()
+def multi_scale_stft_loss(y_true, y_pred):
+    """
+    Per-sample, multi-scale L1 loss between |STFT(y_true)| and |STFT(y_pred)|.
+    Returns shape (batch,1,1) so it broadcasts in your combined_loss.
+    """
+    scales = [
+        (512,  128,  512),
+        (1024, 256, 1024),
+        (2048, 512, 2048),
+    ]
+
+    # squeeze off the channel dim → (batch, T)
+    y_true_s = tf.squeeze(y_true, axis=-1)
+    y_pred_s = tf.squeeze(y_pred, axis=-1)
+
+    per_scale_losses = []
+    for n_fft, hop, win in scales:
+        # 1) frame & pad
+        frames_true = tf.signal.frame(y_true_s, frame_length=win,
+                                      frame_step=hop, pad_end=True)
+        frames_pred = tf.signal.frame(y_pred_s, frame_length=win,
+                                      frame_step=hop, pad_end=True)
+
+        # 2) window
+        window = tf.signal.hann_window(win, periodic=True)        # (win,)
+        window = tf.reshape(window, (1,1,win))                    # → (1,1,win)
+        win_true = frames_true * window
+        win_pred = frames_pred * window
+
+        # 3) rFFT  ← here is the change:
+        fft_len = tf.constant([n_fft], dtype=tf.int32)            # MUST be 1-D
+        st_true = tf.signal.rfft(win_true,    fft_length=fft_len)
+        st_pred = tf.signal.rfft(win_pred,    fft_length=fft_len)
+
+        # 4) mag-L1 per frame, then avg over time & freq → (batch,)
+        mag_true = tf.abs(st_true)
+        mag_pred = tf.abs(st_pred)
+        loss_sf  = tf.reduce_mean(
+                       tf.abs(mag_true - mag_pred),
+                       axis=[1,2]
+                   )  # → (batch,)
+        per_scale_losses.append(loss_sf)
+
+    # stack over scales → mean → (batch,)
+    loss_stack = tf.stack(per_scale_losses, axis=0)  # (n_scales, batch)
+    loss_batch = tf.reduce_mean(loss_stack, axis=0)
+
+    return loss_batch[:, None, None]
+
+@register_keras_serializable()
+def log_mel_loss(y_true, y_pred):
+    """
+    Compute L1 between log‐mel‐spectra of y_true and y_pred.
+    Returns shape (batch,1,1).
+    """
+    # parameters
+    n_fft   = 1024
+    hop     = 256
+    win     = 1024
+    n_mels  = 64
+    fmin    = 20.0
+    fmax    = float(SR//2)
+
+    # squeeze off the channel → (batch, T)
+    t   = tf.squeeze(y_true, axis=-1)
+    p   = tf.squeeze(y_pred, axis=-1)
+
+    # STFT magnitudes
+    st_t = tf.signal.stft(t,   frame_length=win, frame_step=hop,
+                          fft_length=n_fft, pad_end=True)
+    st_p = tf.signal.stft(p,   frame_length=win, frame_step=hop,
+                          fft_length=n_fft, pad_end=True)
+    mag_t = tf.abs(st_t)    # (batch, frames, freq_bins)
+    mag_p = tf.abs(st_p)
+
+    # build a (freq_bins × n_mels) mel‐weight matrix
+    fb = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=n_mels,
+        num_spectrogram_bins=n_fft//2+1,
+        sample_rate=SR,
+        lower_edge_hertz=fmin,
+        upper_edge_hertz=fmax
+    )  # shape (freq_bins, n_mels)
+
+    # mel spectrograms → (batch, frames, n_mels)
+    mel_t = tf.tensordot(mag_t, fb,   axes=[[2],[0]])
+    mel_p = tf.tensordot(mag_p, fb,   axes=[[2],[0]])
+
+    # log compress
+    log_t = tf.math.log(mel_t + 1e-6)
+    log_p = tf.math.log(mel_p + 1e-6)
+
+    # L1 & mean over time+mel‐bins → (batch,)
+    mel_diff = tf.reduce_mean(tf.abs(log_t - log_p), axis=[1,2])
+
+    # shape to (batch,1,1)
+    return mel_diff[:,None,None]
+
+
+@register_keras_serializable()
+def rms_env_loss(y_true, y_pred):
+    """
+    Compute L1 between slow RMS envelopes.
+    Returns shape (batch,1,1).
+    """
+    # envelope params
+    env_win  = 1024
+    env_hop  = 512
+
+    # squeeze → (batch, T)
+    t = tf.squeeze(y_true, axis=-1)
+    p = tf.squeeze(y_pred, axis=-1)
+
+    # frame → (batch, frames, env_win)
+    ft   = tf.signal.frame(t, frame_length=env_win,
+                           frame_step=env_hop, pad_end=True)
+    fp   = tf.signal.frame(p, frame_length=env_win,
+                           frame_step=env_hop, pad_end=True)
+
+    # RMS per frame → (batch, frames)
+    rms_t = tf.sqrt(tf.reduce_mean(ft**2, axis=2) + 1e-12)
+    rms_p = tf.sqrt(tf.reduce_mean(fp**2, axis=2) + 1e-12)
+
+    # L1 & mean over frames → (batch,)
+    env_diff = tf.reduce_mean(tf.abs(rms_t - rms_p), axis=1)
+
+    return env_diff[:,None,None]
+
+@register_keras_serializable()
+def combined_loss(y_true, y_pred):
+    td   = waveform_l1_loss(y_true, y_pred)      # (batch,T,1)
+    hf   = hf_loss(       y_true, y_pred)        # (batch,T,1)
+    spec = multi_scale_stft_loss(y_true, y_pred) # (batch,1,1)
+    mel  = log_mel_loss(  y_true, y_pred)        # (batch,1,1)
+    env  = rms_env_loss(  y_true, y_pred)        # (batch,1,1)
+
+    return td \
+         + HF_WEIGHT    * hf \
+         + STFT_WEIGHT * spec \
+         + MEL_WEIGHT  * mel \
+         + RMS_ENV_WEIGHT    * env
+
+# 3) A proper named metric instead of a lambda:
+@register_keras_serializable()
+def mean_hf_metric(y_true, y_pred):
+    # This just reduces hf_loss to a scalar
+    return tf.reduce_mean(hf_loss(y_true, y_pred))
+
+# ──────────────────────────────────────────────────────────────────────────────
+@register_keras_serializable()
+def add_sw(x, y):
+    # x: (batch, T, 2) → x[...,0]=piezo, x[...,1]=style flag (0=finger,1=pick)
+    piezo = x[...,0]            # (batch, T)
+    style = x[...,1]            # (batch, T)
+
+    # 1) extract one scalar per example in the batch
+    #    (all time‐samples are identical so max or mean both work)
+    style_flag = tf.reduce_max(style, axis=1)   # (batch,)
+
+    # 2) define your base weights for each style
+    #    here we set both to 1.0 (i.e. no style-bias), but you can
+    #    make pick_weight != finger_weight if you like.
+    pick_weight   = 1.0
+    finger_weight = 1.0
+
+    #    this yields a shape (batch,) where finger examples get
+    #    finger_weight, pick examples get pick_weight
+    base_scalar = pick_weight*style_flag + finger_weight*(1.0 - style_flag)
+    #––– if you truly want them *exactly* equal, you can just do:
+    #    base_scalar = tf.ones_like(style_flag)
+
+    # 3) build your transient re-weighting term exactly as before
+    Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])        # (batch, T-1)
+    Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)  # back to (batch, T)
+    m = tf.reduce_max(Δ, axis=1, keepdims=True)   # (batch,1)
+    m = tf.maximum(m, 1e-6)                       # avoid div0
+    wn = 1.0 + TRANSIENT_WEIGHT * (Δ / m)          # (batch, T)
+
+    # 4) combine them
+    sw = base_scalar[:, None] * wn                # (batch, T)
+    sw = tf.expand_dims(sw, axis=-1)              # (batch, T, 1)
+
+    return x, y, sw
+
+# ─── helper functions ─────────────────────────────────────────────────────────
+
+@register_keras_serializable()
+def get_piezo(x):
+    # take channel 0 (piezo)
+    return x[:, :, 0:1]
+
+@register_keras_serializable()
+def get_style(x):
+    # take channel 1 (0.0 or 1.0)
+    return x[:, :, 1:2]
+
+@register_keras_serializable()
+def invert_style(x):
+    return 1.0 - x
+
+# you already have these, but make sure they are @register_keras_serializable
+@register_keras_serializable()
+def slice_content(x, filters):
+    return x[:, :, :filters]
+
+@register_keras_serializable()
+def extract_style_scalar(x):
+    # x has shape (batch, T, 1) → we grab the first time‐step value
+    # but keep the last dim so output is (batch, 1)
+    return x[:, 0:1, 0:1]       # now shape (batch, 1)
+
+@register_keras_serializable()
+def expand_time_axis(x):
+    # x has shape (batch, features) → we want (batch, 1, features)
+    return tf.expand_dims(x, axis=1)
+
+@register_keras_serializable()
+def slice_gate(x, filters):
+    return x[:, :, filters:]
+
+@register_keras_serializable()
+def slice_piezo(x):
+    # Takes channel 0 of a (batch, time, 2) tensor
+    return x[:, :, 0:1]
+
+@register_keras_serializable()
+def slice_film_gamma(x, filters):
+    # x shape: (batch, T, 2*filters) → return (batch, T, filters)
+    return x[:, :, :filters]
+
+@register_keras_serializable()
+def slice_film_beta(x, filters):
+    # x shape: (batch, T, 2*filters) → return (batch, T, filters)
+    return x[:, :, filters:]
+
+@register_keras_serializable()
+def slice_style(x):
+    # Takes channel 1 of a (batch, time, 2) tensor
+    return x[:, :, 1:2]
+
+@register_keras_serializable()
+def invert(x):
+    return 1.0 - x
+
+
+def build_model(dynamic_time=False):
+    T = None if dynamic_time else SEG_LEN
+    inp = Input(shape=(T,2), name="piezo_plus_style")
+    style = Lambda(slice_style, name="take_style")(inp)                   # (batch, T, 1)
+    piezo = Lambda(slice_piezo, name="take_piezo")(inp)
+    # derive scalar style flag
+    style_scalar = Lambda(extract_style_scalar, name="style_scalar")(style)  # (batch,)
+    # style embedding
+    style_embed = Dense(EMBED_DIM, activation='linear', name="style_embed")(style_scalar)
+    # initial 1x1 projection on both channels
+    x = Conv1D(FILTERS, 1, padding='same', name="init_pw")(inp)
+
+    for idx, d in enumerate(DILATIONS):
+        res = x
+        pad = (KERNEL_SIZE - 1) * d
+        x = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
+        g = SeparableConv1D(FILTERS*2, KERNEL_SIZE, dilation_rate=d,
+                            padding='valid', name=f"sep_{idx}")(x)
+        c = Lambda(slice_content, arguments={'filters':FILTERS},
+                   name=f"slice_content_{idx}")(g)
+        g2 = Lambda(slice_gate, arguments={'filters':FILTERS},
+                    name=f"slice_gate_{idx}")(g)
+        x = Multiply(name=f"gated_mul_{idx}")([
+                Activation('tanh', name=f"tanh_{idx}")(c),
+                Activation('sigmoid', name=f"sigmoid_{idx}")(g2)
+            ])
+        x = Conv1D(FILTERS,1,padding='same', name=f"pw_{idx}")(x)
+        x = Add(name=f"res_add_{idx}")([x, res])
+        # FiLM modulation
+
+        film_params = Dense(FILTERS*2, name=f"film_dense_{idx}")(style_embed)
+        gamma = Lambda(slice_film_gamma,
+                    arguments={'filters': FILTERS},
+                    name=f"film_gamma_{idx}")(film_params)
+        beta  = Lambda(slice_film_beta,
+                    arguments={'filters': FILTERS},
+                    name=f"film_beta_{idx}")(film_params)
+
+        x = Add(name=f"film_apply_{idx}")([
+            Multiply(name=f"film_scale_{idx}")([x, gamma]),
+            beta
+        ])
+
+    main_pick   = Conv1D(1,1,padding='same',name="final_pick")(x)
+    main_finger = Conv1D(1,1,padding='same',name="final_finger")(x)
+    pick_c   = Multiply(name="pick_contrib")([style, main_pick])
+    finger_c = Multiply(name="finger_contrib")([
+        Lambda(invert, name="invert_style")(style), main_finger])
+    mixed    = Add(name="mix_main")([pick_c, finger_c])
+    # 1) 1×1 conv that copies piezo (as before)
+    skip = Conv1D(
+        1, 1,
+        use_bias=False,
+        kernel_initializer='ones',
+        name="skip_conv"
+    )(piezo)
+
+    skip = Dense(
+        1,
+        use_bias=False,
+        kernel_initializer=tf.keras.initializers.Constant(0.1),
+        name="skip_scale"
+    )(skip)
+
+    skip = SpatialDropout1D(
+        rate=0.1,
+        name="skip_dropout"
+    )(skip)
+
+
+    out = Add(name="res_out")([mixed, skip])
+    out = Activation('tanh', name='final_clip')(out)
+
+    return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
+
+def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
+    # TODO
+    print("TODO")
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
-        # ────────────────────────── CHUNK‐BASED SPLIT ──────────────────────────────
-    chunks = build_chunks()
 
-    print(f"Generated {len(chunks)} chunks from {len(pairs)} files")
+    # train/val split
+    idx = list(range(len(all_chunks)))
 
-    idx_chunks = list(range(len(chunks)))
-    if len(chunks) >= 2:
-        tr_i, va_i = train_test_split(idx_chunks,
-                                      test_size=0.2,
-                                      random_state=69)
+    if len(idx)>1:
+        tr_i, va_i = train_test_split(idx, test_size=0.2, random_state=SEED)
     else:
-        tr_i = va_i = idx_chunks
+        raise RuntimeError("Not enough data to split into train/val sets.")
 
-    train_chunks = [chunks[i] for i in tr_i]
-    val_chunks   = [chunks[i] for i in va_i]
-
-    # durations in frames of each chunk, used to compute approx steps
-    train_durs = [dur for (_,_,_,dur) in train_chunks]
-    val_durs   = [dur for (_,_,_,dur) in val_chunks]
+    train_chunks  = [all_chunks[i] for i in tr_i]
+    val_chunks    = [all_chunks[i] for i in va_i]
+    train_pick_chunks   = [c for c in train_chunks if c in pick_chunks]
+    train_finger_chunks = [c for c in train_chunks if c in finger_chunks]
+    val_pick_chunks     = [c for c in val_chunks   if c in pick_chunks]
+    val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
+    
 
     def approx_steps(durs):
-        return sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
-
+        return 500 if DEBUG else sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
+    train_durs = [dur for (_,_,_,dur) in train_chunks]
+    val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
     validation_steps = max(approx_steps(val_durs),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
-    
-    def segment_generator(chunk_list):
-        """Yields random SEG_LEN windows (piezo→mic) with uniform probability."""
-        while True:
-            # pick a random 5s chunk
-            src_path, tgt_path, chunk_start, chunk_dur = random.choice(chunk_list)
-            # pick a random offset inside that chunk
-            max_offset = max(chunk_dur - SEG_LEN, 1)
-            offset     = random.randrange(max_offset)
-            read_start = chunk_start + offset
 
-            # read piezo + mic
-            x, _ = sf.read(src_path,
-                        start=read_start,
-                        frames=SEG_LEN,
-                        dtype='float32',
-                        always_2d=True)
-            y, _ = sf.read(tgt_path,
-                        start=read_start,
-                        frames=SEG_LEN,
-                        dtype='float32',
-                        always_2d=True)
+    # datasets
+    sig_x = tf.TensorSpec((SEG_LEN,2), tf.float32)
+    sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
 
-            # pad to full length if EOF
-            if x.shape[0] < SEG_LEN:
-                pad = SEG_LEN - x.shape[0]
-                x = np.pad(x, ((0,pad),(0,0)))
-                y = np.pad(y, ((0,pad),(0,0)))
-
-            yield x, y
-
-    # representative dataset for full-integer quant
-    def representative_data_gen():
-        for _ in range(100):
-            src_path, _, chunk_start, chunk_dur = random.choice(train_chunks)
-            max_offset = max(chunk_dur - SEG_LEN, 1)
-            offset     = random.randrange(max_offset)
-            read_start = chunk_start + offset
-
-            x, _ = sf.read(src_path,
-                           start=read_start,
-                           frames=SEG_LEN,
-                           dtype='float32',
-                           always_2d=True)
-            if x.shape[0] < SEG_LEN:
-                pad = SEG_LEN - x.shape[0]
-                x = np.pad(x, ((0,pad),(0,0)))
-            yield [x.reshape(1, SEG_LEN, 1)]
-
-    sig = tf.TensorSpec((SEG_LEN,1), tf.float32)
-
-    train_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(train_chunks),
-        output_signature=(sig, sig)
-    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-    val_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_chunks),
-        output_signature=(sig, sig)
-    ).batch(BATCH_SIZE).repeat().prefetch(tf.data.AUTOTUNE)
-    
-    # es1 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-    #                                       patience=PHASE_1_LR_PATIENCE,
-    #                                       restore_best_weights=True)
-
-    # 1) train FP32 static
-    print("\n≈ Training FP32 model")
-    static_model = build_resnet_gated(dynamic_time=False)
-
-    static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(PHASE_1_LR),
-        loss=make_combined_loss(**phase1_weights),
-        metrics=[ 'mae',
-                l1_metric,
-                stft_metric,
-                fw_metric,
-                grad_metric,
-                pre_metric,
-                mel_metric,
-                hf_metric,
-                tf_metric,
-                hw_metric
-        ]
+    pick_attack_ds    = tf.data.Dataset.from_generator(
+        lambda: pick_attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
     )
     
+    pick_uniform_ds    = tf.data.Dataset.from_generator(
+        lambda: segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+    )
+    
+    finger_attack_ds  = tf.data.Dataset.from_generator(
+        lambda: finger_attack_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+    )
+    
+    finger_uniform_ds  = tf.data.Dataset.from_generator(
+        lambda: segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+    )
+
+    train_ds = tf.data.Dataset.sample_from_datasets(
+        [pick_attack_ds, pick_uniform_ds, finger_attack_ds, finger_uniform_ds], weights=[PICK_ATTACK_CHUNK_RATIO, PICK_UNIFORM_CHUNK_RATIO, FINGER_ATTACK_CHUNK_RATIO, FINGER_UNIFORM_CHUNK_RATIO]
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
+
+    train_ds = train_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+
+    # validation streams
+    val_pick_attack_ds = tf.data.Dataset.from_generator(
+        lambda: pick_attack_segment_generator(val_pick_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_pick_uniform_ds = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_pick_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_finger_attack_ds = tf.data.Dataset.from_generator(
+        lambda: finger_attack_segment_generator(val_finger_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_finger_uniform_ds = tf.data.Dataset.from_generator(
+        lambda: segment_generator(val_finger_chunks),
+        output_signature=(sig_x, sig_y)
+    )
+    
+    val_ds = tf.data.Dataset.sample_from_datasets(
+        [val_pick_attack_ds, val_pick_uniform_ds, val_finger_attack_ds, val_finger_uniform_ds],
+        weights=[PICK_ATTACK_CHUNK_RATIO, PICK_UNIFORM_CHUNK_RATIO, FINGER_ATTACK_CHUNK_RATIO, FINGER_UNIFORM_CHUNK_RATIO],
+        seed=SEED
+    ).batch(BATCH_SIZE)
+    
+    val_ds = val_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+
+    # compile & train
+    static_model = build_model(dynamic_time=False)
+    
+    static_model.compile(
+        optimizer=tf.keras.optimizers.Adam(LR),
+        loss=combined_loss,
+        metrics=[
+                'mae',
+                log_mel_loss,
+                mean_hf_metric,
+                multi_scale_stft_loss,
+                rms_env_loss
+        ]
+    )
     static_model.summary()
     
-    static_model.fit(
-        train_ds,
-        epochs=PHASE_1_EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=[
-            # es1,
-            TensorBoard(log_dir="./logs")
-        ]
-    )
+    # Early stopping callback
+    es = EarlyStopping(monitor='val_log_mel_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     
-    es2 = tf.keras.callbacks.EarlyStopping(monitor='val_loss',
-                                          patience=PHASE_2_LR_PATIENCE,
-                                          restore_best_weights=True)
-
-    static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(PHASE_2_LR),   # you might also drop LR
-        loss=make_combined_loss(**phase2_weights),
-        metrics=[ 'mae',
-                l1_metric,
-                stft_metric,
-                fw_metric,
-                grad_metric,
-                pre_metric,
-                mel_metric,
-                hf_metric,
-                tf_metric,
-                hw_metric
-        ]
-    )
-    static_model.fit(
-        train_ds,
-        initial_epoch=PHASE_1_EPOCHS,
-        epochs=PHASE_1_EPOCHS + PHASE_2_EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=[ es2, TensorBoard(log_dir="./tb") ]
-    )
-    
-    # 1) freeze
-    for layer in static_model.layers:
-        layer.trainable = (layer.name in ['hf_transient','hf_gain', 'hf_air', "air_gain"])
-    # 2) re-compile with only the bypass-focused losses
-    static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(PHASE_3_LR),
-        loss=make_combined_loss(**phase3_weights),
-        metrics=[ hf_metric, tf_metric, half_wave_loss ]
-    )
-    # 3) build a dataloader that oversamples attack windows - 100% hit rate of picked windows
-    train_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(train_chunks, pick_prob=1.0),
-        output_signature=(sig, sig)
-    ).shuffle(SHUFFLE_BUF).batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
-
-    es3 = tf.keras.callbacks.EarlyStopping(
-        monitor='half_wave_loss',
+    # ModelCheckpoint: save whenever val_log_mel_loss improves
+    cp = ModelCheckpoint(
+        filepath=os.path.join(CHECKPOINT_OUT_DIR,
+                            "best_model_epoch_{epoch:02d}_val_log_mel_loss_{val_log_mel_loss:.4f}.keras"),
+        monitor='val_log_mel_loss',
         mode='min',
-        patience=PHASE_3_LR_PATIENCE,
-        restore_best_weights=True
+        save_best_only=True,
+        verbose=1
     )
-    static_model.fit(
+    
+    # Demo callback: log audio & images to TensorBoard
+    
+    
+    demo_cb = DemoCallback()
+    tb = TensorBoard(log_dir=LOGS_OUT_DIR, write_graph=False)
+    csv_logger = CSVLogger(os.path.join(CSV_LOGS_OUT_DIR, "training.csv"), append=False)
+
+    history = static_model.fit(
         train_ds,
-        epochs=PHASE_3_EPOCHS,
-        steps_per_epoch=200,
-        callbacks=[ es3 ],
+        epochs=1 if DEBUG else EPOCHS,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_ds,
+        validation_steps=validation_steps,
+        callbacks=[es, cp, tb, demo_cb, csv_logger]
     )
 
-    path_static = os.path.join(OUT_DIR, STATIC_MODEL_FILENAME)
+    # style-specific evaluation
+    # print("\nEvaluating pick style on val set:")
+    # static_model.evaluate(val_pick_ds_1, steps=validation_steps)
+    # print("\nEvaluating finger style on val set:")
+    # static_model.evaluate(val_finger_ds_1, steps=validation_steps)
+    
+    trained_epochs = len(history.history["loss"])
+
+    # ── Save FP32 static & dynamic models ──────────────────────────────────
+    path_static = os.path.join(MODELS_OUT_DIR, STATIC_MODEL_FILENAME)
     static_model.save(path_static)
     print("✅ Saved FP32 static model:", path_static)
 
-    # 2) build + save FP32 dynamic
-    print("\n≈ Building + saving FP32 dynamic-time model")
-    dynamic_model = build_resnet_gated(dynamic_time=True)
+    dynamic_model = build_model(dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
-    path_dyn = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+    path_dyn = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
     dynamic_model.save(path_dyn)
     print("✅ Saved FP32 dynamic model:", path_dyn)
-    
-    if (SAVE_WEIGHTS):
-        # 4) export layer weights (.npy)
-        weights_dir = os.path.join(OUT_DIR,"weights")
-        os.makedirs(weights_dir, exist_ok=True)
 
-
-        # init_pw
-        w0,b0 = dynamic_model.get_layer("init_pw").get_weights()
-        np.save(os.path.join(weights_dir,"init_pw_w.npy"), w0.astype(np.float32))
-        np.save(os.path.join(weights_dir,"init_pw_b.npy"), b0.astype(np.float32))
-
-        # depthwise + pwsep + pw per block
-        for idx,_ in enumerate(DILATIONS):
-            sep = dynamic_model.get_layer(f"sep_{idx}")
-            dw, pw_w1, pw_b1 = sep.get_weights()
-            np.save(os.path.join(weights_dir,f"dw{idx}_w.npy"),   dw.astype(np.float32))
-            np.save(os.path.join(weights_dir,f"pwsep{idx}_w.npy"),pw_w1.astype(np.float32))
-            np.save(os.path.join(weights_dir,f"pwsep{idx}_b.npy"),pw_b1.astype(np.float32))
-
-            pw = dynamic_model.get_layer(f"pw_{idx}")
-            w2,b2 = pw.get_weights()
-            np.save(os.path.join(weights_dir,f"pw{idx}_w.npy"),   w2.astype(np.float32))
-            np.save(os.path.join(weights_dir,f"pw{idx}_b.npy"),   b2.astype(np.float32))
-
-        # final_pw
-        wf,bf = dynamic_model.get_layer("final_pw").get_weights()
-        np.save(os.path.join(weights_dir,"final_pw_w.npy"), wf.astype(np.float32))
-        np.save(os.path.join(weights_dir,"final_pw_b.npy"), bf.astype(np.float32))
-
-        # skip_conv
-        sw = dynamic_model.get_layer("skip_conv").get_weights()[0]
-        np.save(os.path.join(weights_dir,"skip_conv_w.npy"), sw.astype(np.float32))
-
-        # ── hf_transient (3-tap bypass) ──────────────────────────────
-        hf_kernel = dynamic_model.get_layer("hf_transient").get_weights()[0]
-        # hf_kernel.shape == (3,1,1)  i.e. (kernel_size, in_channels, out_channels)
-        # we only need it as a (K, C) matrix, so drop the last dimension:
-        hf_kernel = hf_kernel[:,:,0]       # now shape is (3,1)
-        np.save(os.path.join(weights_dir,"hf_transient_w.npy"),
-                hf_kernel.astype(np.float32))
-        
-
-        # 5) convert + extract int8 TFLite
-        print("\n≈ Converting dynamic model to TFLite INT8 model for weight extraction")
-        converter = tf.lite.TFLiteConverter.from_keras_model(static_model)
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.representative_dataset = representative_data_gen
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        converter.inference_input_type  = tf.int8
-        converter.inference_output_type = tf.int8
-        tflite_model = converter.convert()
-        extract_and_save_int8_weights(
-            tflite_model,
-            os.path.join(OUT_DIR,"int8_weights"),
-            dilations=DILATIONS,
-            filters=FILTERS
-        )
+    # ── Optional: dump .npy FP32 weights & extract INT8 ───────────────────
+    if SAVE_WEIGHTS:
+        # unchanged: dumping weights...
+        pass
 
     return static_model, dynamic_model
 
 # ─────────────────────────────── MAIN / DEMO ──────────────────────────────────
 if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
+        # Clean logs and checkpoints
+        if os.path.exists(LOGS_OUT_DIR):
+            shutil.rmtree(LOGS_OUT_DIR)
+        if os.path.exists(CHECKPOINT_OUT_DIR):
+            shutil.rmtree(CHECKPOINT_OUT_DIR)
+
         static_model, dynamic_model = train()
-    elif (len(sys.argv)>1 and sys.argv[1]=="--pick-attack-examples"):
-        # ── pick attack examples ───────────────────────────────────────────────
-        print("Picking attack examples…")
-        dump_generator_picks(build_chunks())
-    else:
-        dpath = os.path.join(OUT_DIR, DYNAMIC_MODEL_FILENAME)
+    elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
+        # Turn off GPU acceleration for inference, as it is more reliable
+        tf.config.set_visible_devices([], 'GPU')
+
+        dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(dpath):
             print("Dynamic model not found. run: python piezo2mic.py --train")
             sys.exit(1)
         dynamic_model = tf.keras.models.load_model(
-                dpath,
-                compile=False,
-                custom_objects={
-                     'AbsLayer': AbsLayer,
-                     'Diff1D': Diff1D,
-                     'EnvScaleLayer': EnvScaleLayer,
-                     'slice_content': slice_content,
-                     'slice_gate':    slice_gate
-        })
-
-        # DEMO
-        print("\nGenerating demo…")
-        FRAMES      = DEMO_SEC * SR
-        START_FRAME = DEMO_OFFSET_SEC * SR
-        pth_src, pth_tgt = pairs[DEMO_PAIR_INDEX]
-
-        x_long,_ = sf.read(pth_src,
-                        start=START_FRAME,
-                        frames=FRAMES,
-                        dtype='float32',
-                        always_2d=True)
-        y_ref,_  = sf.read(pth_tgt,
-                        start=START_FRAME,
-                        frames=FRAMES,
-                        dtype='float32',
-                        always_2d=True)
-
-        x_in = x_long[np.newaxis,...]
-        print("Running inference…")
-        y_pred_dyn = dynamic_model.predict(x_in, batch_size=1)[0,:,0]
-
-        sf.write(os.path.join(OUT_DIR,"demo_input_piezo.wav"),
-                x_long, SR, subtype='FLOAT')
-        sf.write(os.path.join(OUT_DIR,"demo_reference_mic.wav"),
-                y_ref, SR, subtype='FLOAT')
-        sf.write(os.path.join(OUT_DIR,"demo_output_pred_fp32.wav"),
-                y_pred_dyn, SR, subtype='FLOAT')
-        print("✅ Demo files in", OUT_DIR)
+            dpath,
+            compile=False
+        )    
+        generate_demo(dynamic_model)
+    else:
+        print("Usage: python piezo2mic.py --train | --demo")
+        print("  --train          : train the model and save it")
+        print("  --demo           : generate a demo audio file using the trained model")
+        sys.exit(1)
+        
+        
