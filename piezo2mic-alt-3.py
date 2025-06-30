@@ -49,7 +49,7 @@ HF_WEIGHT          = 0.0  # scale of the high-pass loss
 HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
 STFT_WEIGHT = 1.0    # weight of the spectral loss
 MEL_WEIGHT = 0.1   # weight of the log‐mel‐spectrogram L1 loss
-RMS_ENV_WEIGHT   = 1.5   # weight of the RMS‐envelope L1 loss
+RMS_ENV_WEIGHT   = 100.5   # weight of the RMS‐envelope L1 loss
 
 EPOCHS      = 50
 LR          = 1e-3
