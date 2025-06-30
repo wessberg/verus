@@ -33,9 +33,9 @@ tf.random.set_seed(SEED)
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 
 DEBUG               = True
-FILTERS             = 128
-KERNEL_SIZE         = 51
-DILATIONS           = (1,2,4,8,16,32,64)
+FILTERS             = 64
+KERNEL_SIZE         = 25
+DILATIONS           = (1,2,4,8)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -44,11 +44,11 @@ BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
 TRANSIENT_WEIGHT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
-HF_WEIGHT          = 0.07  # scale of the high-pass loss
-HP_PRE_EMPHASIS  = 0.2 # coefficient for 1-sample 1st-order high-pass
+HF_WEIGHT          = 1.0  # scale of the high-pass loss
+HP_PRE_EMPHASIS  = 0.0 # coefficient for 1-sample 1st-order high-pass
 STFT_WEIGHT = 0.5    # weight of the spectral loss
-MEL_WEIGHT = 0.2   # weight of the log‐mel‐spectrogram L1 loss
-RMS_ENV_WEIGHT   = 1.0   # weight of the RMS‐envelope L1 loss
+MEL_WEIGHT = 0.047   # weight of the log‐mel‐spectrogram L1 loss
+RMS_ENV_WEIGHT   = 1.27   # weight of the RMS‐envelope L1 loss
 
 PICK_ATTACK_CHUNK_RATIO = 0.10 # How many pick attack segments the model will see
 PICK_UNIFORM_CHUNK_RATIO = 0.40 # How many general pick segments the model will see
@@ -321,6 +321,27 @@ def segment_generator(chunk_list):
         x = np.concatenate([x, style], axis=-1)
 
         yield x, y
+        
+def analyze_loss_scales(model, dataset ):
+    # Take one batch from your validation dataset
+    (x, y, sw) = next(iter(dataset))
+    
+    y_pred = model(x, training=False)
+    y_true = y
+
+    l1_val = tf.reduce_mean(waveform_l1_loss(y_true, y_pred)).numpy()
+    stft_val = tf.reduce_mean(multi_scale_stft_loss(y_true, y_pred)).numpy()
+    mel_val = tf.reduce_mean(log_mel_loss(y_true, y_pred)).numpy()
+    env_val = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
+    hf_val = tf.reduce_mean(hf_loss(y_true, y_pred)).numpy()
+
+    print(f"Initial L1 Loss: {l1_val}")
+    print(f"Initial STFT Loss: {stft_val}")
+    print(f"Initial Mel Loss: {mel_val}")
+    print(f"Initial RMS Env Loss: {env_val}")
+    print(f"Initial HF Loss: {hf_val}")
+
+    return {'l1': l1_val, 'stft': stft_val, 'mel': mel_val, 'env': env_val, 'hf': hf_val}
         
 def generate_demo (model, prediction_name="demo_prediction", only_prediction=False):
     print("\nGenerating demo…")
@@ -816,10 +837,11 @@ def train():
     
     # Demo callback: log audio & images to TensorBoard
     
-    
     demo_cb = DemoCallback()
     tb = TensorBoard(log_dir=LOGS_OUT_DIR, write_graph=False)
     csv_logger = CSVLogger(os.path.join(CSV_LOGS_OUT_DIR, "training.csv"), append=False)
+    
+    analyze_loss_scales(static_model, val_ds)
 
     history = static_model.fit(
         train_ds,
