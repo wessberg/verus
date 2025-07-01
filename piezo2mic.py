@@ -925,8 +925,12 @@ if __name__=="__main__":
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         # Clean logs and checkpoints
         for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, CHECKPOINT_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR]:
-            if os.path.exists(dir_path):
-                shutil.rmtree(dir_path)
+            for sub in os.listdir(dir_path):
+                sub_path = os.path.join(dir_path, sub)
+                if os.path.isfile(sub_path):
+                    os.remove(sub_path)
+                elif os.path.isdir(sub_path):
+                    shutil.rmtree(sub_path)
 
         static_model, dynamic_model = train()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
