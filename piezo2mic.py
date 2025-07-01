@@ -76,16 +76,22 @@ MODELS_OUT_DIR = os.path.join(OUT_DIR, "models")
 LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
 CSV_LOGS_OUT_DIR = os.path.join(OUT_DIR, "csv-logs")
 DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
+LONG_DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos/long")
+DEMO_CHECKPOINTS_OUT_DIR = os.path.join(OUT_DIR, "demos/checkpoints")
 
 DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
+LONG_DEMO_SEC        = 60
+LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_PAIR_INDEX = 0
+
 STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
-for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
+for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LONG_DEMOS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
@@ -145,7 +151,7 @@ class DemoCallback(Callback):
         self.offset_sec = DEMO_OFFSET_SEC
         self.sr = SR
         self.every = 1
-        self.demos_out_dir = DEMOS_OUT_DIR
+        self.demos_out_dir = DEMO_CHECKPOINTS_OUT_DIR
         os.makedirs(self.demos_out_dir, exist_ok=True)
         # TensorBoard writer for audio
         self.writer = tf.summary.create_file_writer(os.path.join(LOGS_OUT_DIR,"demo"))
@@ -345,11 +351,11 @@ def analyze_loss_scales(model, dataset ):
 
     return {'l1': l1_val, 'stft': stft_val, 'mel': mel_val, 'env': env_val, 'hf': hf_val}
         
-def generate_demo (model, prediction_name="demo_prediction", only_prediction=False):
+def generate_demo (model, prediction_name="demo_pred", only_prediction=False):
     print("\nGenerating demo…")
-    FRAMES      = DEMO_SEC * SR
-    START_FRAME = DEMO_OFFSET_SEC * SR
-    pth_src, pth_tgt = all_pairs[DEMO_PAIR_INDEX]
+    FRAMES      = LONG_DEMO_SEC * SR
+    START_FRAME = LONG_DEMO_OFFSET_SEC * SR
+    pth_src, pth_tgt = all_pairs[LONG_DEMO_PAIR_INDEX]
 
     x_long,_ = sf.read(pth_src,
                       start=START_FRAME,
@@ -374,12 +380,12 @@ def generate_demo (model, prediction_name="demo_prediction", only_prediction=Fal
     print("Running inference…")
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
     
-    prediction_filepath = os.path.join(DEMOS_OUT_DIR, prediction_name + ".wav")
+    prediction_filepath = os.path.join(LONG_DEMOS_OUT_DIR, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
     
     if (not only_prediction):
-        source_filepath = os.path.join(DEMOS_OUT_DIR, "demo_source" +".wav")
-        target_filepath = os.path.join(DEMOS_OUT_DIR, "demo_target" + ".wav")
+        source_filepath = os.path.join(LONG_DEMOS_OUT_DIR, "demo_source" +".wav")
+        target_filepath = os.path.join(LONG_DEMOS_OUT_DIR, "demo_target" + ".wav")
         sf.write(source_filepath,
              x_long, SR, subtype='FLOAT')
         sf.write(target_filepath,
@@ -918,10 +924,9 @@ def train():
 if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         # Clean logs and checkpoints
-        if os.path.exists(LOGS_OUT_DIR):
-            shutil.rmtree(LOGS_OUT_DIR)
-        if os.path.exists(CHECKPOINT_OUT_DIR):
-            shutil.rmtree(CHECKPOINT_OUT_DIR)
+        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, CHECKPOINT_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR]:
+            if os.path.exists(dir_path):
+                shutil.rmtree(dir_path)
 
         static_model, dynamic_model = train()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
@@ -930,12 +935,35 @@ if __name__=="__main__":
 
         dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(dpath):
-            print("Dynamic model not found. run: python piezo2mic.py --train")
-            sys.exit(1)
-        dynamic_model = tf.keras.models.load_model(
-            dpath,
-            compile=False
-        )    
+            # Read the latest checkpoint by finding the most recent file
+            checkpoints = sorted(glob.glob(os.path.join(CHECKPOINT_OUT_DIR, "*.keras")))
+
+            if checkpoints:
+                dpath = checkpoints[-1]
+                
+                print("Loading model from checkpoint:", dpath)
+                static_model = tf.keras.models.load_model(
+                    dpath,
+                    compile=False
+                )
+                
+                dynamic_model = build_model(dynamic_time=True)
+                dynamic_model.set_weights(static_model.get_weights())
+                
+            else:
+                dpath = None
+
+            if not dpath:
+                print("Dynamic model not found. run: python piezo2mic.py --train")
+                sys.exit(1)
+        else:
+             print("Loading dynamic model from:", dpath)
+             dynamic_model = tf.keras.models.load_model(
+                dpath,
+                compile=False
+            )
+
+        print("Generating demo audio file...")
         generate_demo(dynamic_model)
     else:
         print("Usage: python piezo2mic.py --train | --demo")
