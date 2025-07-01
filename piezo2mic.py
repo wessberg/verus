@@ -12,7 +12,7 @@ import soundfile as sf
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
@@ -49,7 +49,7 @@ HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 L1_WEIGHT                 = 1.0 # waveform l1 loss
 HF_WEIGHT                 = 1.0  # scale of the high-pass loss
 STFT_WEIGHT               = 1.0    # weight of the spectral loss
-MEL_WEIGHT                = 1.5   # weight of the log‐mel‐spectrogram L1 loss
+MEL_WEIGHT                = 1.1   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
 PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
@@ -60,6 +60,8 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 
 EPOCHS      = 50
 LR          = 1e-4
+LR_FACTOR  = 0.5
+MIN_LR     = 1e-6
 LR_PATIENCE = 5
 
 SHUFFLE_BUF         = 1000
@@ -716,12 +718,12 @@ def build_model(dynamic_time=False):
         1,
         use_bias=False,
         kernel_initializer=tf.keras.initializers.Constant(0.1),
-        kernel_regularizer=tf.keras.regularizers.l1(1e-3),
+        kernel_regularizer=tf.keras.regularizers.l1(1e-2),
         name="skip_scale"
     )(skip)
 
     skip = SpatialDropout1D(
-        rate=0.1,
+        rate=0.5,
         name="skip_dropout"
     )(skip)
 
@@ -872,6 +874,15 @@ def train():
     # Early stopping callback
     es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=LR_FACTOR,
+        patience=LR_PATIENCE,
+        min_lr=MIN_LR,
+        mode='min',
+        verbose=1
+    )
+    
     # ModelCheckpoint: save whenever val_loss improves
     cp = ModelCheckpoint(
         filepath=os.path.join(CHECKPOINT_OUT_DIR,
@@ -894,7 +905,7 @@ def train():
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
         validation_steps=validation_steps,
-        callbacks=[es, cp, tb, demo_cb, csv_logger]
+        callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger]
     )
 
     # style-specific evaluation
