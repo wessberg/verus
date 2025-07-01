@@ -177,6 +177,8 @@ class DemoCallback(Callback):
         # only every Nth epoch
         if epoch % self.every != 0:
             return
+        
+        friendly_epoch = epoch + 1
 
         # re‐sync weights before each inference
         self.dynamic_model.set_weights(self.static_model.get_weights())
@@ -202,7 +204,7 @@ class DemoCallback(Callback):
         y_pred = self.dynamic_model.predict(x_demo, batch_size=1)[0,:,0]  # (T,)
 
         # 4) write to disk
-        epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{epoch:03d}")
+        epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{friendly_epoch:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
         sf.write(os.path.join(epoch_dir, "demo_source.wav"),
                  x_long[:,0], self.sr, subtype='FLOAT')
@@ -217,17 +219,17 @@ class DemoCallback(Callback):
             tf.summary.audio("demo/source",
                              x_demo[...,0:1],  # (1, T, 1)
                              sample_rate=self.sr,
-                             step=epoch)
+                             step=friendly_epoch)
             tf.summary.audio("demo/target",
                              y_long[np.newaxis, :, 0:1],  # (1, T, 1)
                              sample_rate=self.sr,
-                             step=epoch)
+                             step=friendly_epoch)
             tf.summary.audio("demo/pred",
                              y_pred[np.newaxis, :, np.newaxis],
                              sample_rate=self.sr,
-                             step=epoch)
+                             step=friendly_epoch)
             self.writer.flush()
-        print(f"[DemoCallback] epoch {epoch}: demo written to {epoch_dir}")
+        print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
 
 # --- Generators ---
 def pick_attack_segment_generator(pick_chunks, context_pre=1024):
@@ -714,7 +716,7 @@ def build_model(dynamic_time=False):
         1,
         use_bias=False,
         kernel_initializer=tf.keras.initializers.Constant(0.1),
-        kernel_regularizer=tf.keras.regularizers.l1(1e-3)
+        kernel_regularizer=tf.keras.regularizers.l1(1e-3),
         name="skip_scale"
     )(skip)
 
