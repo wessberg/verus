@@ -43,7 +43,7 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
-TRANSIENT_UPWEIGHT_RATIO  = 0.1   # how strongly to up-weight the ∣Δx∣ spikes
+TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.9 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0 # waveform l1 loss
