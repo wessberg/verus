@@ -33,9 +33,9 @@ tf.random.set_seed(SEED)
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 
 DEBUG               = False
-FILTERS             = 64
-KERNEL_SIZE         = 25
-DILATIONS           = (1,2,4,8)
+FILTERS             = 128
+KERNEL_SIZE         = 51
+DILATIONS           = (1,2,4,8,16,32,64)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -49,7 +49,7 @@ HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 L1_WEIGHT                 = 1.0 # waveform l1 loss
 HF_WEIGHT                 = 1.0  # scale of the high-pass loss
 STFT_WEIGHT               = 1.0    # weight of the spectral loss
-MEL_WEIGHT                = 1.1   # weight of the log‐mel‐spectrogram L1 loss
+MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
 PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
@@ -63,6 +63,7 @@ LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
 LR_PATIENCE = 5
+LR_PLATEAU_PATIENCE = 3
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -877,7 +878,7 @@ def train():
     reduce_lr = ReduceLROnPlateau(
         monitor='val_loss',
         factor=LR_FACTOR,
-        patience=LR_PATIENCE,
+        patience=LR_PLATEAU_PATIENCE,
         min_lr=MIN_LR,
         mode='min',
         verbose=1
