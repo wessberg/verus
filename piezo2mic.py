@@ -43,18 +43,20 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
-TRANSIENT_WEIGHT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
-HF_WEIGHT          = 0.08  # scale of the high-pass loss
-HP_PRE_EMPHASIS  = 0.9 # coefficient for 1-sample 1st-order high-pass
-STFT_WEIGHT = 0.5    # weight of the spectral loss
-MEL_WEIGHT = 0.047   # weight of the log‐mel‐spectrogram L1 loss
-RMS_ENV_WEIGHT   = 1.27   # weight of the RMS‐envelope L1 loss
+TRANSIENT_UPWEIGHT_RATIO  = 0.1   # how strongly to up-weight the ∣Δx∣ spikes
+HP_PRE_EMPHASIS           = 0.9 # coefficient for 1-sample 1st-order high-pass
 
-PICK_ATTACK_CHUNK_RATIO = 0.10 # How many pick attack segments the model will see
-PICK_UNIFORM_CHUNK_RATIO = 0.40 # How many general pick segments the model will see
+L1_WEIGHT                 = 1.0 # waveform l1 loss
+HF_WEIGHT                 = 1.0  # scale of the high-pass loss
+STFT_WEIGHT               = 1.0    # weight of the spectral loss
+MEL_WEIGHT                = 1.5   # weight of the log‐mel‐spectrogram L1 loss
+RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
-FINGER_ATTACK_CHUNK_RATIO = 0.10 # How many finger attack segments the model will see
-FINGER_UNIFORM_CHUNK_RATIO = 0.40 # How many general finger segments the model will see
+PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
+PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will see
+
+FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
+FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
 
 EPOCHS      = 50
 LR          = 1e-4
@@ -536,11 +538,11 @@ def combined_loss(y_true, y_pred):
     mel  = log_mel_loss(  y_true, y_pred)        # (batch,1,1)
     env  = rms_env_loss(  y_true, y_pred)        # (batch,1,1)
 
-    return td \
-         + HF_WEIGHT    * hf \
-         + STFT_WEIGHT * spec \
-         + MEL_WEIGHT  * mel \
-         + RMS_ENV_WEIGHT    * env
+    return (L1_WEIGHT       * td
+          + HF_WEIGHT       * hf
+          + STFT_WEIGHT     * spec
+          + MEL_WEIGHT      * mel
+          + RMS_ENV_WEIGHT  * env)
 
 # 3) A proper named metric instead of a lambda:
 @register_keras_serializable()
@@ -576,7 +578,7 @@ def add_sw(x, y):
     Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)  # back to (batch, T)
     m = tf.reduce_max(Δ, axis=1, keepdims=True)   # (batch,1)
     m = tf.maximum(m, 1e-6)                       # avoid div0
-    wn = 1.0 + TRANSIENT_WEIGHT * (Δ / m)          # (batch, T)
+    wn = 1.0 + TRANSIENT_UPWEIGHT_RATIO * (Δ / m)          # (batch, T)
 
     # 4) combine them
     sw = base_scalar[:, None] * wn                # (batch, T)
@@ -726,6 +728,7 @@ def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
 def train():
+    global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
 
     # train/val split
     idx = list(range(len(all_chunks)))
@@ -809,6 +812,41 @@ def train():
     # compile & train
     static_model = build_model(dynamic_time=False)
     
+     # Measure raw scales of each loss term on one batch of val_ds
+    baseline = analyze_loss_scales(static_model, val_ds)
+    
+    # Recompute *absolute* weights so that
+    #   new_w[i] ∝ user_w[i] / baseline[i], *and* new_w[l1] = user_w[l1]
+    ref_scale = float(baseline['l1'])
+    user_w    = {
+        'l1':  L1_WEIGHT,
+        'stft': STFT_WEIGHT,
+        'mel':  MEL_WEIGHT,
+        'env':  RMS_ENV_WEIGHT,
+        'hf':   HF_WEIGHT
+    }
+
+    new_w = {}
+    for key, uw in user_w.items():
+        bs = float(baseline[key])
+        if bs > 0.0:
+            new_w[key] = uw / bs * ref_scale
+        else:
+            new_w[key] = 0.0
+
+    L1_WEIGHT       = new_w['l1']
+    STFT_WEIGHT     = new_w['stft']
+    MEL_WEIGHT      = new_w['mel']
+    RMS_ENV_WEIGHT  = new_w['env']
+    HF_WEIGHT       = new_w['hf']
+    
+    print(f"→ normalized loss weights:"
+          f"  L1={L1_WEIGHT:.6f}"
+          f"  STFT={STFT_WEIGHT:.6f}"
+          f"  MEL={MEL_WEIGHT:.6f}"
+          f"  ENV={RMS_ENV_WEIGHT:.6f}"
+          f"  HF={HF_WEIGHT:.6f}")
+    
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(LR),
         loss=combined_loss,
@@ -840,8 +878,6 @@ def train():
     demo_cb = DemoCallback()
     tb = TensorBoard(log_dir=LOGS_OUT_DIR, write_graph=False)
     csv_logger = CSVLogger(os.path.join(CSV_LOGS_OUT_DIR, "training.csv"), append=False)
-    
-    analyze_loss_scales(static_model, val_ds)
 
     history = static_model.fit(
         train_ds,
