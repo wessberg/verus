@@ -32,7 +32,7 @@ tf.random.set_seed(SEED)
 
 # ───────────────────────────── PARAMETERS ─────────────────────────────────────
 
-DEBUG               = True
+DEBUG               = False
 FILTERS             = 64
 KERNEL_SIZE         = 25
 DILATIONS           = (1,2,4,8)
@@ -44,8 +44,8 @@ BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
 TRANSIENT_WEIGHT  = 0.0   # how strongly to up-weight the ∣Δx∣ spikes
-HF_WEIGHT          = 1.0  # scale of the high-pass loss
-HP_PRE_EMPHASIS  = 0.0 # coefficient for 1-sample 1st-order high-pass
+HF_WEIGHT          = 0.08  # scale of the high-pass loss
+HP_PRE_EMPHASIS  = 0.9 # coefficient for 1-sample 1st-order high-pass
 STFT_WEIGHT = 0.5    # weight of the spectral loss
 MEL_WEIGHT = 0.047   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT   = 1.27   # weight of the RMS‐envelope L1 loss
@@ -823,13 +823,13 @@ def train():
     static_model.summary()
     
     # Early stopping callback
-    es = EarlyStopping(monitor='val_log_mel_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
+    es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     
-    # ModelCheckpoint: save whenever val_log_mel_loss improves
+    # ModelCheckpoint: save whenever val_loss improves
     cp = ModelCheckpoint(
         filepath=os.path.join(CHECKPOINT_OUT_DIR,
-                            "best_model_epoch_{epoch:02d}_val_log_mel_loss_{val_log_mel_loss:.4f}.keras"),
-        monitor='val_log_mel_loss',
+                            "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
+        monitor='val_loss',
         mode='min',
         save_best_only=True,
         verbose=1
