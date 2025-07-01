@@ -44,7 +44,7 @@ BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
-HP_PRE_EMPHASIS           = 0.9 # coefficient for 1-sample 1st-order high-pass
+HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0 # waveform l1 loss
 HF_WEIGHT                 = 1.0  # scale of the high-pass loss
@@ -702,7 +702,7 @@ def build_model(dynamic_time=False):
     finger_c = Multiply(name="finger_contrib")([
         Lambda(invert, name="invert_style")(style), main_finger])
     mixed    = Add(name="mix_main")([pick_c, finger_c])
-    # 1) 1×1 conv that copies piezo (as before)
+
     skip = Conv1D(
         1, 1,
         use_bias=False,
@@ -714,6 +714,7 @@ def build_model(dynamic_time=False):
         1,
         use_bias=False,
         kernel_initializer=tf.keras.initializers.Constant(0.1),
+        kernel_regularizer=tf.keras.regularizers.l1(1e-3)
         name="skip_scale"
     )(skip)
 
