@@ -44,8 +44,8 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
-TRANSIENT_UPWEIGHT_RATIO  = 0.1   # how strongly to up-weight the ∣Δx∣ spikes
-HP_PRE_EMPHASIS           = 0.9 # coefficient for 1-sample 1st-order high-pass
+TRANSIENT_UPWEIGHT_RATIO  = 0.00   # how strongly to up-weight the ∣Δx∣ spikes
+HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0 # waveform l1 loss
 HF_WEIGHT                 = 1.0  # scale of the high-pass loss
@@ -53,8 +53,8 @@ STFT_WEIGHT               = 1.0    # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
-PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
-PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will see
+PICK_ATTACK_CHUNK_RATIO = 0.25 # How many pick attack segments the model will see
+PICK_UNIFORM_CHUNK_RATIO = 0.25 # How many general pick segments the model will see
 
 FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
 FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
@@ -789,30 +789,7 @@ def build_model(dynamic_time=False):
     finger_c = Multiply(name="finger_contrib")([
         Lambda(invert, name="invert_style")(style), main_finger])
     mixed    = Add(name="mix_main")([pick_c, finger_c])
-
-    skip = Conv1D(
-        1, 1,
-        use_bias=False,
-        kernel_initializer='ones',
-        name="skip_conv"
-    )(piezo)
-
-    skip = Dense(
-        1,
-        use_bias=False,
-        kernel_initializer=tf.keras.initializers.Constant(0.1),
-        kernel_regularizer=tf.keras.regularizers.l1(1e-2),
-        name="skip_scale"
-    )(skip)
-
-    skip = SpatialDropout1D(
-        rate=0.5,
-        name="skip_dropout"
-    )(skip)
-
-
-    out = Add(name="res_out")([mixed, skip])
-    out = Activation('tanh', name='final_clip')(out)
+    out = Activation('tanh', name='final_clip')(mixed)
 
     return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
 
