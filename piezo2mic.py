@@ -10,6 +10,7 @@ import os, glob, random, shutil, sys
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
+from scipy.signal import butter, sosfilt, find_peaks, hilbert
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
@@ -58,12 +59,18 @@ PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will 
 FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
 FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
 
-EPOCHS      = 50
+# ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
+ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
+ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
+#───────────────────────────────────────────────────────────────────────────────
+
+EPOCHS      = 1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
-LR_PATIENCE = 5
-LR_PLATEAU_PATIENCE = 3
+LR_PATIENCE = 10
+LR_PLATEAU_PATIENCE = 5
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -80,6 +87,7 @@ LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
 CSV_LOGS_OUT_DIR = os.path.join(OUT_DIR, "csv-logs")
 DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
 LONG_DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos/long")
+DEMO_GENERATOR_OUTPUTS_OUT_DIR = os.path.join(OUT_DIR, "demos/generator-outputs")
 DEMO_CHECKPOINTS_OUT_DIR = os.path.join(OUT_DIR, "demos/checkpoints")
 
 DEMO_SEC        = 10
@@ -94,7 +102,7 @@ STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
 DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
-for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LONG_DEMOS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
+for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LONG_DEMOS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
@@ -234,83 +242,156 @@ class DemoCallback(Callback):
             self.writer.flush()
         print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
 
-# --- Generators ---
-def pick_attack_segment_generator(pick_chunks, context_pre=1024):
-    
+
+def dump_pick_attacks(gap_sec=0.1, n_segments=None):
+    """
+    Use the exact same pick_attack_segment_generator() logic
+    to pull out N segments and stitch them together with gaps.
+    If n_segments is None we will grab one segment _per_ chunk.
+    """
+    gap      = int(gap_sec * SR)
+    gap_arr  = np.zeros((gap,), dtype='float32')
+
+    gen      = attack_segment_generator(pick_chunks)
+    collected = []
+
+    # how many segments do we want?
+    #  – if you pass n_segments, use that,
+    #  – otherwise default to len(pick_chunks)
+    total = n_segments or len(pick_chunks)
+
+    for i in range(total):
+        x, _ = next(gen)
+        # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
+        piezo_only = x[:, 0]   # (SEG_LEN,)
+        collected.append(piezo_only)
+        collected.append(gap_arr)
+
+    if not collected:
+        print("⚠️  No pick‐attack segments were generated.")
+        return
+
+    out     = np.concatenate(collected)
+    dpath   = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR,
+                           "pick-attack-segments.wav")
+    sf.write(dpath, out, SR, subtype='FLOAT')
+    print(f"✅  Wrote {total} pick‐attack segments → {dpath}")
+
+def dump_finger_attacks(gap_sec=0.1, n_segments=None):
+    """
+    Use the exact same finger_attack_segment_generator() logic
+    to pull out N segments and stitch them together with gaps.
+    If n_segments is None we will grab one segment _per_ chunk.
+    """
+    gap      = int(gap_sec * SR)
+    gap_arr  = np.zeros((gap,), dtype='float32')
+
+    gen      = attack_segment_generator(finger_chunks)
+    collected = []
+
+    # how many segments do we want?
+    #  – if you pass n_segments, use that,
+    #  – otherwise default to len(pick_chunks)
+    total = n_segments or len(finger_chunks)
+
+    for i in range(total):
+        x, _ = next(gen)
+        # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
+        piezo_only = x[:, 0]   # (SEG_LEN,)
+        collected.append(piezo_only)
+        collected.append(gap_arr)
+
+    if not collected:
+        print("⚠️  No finger‐attack segments were generated.")
+        return
+
+    out     = np.concatenate(collected)
+    dpath   = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR,
+                           "finger-attack-segments.wav")
+    sf.write(dpath, out, SR, subtype='FLOAT')
+    print(f"✅  Wrote {total} finger‐attack segments → {dpath}")
+
+
+
+
+# design a 3–15 kHz band-pass for the HF envelope
+SOS_BP = butter(4, [3000, 15000], fs=SR, btype='bp', output='sos')
+
+def hp_diff_env(window, α=0.8):
+    """1-tap pre-emphasis → abs(diff)"""
+    hp = np.empty_like(window)
+    hp[0] = window[0]
+    hp[1:] = window[1:] - α * window[:-1]
+    return np.abs(np.diff(hp))
+
+def hf_envelope(window):
+    """band‐pass → analytic envelope"""
+    bp = sosfilt(SOS_BP, window)
+    return np.abs(hilbert(bp))
+
+def find_pick_spikes(window,
+                     pct_diff=99.9,
+                     pct_env=99.5,
+                     min_dist=SR//200):
+    """
+    Return indices of candidate pick‐clicks in `window`.
+    Enforce both a high‐percentile _and_ an absolute floor.
+    """
+    denv = hp_diff_env(window)
+    env  = hf_envelope(window)
+
+    # percentile thresholds
+    thr_d_pct = np.percentile(denv, pct_diff)
+    thr_e_pct = np.percentile(env,  pct_env)
+
+    # absolute floors
+    thr_d = max(thr_d_pct, ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH)
+    thr_e = max(thr_e_pct, ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH)
+
+    # find fast‐diff peaks
+    peaks, props = find_peaks(denv,
+                              height=thr_d,
+                              distance=min_dist)
+
+    # keep only those with a big HF‐env too
+    good = [i for i in peaks if env[i] >= thr_e]
+
+    return np.array(good, dtype=int)
+
+
+def attack_segment_generator(chunks, context_pre=1024):
     while True:
-        src,tgt,cstart,cdur = random.choice(pick_chunks)
-        src_wav = audio_cache[src]
-        tgt_wav = audio_cache[tgt]
-        
-        window = src_wav[cstart : cstart + cdur, 0]
-        diffs = np.abs(np.diff(window))
-        
-        if (diffs.size):
-            thresh = np.median(diffs) * 3.0
-            spikes = np.where(diffs > thresh)[0]
-            
-            if (spikes.size):
-                idx = random.choice(spikes)
-                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
-            else:
-                off = random.randint(0, max(cdur-SEG_LEN, 0))
-        else:
-            off = random.randint(0, max(cdur-SEG_LEN, 0))
+        src, tgt, cstart, cdur = random.choice(chunks)
+        mono = audio_cache[src][:,0]
+        window = mono[cstart : cstart + cdur]
 
-        read_start = cstart + off
-        x = src_wav[read_start : read_start + SEG_LEN]
-        y = tgt_wav[read_start : read_start + SEG_LEN]
-        
-        if x.shape[0]<SEG_LEN:
-            p=SEG_LEN - x.shape[0]
-            x=np.pad(x,((0,p),(0,0)))
-            y=np.pad(y,((0,p),(0,0)))
+        # 1) find all “pick‐like” spikes in this chunk
+        spikes = find_pick_spikes(window)
+        if spikes.size == 0:
+            # no large clean pick‐clicks here
+            continue
 
-        # style channel
-        style = np.ones((SEG_LEN,1),dtype='float32')
-        x = np.concatenate([x,style],axis=-1)
-        yield x,y
+        # 2) choose one at random, center it in your SEG_LEN slice
+        idx   = int(random.choice(spikes))
+        start = idx - context_pre
+        start = np.clip(start, 0, cdur - SEG_LEN)
+        rs    = cstart + start
 
-def finger_attack_segment_generator(finger_chunks, context_pre=1024):
-    while True:
-        src,tgt,cstart,cdur = random.choice(finger_chunks)
-        src_wav = audio_cache[src]
-        tgt_wav = audio_cache[tgt]
+        # 3) slice out exactly SEG_LEN samples
+        x = mono[rs: rs + SEG_LEN]
+        y = audio_cache[tgt][rs: rs + SEG_LEN, 0]
 
-        window = src_wav[cstart : cstart + cdur, 0]
-        diffs = np.abs(np.diff(window))
-        
-        if (diffs.size):
-            thresh = np.median(diffs) * 3.0
-            spikes = np.where(diffs > thresh)[0]
-            if (spikes.size):
-                idx = random.choice(spikes)
-                off = max(0, min(int(idx-context_pre), cdur-SEG_LEN))
-            else:
-                off = random.randint(0, max(cdur-SEG_LEN, 0))
-        else:
-            off = random.randint(0, max(cdur-SEG_LEN, 0))
-            
+        # 4) enforce a minimum waveform amplitude
+        if np.max(np.abs(x)) < ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH:
+            # still too quiet → skip
+            continue
 
-        thresh = np.median(diffs)*3; candidates = np.where(diffs>thresh)[0]
-        if len(candidates)==0:
-            off = random.randint(0, max(cdur-SEG_LEN,0))
-        else:
-            idx = random.choice(candidates)
-            off = max(0, min(idx-context_pre, cdur-SEG_LEN))
-
-        read_start = cstart + off
-        x = src_wav[read_start : read_start + SEG_LEN]
-        y = tgt_wav[read_start : read_start + SEG_LEN]
-
-        if x.shape[0]<SEG_LEN:
-            p=SEG_LEN-x.shape[0]
-            x=np.pad(x,((0,p),(0,0)))
-            y=np.pad(y,((0,p),(0,0)))
-
-        style = np.zeros((SEG_LEN,1),dtype='float32')
-        x = np.concatenate([x,style],axis=-1)
-        yield x,y
+        # 5) build your style‐augmented (SEG_LEN,2) and yield
+        x = x.astype('float32')[:, None]
+        style = np.ones((SEG_LEN,1), dtype='float32')
+        xx = np.concatenate([x, style], axis=-1)
+        yy = y.astype('float32')[:, None]
+        yield xx, yy
 
 def segment_generator(chunk_list):
     """Uniform random windows, style=1.0 if pick-path else 0.0."""
@@ -419,6 +500,7 @@ def multi_scale_stft_loss(y_true, y_pred):
     Returns shape (batch,1,1) so it broadcasts in your combined_loss.
     """
     scales = [
+        (256,   64,  256),
         (512,  128,  512),
         (1024, 256, 1024),
         (2048, 512, 2048),
@@ -771,7 +853,7 @@ def train():
     sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
 
     pick_attack_ds    = tf.data.Dataset.from_generator(
-        lambda: pick_attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
     )
     
     pick_uniform_ds    = tf.data.Dataset.from_generator(
@@ -779,7 +861,7 @@ def train():
     )
     
     finger_attack_ds  = tf.data.Dataset.from_generator(
-        lambda: finger_attack_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
     )
     
     finger_uniform_ds  = tf.data.Dataset.from_generator(
@@ -794,7 +876,7 @@ def train():
 
     # validation streams
     val_pick_attack_ds = tf.data.Dataset.from_generator(
-        lambda: pick_attack_segment_generator(val_pick_chunks),
+        lambda: attack_segment_generator(val_pick_chunks),
         output_signature=(sig_x, sig_y)
     )
     
@@ -804,7 +886,7 @@ def train():
     )
     
     val_finger_attack_ds = tf.data.Dataset.from_generator(
-        lambda: finger_attack_segment_generator(val_finger_chunks),
+        lambda: attack_segment_generator(val_finger_chunks),
         output_signature=(sig_x, sig_y)
     )
     
@@ -939,7 +1021,7 @@ def train():
 if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         # Clean logs and checkpoints
-        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, CHECKPOINT_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR]:
+        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, CHECKPOINT_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR]:
             for sub in os.listdir(dir_path):
                 sub_path = os.path.join(dir_path, sub)
                 if os.path.isfile(sub_path):
@@ -984,10 +1066,14 @@ if __name__=="__main__":
 
         print("Generating demo audio file...")
         generate_demo(dynamic_model)
+    elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
+        dump_pick_attacks()
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--dump-finger-attacks":
+        dump_finger_attacks()
+        sys.exit(0)
     else:
-        print("Usage: python piezo2mic.py --train | --demo")
-        print("  --train          : train the model and save it")
-        print("  --demo           : generate a demo audio file using the trained model")
+        print("No command given.")
         sys.exit(1)
         
         
