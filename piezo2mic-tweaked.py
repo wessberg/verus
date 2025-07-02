@@ -35,8 +35,8 @@ tf.random.set_seed(SEED)
 
 DEBUG               = False
 FILTERS             = 128
-KERNEL_SIZE         = 61
-DILATIONS           = (1,2,4,8,16,32,64,128)
+KERNEL_SIZE         = 51
+DILATIONS           = (1,2,4,8,16,32,64)
 RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
 TRAIN_BLOCK_SIZE    = 4096
 SR                  = 48000
@@ -80,7 +80,7 @@ PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
-OUT_DIR        = "./out"
+OUT_DIR        = "./out-tweaked"
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
 MODELS_OUT_DIR = os.path.join(OUT_DIR, "models")
 LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
