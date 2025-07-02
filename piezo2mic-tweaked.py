@@ -62,7 +62,7 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 2e-1    # absolute floor on the piezo signal itself
 #───────────────────────────────────────────────────────────────────────────────
 
 EPOCHS      = 1000
@@ -243,12 +243,7 @@ class DemoCallback(Callback):
         print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
 
 
-def dump_pick_attacks(gap_sec=0.1, n_segments=None):
-    """
-    Use the exact same pick_attack_segment_generator() logic
-    to pull out N segments and stitch them together with gaps.
-    If n_segments is None we will grab one segment _per_ chunk.
-    """
+def dump_pick_attacks(gap_sec=0.01, n_segments=None):
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
@@ -261,6 +256,7 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     total = n_segments or len(pick_chunks)
 
     for i in range(total):
+        print(f"Generating pick attack segment {i+1}/{total}…")
         x, _ = next(gen)
         # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
         piezo_only = x[:, 0]   # (SEG_LEN,)
@@ -277,16 +273,12 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     sf.write(dpath, out, SR, subtype='FLOAT')
     print(f"✅  Wrote {total} pick‐attack segments → {dpath}")
 
-def dump_finger_attacks(gap_sec=0.1, n_segments=None):
-    """
-    Use the exact same finger_attack_segment_generator() logic
-    to pull out N segments and stitch them together with gaps.
-    If n_segments is None we will grab one segment _per_ chunk.
-    """
+def dump_finger_attacks(gap_sec=0.01, n_segments=None):
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
     gen      = attack_segment_generator(finger_chunks)
+
     collected = []
 
     # how many segments do we want?
@@ -295,7 +287,9 @@ def dump_finger_attacks(gap_sec=0.1, n_segments=None):
     total = n_segments or len(finger_chunks)
 
     for i in range(total):
+        print(f"Generating finger attack segment {i+1}/{total}…")
         x, _ = next(gen)
+
         # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
         piezo_only = x[:, 0]   # (SEG_LEN,)
         collected.append(piezo_only)
@@ -329,14 +323,11 @@ def hf_envelope(window):
     bp = sosfilt(SOS_BP, window)
     return np.abs(hilbert(bp))
 
-def find_pick_spikes(window,
+def find_attack_spikes(window,
                      pct_diff=99.9,
                      pct_env=99.5,
                      min_dist=SR//200):
-    """
-    Return indices of candidate pick‐clicks in `window`.
-    Enforce both a high‐percentile _and_ an absolute floor.
-    """
+
     denv = hp_diff_env(window)
     env  = hf_envelope(window)
 
@@ -365,13 +356,10 @@ def attack_segment_generator(chunks, context_pre=1024):
         mono = audio_cache[src][:,0]
         window = mono[cstart : cstart + cdur]
 
-        # 1) find all “pick‐like” spikes in this chunk
-        spikes = find_pick_spikes(window)
+        spikes = find_attack_spikes(window)
         if spikes.size == 0:
-            # no large clean pick‐clicks here
             continue
 
-        # 2) choose one at random, center it in your SEG_LEN slice
         idx   = int(random.choice(spikes))
         start = idx - context_pre
         start = np.clip(start, 0, cdur - SEG_LEN)
@@ -386,7 +374,6 @@ def attack_segment_generator(chunks, context_pre=1024):
             # still too quiet → skip
             continue
 
-        # 5) build your style‐augmented (SEG_LEN,2) and yield
         x = x.astype('float32')[:, None]
         style = np.ones((SEG_LEN,1), dtype='float32')
         xx = np.concatenate([x, style], axis=-1)
