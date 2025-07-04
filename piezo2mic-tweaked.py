@@ -17,7 +17,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoi
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
-    Activation, Multiply, Add, Lambda, Dense
+    Activation, Multiply, Add, Lambda, Dense, Layer
 )
 
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
@@ -60,8 +60,8 @@ STUDENT_TRAIN_BLOCK_SIZE = 4096
 STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
 STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
 STUDENT_DISTILL_ALPHA    = 0.5      # weight on the distillation loss
-STUDENT_STATIC_FILENAME  = "piezo2mic_baseline_student.keras"
-STUDENT_DYNAMIC_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
+STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_student.keras"
+STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
 
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
@@ -186,13 +186,15 @@ def build_chunks(pairs_list, seg_len):
     return chunks
 
 class DemoCallback(Callback):
-    def __init__(self, demo_checkpoints_out_dir, logs_out_dir):
+    def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
         super().__init__()
         demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
         self.src_path = demo_src
         self.tgt_path = demo_tgt
         self.demo_sec = DEMO_SEC
         self.offset_sec = DEMO_OFFSET_SEC
+        self.build_model_fn = build_model_fn
+        self.build_model_fn_args = build_model_fn_args
         self.sr = SR
         self.every = 1
         self.demos_out_dir = demo_checkpoints_out_dir
@@ -205,15 +207,10 @@ class DemoCallback(Callback):
         self.offset_frames = DEMO_OFFSET_SEC * SR
 
     def set_model(self, model):
-        """
-        Called by Keras when the training begins.
-        model is your static, fixed‐length model.
-        We make a dynamic copy here just for inference.
-        """
         self.static_model = model
         # build a dynamic‐time version of your model
         # you must have `build_model(dynamic_time=True)` available
-        self.dynamic_model = build_teacher_model(dynamic_time=True)
+        self.dynamic_model = self.build_model_fn(**self.build_model_fn_args, dynamic_time=True)
         # copy weights
         self.dynamic_model.set_weights(self.static_model.get_weights())
 
@@ -282,6 +279,29 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
+    
+@register_keras_serializable()
+class DistillLoss(Layer):
+    def __init__(self, alpha, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+
+    def call(self, inputs):
+        # inputs = [y_teacher, y_student], both shape (batch, T, 1)
+        y_t, y_s = inputs
+        # squared error → (batch, T, 1)
+        sq = tf.math.squared_difference(y_t, y_s)
+        # mean over everything → scalar
+        loss = tf.reduce_mean(sq)
+        # register it (automatically gets added to model.losses)
+        self.add_loss(self.alpha * loss)
+        # pass the student output on unchanged
+        return y_s
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'alpha': self.alpha})
+        return cfg
         
 
 # right after you define CHECKPOINT_OUT_DIR, etc:
@@ -300,13 +320,15 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     and write both piezo and mic signals (mono or stereo).
     """
     
-    # It is fine to always use TEACHER_SEG_LEN here
-    pick_chunks   = build_chunks(pairs_list=picked_pairs, seg_len=TEACHER_SEG_LEN)
+    # It is fine to always use TEACHER_SEG_LEN here, as we're dumping them based on the teacher model's receptive field
+    seg_len=TEACHER_SEG_LEN
+    
+    pick_chunks   = build_chunks(pairs_list=picked_pairs, seg_len=seg_len)
     
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
-    gen      = attack_segment_generator(pick_chunks)
+    gen      = attack_segment_generator(seg_len=seg_len, chunks=pick_chunks, is_pick_chunks=True)
     collected_piezo = []
     collected_mic   = []
 
@@ -352,9 +374,11 @@ def dump_finger_attacks(gap_sec=0.1, n_segments=None):
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
     
-    # It is fine to always use TEACHER_SEG_LEN here
-    finger_chunks   = build_chunks(pairs_list=finger_pairs, seg_len=TEACHER_SEG_LEN)
-    gen      = attack_segment_generator(finger_chunks)
+    # It is fine to always use TEACHER_SEG_LEN here, as we're dumping them based on the teacher model's receptive field
+    seg_len = TEACHER_SEG_LEN
+    
+    finger_chunks   = build_chunks(pairs_list=finger_pairs, seg_len=seg_len)
+    gen      = attack_segment_generator(seg_len=seg_len, chunks=finger_chunks, is_pick_chunks=False)
     collected_piezo = []
     collected_mic   = []
 
@@ -442,7 +466,7 @@ def hp_diff_env(window, α=0.8):
     return np.abs(np.diff(hp))
 
 
-def attack_segment_generator(chunks, context_pre=1024):
+def attack_segment_generator(seg_len, chunks, is_pick_chunks, context_pre=1024):
     while True:
         src, tgt, cstart, cdur = random.choice(chunks)
         mono = audio_cache[src][:,0]
@@ -454,43 +478,45 @@ def attack_segment_generator(chunks, context_pre=1024):
 
         idx   = int(random.choice(spikes))
         start = idx - context_pre
-        start = np.clip(start, 0, cdur - TEACHER_SEG_LEN)
+        start = np.clip(start, 0, cdur - seg_len)
         rs    = cstart + start
 
         # 3) slice out exactly SEG_LEN samples
-        x = mono[rs: rs + TEACHER_SEG_LEN]
-        y = audio_cache[tgt][rs: rs + TEACHER_SEG_LEN, 0]
+        x = mono[rs: rs + seg_len]
+        y = audio_cache[tgt][rs: rs + seg_len, 0]
 
         # 4) enforce a minimum waveform amplitude
         if np.max(np.abs(x)) < ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH:
             # still too quiet → skip
             continue
 
-        x = x.astype('float32')[:, None]
-        style = np.ones((TEACHER_SEG_LEN,1), dtype='float32')
+        x = x.astype('float32')[:,None]
+        style_flag = 1.0 if is_pick_chunks else 0.0
+        style = np.full((seg_len,1), style_flag, dtype='float32')
         xx = np.concatenate([x, style], axis=-1)
-        yy = y.astype('float32')[:, None]
+        yy = y.astype('float32')[:,None]
+        
         yield xx, yy
 
-def segment_generator(chunk_list):
+def segment_generator(seg_len, chunks, is_pick_chunks):
     """Uniform random windows, style=1.0 if pick-path else 0.0."""
     while True:
-        src, tgt, cstart, cdur = random.choice(chunk_list)
+        src, tgt, cstart, cdur = random.choice(chunks)
         src_wav = audio_cache[src]
         tgt_wav = audio_cache[tgt]
 
-        off = random.randrange(max(cdur - TEACHER_SEG_LEN, 1))
+        off = random.randrange(max(cdur - seg_len, 1))
         read_start = cstart + off
-        x = src_wav[read_start : read_start + TEACHER_SEG_LEN]
-        y = tgt_wav[read_start : read_start + TEACHER_SEG_LEN]
+        x = src_wav[read_start : read_start + seg_len]
+        y = tgt_wav[read_start : read_start + seg_len]
 
-        if x.shape[0] < TEACHER_SEG_LEN:
-            p = TEACHER_SEG_LEN - x.shape[0]
+        if x.shape[0] < seg_len:
+            p = seg_len - x.shape[0]
             x = np.pad(x, ((0,p),(0,0)))
             y = np.pad(y, ((0,p),(0,0)))
 
-        style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
-        style = np.full((TEACHER_SEG_LEN,1), style_flag, dtype='float32')
+        style_flag = 1.0 if is_pick_chunks else 0.0
+        style = np.full((seg_len,1), style_flag, dtype='float32')
         x = np.concatenate([x, style], axis=-1)
 
         yield x, y
@@ -874,6 +900,7 @@ def build_teacher_model(dynamic_time=False):
     return tf.keras.models.Model(inp, out, name="piezo2mic_teacher")
 
 def build_student_model(teacher=None, dynamic_time=False, distill_alpha=STUDENT_DISTILL_ALPHA):
+    
     """
     If teacher is not None, it must be a compiled & loaded Keras model
     mapping (batch,T,2)→(batch,T,1).  We will call it internally, freeze it,
@@ -931,19 +958,19 @@ def build_student_model(teacher=None, dynamic_time=False, distill_alpha=STUDENT_
                  out_finger])
     y_student = Add(name="stu_out")([pick_c, finger_c])
 
-    # 6) optionally: distillation loss
     model = tf.keras.models.Model(inputs=inp, outputs=y_student, name="piezo2mic_student")
     if teacher is not None:
         # freeze teacher
         teacher.trainable = False
         # call teacher on the same input
         y_teacher = teacher(inp)
-        # L2 distillation
-        mse = tf.keras.losses.MeanSquaredError()
-        # we reduce over (batch,T,1)
-        # Keras will sum all model.losses for the final loss
-        distill = distill_alpha * tf.reduce_mean(mse(y_teacher, y_student))
-        model.add_loss(distill)
+        
+        # now wrap them both in DistillLoss, which calls add_loss internally
+        y_student = DistillLoss(alpha=distill_alpha, name="distillation")(
+                        [y_teacher, y_student]
+                    )
+        # and redefine the model output so Keras knows about it
+        model = tf.keras.models.Model(inputs=inp, outputs=y_student, name="piezo2mic_student")
 
     return model
 
@@ -1001,19 +1028,19 @@ def train_shared(
     sig_y = tf.TensorSpec((seg_len,1), tf.float32)
 
     pick_attack_ds    = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_pick_chunks, is_pick_chunks=True), output_signature=(sig_x,sig_y)
     )
     
     pick_uniform_ds    = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
+        lambda: segment_generator(seg_len=seg_len, chunks=train_pick_chunks, is_pick_chunks=True), output_signature=(sig_x,sig_y)
     )
     
     finger_attack_ds  = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
     )
     
     finger_uniform_ds  = tf.data.Dataset.from_generator(
-        lambda: segment_generator(train_finger_chunks), output_signature=(sig_x,sig_y)
+        lambda: segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
     )
 
     train_ds = tf.data.Dataset.sample_from_datasets(
@@ -1024,22 +1051,22 @@ def train_shared(
 
     # validation streams
     val_pick_attack_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(val_pick_chunks),
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_pick_chunks, is_pick_chunks=True),
         output_signature=(sig_x, sig_y)
     )
     
     val_pick_uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_pick_chunks),
+        lambda: segment_generator(seg_len=seg_len, chunks=val_pick_chunks, is_pick_chunks=True),
         output_signature=(sig_x, sig_y)
     )
     
     val_finger_attack_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(val_finger_chunks),
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_finger_chunks, is_pick_chunks=False),
         output_signature=(sig_x, sig_y)
     )
     
     val_finger_uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(val_finger_chunks),
+        lambda: segment_generator(seg_len=seg_len, chunks=val_finger_chunks, is_pick_chunks=False),
         output_signature=(sig_x, sig_y)
     )
     
@@ -1130,6 +1157,8 @@ def train_shared(
     )
         
     demo_cb = DemoCallback(
+        build_model_fn=build_model_fn,
+        build_model_fn_args=build_model_fn_args,
         logs_out_dir=logs_out_dir,
         demo_checkpoints_out_dir=demo_checkpoints_out_dir
     )
@@ -1178,27 +1207,27 @@ def train_teacher(resume=False, resume_ckpt_path=None):
     )
 
 def train_student(resume=False, resume_ckpt_path=None):
-    teacher_static_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
-    if not os.path.exists(teacher_static_model_filepath):
+    teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(teacher_dynamic_model_filepath):
         print("Teacher model not found, run --train-teacher first")
         sys.exit(1)
-    teacher = tf.keras.models.load_model(teacher_static_model_filepath, compile=False)
-    print("Loaded teacher from", teacher_static_model_filepath)
+    teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
+    print("Loaded teacher from", teacher_dynamic_model_filepath)
     
     train_shared(
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
-        seg_len=TEACHER_SEG_LEN,
-        static_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
-        dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+        seg_len=STUDENT_SEG_LEN,
+        static_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
+        dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_student_model,
         build_model_fn_args={
             'teacher': teacher
         },
-        checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
-        logs_out_dir=LOGS_TEACHER_OUT_DIR,
-        csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
-        demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR
+        checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
+        logs_out_dir=LOGS_STUDENT_OUT_DIR,
+        csv_logs_out_dir=CSV_LOGS_STUDENT_OUT_DIR,
+        demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR
     )
 
 def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
@@ -1223,7 +1252,7 @@ def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_d
         else:
             return (False, None)
 
-def prepare_and_generate_demo (dynamic_model_filepath, checkpoint_out_dir, demo_out_dir):
+def prepare_and_generate_demo (dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args={}):
     # Turn off GPU acceleration for inference, as it is more reliable
         tf.config.set_visible_devices([], 'GPU')
 
@@ -1241,7 +1270,7 @@ def prepare_and_generate_demo (dynamic_model_filepath, checkpoint_out_dir, demo_
                     compile=False
                 )
                 
-                dynamic_model = build_teacher_model(dynamic_time=True)
+                dynamic_model = build_model_fn(**build_model_fn_args, dynamic_time=True)
                 dynamic_model.set_weights(static_model.get_weights())
                 
             else:
@@ -1288,18 +1317,29 @@ def main ():
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         
+        teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
+        if not os.path.exists(teacher_dynamic_model_filepath):
+            print("Teacher model not found, run --train-teacher first")
+            sys.exit(1)
+        teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
+        
         print("Generating demo audio files...")
         
         prepare_and_generate_demo(
             demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
             dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR
+            checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+            build_model_fn=build_teacher_model,
         )
         
         prepare_and_generate_demo(
             demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
-            dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR
+            dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
+            checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
+            build_model_fn=build_student_model,
+            build_model_fn_args={
+                'teacher': teacher
+            }
         )
     elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
         dump_pick_attacks()
