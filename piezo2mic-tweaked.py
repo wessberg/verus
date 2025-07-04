@@ -17,7 +17,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoi
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
-    Activation, Multiply, Add, Lambda, Dense, SpatialDropout1D
+    Activation, Multiply, Add, Lambda, Dense
 )
 
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
@@ -30,19 +30,38 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# Audio channel configuration
+SR                  = 48000 
 
-# ───────────────────────────── PARAMETERS ─────────────────────────────────────
+# Debugging params
+DEBUG               = True
 
-DEBUG               = False
-FILTERS             = 128
-KERNEL_SIZE         = 51
-DILATIONS           = (1,2,4,8,16,32,64)
-RECEPTIVE_FIELD     = 1 + (KERNEL_SIZE - 1) * sum(DILATIONS)
-TRAIN_BLOCK_SIZE    = 4096
-SR                  = 48000
-SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
+# Batch params
 BATCH_SIZE          = 32
-EMBED_DIM           = 32
+
+# Teacher params
+TEACHER_FILTERS                = 128
+TEACHER_KERNEL_SIZE            = 51
+TEACHER_DILATIONS              = (1,2,4,8,16,32,64)
+TEACHER_RECEPTIVE_FIELD        = 1 + (TEACHER_KERNEL_SIZE - 1) * sum(TEACHER_DILATIONS)
+TEACHER_TRAIN_BLOCK_SIZE       = 4096
+TEACHER_SEG_LEN                = TEACHER_RECEPTIVE_FIELD + TEACHER_TRAIN_BLOCK_SIZE
+TEACHER_EMBED_DIM              = 32
+TEACHER_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_teacher.keras"
+TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_teacher_dynamic.keras"
+
+# Student params
+
+STUDENT_FILTERS          = 32       # number of channels in the student
+STUDENT_KERNEL_SIZE      = 25       # (25−1)*(1+2+4+8)=24*15=360 +1 ≃361 samples ≃7.5 ms RF
+STUDENT_DILATIONS        = (1,2,4,8)
+STUDENT_RECEPTIVE_FIELD  = 1 + (STUDENT_KERNEL_SIZE - 1) * sum(STUDENT_DILATIONS)
+STUDENT_TRAIN_BLOCK_SIZE = 4096
+STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
+STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
+STUDENT_DISTILL_ALPHA    = 0.5      # weight on the distillation loss
+STUDENT_STATIC_FILENAME  = "piezo2mic_baseline_student.keras"
+STUDENT_DYNAMIC_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
 
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
@@ -81,28 +100,47 @@ FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
 OUT_DIR        = "./out-tweaked"
+
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
+CHECKPOINT_TEACHER_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "teacher")
+CHECKPOINT_STUDENT_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "student")
+
 MODELS_OUT_DIR = os.path.join(OUT_DIR, "models")
+MODELS_TEACHER_OUT_DIR = os.path.join(MODELS_OUT_DIR, "teacher")
+MODELS_STUDENT_OUT_DIR = os.path.join(MODELS_OUT_DIR, "student")
+
 LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
+LOGS_TEACHER_OUT_DIR = os.path.join(LOGS_OUT_DIR, "teacher")
+LOGS_STUDENT_OUT_DIR = os.path.join(LOGS_OUT_DIR, "student")
+
 CSV_LOGS_OUT_DIR = os.path.join(OUT_DIR, "csv-logs")
+CSV_LOGS_TEACHER_OUT_DIR = os.path.join(CSV_LOGS_OUT_DIR, "teacher")
+CSV_LOGS_STUDENT_OUT_DIR = os.path.join(CSV_LOGS_OUT_DIR, "student")
+
 DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
-LONG_DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos/long")
-DEMO_GENERATOR_OUTPUTS_OUT_DIR = os.path.join(OUT_DIR, "demos/generator-outputs")
-DEMO_CHECKPOINTS_OUT_DIR = os.path.join(OUT_DIR, "demos/checkpoints")
+
+LONG_DEMOS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "long")
+LONG_DEMOS_TEACHER_OUT_DIR = os.path.join(LONG_DEMOS_OUT_DIR, "teacher")
+LONG_DEMOS_STUDENT_OUT_DIR = os.path.join(LONG_DEMOS_OUT_DIR, "student")
+
+DEMO_GENERATOR_OUTPUTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "generator-outputs")
+
+DEMO_CHECKPOINTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "checkpoints")
+DEMO_CHECKPOINTS_TEACHER_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "teacher")
+DEMO_CHECKPOINTS_STUDENT_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "student")
 
 DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
+LONG_DEMO_SEC        = 30
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
-STATIC_MODEL_FILENAME  = "piezo2mic_resnet.keras"
-DYNAMIC_MODEL_FILENAME = "piezo2mic_resnet_dynamic.keras"
+
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
-for dir_path in [OUT_DIR, CHECKPOINT_OUT_DIR, MODELS_OUT_DIR, DEMOS_OUT_DIR, LONG_DEMOS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR, LOGS_OUT_DIR, CSV_LOGS_OUT_DIR]:
+for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR, CSV_LOGS_TEACHER_OUT_DIR, CSV_LOGS_STUDENT_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
@@ -129,7 +167,7 @@ for (src,tgt) in all_pairs:
     audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
     audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
 
-def build_chunks(pairs_list):
+def build_chunks(pairs_list, seg_len):
     """
     Turn a list of (src,tgt) into
     [(src,tgt,chunk_start,chunk_len), …].
@@ -143,17 +181,12 @@ def build_chunks(pairs_list):
         for i in range(n_full):
             chunks.append((src,tgt,i*chunk_len,chunk_len))
         rem = total - n_full*chunk_len
-        if rem >= SEG_LEN:
+        if rem >= seg_len:
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
-pick_chunks   = build_chunks(picked_pairs)
-finger_chunks = build_chunks(finger_pairs)
-all_chunks    = pick_chunks + finger_chunks
-print(f"Generated {len(all_chunks)} chunks")
-
 class DemoCallback(Callback):
-    def __init__(self):
+    def __init__(self, demo_checkpoints_out_dir, logs_out_dir):
         super().__init__()
         demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
         self.src_path = demo_src
@@ -162,10 +195,10 @@ class DemoCallback(Callback):
         self.offset_sec = DEMO_OFFSET_SEC
         self.sr = SR
         self.every = 1
-        self.demos_out_dir = DEMO_CHECKPOINTS_OUT_DIR
+        self.demos_out_dir = demo_checkpoints_out_dir
         os.makedirs(self.demos_out_dir, exist_ok=True)
         # TensorBoard writer for audio
-        self.writer = tf.summary.create_file_writer(os.path.join(LOGS_OUT_DIR,"demo"))
+        self.writer = tf.summary.create_file_writer(os.path.join(logs_out_dir,"demo"))
 
         # how many frames to read
         self.demo_frames  = DEMO_SEC * SR
@@ -180,7 +213,7 @@ class DemoCallback(Callback):
         self.static_model = model
         # build a dynamic‐time version of your model
         # you must have `build_model(dynamic_time=True)` available
-        self.dynamic_model = build_model(dynamic_time=True)
+        self.dynamic_model = build_teacher_model(dynamic_time=True)
         # copy weights
         self.dynamic_model.set_weights(self.static_model.get_weights())
 
@@ -241,6 +274,14 @@ class DemoCallback(Callback):
                              step=friendly_epoch)
             self.writer.flush()
         print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "demos_out_dir": self.demos_out_dir,
+            "logs_out_dir":  self.logs_out_dir
+        })
+        return config
         
 
 # right after you define CHECKPOINT_OUT_DIR, etc:
@@ -258,6 +299,10 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     Use your attack_segment_generator() to pull out N pick‐attack windows,
     and write both piezo and mic signals (mono or stereo).
     """
+    
+    # It is fine to always use TEACHER_SEG_LEN here
+    pick_chunks   = build_chunks(pairs_list=picked_pairs, seg_len=TEACHER_SEG_LEN)
+    
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
@@ -306,7 +351,9 @@ def dump_finger_attacks(gap_sec=0.1, n_segments=None):
     """
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
-
+    
+    # It is fine to always use TEACHER_SEG_LEN here
+    finger_chunks   = build_chunks(pairs_list=finger_pairs, seg_len=TEACHER_SEG_LEN)
     gen      = attack_segment_generator(finger_chunks)
     collected_piezo = []
     collected_mic   = []
@@ -407,12 +454,12 @@ def attack_segment_generator(chunks, context_pre=1024):
 
         idx   = int(random.choice(spikes))
         start = idx - context_pre
-        start = np.clip(start, 0, cdur - SEG_LEN)
+        start = np.clip(start, 0, cdur - TEACHER_SEG_LEN)
         rs    = cstart + start
 
         # 3) slice out exactly SEG_LEN samples
-        x = mono[rs: rs + SEG_LEN]
-        y = audio_cache[tgt][rs: rs + SEG_LEN, 0]
+        x = mono[rs: rs + TEACHER_SEG_LEN]
+        y = audio_cache[tgt][rs: rs + TEACHER_SEG_LEN, 0]
 
         # 4) enforce a minimum waveform amplitude
         if np.max(np.abs(x)) < ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH:
@@ -420,7 +467,7 @@ def attack_segment_generator(chunks, context_pre=1024):
             continue
 
         x = x.astype('float32')[:, None]
-        style = np.ones((SEG_LEN,1), dtype='float32')
+        style = np.ones((TEACHER_SEG_LEN,1), dtype='float32')
         xx = np.concatenate([x, style], axis=-1)
         yy = y.astype('float32')[:, None]
         yield xx, yy
@@ -432,18 +479,18 @@ def segment_generator(chunk_list):
         src_wav = audio_cache[src]
         tgt_wav = audio_cache[tgt]
 
-        off = random.randrange(max(cdur - SEG_LEN, 1))
+        off = random.randrange(max(cdur - TEACHER_SEG_LEN, 1))
         read_start = cstart + off
-        x = src_wav[read_start : read_start + SEG_LEN]
-        y = tgt_wav[read_start : read_start + SEG_LEN]
+        x = src_wav[read_start : read_start + TEACHER_SEG_LEN]
+        y = tgt_wav[read_start : read_start + TEACHER_SEG_LEN]
 
-        if x.shape[0] < SEG_LEN:
-            p = SEG_LEN - x.shape[0]
+        if x.shape[0] < TEACHER_SEG_LEN:
+            p = TEACHER_SEG_LEN - x.shape[0]
             x = np.pad(x, ((0,p),(0,0)))
             y = np.pad(y, ((0,p),(0,0)))
 
         style_flag = 1.0 if src.startswith(PICK_SRC_DIR) else 0.0
-        style = np.full((SEG_LEN,1), style_flag, dtype='float32')
+        style = np.full((TEACHER_SEG_LEN,1), style_flag, dtype='float32')
         x = np.concatenate([x, style], axis=-1)
 
         yield x, y
@@ -469,7 +516,7 @@ def analyze_loss_scales(model, dataset ):
 
     return {'l1': l1_val, 'stft': stft_val, 'mel': mel_val, 'env': env_val, 'hf': hf_val}
         
-def generate_demo (model, prediction_name="demo_pred", only_prediction=False):
+def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=False):
     print("\nGenerating demo…")
     FRAMES      = LONG_DEMO_SEC * SR
     START_FRAME = LONG_DEMO_OFFSET_SEC * SR
@@ -498,12 +545,12 @@ def generate_demo (model, prediction_name="demo_pred", only_prediction=False):
     print("Running inference…")
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
     
-    prediction_filepath = os.path.join(LONG_DEMOS_OUT_DIR, prediction_name + ".wav")
+    prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
     
     if (not only_prediction):
-        source_filepath = os.path.join(LONG_DEMOS_OUT_DIR, "demo_source" +".wav")
-        target_filepath = os.path.join(LONG_DEMOS_OUT_DIR, "demo_target" + ".wav")
+        source_filepath = os.path.join(out_dir, "demo_source" +".wav")
+        target_filepath = os.path.join(out_dir, "demo_target" + ".wav")
         sf.write(source_filepath,
              x_long, SR, subtype='FLOAT')
         sf.write(target_filepath,
@@ -536,6 +583,7 @@ def multi_scale_stft_loss(y_true, y_pred):
         (512,  128,  512),
         (1024, 256, 1024),
         (2048, 512, 2048),
+        (8192, 2048, 8192)
     ]
 
     # squeeze off the channel dim → (batch, T)
@@ -772,42 +820,42 @@ def invert(x):
     return 1.0 - x
 
 
-def build_model(dynamic_time=False):
-    T = None if dynamic_time else SEG_LEN
+def build_teacher_model(dynamic_time=False):
+    T = None if dynamic_time else TEACHER_SEG_LEN
     inp = Input(shape=(T,2), name="piezo_plus_style")
     style = Lambda(slice_style, name="take_style")(inp)                   # (batch, T, 1)
     piezo = Lambda(slice_piezo, name="take_piezo")(inp)
     # derive scalar style flag
     style_scalar = Lambda(extract_style_scalar, name="style_scalar")(style)  # (batch,)
     # style embedding
-    style_embed = Dense(EMBED_DIM, activation='linear', name="style_embed")(style_scalar)
+    style_embed = Dense(TEACHER_EMBED_DIM, activation='linear', name="style_embed")(style_scalar)
     # initial 1x1 projection on both channels
-    x = Conv1D(FILTERS, 1, padding='same', name="init_pw")(inp)
+    x = Conv1D(TEACHER_FILTERS, 1, padding='same', name="init_pw")(inp)
 
-    for idx, d in enumerate(DILATIONS):
+    for idx, d in enumerate(TEACHER_DILATIONS):
         res = x
-        pad = (KERNEL_SIZE - 1) * d
+        pad = (TEACHER_KERNEL_SIZE - 1) * d
         x = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
-        g = SeparableConv1D(FILTERS*2, KERNEL_SIZE, dilation_rate=d,
+        g = SeparableConv1D(TEACHER_FILTERS*2, TEACHER_KERNEL_SIZE, dilation_rate=d,
                             padding='valid', name=f"sep_{idx}")(x)
-        c = Lambda(slice_content, arguments={'filters':FILTERS},
+        c = Lambda(slice_content, arguments={'filters':TEACHER_FILTERS},
                    name=f"slice_content_{idx}")(g)
-        g2 = Lambda(slice_gate, arguments={'filters':FILTERS},
+        g2 = Lambda(slice_gate, arguments={'filters':TEACHER_FILTERS},
                     name=f"slice_gate_{idx}")(g)
         x = Multiply(name=f"gated_mul_{idx}")([
                 Activation('tanh', name=f"tanh_{idx}")(c),
                 Activation('sigmoid', name=f"sigmoid_{idx}")(g2)
             ])
-        x = Conv1D(FILTERS,1,padding='same', name=f"pw_{idx}")(x)
+        x = Conv1D(TEACHER_FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
         # FiLM modulation
 
-        film_params = Dense(FILTERS*2, name=f"film_dense_{idx}")(style_embed)
+        film_params = Dense(TEACHER_FILTERS*2, name=f"film_dense_{idx}")(style_embed)
         gamma = Lambda(slice_film_gamma,
-                    arguments={'filters': FILTERS},
+                    arguments={'filters': TEACHER_FILTERS},
                     name=f"film_gamma_{idx}")(film_params)
         beta  = Lambda(slice_film_beta,
-                    arguments={'filters': FILTERS},
+                    arguments={'filters': TEACHER_FILTERS},
                     name=f"film_beta_{idx}")(film_params)
 
         x = Add(name=f"film_apply_{idx}")([
@@ -823,15 +871,106 @@ def build_model(dynamic_time=False):
     mixed    = Add(name="mix_main")([pick_c, finger_c])
     out = mixed
 
-    return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
+    return tf.keras.models.Model(inp, out, name="piezo2mic_teacher")
+
+def build_student_model(teacher=None, dynamic_time=False, distill_alpha=STUDENT_DISTILL_ALPHA):
+    """
+    If teacher is not None, it must be a compiled & loaded Keras model
+    mapping (batch,T,2)→(batch,T,1).  We will call it internally, freeze it,
+    and add a (MSE) distillation loss between teacher(inp) and student(inp).
+    """
+    # 1) input & style split
+    T = None if dynamic_time else STUDENT_SEG_LEN
+    inp = Input(shape=(T,2), name="stu_piezo_plus_style")
+    style = Lambda(slice_style, name="stu_slice_style")(inp)      # (B,T,1)
+    piezo = Lambda(slice_piezo, name="stu_slice_piezo")(inp)     # (B,T,1)
+
+    # 2) style embedding
+    style_scalar = Lambda(extract_style_scalar, name="stu_style_scalar")(style)  # (B,1)
+    style_embed  = Dense(STUDENT_EMBED_DIM, activation='linear',
+                         name="stu_style_embed")(style_scalar)                  # (B,EMB)
+
+    # 3) initial 1×1 conv
+    x = Conv1D(STUDENT_FILTERS, 1, padding='same', name="stu_init_pw")(inp)
+
+    # 4) small stack of gated separable convs + FiLM
+    for i, d in enumerate(STUDENT_DILATIONS):
+        res = x
+        pad = (STUDENT_KERNEL_SIZE-1)*d
+        x = ZeroPadding1D((pad,0), name=f"stu_pad_{i}")(x)
+        g = SeparableConv1D(STUDENT_FILTERS*2, STUDENT_KERNEL_SIZE,
+                            dilation_rate=d, padding='valid',
+                            name=f"stu_sep_{i}")(x)
+        c = Lambda(slice_content,   arguments={'filters':STUDENT_FILTERS},
+                   name=f"stu_slice_c_{i}")(g)
+        g2= Lambda(slice_gate,      arguments={'filters':STUDENT_FILTERS},
+                   name=f"stu_slice_g_{i}")(g)
+        x = Multiply(name=f"stu_gate_mul_{i}")([
+              Activation('tanh')(c),
+              Activation('sigmoid')(g2)
+            ])
+        x = Conv1D(STUDENT_FILTERS,1,padding='same', name=f"stu_pw_{i}")(x)
+        x = Add(name=f"stu_res_add_{i}")([x,res])
+        # FiLM:
+        film = Dense(STUDENT_FILTERS*2, name=f"stu_film_dense_{i}")(style_embed)
+        gamma = Lambda(slice_film_gamma,   arguments={'filters':STUDENT_FILTERS},
+                       name=f"stu_film_gamma_{i}")(film)
+        beta  = Lambda(slice_film_beta,    arguments={'filters':STUDENT_FILTERS},
+                       name=f"stu_film_beta_{i}")(film)
+        x = Add(name=f"stu_film_apply_{i}")([
+              Multiply(name=f"stu_film_scale_{i}")([x,gamma]),
+              beta
+            ])
+
+    # 5) style‐conditioned 1×1 outputs
+    out_pick   = Conv1D(1,1,padding='same', name="stu_final_pick")(x)
+    out_finger = Conv1D(1,1,padding='same', name="stu_final_finger")(x)
+    pick_c   = Multiply(name="stu_pick_contrib")([style, out_pick])
+    finger_c = Multiply(name="stu_finger_contrib")([
+                 Lambda(invert, name="stu_invert_style")(style),
+                 out_finger])
+    y_student = Add(name="stu_out")([pick_c, finger_c])
+
+    # 6) optionally: distillation loss
+    model = tf.keras.models.Model(inputs=inp, outputs=y_student, name="piezo2mic_student")
+    if teacher is not None:
+        # freeze teacher
+        teacher.trainable = False
+        # call teacher on the same input
+        y_teacher = teacher(inp)
+        # L2 distillation
+        mse = tf.keras.losses.MeanSquaredError()
+        # we reduce over (batch,T,1)
+        # Keras will sum all model.losses for the final loss
+        distill = distill_alpha * tf.reduce_mean(mse(y_teacher, y_student))
+        model.add_loss(distill)
+
+    return model
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     # TODO
     print("TODO")
 
-# ─────────────────────────────── TRAINING ──────────────────────────────────────
-def train(resume=False, resume_ckpt_path=None):
+
+
+
+def train_shared(
+    seg_len,
+    build_model_fn,
+    checkpoint_out_dir,
+    logs_out_dir,
+    csv_logs_out_dir,
+    demo_checkpoints_out_dir,
+    static_model_filepath,
+    dynamic_model_filepath,
+    resume=False,
+    resume_ckpt_path=None,
+    build_model_fn_args={}):
     global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
+    
+    all_chunks = build_chunks(pairs_list=all_pairs, seg_len=seg_len)
+    pick_chunks = build_chunks(pairs_list=picked_pairs, seg_len=seg_len)
+    finger_chunks = build_chunks(pairs_list=finger_pairs, seg_len=seg_len)
 
     # train/val split
     idx = list(range(len(all_chunks)))
@@ -850,7 +989,7 @@ def train(resume=False, resume_ckpt_path=None):
     
 
     def approx_steps(durs):
-        return 500 if DEBUG else sum(max((d-SEG_LEN)//(SEG_LEN//2)+1,0) for d in durs)//BATCH_SIZE
+        return 200 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
     train_durs = [dur for (_,_,_,dur) in train_chunks]
     val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
@@ -858,8 +997,8 @@ def train(resume=False, resume_ckpt_path=None):
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     # datasets
-    sig_x = tf.TensorSpec((SEG_LEN,2), tf.float32)
-    sig_y = tf.TensorSpec((SEG_LEN,1), tf.float32)
+    sig_x = tf.TensorSpec((seg_len,2), tf.float32)
+    sig_y = tf.TensorSpec((seg_len,1), tf.float32)
 
     pick_attack_ds    = tf.data.Dataset.from_generator(
         lambda: attack_segment_generator(train_pick_chunks), output_signature=(sig_x,sig_y)
@@ -911,9 +1050,7 @@ def train(resume=False, resume_ckpt_path=None):
     ).batch(BATCH_SIZE)
     
     val_ds = val_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
-    
-    
-    
+
     # build or load model
     if resume and resume_ckpt_path:
         print(f"Resuming training from checkpoint: {resume_ckpt_path}")
@@ -921,14 +1058,12 @@ def train(resume=False, resume_ckpt_path=None):
         static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
         initial_epoch = _extract_epoch_from_ckpt(resume_ckpt_path)
     else:
-        static_model = build_model(dynamic_time=False)
+        static_model = build_model_fn(**build_model_fn_args, dynamic_time=False)
         initial_epoch = 0
     
      # Measure raw scales of each loss term on one batch of val_ds
     baseline = analyze_loss_scales(static_model, val_ds)
     
-    # Recompute *absolute* weights so that
-    #   new_w[i] ∝ user_w[i] / baseline[i], *and* new_w[l1] = user_w[l1]
     ref_scale = float(baseline['l1'])
     user_w    = {
         'l1':  L1_WEIGHT,
@@ -986,21 +1121,22 @@ def train(resume=False, resume_ckpt_path=None):
     
     # ModelCheckpoint: save whenever val_loss improves
     cp = ModelCheckpoint(
-        filepath=os.path.join(CHECKPOINT_OUT_DIR,
+        filepath=os.path.join(checkpoint_out_dir,
                             "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
         monitor='val_loss',
         mode='min',
         save_best_only=True,
         verbose=1
     )
-    
-    # Demo callback: log audio & images to TensorBoard
-    
-    demo_cb = DemoCallback()
-    tb = TensorBoard(log_dir=LOGS_OUT_DIR, write_graph=False)
-    csv_logger = CSVLogger(os.path.join(CSV_LOGS_OUT_DIR, "training.csv"), append=False)
+        
+    demo_cb = DemoCallback(
+        logs_out_dir=logs_out_dir,
+        demo_checkpoints_out_dir=demo_checkpoints_out_dir
+    )
+    tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
+    csv_logger = CSVLogger(os.path.join(csv_logs_out_dir, "training.csv"), append=False)
 
-    history = static_model.fit(
+    static_model.fit(
         train_ds,
         initial_epoch=initial_epoch,
         epochs=1 if DEBUG else EPOCHS,
@@ -1009,38 +1145,65 @@ def train(resume=False, resume_ckpt_path=None):
         validation_steps=validation_steps,
         callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger]
     )
-
-    # style-specific evaluation
-    # print("\nEvaluating pick style on val set:")
-    # static_model.evaluate(val_pick_ds_1, steps=validation_steps)
-    # print("\nEvaluating finger style on val set:")
-    # static_model.evaluate(val_finger_ds_1, steps=validation_steps)
     
-    trained_epochs = len(history.history["loss"])
+    # trained_epochs = len(history.history["loss"])
 
-    # ── Save FP32 static & dynamic models ──────────────────────────────────
-    path_static = os.path.join(MODELS_OUT_DIR, STATIC_MODEL_FILENAME)
-    static_model.save(path_static)
-    print("✅ Saved FP32 static model:", path_static)
+    # Save FP32 static and dynamic models
+    static_model.save(static_model_filepath)
+    print("✅ Saved FP32 static model:", static_model_filepath)
 
-    dynamic_model = build_model(dynamic_time=True)
+    dynamic_model = build_model_fn(**build_model_fn_args, dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
-    path_dyn = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
-    dynamic_model.save(path_dyn)
-    print("✅ Saved FP32 dynamic model:", path_dyn)
+    dynamic_model.save(dynamic_model_filepath)
+    print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
 
     # ── Optional: dump .npy FP32 weights & extract INT8 ───────────────────
     if SAVE_WEIGHTS:
-        # unchanged: dumping weights...
         pass
 
     return static_model, dynamic_model
 
-# ─────────────────────────────── MAIN / DEMO ──────────────────────────────────
-if __name__=="__main__":   
-    if len(sys.argv)>1 and sys.argv[1]=="--train":
-        # Clean logs and checkpoints
-        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR]:
+def train_teacher(resume=False, resume_ckpt_path=None):
+    train_shared(
+        resume=resume,
+        resume_ckpt_path=resume_ckpt_path,
+        seg_len=TEACHER_SEG_LEN,
+        static_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
+        dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+        build_model_fn=build_teacher_model,
+        checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+        logs_out_dir=LOGS_TEACHER_OUT_DIR,
+        csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
+        demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR
+    )
+
+def train_student(resume=False, resume_ckpt_path=None):
+    teacher_static_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
+    if not os.path.exists(teacher_static_model_filepath):
+        print("Teacher model not found, run --train-teacher first")
+        sys.exit(1)
+    teacher = tf.keras.models.load_model(teacher_static_model_filepath, compile=False)
+    print("Loaded teacher from", teacher_static_model_filepath)
+    
+    train_shared(
+        resume=resume,
+        resume_ckpt_path=resume_ckpt_path,
+        seg_len=TEACHER_SEG_LEN,
+        static_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
+        dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+        build_model_fn=build_student_model,
+        build_model_fn_args={
+            'teacher': teacher
+        },
+        checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+        logs_out_dir=LOGS_TEACHER_OUT_DIR,
+        csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
+        demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR
+    )
+
+def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
+    # Clean logs and checkpoints
+        for dir_path in [logs_out_dir, csv_logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
             for sub in os.listdir(dir_path):
                 sub_path = os.path.join(dir_path, sub)
                 if os.path.isfile(sub_path):
@@ -1049,42 +1212,43 @@ if __name__=="__main__":
                     shutil.rmtree(sub_path)
         
          # look for existing checkpoints
-        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OUT_DIR, "*.keras")))
+        ckpts = sorted(glob.glob(os.path.join(checkpoints_out_dir, "*.keras")))
         resume = len(ckpts) > 0
         resume_ckpt = ckpts[-1] if resume else None
 
         if resume:
             ep = _extract_epoch_from_ckpt(resume_ckpt)
             print(f"→ Found checkpoint, will resume from epoch {ep}: {resume_ckpt}")
-            static_model, dynamic_model = train(resume=resume, resume_ckpt_path=resume_ckpt)
+            return (resume, resume_ckpt)
         else:
-            static_model, dynamic_model = train()
-    elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
-        # Turn off GPU acceleration for inference, as it is more reliable
+            return (False, None)
+
+def prepare_and_generate_demo (dynamic_model_filepath, checkpoint_out_dir, demo_out_dir):
+    # Turn off GPU acceleration for inference, as it is more reliable
         tf.config.set_visible_devices([], 'GPU')
 
-        dpath = os.path.join(MODELS_OUT_DIR, DYNAMIC_MODEL_FILENAME)
+        dpath = dynamic_model_filepath
         if not os.path.exists(dpath):
             # Read the latest checkpoint by finding the most recent file
-            checkpoints = sorted(glob.glob(os.path.join(CHECKPOINT_OUT_DIR, "*.keras")))
+            checkpoints = sorted(glob.glob(os.path.join(checkpoint_out_dir, "*.keras")))
 
             if checkpoints:
                 dpath = checkpoints[-1]
-                
+                 
                 print("Loading model from checkpoint:", dpath)
                 static_model = tf.keras.models.load_model(
                     dpath,
                     compile=False
                 )
                 
-                dynamic_model = build_model(dynamic_time=True)
+                dynamic_model = build_teacher_model(dynamic_time=True)
                 dynamic_model.set_weights(static_model.get_weights())
                 
             else:
                 dpath = None
 
             if not dpath:
-                print("Dynamic model not found. run: python piezo2mic.py --train")
+                print("Dynamic model not found. run: python piezo2mic.py --train-teacher and/or python piezo2mic.py --train-student")
                 sys.exit(1)
         else:
              print("Loading dynamic model from:", dpath)
@@ -1093,8 +1257,50 @@ if __name__=="__main__":
                 compile=False
             )
 
-        print("Generating demo audio file...")
-        generate_demo(dynamic_model)
+        generate_demo(model=dynamic_model, out_dir=demo_out_dir)
+
+def main ():
+    if len(sys.argv)>1 and sys.argv[1]=="--train-teacher":
+        resume, resume_ckpt = cleanup_and_prepare_train(
+            logs_out_dir=LOGS_TEACHER_OUT_DIR,
+            csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
+            checkpoints_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+            demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR,
+            demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
+        )
+
+        if resume:
+            train_teacher(resume=resume, resume_ckpt_path=resume_ckpt)
+        else:
+            train_teacher()
+    elif len(sys.argv)>1 and sys.argv[1]=="--train-student":
+        resume, resume_ckpt = cleanup_and_prepare_train(
+            logs_out_dir=LOGS_STUDENT_OUT_DIR,
+            csv_logs_out_dir=CSV_LOGS_STUDENT_OUT_DIR,
+            checkpoints_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
+            demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR,
+            demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
+        )
+
+        if resume:
+            train_student(resume=resume, resume_ckpt_path=resume_ckpt)
+        else:
+            train_student()
+    elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
+        
+        print("Generating demo audio files...")
+        
+        prepare_and_generate_demo(
+            demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
+            dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+            checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR
+        )
+        
+        prepare_and_generate_demo(
+            demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
+            dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_FILENAME),
+            checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR
+        )
     elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
         dump_pick_attacks()
         sys.exit(0)
@@ -1104,5 +1310,8 @@ if __name__=="__main__":
     else:
         print("No command given.")
         sys.exit(1)
-        
-        
+    
+
+# Main
+if __name__=="__main__":
+    main()
