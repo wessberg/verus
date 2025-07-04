@@ -52,7 +52,7 @@ TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_teacher_dynamic.keras"
 
 # Student params
 
-STUDENT_FILTERS          = 32       # number of channels in the student
+STUDENT_FILTERS          = 48       # number of channels in the student
 STUDENT_KERNEL_SIZE      = 25       # (25−1)*(1+2+4+8)=24*15=360 +1 ≃361 samples ≃7.5 ms RF
 STUDENT_DILATIONS        = (1,2,4,8)
 STUDENT_RECEPTIVE_FIELD  = 1 + (STUDENT_KERNEL_SIZE - 1) * sum(STUDENT_DILATIONS)
@@ -1253,8 +1253,6 @@ def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_d
             return (False, None)
 
 def prepare_and_generate_demo (dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args={}):
-    # Turn off GPU acceleration for inference, as it is more reliable
-        tf.config.set_visible_devices([], 'GPU')
 
         dpath = dynamic_model_filepath
         if not os.path.exists(dpath):
@@ -1317,6 +1315,9 @@ def main ():
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         
+        # Turn off GPU acceleration for inference, as it is more reliable
+        tf.config.set_visible_devices([], 'GPU')
+        
         teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(teacher_dynamic_model_filepath):
             print("Teacher model not found, run --train-teacher first")
@@ -1324,7 +1325,7 @@ def main ():
         teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
         
         print("Generating demo audio files...")
-        
+
         prepare_and_generate_demo(
             demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
             dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
