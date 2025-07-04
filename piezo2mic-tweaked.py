@@ -6,7 +6,7 @@ and a 2nd “style” channel so one model can handle finger vs pick.
 It is designed to be ultra-low latency for real-time inference for live-use.
 This is why dilations and kernel_size are small, and the model is causal.
 """
-import os, glob, random, shutil, sys
+import os, glob, random, shutil, sys, re
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -44,7 +44,7 @@ SEG_LEN             = RECEPTIVE_FIELD + TRAIN_BLOCK_SIZE
 BATCH_SIZE          = 32
 EMBED_DIM           = 32
 
-TRANSIENT_UPWEIGHT_RATIO  = 0.00   # how strongly to up-weight the ∣Δx∣ spikes
+TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0 # waveform l1 loss
@@ -53,8 +53,8 @@ STFT_WEIGHT               = 1.0    # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
-PICK_ATTACK_CHUNK_RATIO = 0.25 # How many pick attack segments the model will see
-PICK_UNIFORM_CHUNK_RATIO = 0.25 # How many general pick segments the model will see
+PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
+PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will see
 
 FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
 FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
@@ -62,7 +62,7 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 2e-1    # absolute floor on the piezo signal itself
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
 #───────────────────────────────────────────────────────────────────────────────
 
 EPOCHS      = 1000
@@ -241,75 +241,151 @@ class DemoCallback(Callback):
                              step=friendly_epoch)
             self.writer.flush()
         print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
+        
 
+# right after you define CHECKPOINT_OUT_DIR, etc:
+def _extract_epoch_from_ckpt(path):
+    """
+    Given a filename like 'best_model_epoch_05_val_loss_0.1234.keras',
+    return 5 as an int.  If no match, returns 0.
+    """
+    fn = os.path.basename(path)
+    m = re.search(r'epoch_(\d+)', fn)
+    return int(m.group(1)) if m else 0
 
-def dump_pick_attacks(gap_sec=0.01, n_segments=None):
+def dump_pick_attacks(gap_sec=0.1, n_segments=None):
+    """
+    Use your attack_segment_generator() to pull out N pick‐attack windows,
+    and write both piezo and mic signals (mono or stereo).
+    """
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
     gen      = attack_segment_generator(pick_chunks)
-    collected = []
+    collected_piezo = []
+    collected_mic   = []
 
-    # how many segments do we want?
-    #  – if you pass n_segments, use that,
-    #  – otherwise default to len(pick_chunks)
     total = n_segments or len(pick_chunks)
 
     for i in range(total):
-        print(f"Generating pick attack segment {i+1}/{total}…")
-        x, _ = next(gen)
-        # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
-        piezo_only = x[:, 0]   # (SEG_LEN,)
-        collected.append(piezo_only)
-        collected.append(gap_arr)
+        x, y = next(gen)
+        # x.shape = (SEG_LEN,2),  x[:,0]=piezo,  y.shape=(SEG_LEN,1)
+        piezo = x[:,0]       # (SEG_LEN,)
+        mic   = y[:,0]       # (SEG_LEN,)
 
-    if not collected:
+        collected_piezo.append(piezo)
+        collected_piezo.append(gap_arr)
+
+        collected_mic.append(mic)
+        collected_mic.append(gap_arr)
+
+    if not collected_piezo:
         print("⚠️  No pick‐attack segments were generated.")
         return
 
-    out     = np.concatenate(collected)
-    dpath   = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR,
-                           "pick-attack-segments.wav")
-    sf.write(dpath, out, SR, subtype='FLOAT')
-    print(f"✅  Wrote {total} pick‐attack segments → {dpath}")
+    out_p = np.concatenate(collected_piezo)
+    out_m = np.concatenate(collected_mic)
 
-def dump_finger_attacks(gap_sec=0.01, n_segments=None):
+    # 1) write two monos
+    p_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "pick-attack-piezo.wav")
+    m_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "pick-attack-mic.wav")
+    sf.write(p_path, out_p, SR, subtype='FLOAT')
+    sf.write(m_path, out_m, SR, subtype='FLOAT')
+    print(f"✅  Wrote piezo → {p_path}")
+    print(f"✅  Wrote mic   → {m_path}")
+
+    # 2) (optional) write a stereo file: L=piezo, R=mic
+    stereo = np.stack([out_p, out_m], axis=1)  # shape (frames,2)
+    st_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "pick-attack-stereo.wav")
+    sf.write(st_path, stereo, SR, subtype='FLOAT')
+    print(f"✅  Wrote stereo (L=piezo,R=mic) → {st_path}")
+
+def dump_finger_attacks(gap_sec=0.1, n_segments=None):
+    """
+    Same as above but for finger-attack windows.
+    """
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
     gen      = attack_segment_generator(finger_chunks)
+    collected_piezo = []
+    collected_mic   = []
 
-    collected = []
-
-    # how many segments do we want?
-    #  – if you pass n_segments, use that,
-    #  – otherwise default to len(pick_chunks)
     total = n_segments or len(finger_chunks)
 
     for i in range(total):
-        print(f"Generating finger attack segment {i+1}/{total}…")
-        x, _ = next(gen)
+        x, y = next(gen)
+        piezo = x[:,0]
+        mic   = y[:,0]
 
-        # x is shape (SEG_LEN, 2) → channel 0 is piezo, channel 1 is style
-        piezo_only = x[:, 0]   # (SEG_LEN,)
-        collected.append(piezo_only)
-        collected.append(gap_arr)
+        collected_piezo.append(piezo)
+        collected_piezo.append(gap_arr)
 
-    if not collected:
+        collected_mic.append(mic)
+        collected_mic.append(gap_arr)
+
+    if not collected_piezo:
         print("⚠️  No finger‐attack segments were generated.")
         return
 
-    out     = np.concatenate(collected)
-    dpath   = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR,
-                           "finger-attack-segments.wav")
-    sf.write(dpath, out, SR, subtype='FLOAT')
-    print(f"✅  Wrote {total} finger‐attack segments → {dpath}")
+    out_p = np.concatenate(collected_piezo)
+    out_m = np.concatenate(collected_mic)
 
+    p_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "finger-attack-piezo.wav")
+    m_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "finger-attack-mic.wav")
+    sf.write(p_path, out_p, SR, subtype='FLOAT')
+    sf.write(m_path, out_m, SR, subtype='FLOAT')
+    print(f"✅  Wrote piezo → {p_path}")
+    print(f"✅  Wrote mic   → {m_path}")
 
+    stereo = np.stack([out_p, out_m], axis=1)
+    st_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "finger-attack-stereo.wav")
+    sf.write(st_path, stereo, SR, subtype='FLOAT')
+    print(f"✅  Wrote stereo (L=piezo,R=mic) → {st_path}")
 
+# 1) redefine your band-passes at the top of the file:
+SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
+SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 
-# design a 3–15 kHz band-pass for the HF envelope
-SOS_BP = butter(4, [3000, 15000], fs=SR, btype='bp', output='sos')
+def find_attack_spikes(window,
+                     pct_diff=99.0,    # diff-percentile
+                     pct_hf=95.0,      # HF envelope percentile
+                     pct_ratio=90.0,   # HF/LF envelope ratio percentile
+                     min_dist=SR//100):# 480 samples = 10ms spacing
+    """
+    Detect candidate pick‐clicks by:
+     - looking for large diffs,
+     - requiring a strong HF envelope,
+     - requiring HF / LF envelope > some ratio.
+    """
+    # 1) fast-diff
+    denv = hp_diff_env(window)   # abs diff after pre-emphasis
+
+    # 2) band-pass → analytic envelopes
+    hf  = sosfilt(SOS_HF, window)
+    env_hf = np.abs(hilbert(hf))
+
+    lf  = sosfilt(SOS_LF, window)
+    env_lf = np.abs(hilbert(lf))
+
+    # 3) ratio of HF to LF
+    ratio = env_hf / (env_lf + 1e-8)
+
+    # 4) set thresholds from percentiles + absolute floors
+    thr_d = max(np.percentile(denv, pct_diff),
+                ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH)
+    thr_h = max(np.percentile(env_hf, pct_hf),
+                ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH)
+    thr_r = max(np.percentile(ratio, pct_ratio), 1.0)  # at least 1×
+
+    # 5) find all diff‐peaks
+    peaks, _ = find_peaks(denv, height=thr_d, distance=min_dist)
+
+    # 6) only keep those with both HF energy *and* HF/LF ratio
+    good = [i for i in peaks
+            if env_hf[i] >= thr_h and ratio[i] >= thr_r]
+
+    return np.array(good, dtype=int)
 
 def hp_diff_env(window, α=0.8):
     """1-tap pre-emphasis → abs(diff)"""
@@ -317,37 +393,6 @@ def hp_diff_env(window, α=0.8):
     hp[0] = window[0]
     hp[1:] = window[1:] - α * window[:-1]
     return np.abs(np.diff(hp))
-
-def hf_envelope(window):
-    """band‐pass → analytic envelope"""
-    bp = sosfilt(SOS_BP, window)
-    return np.abs(hilbert(bp))
-
-def find_attack_spikes(window,
-                     pct_diff=99.9,
-                     pct_env=99.5,
-                     min_dist=SR//200):
-
-    denv = hp_diff_env(window)
-    env  = hf_envelope(window)
-
-    # percentile thresholds
-    thr_d_pct = np.percentile(denv, pct_diff)
-    thr_e_pct = np.percentile(env,  pct_env)
-
-    # absolute floors
-    thr_d = max(thr_d_pct, ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH)
-    thr_e = max(thr_e_pct, ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH)
-
-    # find fast‐diff peaks
-    peaks, props = find_peaks(denv,
-                              height=thr_d,
-                              distance=min_dist)
-
-    # keep only those with a big HF‐env too
-    good = [i for i in peaks if env[i] >= thr_e]
-
-    return np.array(good, dtype=int)
 
 
 def attack_segment_generator(chunks, context_pre=1024):
@@ -776,7 +821,7 @@ def build_model(dynamic_time=False):
     finger_c = Multiply(name="finger_contrib")([
         Lambda(invert, name="invert_style")(style), main_finger])
     mixed    = Add(name="mix_main")([pick_c, finger_c])
-    out = Activation('tanh', name='final_clip')(mixed)
+    out = mixed
 
     return tf.keras.models.Model(inp, out, name="piezo2mic_conditional")
 
@@ -785,7 +830,7 @@ def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     print("TODO")
 
 # ─────────────────────────────── TRAINING ──────────────────────────────────────
-def train():
+def train(resume=False, resume_ckpt_path=None):
     global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
 
     # train/val split
@@ -866,9 +911,18 @@ def train():
     ).batch(BATCH_SIZE)
     
     val_ds = val_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
-
-    # compile & train
-    static_model = build_model(dynamic_time=False)
+    
+    
+    
+    # build or load model
+    if resume and resume_ckpt_path:
+        print(f"Resuming training from checkpoint: {resume_ckpt_path}")
+        # load weights (we do compile=False so we can recompile with fresh optimizer)
+        static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
+        initial_epoch = _extract_epoch_from_ckpt(resume_ckpt_path)
+    else:
+        static_model = build_model(dynamic_time=False)
+        initial_epoch = 0
     
      # Measure raw scales of each loss term on one batch of val_ds
     baseline = analyze_loss_scales(static_model, val_ds)
@@ -948,6 +1002,7 @@ def train():
 
     history = static_model.fit(
         train_ds,
+        initial_epoch=initial_epoch,
         epochs=1 if DEBUG else EPOCHS,
         steps_per_epoch=steps_per_epoch,
         validation_data=val_ds,
@@ -985,15 +1040,25 @@ def train():
 if __name__=="__main__":   
     if len(sys.argv)>1 and sys.argv[1]=="--train":
         # Clean logs and checkpoints
-        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, CHECKPOINT_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR]:
+        for dir_path in [LOGS_OUT_DIR, CSV_LOGS_OUT_DIR, DEMO_CHECKPOINTS_OUT_DIR, DEMO_GENERATOR_OUTPUTS_OUT_DIR]:
             for sub in os.listdir(dir_path):
                 sub_path = os.path.join(dir_path, sub)
                 if os.path.isfile(sub_path):
                     os.remove(sub_path)
                 elif os.path.isdir(sub_path):
                     shutil.rmtree(sub_path)
+        
+         # look for existing checkpoints
+        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OUT_DIR, "*.keras")))
+        resume = len(ckpts) > 0
+        resume_ckpt = ckpts[-1] if resume else None
 
-        static_model, dynamic_model = train()
+        if resume:
+            ep = _extract_epoch_from_ckpt(resume_ckpt)
+            print(f"→ Found checkpoint, will resume from epoch {ep}: {resume_ckpt}")
+            static_model, dynamic_model = train(resume=resume, resume_ckpt_path=resume_ckpt)
+        else:
+            static_model, dynamic_model = train()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         # Turn off GPU acceleration for inference, as it is more reliable
         tf.config.set_visible_devices([], 'GPU')
