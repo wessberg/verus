@@ -989,7 +989,7 @@ def train_shared(
     
 
     def approx_steps(durs):
-        return 200 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
+        return sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
     train_durs = [dur for (_,_,_,dur) in train_chunks]
     val_durs   = [dur for (_,_,_,dur) in val_chunks]
     steps_per_epoch  = max(approx_steps(train_durs),1)
