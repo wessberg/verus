@@ -5,6 +5,11 @@ out/checkpoints/
 out/logs/
 out/csv-logs/
 
+out-tweaked/demos/
+out-tweaked/checkpoints/
+out-tweaked/logs/
+out-tweaked/csv-logs/
+
 cpp/lib/
 cpp/build/
 cpp2/lib/
