@@ -60,6 +60,12 @@ STUDENT_TRAIN_BLOCK_SIZE = 4096
 STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
 STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
 STUDENT_DISTILL_ALPHA    = 0.5      # weight on the distillation loss
+
+# which teacher‐layers to use for intermediate‐feature hints:
+STUDENT_TEACHER_FEAT_LAYERS   = ["res_add_2", "res_add_3"]
+# how strongly to weight each of those feature‐distill losses
+STUDENT_FEAT_DISTILL_ALPHA    = 0.3
+
 STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_student.keras"
 STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
 
@@ -133,9 +139,9 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 30
-LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_SEC        = 120
+LONG_DEMO_OFFSET_SEC = 60 * 3
+LONG_DEMO_PAIR_INDEX = 6
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
@@ -185,6 +191,15 @@ def build_chunks(pairs_list, seg_len):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
+def reset_stateful_layers(model):
+    """
+    Walk through all layers in `model` and call reset_states()
+    on any layer that has that method (i.e. your stateful GRU).
+    """
+    for layer in model.layers:
+        if hasattr(layer, "reset_states"):
+            layer.reset_states()
+
 class DemoCallback(Callback):
     def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
         super().__init__()
@@ -208,11 +223,16 @@ class DemoCallback(Callback):
 
     def set_model(self, model):
         self.static_model = model
-        # build a dynamic‐time version of your model
-        # you must have `build_model(dynamic_time=True)` available
-        self.dynamic_model = self.build_model_fn(**self.build_model_fn_args, dynamic_time=True)
+        
+        # build a *stateful* dynamic model
+        self.dynamic_model = self.build_model_fn(
+                            **self.build_model_fn_args,
+                            dynamic_time=True)
+        
         # copy weights
         self.dynamic_model.set_weights(self.static_model.get_weights())
+        # clear the GRU (and any other stateful RNNs)
+        reset_stateful_layers(self.dynamic_model)
 
     def on_epoch_end(self, epoch, logs=None):
         # only every Nth epoch
@@ -220,6 +240,9 @@ class DemoCallback(Callback):
             return
         
         friendly_epoch = epoch + 1
+        
+        # reset again at start of each demo
+        reset_stateful_layers(self.dynamic_model)
 
         # re‐sync weights before each inference
         self.dynamic_model.set_weights(self.static_model.get_weights())
@@ -559,6 +582,7 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
                       dtype='float32',
                       always_2d=True)
 
+
     # --- ADD STYLE CHANNEL TO LONG SIGNAL ---
     if pth_src.startswith(PICK_SRC_DIR):
         style = 1.0
@@ -569,6 +593,10 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
 
     x_in = x_long2[np.newaxis,...]  # (1,FRAMES,2)
     print("Running inference…")
+    
+    # if it's stateful, make sure to clear the hidden state
+    reset_stateful_layers(model)
+
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
     
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
@@ -899,80 +927,145 @@ def build_teacher_model(dynamic_time=False):
 
     return tf.keras.models.Model(inp, out, name="piezo2mic_teacher")
 
-def build_student_model(teacher=None, dynamic_time=False, distill_alpha=STUDENT_DISTILL_ALPHA):
-    
-    """
-    If teacher is not None, it must be a compiled & loaded Keras model
-    mapping (batch,T,2)→(batch,T,1).  We will call it internally, freeze it,
-    and add a (MSE) distillation loss between teacher(inp) and student(inp).
-    """
-    # 1) input & style split
-    T = None if dynamic_time else STUDENT_SEG_LEN
-    inp = Input(shape=(T,2), name="stu_piezo_plus_style")
-    style = Lambda(slice_style, name="stu_slice_style")(inp)      # (B,T,1)
-    piezo = Lambda(slice_piezo, name="stu_slice_piezo")(inp)     # (B,T,1)
+@register_keras_serializable()
+def build_student_model(
+    teacher=None,
+    dynamic_time=False
+):
+    # ── 1) Input ────────────────────────────────────────────────────────────
+    #    - dynamic_time=False (training): variable batch‐size, fixed time‐length
+    #    - dynamic_time=True  (inference): batch_size=1, variable time‐length
+    if dynamic_time:
+        inp = Input(batch_shape=(1, None, 2),
+                    name="stu_piezo_plus_style")
+    else:
+        inp = Input(shape=(STUDENT_SEG_LEN, 2),
+                    name="stu_piezo_plus_style")
 
-    # 2) style embedding
-    style_scalar = Lambda(extract_style_scalar, name="stu_style_scalar")(style)  # (B,1)
-    style_embed  = Dense(STUDENT_EMBED_DIM, activation='linear',
-                         name="stu_style_embed")(style_scalar)                  # (B,EMB)
+    # ── 2) Style + Piezo and Style‐Embedding ───────────────────────────────
+    style        = Lambda(slice_style,   name="stu_slice_style")(inp)       # (B,T,1)
+    piezo        = Lambda(slice_piezo,   name="stu_slice_piezo")(inp)       # (B,T,1)
+    style_scalar = Lambda(extract_style_scalar, name="stu_style_scalar")(style)  # (B,1,1)
+    style_embed  = Dense(STUDENT_EMBED_DIM,
+                         activation="linear",
+                         name="stu_style_embed")(style_scalar)               # (B,EMB)
 
-    # 3) initial 1×1 conv
-    x = Conv1D(STUDENT_FILTERS, 1, padding='same', name="stu_init_pw")(inp)
+    # ── 3) Initial 1×1 projection ───────────────────────────────────────────
+    x = Conv1D(STUDENT_FILTERS,
+               kernel_size=1,
+               padding="same",
+               name="stu_init_pw")(inp)  # (B,T,F)
 
-    # 4) small stack of gated separable convs + FiLM
+    # ── 4) Dilated TCN Blocks (gated SeparableConv + FiLM) ─────────────────
+    student_feats = []
     for i, d in enumerate(STUDENT_DILATIONS):
         res = x
-        pad = (STUDENT_KERNEL_SIZE-1)*d
-        x = ZeroPadding1D((pad,0), name=f"stu_pad_{i}")(x)
-        g = SeparableConv1D(STUDENT_FILTERS*2, STUDENT_KERNEL_SIZE,
-                            dilation_rate=d, padding='valid',
-                            name=f"stu_sep_{i}")(x)
-        c = Lambda(slice_content,   arguments={'filters':STUDENT_FILTERS},
-                   name=f"stu_slice_c_{i}")(g)
-        g2= Lambda(slice_gate,      arguments={'filters':STUDENT_FILTERS},
-                   name=f"stu_slice_g_{i}")(g)
-        x = Multiply(name=f"stu_gate_mul_{i}")([
-              Activation('tanh')(c),
-              Activation('sigmoid')(g2)
-            ])
-        x = Conv1D(STUDENT_FILTERS,1,padding='same', name=f"stu_pw_{i}")(x)
-        x = Add(name=f"stu_res_add_{i}")([x,res])
-        # FiLM:
-        film = Dense(STUDENT_FILTERS*2, name=f"stu_film_dense_{i}")(style_embed)
-        gamma = Lambda(slice_film_gamma,   arguments={'filters':STUDENT_FILTERS},
-                       name=f"stu_film_gamma_{i}")(film)
-        beta  = Lambda(slice_film_beta,    arguments={'filters':STUDENT_FILTERS},
-                       name=f"stu_film_beta_{i}")(film)
-        x = Add(name=f"stu_film_apply_{i}")([
-              Multiply(name=f"stu_film_scale_{i}")([x,gamma]),
-              beta
-            ])
+        pad = (STUDENT_KERNEL_SIZE - 1) * d
+        x   = ZeroPadding1D((pad, 0), name=f"stu_pad_{i}")(x)
+        g   = SeparableConv1D(2*STUDENT_FILTERS,
+                              STUDENT_KERNEL_SIZE,
+                              dilation_rate=d,
+                              padding="valid",
+                              name=f"stu_sep_{i}")(x)
+        c   = Lambda(slice_content,
+                     arguments={"filters": STUDENT_FILTERS},
+                     name=f"stu_slice_c_{i}")(g)
+        g2  = Lambda(slice_gate,
+                     arguments={"filters": STUDENT_FILTERS},
+                     name=f"stu_slice_g_{i}")(g)
+        x   = Multiply(name=f"stu_gate_mul_{i}")([
+                  Activation("tanh",    name=f"stu_tanh_{i}")(c),
+                  Activation("sigmoid", name=f"stu_sigmoid_{i}")(g2)
+              ])
+        x   = Conv1D(STUDENT_FILTERS,
+                     kernel_size=1,
+                     padding="same",
+                     name=f"stu_pw_{i}")(x)
+        x   = Add(name=f"stu_res_add_{i}")([x, res])
 
-    # 5) style‐conditioned 1×1 outputs
-    out_pick   = Conv1D(1,1,padding='same', name="stu_final_pick")(x)
-    out_finger = Conv1D(1,1,padding='same', name="stu_final_finger")(x)
+        # FiLM
+        film  = Dense(2*STUDENT_FILTERS,
+                      name=f"stu_film_dense_{i}")(style_embed)
+        gamma = Lambda(slice_film_gamma,
+                       arguments={"filters": STUDENT_FILTERS},
+                       name=f"stu_film_gamma_{i}")(film)
+        beta  = Lambda(slice_film_beta,
+                       arguments={"filters": STUDENT_FILTERS},
+                       name=f"stu_film_beta_{i}")(film)
+        x     = Add(name=f"stu_film_apply_{i}")([
+                    Multiply(name=f"stu_film_scale_{i}")([x, gamma]),
+                    beta
+                ])
+
+        # collect this feature if we're hinting at it
+        layer_name = f"res_add_{i}"
+        if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
+            student_feats.append(x)   # will be (B,T,STUDENT_FILTERS)
+
+    # ── 5) Stateful GRU for “infinite” look-back ─────────────────────────────
+    # Note: setting stateful=dynamic_time lets us carry its hidden state
+    # across predict() calls in demo/inference, without adding to group-delay.
+    gru_units = 48
+    x = tf.keras.layers.GRU(
+          gru_units,
+          return_sequences=True,
+          stateful=dynamic_time,
+          name="stu_global_gru"
+        )(x)
+    # project back to STUDENT_FILTERS channels
+    x = Conv1D(STUDENT_FILTERS,
+               kernel_size=1,
+               padding="same",
+               name="stu_gru_proj")(x)
+
+    # ── 6) Final Style-conditioned 1×1 pick/finger outputs ──────────────────
+    out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
+    out_finger = Conv1D(1,1,padding="same", name="stu_final_finger")(x)
     pick_c   = Multiply(name="stu_pick_contrib")([style, out_pick])
     finger_c = Multiply(name="stu_finger_contrib")([
-                 Lambda(invert, name="stu_invert_style")(style),
-                 out_finger])
-    y_student = Add(name="stu_out")([pick_c, finger_c])
+                    Lambda(invert, name="stu_invert_style")(style),
+                    out_finger
+                ])
+    y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
 
-    model = tf.keras.models.Model(inputs=inp, outputs=y_student, name="piezo2mic_student")
+    # ── 7) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
-        # freeze teacher
         teacher.trainable = False
-        # call teacher on the same input
-        y_teacher = teacher(inp)
-        
-        # now wrap them both in DistillLoss, which calls add_loss internally
-        y_student = DistillLoss(alpha=distill_alpha, name="distillation")(
-                        [y_teacher, y_student]
-                    )
-        # and redefine the model output so Keras knows about it
-        model = tf.keras.models.Model(inputs=inp, outputs=y_student, name="piezo2mic_student")
 
-    return model
+        # a) intermediate-feature distillation
+        if STUDENT_TEACHER_FEAT_LAYERS:
+            # build a mini-model to pull out teacher internals
+            teacher_feat_model = tf.keras.models.Model(
+                inputs = teacher.input,
+                outputs= [teacher.get_layer(n).output
+                          for n in STUDENT_TEACHER_FEAT_LAYERS]
+            )
+            T_feats = teacher_feat_model(inp)
+            if not isinstance(T_feats, list):
+                T_feats = [T_feats]
+
+            for idx, (T_f, S_f) in enumerate(zip(T_feats, student_feats)):
+                # get channel count statically
+                chan = int(T_f.shape[-1])
+                proj = Conv1D(filters   = chan,
+                              kernel_size=1,
+                              padding   ="same",
+                              name      =f"stu_proj_feat_{idx}"
+                             )(S_f)
+                _ = DistillLoss(alpha=STUDENT_FEAT_DISTILL_ALPHA,
+                                name =f"feat_distill_{idx}")([T_f, proj])
+
+        # b) final-waveform distillation
+        Y_t = teacher(inp)  # (B,T,1)
+        y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA,
+                                name="distillation")([Y_t, y_student])
+
+    # ── 8) Final model ───────────────────────────────────────────────────────
+    return tf.keras.models.Model(
+        inputs = inp,
+        outputs= y_student,
+        name   ="piezo2mic_student"
+    )
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     # TODO
@@ -1212,6 +1305,16 @@ def train_student(resume=False, resume_ckpt_path=None):
         print("Teacher model not found, run --train-teacher first")
         sys.exit(1)
     teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
+    
+    
+    teacher_feature_model = tf.keras.Model(
+        inputs=teacher.input,
+        outputs=[
+            teacher.get_layer("slice_content_2").output,   # e.g. after dilation=4
+            teacher.get_layer("slice_content_4").output,   # e.g. after dilation=16
+        ]
+    )
+    
     print("Loaded teacher from", teacher_dynamic_model_filepath)
     
     train_shared(
