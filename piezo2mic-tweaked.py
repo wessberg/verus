@@ -17,7 +17,7 @@ from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoi
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer
+    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
 )
 
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
@@ -59,12 +59,12 @@ STUDENT_RECEPTIVE_FIELD  = 1 + (STUDENT_KERNEL_SIZE - 1) * sum(STUDENT_DILATIONS
 STUDENT_TRAIN_BLOCK_SIZE = 4096
 STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
 STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
-STUDENT_DISTILL_ALPHA    = 1.0      # weight on the distillation loss
+STUDENT_DISTILL_ALPHA    = 5.0      # weight on the distillation loss
 
 # which teacher‐layers to use for intermediate‐feature hints:
 STUDENT_TEACHER_FEAT_LAYERS   = ["res_add_2", "res_add_3"]
 # how strongly to weight each of those feature‐distill losses
-STUDENT_FEAT_DISTILL_ALPHA    = 0.3
+STUDENT_FEAT_DISTILL_ALPHA    = 1.0
 
 STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_student.keras"
 STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
@@ -94,7 +94,7 @@ EPOCHS      = 1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
-LR_PATIENCE = 10
+LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 SHUFFLE_BUF         = 1000
@@ -139,8 +139,8 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 120
-LONG_DEMO_OFFSET_SEC = 60 * 3
+LONG_DEMO_SEC        = 60
+LONG_DEMO_OFFSET_SEC = 60 * 5
 LONG_DEMO_PAIR_INDEX = 6
 
 
@@ -601,6 +601,19 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
                 y_ref, SR, subtype='FLOAT')
     
     print(f"✅ Demo saved to {prediction_filepath}")
+    
+@register_keras_serializable()
+def stu_ir_downsample(x, D):
+    # pull off channel-0 (piezo) and stride by D
+    # x.shape = (batch, time, 2) → out.shape = (batch, time//D, 1)
+    return x[:, ::D, 0:1]
+
+@register_keras_serializable()
+def stu_ir_trim(inputs):
+    # inputs = [ir_lowrate, y_main], we crop ir_lowrate to y_main’s length
+    ir, y_main = inputs
+    # tf.shape(y_main)[1] is the true time-length
+    return ir[:, : tf.shape(y_main)[1], :]
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
@@ -991,6 +1004,8 @@ def build_student_model(
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
             student_feats.append(x)   # will be (B,T,STUDENT_FILTERS)
+    
+    
 
     # ── 6) Final Style-conditioned 1×1 pick/finger outputs ──────────────────
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
@@ -1001,6 +1016,40 @@ def build_student_model(
                     out_finger
                 ])
     y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
+    
+    
+    
+    # ─── IR branch ──────────────────────────────────────────────────────────────
+    # decimation factor
+    D = 8
+
+    # 1) Down‐sample the piezo input by striding (you could also use a tiny LP+pool)
+    ir_in = Lambda(stu_ir_downsample,
+                arguments={'D': D},
+                name="stu_ir_downsample")(inp)   # (batch, T/D, 1)
+
+    # 2) A small causal filter stack at low‐rate:
+    ir = ir_in
+    IR_KERNEL = 33          # you can sweep this
+    IR_DILATIONS = (1,2,4,8,16,32)
+    for i, d in enumerate(IR_DILATIONS):
+        pad = (IR_KERNEL - 1) * d
+        ir = ZeroPadding1D((pad,0), name=f"stu_ir_pad_{i}")(ir)
+        ir = SeparableConv1D(1, IR_KERNEL,
+                            dilation_rate=d,
+                            padding="valid",
+                            name=f"stu_ir_sep_{i}")(ir)
+        ir = Activation("relu", name=f"stu_ir_relu_{i}")(ir)
+
+    # 3) Up‐sample back to 48 kHz
+    ir = UpSampling1D(size=D, name="stu_ir_upsample")(ir)                     # (B, ~T,1)
+    # 4) Trim to exactly the main branch length
+    ir = Lambda(stu_ir_trim,
+                name="stu_ir_trim")([ir, y_student])  # (batch, T, 1)
+
+    # 5) Fuse with the main output
+    y_student = Add(name="stu_out_with_ir")([y_student, ir])
+    
 
     # ── 7) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
