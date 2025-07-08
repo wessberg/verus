@@ -436,6 +436,11 @@ def dump_finger_attacks(gap_sec=0.1, n_segments=None):
     st_path = os.path.join(DEMO_GENERATOR_OUTPUTS_OUT_DIR, "finger-attack-stereo.wav")
     sf.write(st_path, stereo, SR, subtype='FLOAT')
     print(f"✅  Wrote stereo (L=piezo,R=mic) → {st_path}")
+    
+@register_keras_serializable()
+def pack_for_rnn(x):
+    # no-op but forces TensorFlow to materialize a contiguous buffer
+    return tf.identity(x)
 
 # 1) redefine your band-passes at the top of the file:
 SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
@@ -1006,6 +1011,17 @@ def build_student_model(
     # Note: setting stateful=dynamic_time lets us carry its hidden state
     # across predict() calls in demo/inference, without adding to group-delay.
     gru_units = 48
+    
+    # pack the convolutional output into a contiguous buffer
+    x = Lambda(pack_for_rnn, name="stu_pre_rnn_pack")(x)
+    # now the GRU can use MIOpen’s fused kernels at full speed
+    x = tf.keras.layers.GRU(
+        gru_units,
+        return_sequences=True,
+        stateful=dynamic_time,
+        name="stu_global_gru"
+        )(x)
+    
     x = tf.keras.layers.GRU(
           gru_units,
           return_sequences=True,
