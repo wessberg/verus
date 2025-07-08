@@ -1026,6 +1026,8 @@ def build_student_model(
           gru_units,
           return_sequences=True,
           stateful=dynamic_time,
+          implementation=1,
+          reset_after=False,
           name="stu_global_gru"
         )(x)
     # project back to STUDENT_FILTERS channels
