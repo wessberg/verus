@@ -59,7 +59,7 @@ STUDENT_RECEPTIVE_FIELD  = 1 + (STUDENT_KERNEL_SIZE - 1) * sum(STUDENT_DILATIONS
 STUDENT_TRAIN_BLOCK_SIZE = 4096
 STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
 STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
-STUDENT_DISTILL_ALPHA    = 0.5      # weight on the distillation loss
+STUDENT_DISTILL_ALPHA    = 1.0      # weight on the distillation loss
 
 # which teacher‐layers to use for intermediate‐feature hints:
 STUDENT_TEACHER_FEAT_LAYERS   = ["res_add_2", "res_add_3"]
@@ -191,14 +191,6 @@ def build_chunks(pairs_list, seg_len):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
-def reset_stateful_layers(model):
-    """
-    Walk through all layers in `model` and call reset_states()
-    on any layer that has that method (i.e. your stateful GRU).
-    """
-    for layer in model.layers:
-        if hasattr(layer, "reset_states"):
-            layer.reset_states()
 
 class DemoCallback(Callback):
     def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
@@ -231,8 +223,7 @@ class DemoCallback(Callback):
         
         # copy weights
         self.dynamic_model.set_weights(self.static_model.get_weights())
-        # clear the GRU (and any other stateful RNNs)
-        reset_stateful_layers(self.dynamic_model)
+
 
     def on_epoch_end(self, epoch, logs=None):
         # only every Nth epoch
@@ -240,9 +231,6 @@ class DemoCallback(Callback):
             return
         
         friendly_epoch = epoch + 1
-        
-        # reset again at start of each demo
-        reset_stateful_layers(self.dynamic_model)
 
         # re‐sync weights before each inference
         self.dynamic_model.set_weights(self.static_model.get_weights())
@@ -598,9 +586,6 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
 
     x_in = x_long2[np.newaxis,...]  # (1,FRAMES,2)
     print("Running inference…")
-    
-    # if it's stateful, make sure to clear the hidden state
-    reset_stateful_layers(model)
 
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]
     
@@ -1006,27 +991,6 @@ def build_student_model(
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
             student_feats.append(x)   # will be (B,T,STUDENT_FILTERS)
-
-    # ── 5) Stateful GRU for “infinite” look-back ─────────────────────────────
-    # Note: setting stateful=dynamic_time lets us carry its hidden state
-    # across predict() calls in demo/inference, without adding to group-delay.
-    gru_units = 48
-    
-    # pack the convolutional output into a contiguous buffer
-    x = Lambda(pack_for_rnn, name="stu_pre_rnn_pack")(x)
-    # now the GRU can use MIOpen’s fused kernels at full speed
-    x = tf.keras.layers.GRU(
-        gru_units,
-        return_sequences=True,
-        stateful=dynamic_time,
-        name="stu_global_gru"
-        )(x)
-
-    # project back to STUDENT_FILTERS channels
-    x = Conv1D(STUDENT_FILTERS,
-               kernel_size=1,
-               padding="same",
-               name="stu_gru_proj")(x)
 
     # ── 6) Final Style-conditioned 1×1 pick/finger outputs ──────────────────
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
