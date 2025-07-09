@@ -604,16 +604,30 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     
 @register_keras_serializable()
 def stu_ir_downsample(x, D):
-    # pull off channel-0 (piezo) and stride by D
-    # x.shape = (batch, time, 2) → out.shape = (batch, time//D, 1)
-    return x[:, ::D, 0:1]
+    # x: (batch, T, 2) → piezo + style
+    p = x[...,0:1]   # take piezo channel
+    # causal pad so conv1d doesn’t look ahead
+    pad = tf.zeros((tf.shape(p)[0], D-1, 1), dtype=p.dtype)
+    p_pad = tf.concat([pad, p], axis=1)  # (batch, T+D-1,1)
+    # moving-average LPF & decimate in one go
+    # filters shape = (kernel_width, in_chan, out_chan)
+    kernel = tf.ones((D,1,1), dtype=p.dtype) / tf.cast(D, p.dtype)
+    # stride=D → downsample
+    p_lp = tf.nn.conv1d(p_pad, filters=kernel, stride=D, padding='VALID')
+    # now p_lp.shape = (batch, ceil(T/D), 1)
+    return p_lp
 
 @register_keras_serializable()
 def stu_ir_trim(inputs):
-    # inputs = [ir_lowrate, y_main], we crop ir_lowrate to y_main’s length
-    ir, y_main = inputs
-    # tf.shape(y_main)[1] is the true time-length
-    return ir[:, : tf.shape(y_main)[1], :]
+    # inputs: [ir_up, main_out] → both (batch, T*?,1) and (batch, T,1)
+    ir_up, main = inputs
+    T = tf.shape(main)[1]
+    ir_len = tf.shape(ir_up)[1]
+    # if ir_up shorter, pad zeros; if longer, truncate
+    pad_amt = tf.maximum(T - ir_len, 0)
+    ir_pad = tf.pad(ir_up, [[0,0],[0,pad_amt],[0,0]])
+    ir_trim = ir_pad[:, :T, :]
+    return ir_trim
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
@@ -1019,36 +1033,43 @@ def build_student_model(
     
     
     
-    # ─── IR branch ──────────────────────────────────────────────────────────────
-    # decimation factor
-    D = 8
-
-    # 1) Down‐sample the piezo input by striding (you could also use a tiny LP+pool)
-    ir_in = Lambda(stu_ir_downsample,
-                arguments={'D': D},
-                name="stu_ir_downsample")(inp)   # (batch, T/D, 1)
-
-    # 2) A small causal filter stack at low‐rate:
-    ir = ir_in
-    IR_KERNEL = 33          # you can sweep this
+    D = 8  # down/up sample factor; try 4 or 6 if artifacts persist
+    IR_KERNEL = 33
     IR_DILATIONS = (1,2,4,8,16,32)
+
+    # 1) Downsample + LPF
+    ir = Lambda(stu_ir_downsample,
+                arguments={'D': D},
+                name='stu_ir_downsample')(inp)  # (batch, T/D,1)
+
+    # 2) Low-rate dilated conv stack (you can shrink IR_KERNEL or cut dilations)
     for i, d in enumerate(IR_DILATIONS):
-        pad = (IR_KERNEL - 1) * d
-        ir = ZeroPadding1D((pad,0), name=f"stu_ir_pad_{i}")(ir)
+        ir = ZeroPadding1D(((IR_KERNEL-1)*d, 0),
+                           name=f'stu_ir_pad_{i}')(ir)
         ir = SeparableConv1D(1, IR_KERNEL,
-                            dilation_rate=d,
-                            padding="valid",
-                            name=f"stu_ir_sep_{i}")(ir)
-        ir = Activation("relu", name=f"stu_ir_relu_{i}")(ir)
+                             dilation_rate=d,
+                             padding='valid',
+                             name=f'stu_ir_sep_{i}')(ir)
+        ir = Activation('relu', name=f'stu_ir_relu_{i}')(ir)
 
-    # 3) Up‐sample back to 48 kHz
-    ir = UpSampling1D(size=D, name="stu_ir_upsample")(ir)                     # (B, ~T,1)
-    # 4) Trim to exactly the main branch length
-    ir = Lambda(stu_ir_trim,
-                name="stu_ir_trim")([ir, y_student])  # (batch, T, 1)
+    # 3) Nearest-neighbor upsample
+    ir = UpSampling1D(size=D, name='stu_ir_upsample')(ir)  # (batch, ≥T,1)
 
-    # 5) Fuse with the main output
-    y_student = Add(name="stu_out_with_ir")([y_student, ir])
+    # 4) Tiny causal LPF to smooth the ZOH steps
+    #    non-trainable moving average of length 5
+    lp_kernel = np.ones((5,1,1), dtype=np.float32)/5
+    ir = Conv1D(1, 5,
+                padding='causal',
+                use_bias=False,
+                kernel_initializer=tf.constant_initializer(lp_kernel),
+                trainable=False,
+                name='stu_ir_post_lp')(ir)
+
+    # 5) Trim/pad to exactly the main branch length
+    ir = Lambda(stu_ir_trim, name='stu_ir_trim')([ir, y_student])
+
+    # 6) Fuse
+    y_student = Add(name='stu_with_ir')([y_student, ir])
     
 
     # ── 7) Distillation Losses (if teacher is provided) ──────────────────────

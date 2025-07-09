@@ -139,9 +139,9 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 60 * 5
-LONG_DEMO_PAIR_INDEX = 6
+LONG_DEMO_SEC        = 10
+LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_PAIR_INDEX = 0
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
