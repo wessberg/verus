@@ -34,7 +34,7 @@ tf.random.set_seed(SEED)
 SR                  = 48000 
 
 # Debugging params
-DEBUG               = False
+DEBUG               = True
 
 # Batch params
 BATCH_SIZE          = 32
@@ -88,7 +88,16 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
 ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
+
+# Pick-attack band pass filters
+SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
+SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 #───────────────────────────────────────────────────────────────────────────────
+
+# ─── IR branch FIR FILTER DESIGN ────────────────────────────────────────────
+IR_DOWNSAMPLE_FACTOR = 8
+IR_FIR_SIZE          = 65    # odd for a symmetric window
+IR_CUTOFF            = 1.0 / IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
 
 EPOCHS      = 1000
 LR          = 1e-4
@@ -430,9 +439,6 @@ def pack_for_rnn(x):
     # no-op but forces TensorFlow to materialize a contiguous buffer
     return tf.identity(x)
 
-# 1) redefine your band-passes at the top of the file:
-SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
-SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 
 def find_attack_spikes(window,
                      pct_diff=99.0,    # diff-percentile
@@ -602,35 +608,113 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     
     print(f"✅ Demo saved to {prediction_filepath}")
     
-@register_keras_serializable()
-def stu_ir_downsample(x, D):
-    # x: (batch, T, 2) → piezo + style
-    p = x[...,0:1]   # take piezo channel
-    # causal pad so conv1d doesn’t look ahead
-    pad = tf.zeros((tf.shape(p)[0], D-1, 1), dtype=p.dtype)
-    p_pad = tf.concat([pad, p], axis=1)  # (batch, T+D-1,1)
-    # moving-average LPF & decimate in one go
-    # filters shape = (kernel_width, in_chan, out_chan)
-    kernel = tf.ones((D,1,1), dtype=p.dtype) / tf.cast(D, p.dtype)
-    # stride=D → downsample
-    p_lp = tf.nn.conv1d(p_pad, filters=kernel, stride=D, padding='VALID')
-    # now p_lp.shape = (batch, ceil(T/D), 1)
-    return p_lp
+def make_sinc_filter(cutoff, num_taps):
+    t = np.arange(num_taps) - (num_taps - 1)/2.0
+    h = np.sinc(2 * cutoff * t)
+    w = np.hamming(num_taps)
+    h = h * w
+    h = h / np.sum(h)
+    return h.astype(np.float32)
+
+_ir_fir     = make_sinc_filter(IR_CUTOFF, IR_FIR_SIZE)           # (65,)
+_ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)                      # (65,1,1)
+_ir_fir_fwd = _ir_fir.reshape(-1,1,1)                            # (65,1,1)
+_ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
+_ir_fir_up  = tf.constant(_ir_fir_fwd, dtype=tf.float32)
+
 
 @register_keras_serializable()
-def stu_ir_trim(inputs, lpf_ksize):
-    ir_up, main = inputs
-    T = tf.shape(main)[1]
+class StuIrDownsampleFIR(Layer):
+    """
+    Causal FIR+decimate on the piezo channel.
+    Input:  (batch, T, 2)
+    Output: (batch, ceil(T/ factor), 1)
+    """
+    def __init__(self, factor=IR_DOWNSAMPLE_FACTOR, **kwargs):
+        super().__init__(**kwargs)
+        self.factor = factor
+        self.kernel_size = IR_FIR_SIZE
 
-    # only remove the causal‐LPF padding — do *not* subtract (D-1) again
-    front_pad = (lpf_ksize - 1)
+    def call(self, x):
+        # x[...,0:1] is (batch, T, 1)
+        p = x[...,0:1]
+        # pad on left by kernel_size-1
+        pad = self.kernel_size - 1
+        p_pad = tf.pad(p, [[0,0], [pad,0], [0,0]])
+        # VALID conv1d + stride = decimate
+        return tf.nn.conv1d(
+            p_pad,
+            filters=_ir_fir_tf,
+            stride=self.factor,
+            padding='VALID'
+        )
 
-    ir_cropped = ir_up[:, front_pad:, :]
-    new_len    = tf.shape(ir_cropped)[1]
-    pad_back   = tf.maximum(T - new_len, 0)
-    ir_padded  = tf.pad(ir_cropped,
-                        [[0,0], [0,pad_back], [0,0]])
-    return ir_padded[:, :T, :]
+    def compute_output_shape(self, input_shape):
+        b, T, _ = input_shape
+        if T is None:
+            return (b, None, 1)
+        # after pad left by K-1, length = T + (K-1)
+        padded = T + (self.kernel_size - 1)
+        # VALID conv length = padded - (K-1) = T
+        # then stride -> ceil(T/factor)
+        out_T = (T + self.factor - 1) // self.factor
+        return (b, out_T, 1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'factor': self.factor})
+        return cfg
+
+
+@register_keras_serializable()
+class StuIrPostLP(Layer):
+    """
+    Causal FIR smooth after upsampling.
+    Input:  (batch, T, 1)
+    Output: (batch, T, 1)
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = IR_FIR_SIZE
+
+    def call(self, x):
+        # pad left by K-1
+        pad = self.kernel_size - 1
+        x_pad = tf.pad(x, [[0,0], [pad,0], [0,0]])
+        return tf.nn.conv1d(
+            x_pad,
+            filters=_ir_fir_up,
+            stride=1,
+            padding='VALID'
+        )
+
+    def compute_output_shape(self, input_shape):
+        # stays exactly (batch, T, 1)
+        return input_shape
+
+    def get_config(self):
+        return super().get_config()
+
+
+@register_keras_serializable()
+class StuIrTrimToInput(Layer):
+    """
+    Crop the IR branch to match main-branch length.
+    inputs = [ir:(batch,≥T,1), main_in:(batch,T,2)]
+    output = ir[:, :T, :]
+    """
+    def call(self, inputs):
+        ir, main = inputs
+        T = tf.shape(main)[1]
+        return ir[:, :T, :]
+
+    def compute_output_shape(self, input_shape):
+        # input_shape = [(batch, Tir, 1),(batch, Tmain, 2)]
+        b, Tmain, _ = input_shape[1]
+        return (b, Tmain, input_shape[0][2])
+
+    def get_config(self):
+        return super().get_config()
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
@@ -1031,43 +1115,35 @@ def build_student_model(
     y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
 
     # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
-    D = 8          # down/up sample factor
     IR_KERNEL = 33
     IR_DILATIONS = (1,2,4,8,16,32)
 
-    # 7.1) Downsample + LPF
-    ir = Lambda(stu_ir_downsample,
-                arguments={'D': D},
-                name='stu_ir_downsample')(inp)  # (batch, T/D,1)
+    # ─── 7) PROPER FIR‐BASED IR BRANCH ──────────────────────────────────────
 
-    # 7.2) Low-rate dilated conv stack
+    # 7.1) anti‐alias & decimate
+    ir = StuIrDownsampleFIR(name='stu_ir_downsample')(inp)    # → (batch,≈T/8,1)
+
+    # 7.2) linear dilated conv stack (no ReLU)
     for i, d in enumerate(IR_DILATIONS):
-        ir = ZeroPadding1D(((IR_KERNEL-1)*d, 0),
+        ir = ZeroPadding1D(((IR_KERNEL-1)*d,0),
                            name=f'stu_ir_pad_{i}')(ir)
         ir = SeparableConv1D(1, IR_KERNEL,
                              dilation_rate=d,
                              padding='valid',
                              name=f'stu_ir_sep_{i}')(ir)
-        ir = Activation('relu', name=f'stu_ir_relu_{i}')(ir)
+        # <-- deliberately no Activation()
 
-    # 7.3) Nearest-neighbor upsample
-    ir = UpSampling1D(size=D, name='stu_ir_upsample')(ir)  # (batch, ≥T,1)
+    # 7.3) zero‐order‐hold upsample
+    ir = UpSampling1D(size=IR_DOWNSAMPLE_FACTOR,
+                      name='stu_ir_upsample')(ir)
 
-    # 7.4) Tiny causal LPF to smooth the ZOH steps
-    lp_kernel = np.ones((5,1,1), dtype=np.float32)/5
-    ir = Conv1D(1, 5,
-                padding='causal',
-                use_bias=False,
-                kernel_initializer=tf.constant_initializer(lp_kernel),
-                trainable=False,
-                name='stu_ir_post_lp')(ir)
+    # 7.4) FIR‐smooth the steps
+    ir = StuIrPostLP(name='stu_ir_post_lp')(ir)
 
-    # 7.5) Trim **all** front padding (D−1 + causal-LPF-pad), then pad/truncate to T
-    ir = Lambda(stu_ir_trim,
-                arguments={'lpf_ksize': 5},
-                name='stu_ir_trim')([ir, y_student])
+    # 7.5) trim to exactly the main‐branch length
+    ir = StuIrTrimToInput(name='stu_ir_trim')([ir, inp])
 
-    # 7.6) Fuse back into the main branch
+    # 7.6) fuse back in
     y_student = Add(name='stu_with_ir')([y_student, ir])
 
     # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
