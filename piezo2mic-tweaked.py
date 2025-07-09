@@ -618,24 +618,18 @@ def stu_ir_downsample(x, D):
     return p_lp
 
 @register_keras_serializable()
-def stu_ir_trim(inputs, D, lpf_ksize):
-    # inputs = [ir_up, main_out]
+def stu_ir_trim(inputs, lpf_ksize):
     ir_up, main = inputs
     T = tf.shape(main)[1]
 
-    # total causal pad at the front = (D-1) from down-sampler + (lpf_ksize-1) from causal LPF
-    front_pad = (D - 1) + (lpf_ksize - 1)
+    # only remove the causal‐LPF padding — do *not* subtract (D-1) again
+    front_pad = (lpf_ksize - 1)
 
-    # 1) knock off that many samples at the front
     ir_cropped = ir_up[:, front_pad:, :]
-
-    # 2) if it’s now too short, pad the end; if too long, we’ll slice next
-    new_len  = tf.shape(ir_cropped)[1]
-    pad_back = tf.maximum(T - new_len, 0)
-    ir_padded = tf.pad(ir_cropped,
-                       [[0,0], [0,pad_back], [0,0]])
-
-    # 3) finally grab exactly T samples
+    new_len    = tf.shape(ir_cropped)[1]
+    pad_back   = tf.maximum(T - new_len, 0)
+    ir_padded  = tf.pad(ir_cropped,
+                        [[0,0], [0,pad_back], [0,0]])
     return ir_padded[:, :T, :]
 
 @register_keras_serializable()
@@ -1070,7 +1064,7 @@ def build_student_model(
 
     # 7.5) Trim **all** front padding (D−1 + causal-LPF-pad), then pad/truncate to T
     ir = Lambda(stu_ir_trim,
-                arguments={'D': D, 'lpf_ksize': 5},
+                arguments={'lpf_ksize': 5},
                 name='stu_ir_trim')([ir, y_student])
 
     # 7.6) Fuse back into the main branch
