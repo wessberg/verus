@@ -618,16 +618,25 @@ def stu_ir_downsample(x, D):
     return p_lp
 
 @register_keras_serializable()
-def stu_ir_trim(inputs):
-    # inputs: [ir_up, main_out] → both (batch, T*?,1) and (batch, T,1)
+def stu_ir_trim(inputs, D, lpf_ksize):
+    # inputs = [ir_up, main_out]
     ir_up, main = inputs
     T = tf.shape(main)[1]
-    ir_len = tf.shape(ir_up)[1]
-    # if ir_up shorter, pad zeros; if longer, truncate
-    pad_amt = tf.maximum(T - ir_len, 0)
-    ir_pad = tf.pad(ir_up, [[0,0],[0,pad_amt],[0,0]])
-    ir_trim = ir_pad[:, :T, :]
-    return ir_trim
+
+    # total causal pad at the front = (D-1) from down-sampler + (lpf_ksize-1) from causal LPF
+    front_pad = (D - 1) + (lpf_ksize - 1)
+
+    # 1) knock off that many samples at the front
+    ir_cropped = ir_up[:, front_pad:, :]
+
+    # 2) if it’s now too short, pad the end; if too long, we’ll slice next
+    new_len  = tf.shape(ir_cropped)[1]
+    pad_back = tf.maximum(T - new_len, 0)
+    ir_padded = tf.pad(ir_cropped,
+                       [[0,0], [0,pad_back], [0,0]])
+
+    # 3) finally grab exactly T samples
+    return ir_padded[:, :T, :]
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
@@ -950,8 +959,6 @@ def build_student_model(
     dynamic_time=False
 ):
     # ── 1) Input ────────────────────────────────────────────────────────────
-    #    - dynamic_time=False (training): variable batch‐size, fixed time‐length
-    #    - dynamic_time=True  (inference): batch_size=1, variable time‐length
     if dynamic_time:
         inp = Input(batch_shape=(1, None, 2),
                     name="stu_piezo_plus_style")
@@ -1017,9 +1024,7 @@ def build_student_model(
         # collect this feature if we're hinting at it
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
-            student_feats.append(x)   # will be (B,T,STUDENT_FILTERS)
-    
-    
+            student_feats.append(x)   # (B,T,STUDENT_FILTERS)
 
     # ── 6) Final Style-conditioned 1×1 pick/finger outputs ──────────────────
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
@@ -1030,19 +1035,18 @@ def build_student_model(
                     out_finger
                 ])
     y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
-    
-    
-    
-    D = 8  # down/up sample factor; try 4 or 6 if artifacts persist
+
+    # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
+    D = 8          # down/up sample factor
     IR_KERNEL = 33
     IR_DILATIONS = (1,2,4,8,16,32)
 
-    # 1) Downsample + LPF
+    # 7.1) Downsample + LPF
     ir = Lambda(stu_ir_downsample,
                 arguments={'D': D},
                 name='stu_ir_downsample')(inp)  # (batch, T/D,1)
 
-    # 2) Low-rate dilated conv stack (you can shrink IR_KERNEL or cut dilations)
+    # 7.2) Low-rate dilated conv stack
     for i, d in enumerate(IR_DILATIONS):
         ir = ZeroPadding1D(((IR_KERNEL-1)*d, 0),
                            name=f'stu_ir_pad_{i}')(ir)
@@ -1052,11 +1056,10 @@ def build_student_model(
                              name=f'stu_ir_sep_{i}')(ir)
         ir = Activation('relu', name=f'stu_ir_relu_{i}')(ir)
 
-    # 3) Nearest-neighbor upsample
+    # 7.3) Nearest-neighbor upsample
     ir = UpSampling1D(size=D, name='stu_ir_upsample')(ir)  # (batch, ≥T,1)
 
-    # 4) Tiny causal LPF to smooth the ZOH steps
-    #    non-trainable moving average of length 5
+    # 7.4) Tiny causal LPF to smooth the ZOH steps
     lp_kernel = np.ones((5,1,1), dtype=np.float32)/5
     ir = Conv1D(1, 5,
                 padding='causal',
@@ -1065,20 +1068,20 @@ def build_student_model(
                 trainable=False,
                 name='stu_ir_post_lp')(ir)
 
-    # 5) Trim/pad to exactly the main branch length
-    ir = Lambda(stu_ir_trim, name='stu_ir_trim')([ir, y_student])
+    # 7.5) Trim **all** front padding (D−1 + causal-LPF-pad), then pad/truncate to T
+    ir = Lambda(stu_ir_trim,
+                arguments={'D': D, 'lpf_ksize': 5},
+                name='stu_ir_trim')([ir, y_student])
 
-    # 6) Fuse
+    # 7.6) Fuse back into the main branch
     y_student = Add(name='stu_with_ir')([y_student, ir])
-    
 
-    # ── 7) Distillation Losses (if teacher is provided) ──────────────────────
+    # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
         teacher.trainable = False
 
         # a) intermediate-feature distillation
         if STUDENT_TEACHER_FEAT_LAYERS:
-            # build a mini-model to pull out teacher internals
             teacher_feat_model = tf.keras.models.Model(
                 inputs = teacher.input,
                 outputs= [teacher.get_layer(n).output
@@ -1089,22 +1092,18 @@ def build_student_model(
                 T_feats = [T_feats]
 
             for idx, (T_f, S_f) in enumerate(zip(T_feats, student_feats)):
-                # get channel count statically
                 chan = int(T_f.shape[-1])
-                proj = Conv1D(filters   = chan,
-                              kernel_size=1,
-                              padding   ="same",
-                              name      =f"stu_proj_feat_{idx}"
-                             )(S_f)
+                proj = Conv1D(chan, 1, padding="same",
+                              name=f"stu_proj_feat_{idx}")(S_f)
                 _ = DistillLoss(alpha=STUDENT_FEAT_DISTILL_ALPHA,
-                                name =f"feat_distill_{idx}")([T_f, proj])
+                                name=f"feat_distill_{idx}")([T_f, proj])
 
-        # b) final-waveform distillation
+        # b) final‐waveform distillation
         Y_t = teacher(inp)  # (B,T,1)
         y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA,
                                 name="distillation")([Y_t, y_student])
 
-    # ── 8) Final model ───────────────────────────────────────────────────────
+    # ── 9) Final model ───────────────────────────────────────────────────────
     return tf.keras.models.Model(
         inputs = inp,
         outputs= y_student,
