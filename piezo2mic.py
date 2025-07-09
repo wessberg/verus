@@ -105,7 +105,7 @@ PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
-OUT_DIR        = "./out-tweaked"
+OUT_DIR        = "./out"
 
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
 CHECKPOINT_TEACHER_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "teacher")
