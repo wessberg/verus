@@ -52,7 +52,6 @@ TEACHER_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_teacher.keras"
 TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_teacher_dynamic.keras"
 
 # Student params
-
 STUDENT_FILTERS          = 48       # number of channels in the student
 STUDENT_KERNEL_SIZE      = 25       # (25−1)*(1+2+4+8)=24*15=360 +1 ≃361 samples ≃7.5 ms RF
 STUDENT_DILATIONS        = (1,2,4,8)
@@ -88,7 +87,8 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3           # absolute floor on the piezo signal itself, for the attack segment generator
+SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-3           # absolute floor on the piezo signal itself, for the standard segment generator
 
 # Pick-attack band pass filters
 SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
@@ -96,15 +96,17 @@ SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 #───────────────────────────────────────────────────────────────────────────────
 
 # ─── IR branch FIR FILTER DESIGN ────────────────────────────────────────────
-IR_DOWNSAMPLE_FACTOR = 8
-IR_FIR_SIZE          = 65    # odd for a symmetric window
-IR_CUTOFF            = 1.0 / IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
-IR_KERNEL    = 33
-IR_DILATIONS = (1,2,4,8,16,32)
+STUDENT_IR_DOWNSAMPLE_FACTOR = 8
+STUDENT_IR_FIR_SIZE          = 65    # odd for a symmetric window
+STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
+STUDENT_IR_KERNEL    = 33
+STUDENT_IR_DILATIONS = (1,2,4,8,16,32)
+STUDENT_IR_ALIGN_OFFSET_CORRECTION = 0
+STUDENT_TOTAL_EXPECTED_IR_DELAY = STUDENT_IR_FIR_SIZE - 1    # 64
 
 # how many *coarse* steps until the FIR is “fully” onto the input?
-coarse_steps = math.ceil((IR_FIR_SIZE - 1) / IR_DOWNSAMPLE_FACTOR)
-IR_PREDELAY = coarse_steps * IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
+coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
+IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
 EPOCHS      = 1000
 LR          = 1e-4
@@ -207,6 +209,30 @@ def build_chunks(pairs_list, seg_len):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
+def validate_ir_delay(dynamic_student_model):
+     # isolate only the two fixed FIRs
+    inp  = dynamic_student_model.input
+    down = dynamic_student_model.get_layer("stu_ir_downsample").output
+    ups  = dynamic_student_model.get_layer("stu_ir_upsample")(down)
+    fir  = dynamic_student_model.get_layer("stu_ir_post_lp")(ups)
+    fir_only = tf.keras.models.Model(inp, fir)
+
+    T = STUDENT_SEG_LEN
+    imp = np.zeros((1, T, 2), np.float32)
+    imp[0,0,0] = 1.0
+    imp[0,:,1] = 0.0
+
+    out = fir_only.predict(imp, batch_size=1)[0,:,0]
+
+    # measure by the peak location (argmax) to avoid tiny‐tap threshold issues
+    measured = int(np.argmax(np.abs(out)))
+    expected = STUDENT_TOTAL_EXPECTED_IR_DELAY
+
+    print(f"FIR-only → expected delay {expected}, measured {measured}")
+    if measured != expected:
+        print("⚠️  MISMATCH!  adjust StuIrAlign.offset to", measured)
+    else:
+        print("✅ FIR‐delay lines up.")
 
 class DemoCallback(Callback):
     def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
@@ -584,6 +610,10 @@ def segment_generator(seg_len, chunks, is_pick_chunks):
         read_start = cstart + off
         x = src_wav[read_start : read_start + seg_len]
         y = tgt_wav[read_start : read_start + seg_len]
+        
+        # Skip if too quiet
+        if np.max(np.abs(x[:,0])) < SEGMENT_GENERATOR_MIN_AMP_THRESH:
+            continue
 
         if x.shape[0] < seg_len:
             p = seg_len - x.shape[0]
@@ -609,13 +639,21 @@ def analyze_loss_scales(model, dataset ):
     env_val = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
     hf_val = tf.reduce_mean(hf_loss(y_true, y_pred)).numpy()
 
-    print(f"Initial L1 Loss: {l1_val}")
-    print(f"Initial STFT Loss: {stft_val}")
-    print(f"Initial Mel Loss: {mel_val}")
-    print(f"Initial RMS Env Loss: {env_val}")
-    print(f"Initial HF Loss: {hf_val}")
-
     return {'l1': l1_val, 'stft': stft_val, 'mel': mel_val, 'env': env_val, 'hf': hf_val}
+
+def calibrate_loss_weights(model, dataset, n_batches=5):
+    sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
+    for i, (x,y,sw) in enumerate(dataset.take(n_batches)):
+        scales = analyze_loss_scales(model, tf.data.Dataset.from_tensors((x,y,sw)))
+        for k,v in scales.items():
+            sums[k] += v
+            
+    # Print the average loss scales
+    print("Average loss scales over", n_batches, "batches:")
+    for k,v in sums.items():
+        print(f"Initial {k} loss: {v:.4f}")
+        
+    return {k: sums[k]/n_batches for k in sums}
         
 def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=False):
     print("\nGenerating demo…")
@@ -669,7 +707,7 @@ def make_sinc_filter(cutoff, num_taps):
     h = h / np.sum(h)
     return h.astype(np.float32)
 
-_ir_fir     = make_sinc_filter(IR_CUTOFF, IR_FIR_SIZE)           # (65,)
+_ir_fir     = make_sinc_filter(STUDENT_IR_CUTOFF, STUDENT_IR_FIR_SIZE)           # (65,)
 _ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)                      # (65,1,1)
 _ir_fir_fwd = _ir_fir.reshape(-1,1,1)                            # (65,1,1)
 _ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
@@ -726,10 +764,10 @@ class StuIrDownsampleFIR(Layer):
     Input:  (batch, T, 2)
     Output: (batch, ceil(T/ factor), 1)
     """
-    def __init__(self, factor=IR_DOWNSAMPLE_FACTOR, **kwargs):
+    def __init__(self, factor=STUDENT_IR_DOWNSAMPLE_FACTOR, **kwargs):
         super().__init__(**kwargs)
         self.factor = factor
-        self.kernel_size = IR_FIR_SIZE
+        self.kernel_size = STUDENT_IR_FIR_SIZE
 
     def call(self, x):
         # x[...,0:1] is (batch, T, 1)
@@ -771,7 +809,7 @@ class StuIrPostLP(Layer):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.kernel_size = IR_FIR_SIZE
+        self.kernel_size = STUDENT_IR_FIR_SIZE
 
     def call(self, x):
         # pad left by K-1
@@ -1111,6 +1149,7 @@ def build_student_model(
     teacher=None,
     dynamic_time=False
 ):
+    
     # ── 1) Input ────────────────────────────────────────────────────────────
     if dynamic_time:
         inp = Input(batch_shape=(1, None, 2),
@@ -1194,12 +1233,12 @@ def build_student_model(
     ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)   # → (B,≈T/8,1)
 
     #    7.2) linear dilated conv stack (no non-linearity)
-    for i, d in enumerate(IR_DILATIONS):
-        pad = (IR_KERNEL - 1) * d
+    for i, d in enumerate(STUDENT_IR_DILATIONS):
+        pad = (STUDENT_IR_KERNEL - 1) * d
         ir = ZeroPadding1D((pad, 0), name=f"stu_ir_pad_{i}")(ir)
         ir = SeparableConv1D(
             filters=1,
-            kernel_size=IR_KERNEL,
+            kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
             depthwise_regularizer=regularizers.l2(1e-4),
@@ -1216,7 +1255,7 @@ def build_student_model(
     ir = IRDecayTrainable(sr=SR, init_tau=0.08, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
-    ir = UpSampling1D(size=IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
+    ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
 
     #    7.4) FIR-smooth the steps
     ir = StuIrPostLP(name="stu_ir_post_lp")(ir)
@@ -1226,10 +1265,9 @@ def build_student_model(
     # compute total group-delay:
     #   first FIR (downsample) = IR_FIR_SIZE-1,
     #   second FIR (postLP)     = floor((IR_FIR_SIZE-1)/2)
-    total_delay = (IR_FIR_SIZE - 1)                    \
-                  + ((IR_FIR_SIZE - 1)//2)
+    total_delay = STUDENT_TOTAL_EXPECTED_IR_DELAY
 
-    ir = StuIrAlign(offset=total_delay,
+    ir = StuIrAlign(offset=total_delay + STUDENT_IR_ALIGN_OFFSET_CORRECTION,
                     name='stu_ir_align')([ir, inp])
 
     #    7.7) fuse it back in
@@ -1384,7 +1422,7 @@ def train_shared(
         initial_epoch = 0
     
      # Measure raw scales of each loss term on one batch of val_ds
-    baseline = analyze_loss_scales(static_model, val_ds)
+    baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
     
     ref_scale = float(baseline['l1'])
     user_w    = {
@@ -1508,16 +1546,15 @@ def train_student(resume=False, resume_ckpt_path=None):
         sys.exit(1)
     teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
     
+    print("Loaded teacher from", teacher_dynamic_model_filepath)
     
-    teacher_feature_model = tf.keras.Model(
-        inputs=teacher.input,
-        outputs=[
-            teacher.get_layer("slice_content_2").output,   # e.g. after dilation=4
-            teacher.get_layer("slice_content_4").output,   # e.g. after dilation=16
-        ]
+    tmp_dynamic_model = build_student_model(
+        teacher=teacher,
+        dynamic_time=True
     )
     
-    print("Loaded teacher from", teacher_dynamic_model_filepath)
+    # Validate the final group delay
+    validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
         resume=resume,
