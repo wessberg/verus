@@ -6,7 +6,7 @@ and a 2nd “style” channel so one model can handle finger vs pick.
 It is designed to be ultra-low latency for real-time inference for live-use.
 This is why dilations and kernel_size are small, and the model is causal.
 """
-import os, glob, random, shutil, sys, re
+import os, glob, random, shutil, sys, re, math
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -14,6 +14,7 @@ from scipy.signal import butter, sosfilt, find_peaks, hilbert
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
+from tensorflow.keras import regularizers, constraints
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
@@ -98,6 +99,12 @@ SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 IR_DOWNSAMPLE_FACTOR = 8
 IR_FIR_SIZE          = 65    # odd for a symmetric window
 IR_CUTOFF            = 1.0 / IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
+IR_KERNEL    = 33
+IR_DILATIONS = (1,2,4,8,16,32)
+
+# how many *coarse* steps until the FIR is “fully” onto the input?
+coarse_steps = math.ceil((IR_FIR_SIZE - 1) / IR_DOWNSAMPLE_FACTOR)
+IR_PREDELAY = coarse_steps * IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
 EPOCHS      = 1000
 LR          = 1e-4
@@ -299,6 +306,52 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
+    
+@register_keras_serializable()
+class IRDecayTrainable(Layer):
+    def __init__(self, sr=48000, init_tau=0.08, min_tau=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.sr = sr
+        self.init_tau = init_tau
+        self.min_tau = min_tau
+    def build(self, input_shape):
+        self.tau = self.add_weight(
+            name="tau_secs",
+            shape=(1,),                  # <-- 1-D length-1, good
+            initializer=tf.keras.initializers.Constant(self.init_tau),
+            constraint=constraints.MinMaxNorm(min_value=self.min_tau, max_value=1.0),
+            trainable=True
+        )
+    def call(self, x):
+        T = tf.shape(x)[1]
+        t = tf.cast(tf.range(T), tf.float32) / tf.cast(self.sr, tf.float32)
+        decay = tf.exp(-t / self.tau)
+        return x * decay[None, :, None]
+    def get_config(self):
+        return {"sr":self.sr, "init_tau":self.init_tau, "min_tau":self.min_tau}
+
+
+@register_keras_serializable()
+class IrScale(Layer):
+    """A tiny trainable scalar (<1) to keep the IR branch subtle."""
+    def __init__(self, init=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.init = init
+    def build(self, input_shape):
+        self.scale = self.add_weight(
+            name="ir_scale",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.init),
+            trainable=True
+        )
+    def call(self, x):
+        return x * self.scale
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"init": self.init})
+        return cfg
+
+
     
 @register_keras_serializable()
 class DistillLoss(Layer):
@@ -622,6 +675,49 @@ _ir_fir_fwd = _ir_fir.reshape(-1,1,1)                            # (65,1,1)
 _ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
 _ir_fir_up  = tf.constant(_ir_fir_fwd, dtype=tf.float32)
 
+@register_keras_serializable()
+class StuIrAlign(Layer):
+    """
+    1) Pads the end of the IR branch if it's too short
+    2) Crops off exactly `offset` samples from the front
+    3) Then takes exactly as many samples as the main-branch (so Add(…,ir) always lines up)
+    """
+    def __init__(self,
+                 offset,        # total group-delay in *input* samples
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.offset = int(offset)
+
+    def call(self, inputs):
+        ir, main = inputs
+        # main shape = (batch, T, 2)  →  we only care about T
+        T = tf.shape(main)[1]
+
+        # after all your ↓→dilate→↑→postLP,  ir.shape = (batch, T′, 1)
+        T_ir = tf.shape(ir)[1]
+
+        # we need at least offset + T samples; pad if we ran short
+        needed = self.offset + T
+        pad_end = needed - T_ir
+        # if pad_end>0, pad zeros on the right; else do nothing
+        ir = tf.cond(
+            pad_end>0,
+            lambda: tf.pad(ir, [[0,0],[0,pad_end],[0,0]]),
+            lambda: ir
+        )
+
+        # now crop out the first `offset` samples and take exactly T
+        return ir[:, self.offset : self.offset + T, :]
+
+    def compute_output_shape(self, input_shape):
+        # input_shape = [ (batch, T′,1), (batch, T,2) ]
+        b, T, _ = input_shape[1]
+        return (b, T, 1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"offset": self.offset})
+        return cfg
 
 @register_keras_serializable()
 class StuIrDownsampleFIR(Layer):
@@ -691,27 +787,6 @@ class StuIrPostLP(Layer):
     def compute_output_shape(self, input_shape):
         # stays exactly (batch, T, 1)
         return input_shape
-
-    def get_config(self):
-        return super().get_config()
-
-
-@register_keras_serializable()
-class StuIrTrimToInput(Layer):
-    """
-    Crop the IR branch to match main-branch length.
-    inputs = [ir:(batch,≥T,1), main_in:(batch,T,2)]
-    output = ir[:, :T, :]
-    """
-    def call(self, inputs):
-        ir, main = inputs
-        T = tf.shape(main)[1]
-        return ir[:, :T, :]
-
-    def compute_output_shape(self, input_shape):
-        # input_shape = [(batch, Tir, 1),(batch, Tmain, 2)]
-        b, Tmain, _ = input_shape[1]
-        return (b, Tmain, input_shape[0][2])
 
     def get_config(self):
         return super().get_config()
@@ -1115,36 +1190,50 @@ def build_student_model(
     y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
 
     # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
-    IR_KERNEL = 33
-    IR_DILATIONS = (1,2,4,8,16,32)
+    #    7.1) anti-alias & decimate
+    ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)   # → (B,≈T/8,1)
 
-    # ─── 7) PROPER FIR‐BASED IR BRANCH ──────────────────────────────────────
-
-    # 7.1) anti‐alias & decimate
-    ir = StuIrDownsampleFIR(name='stu_ir_downsample')(inp)    # → (batch,≈T/8,1)
-
-    # 7.2) linear dilated conv stack (no ReLU)
+    #    7.2) linear dilated conv stack (no non-linearity)
     for i, d in enumerate(IR_DILATIONS):
-        ir = ZeroPadding1D(((IR_KERNEL-1)*d,0),
-                           name=f'stu_ir_pad_{i}')(ir)
-        ir = SeparableConv1D(1, IR_KERNEL,
-                             dilation_rate=d,
-                             padding='valid',
-                             name=f'stu_ir_sep_{i}')(ir)
-        # <-- deliberately no Activation()
+        pad = (IR_KERNEL - 1) * d
+        ir = ZeroPadding1D((pad, 0), name=f"stu_ir_pad_{i}")(ir)
+        ir = SeparableConv1D(
+            filters=1,
+            kernel_size=IR_KERNEL,
+            dilation_rate=d,
+            padding="valid",
+            depthwise_regularizer=regularizers.l2(1e-4),
+            pointwise_regularizer=regularizers.l2(1e-4),
+            depthwise_constraint=constraints.NonNeg(),
+            pointwise_constraint=constraints.NonNeg(),
+            name=f"stu_ir_sep_{i}"
+        )(ir)
 
-    # 7.3) zero‐order‐hold upsample
-    ir = UpSampling1D(size=IR_DOWNSAMPLE_FACTOR,
-                      name='stu_ir_upsample')(ir)
+    #    *optional*  total-IR-scale → keeps it from growing too loud
+    ir = IrScale(init=0.1, name="stu_ir_scale")(ir)
 
-    # 7.4) FIR‐smooth the steps
-    ir = StuIrPostLP(name='stu_ir_post_lp')(ir)
+    #    *optional*  fast envelope → kills the “reverb tail”
+    ir = IRDecayTrainable(sr=SR, init_tau=0.08, name="stu_ir_decay")(ir)
 
-    # 7.5) trim to exactly the main‐branch length
-    ir = StuIrTrimToInput(name='stu_ir_trim')([ir, inp])
+    #    7.3) zero-order hold upsample
+    ir = UpSampling1D(size=IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
 
-    # 7.6) fuse back in
-    y_student = Add(name='stu_with_ir')([y_student, ir])
+    #    7.4) FIR-smooth the steps
+    ir = StuIrPostLP(name="stu_ir_post_lp")(ir)
+
+    # 7.5) align IR to main-branch: remove the total FIR delay,
+    # pad at end if we overshot, then grab exactly T_main samples
+    # compute total group-delay:
+    #   first FIR (downsample) = IR_FIR_SIZE-1,
+    #   second FIR (postLP)     = floor((IR_FIR_SIZE-1)/2)
+    total_delay = (IR_FIR_SIZE - 1)                    \
+                  + ((IR_FIR_SIZE - 1)//2)
+
+    ir = StuIrAlign(offset=total_delay,
+                    name='stu_ir_align')([ir, inp])
+
+    #    7.7) fuse it back in
+    y_student = Add(name="stu_with_ir")([y_student, ir])
 
     # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
