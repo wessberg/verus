@@ -101,8 +101,8 @@ STUDENT_IR_FIR_SIZE          = 65    # odd for a symmetric window
 STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
 STUDENT_IR_KERNEL    = 33
 STUDENT_IR_DILATIONS = (1,2,4,8,16,32)
-STUDENT_IR_ALIGN_OFFSET_CORRECTION = 0
-STUDENT_TOTAL_EXPECTED_IR_DELAY = STUDENT_IR_FIR_SIZE - 1    # 64
+STUDENT_IR_ALIGN_OFFSET_CORRECTION = -63
+STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_SIZE - 1)//2)
 
 # how many *coarse* steps until the FIR is “fully” onto the input?
 coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
@@ -210,29 +210,48 @@ def build_chunks(pairs_list, seg_len):
     return chunks
 
 def validate_ir_delay(dynamic_student_model):
-     # isolate only the two fixed FIRs
-    inp  = dynamic_student_model.input
-    down = dynamic_student_model.get_layer("stu_ir_downsample").output
-    ups  = dynamic_student_model.get_layer("stu_ir_upsample")(down)
-    fir  = dynamic_student_model.get_layer("stu_ir_post_lp")(ups)
-    fir_only = tf.keras.models.Model(inp, fir)
+    """
+    Measure the group-delay of the two FIRs in your IR branch
+    (downsampler + post-LP) and check it against the offset
+    in StuIrAlign.
+    """
 
-    T = STUDENT_SEG_LEN
-    imp = np.zeros((1, T, 2), np.float32)
-    imp[0,0,0] = 1.0
-    imp[0,:,1] = 0.0
+    # grab the two FIR layers out of your model
+    fir_down = dynamic_student_model.get_layer("stu_ir_downsample")
+    fir_post = dynamic_student_model.get_layer("stu_ir_post_lp")
+    # grab the align layer so we can read back its offset
+    align   = dynamic_student_model.get_layer("stu_ir_align")
+    expected = int(align.offset)  # what you told it to crop
 
-    out = fir_only.predict(imp, batch_size=1)[0,:,0]
+    # how many samples to test? make sure > expected and a multiple of factor
+    factor = STUDENT_IR_DOWNSAMPLE_FACTOR
+    N = expected + factor
+    N = int(math.ceil(N / factor) * factor)
 
-    # measure by the peak location (argmax) to avoid tiny‐tap threshold issues
-    measured = int(np.argmax(np.abs(out)))
-    expected = STUDENT_TOTAL_EXPECTED_IR_DELAY
+    # build a single‐impulse test signal:
+    # shape = (batch=1, time=N, channels=2)
+    # channel 0 = impulse, channel 1 = style flag (we can set to 0)
+    x = np.zeros((1, N, 2), dtype=np.float32)
+    x[0, 0, 0] = 1.0
+
+    # run it through down-sample FIR
+    y_down = fir_down(x)          # -> (1, ceil(N/factor), 1)
+    # then up-sample back
+    y_up   = UpSampling1D(size=factor)(y_down)  # -> (1, ~N, 1)
+    # then the post-LP FIR
+    y_fir  = fir_post(y_up)       # -> (1, T_fir, 1)
+    ir     = y_fir.numpy()[0, :, 0]
+
+    # find first non-zero (above a tiny threshold)
+    thresh = 1e-6
+    nz     = np.where(np.abs(ir) > thresh)[0]
+    measured = int(nz[0]) if len(nz) else None
 
     print(f"FIR-only → expected delay {expected}, measured {measured}")
     if measured != expected:
         print("⚠️  MISMATCH!  adjust StuIrAlign.offset to", measured)
     else:
-        print("✅ FIR‐delay lines up.")
+        print("✅ FIR-delay lines up.")
 
 class DemoCallback(Callback):
     def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
