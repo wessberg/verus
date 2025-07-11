@@ -1267,8 +1267,6 @@ def build_student_model(
             padding="valid",
             depthwise_regularizer=regularizers.l2(1e-6),
             pointwise_regularizer=regularizers.l2(1e-6),
-            depthwise_constraint=constraints.NonNeg(),
-            pointwise_constraint=constraints.NonNeg(),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
@@ -1276,7 +1274,7 @@ def build_student_model(
     ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.1, name="stu_ir_decay")(ir)
+    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.2, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
@@ -1688,23 +1686,25 @@ def main ():
         teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
         
         print("Generating demo audio files...")
-
-        prepare_and_generate_demo(
-            demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
-            dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
-            build_model_fn=build_teacher_model,
-        )
         
-        prepare_and_generate_demo(
-            demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
-            dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
-            build_model_fn=build_student_model,
-            build_model_fn_args={
-                'teacher': teacher
-            }
-        )
+        if (len(sys.argv)< 2 or sys.argv[2] !="--student-only"):
+            prepare_and_generate_demo(
+                demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
+                dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+                checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+                build_model_fn=build_teacher_model,
+            )
+            
+        if (len(sys.argv)< 2 or sys.argv[2] !="--teacher-only"):
+            prepare_and_generate_demo(
+                demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
+                dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
+                checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
+                build_model_fn=build_student_model,
+                build_model_fn_args={
+                    'teacher': teacher
+                }
+            )
     elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
         dump_pick_attacks()
         sys.exit(0)
