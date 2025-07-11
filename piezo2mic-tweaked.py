@@ -21,6 +21,11 @@ from tensorflow.keras.layers import (
     Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
 )
 
+# Turn off GPU acceleration for inference, as it is more reliable.
+# We need to do this before doing any TensorFlow stuff at root level
+if len(sys.argv)>1 and sys.argv[1]=="--demo":
+    tf.config.set_visible_devices([], 'GPU')
+
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
 SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
@@ -1260,18 +1265,18 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-4),
-            pointwise_regularizer=regularizers.l2(1e-4),
+            depthwise_regularizer=regularizers.l2(1e-6),
+            pointwise_regularizer=regularizers.l2(1e-6),
             depthwise_constraint=constraints.NonNeg(),
             pointwise_constraint=constraints.NonNeg(),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.1, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayTrainable(sr=SR, init_tau=0.08, name="stu_ir_decay")(ir)
+    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.1 name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
@@ -1675,9 +1680,6 @@ def main ():
         else:
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
-        
-        # Turn off GPU acceleration for inference, as it is more reliable
-        tf.config.set_visible_devices([], 'GPU')
         
         teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(teacher_dynamic_model_filepath):
