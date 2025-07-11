@@ -1276,7 +1276,7 @@ def build_student_model(
     ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.1 name="stu_ir_decay")(ir)
+    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.1, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
