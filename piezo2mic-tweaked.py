@@ -113,7 +113,7 @@ STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_S
 coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
 IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
-EPOCHS      = 1000
+EPOCHS      = 3 #1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -1265,16 +1265,18 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-6),
-            pointwise_regularizer=regularizers.l2(1e-6),
+            depthwise_regularizer=regularizers.l2(1e-2),
+            pointwise_regularizer=regularizers.l2(1e-2),
+            #depthwise_constraint=constraints.NonNeg(),
+            #pointwise_constraint=constraints.NonNeg(),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.1, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayTrainable(sr=SR, init_tau=0.5, min_tau=0.2, name="stu_ir_decay")(ir)
+    ir = IRDecayTrainable(sr=SR, init_tau=0.08, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
