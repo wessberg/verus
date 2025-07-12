@@ -163,8 +163,8 @@ DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
 LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 60 * 5
-LONG_DEMO_PAIR_INDEX = 6
+LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_PAIR_INDEX = 0
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
@@ -356,6 +356,35 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
+    
+@register_keras_serializable()
+class IRDecayFixed(Layer):
+    """
+    A fixed exponential‐decay layer: y[t] = x[t] * exp(–t / tau_secs).
+    """
+    def __init__(self, sr=48000, tau_secs=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.sr       = int(sr)
+        self.tau_secs = float(tau_secs)
+        # we store tau as a constant, not a trainable weight
+        self._tau = tf.constant(self.tau_secs, tf.float32)
+
+    def call(self, x):
+        # x: (batch, T, C)
+        T = tf.shape(x)[1]
+        # build time‐axis [0,1,2…T-1] / sr
+        t = tf.cast(tf.range(T), tf.float32) / tf.cast(self.sr, tf.float32)
+        decay = tf.exp(-t / self._tau)             # (T,)
+        # broadcast to (batch, T, C)
+        return x * decay[None, :, None]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sr": self.sr,
+            "tau_secs": self.tau_secs
+        })
+        return cfg
     
 @register_keras_serializable()
 class IRDecayTrainable(Layer):
@@ -1265,18 +1294,18 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-3),
-            pointwise_regularizer=regularizers.l2(1e-3),
+            depthwise_regularizer=regularizers.l2(1e-6),
+            pointwise_regularizer=regularizers.l2(1e-6),
             #depthwise_constraint=constraints.NonNeg(),
             #pointwise_constraint=constraints.NonNeg(),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.2, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.3, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayTrainable(sr=SR, init_tau=0.1, name="stu_ir_decay")(ir)
+    ir = IRDecayFixed(sr=SR, tau_secs=0.1, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
