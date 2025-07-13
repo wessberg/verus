@@ -106,7 +106,7 @@ STUDENT_IR_FIR_SIZE          = 129    # odd for a symmetric window
 STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
 STUDENT_IR_KERNEL    = 33
 STUDENT_IR_DILATIONS = (1,2,4,8)
-STUDENT_IR_ALIGN_OFFSET_CORRECTION = -63
+STUDENT_IR_ALIGN_OFFSET_CORRECTION = -64
 STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_SIZE - 1)//2)
 
 # how many *coarse* steps until the FIR is “fully” onto the input?
