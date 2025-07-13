@@ -102,7 +102,7 @@ SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 
 # ─── IR branch FIR FILTER DESIGN ────────────────────────────────────────────
 STUDENT_IR_DOWNSAMPLE_FACTOR = 8
-STUDENT_IR_FIR_SIZE          = 65    # odd for a symmetric window
+STUDENT_IR_FIR_SIZE          = 129    # odd for a symmetric window
 STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
 STUDENT_IR_KERNEL    = 33
 STUDENT_IR_DILATIONS = (1,2,4,8)
