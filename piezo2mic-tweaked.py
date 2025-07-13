@@ -162,7 +162,7 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
+LONG_DEMO_SEC        = 10
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -753,11 +753,15 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     print(f"✅ Demo saved to {prediction_filepath}")
     
 def make_sinc_filter(cutoff, num_taps):
+    # time axis, centered
     t = np.arange(num_taps) - (num_taps - 1)/2.0
+    # ideal sinc low-pass
     h = np.sinc(2 * cutoff * t)
-    w = np.hamming(num_taps)
-    h = h * w
-    h = h / np.sum(h)
+    # use a Blackman window instead of Hamming
+    w = np.blackman(num_taps)
+    h *= w
+    # normalize to unity DC gain
+    h /= np.sum(h)
     return h.astype(np.float32)
 
 _ir_fir     = make_sinc_filter(STUDENT_IR_CUTOFF, STUDENT_IR_FIR_SIZE)           # (65,)
@@ -1294,15 +1298,15 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-5),
-            pointwise_regularizer=regularizers.l2(1e-5),
+            depthwise_regularizer=regularizers.l2(1e-4),
+            pointwise_regularizer=regularizers.l2(1e-4),
             depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=1.0, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
     #  Problematic right now because it triggers from the start of the demo sample and never resets.
