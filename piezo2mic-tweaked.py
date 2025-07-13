@@ -10,7 +10,7 @@ import os, glob, random, shutil, sys, re, math
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from scipy.signal import butter, sosfilt, find_peaks, hilbert, minimum_phase
+from scipy.signal import butter, sosfilt, find_peaks, hilbert, minimum_phase, firwin
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
@@ -112,6 +112,15 @@ STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_S
 # how many *coarse* steps until the FIR is “fully” onto the input?
 coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
 IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
+
+STUDENT_LP_ORDER   = 65
+STUDENT_LP_CUTOFF  = 4000    # Hz
+
+student_lp_taps_np = firwin(STUDENT_LP_ORDER,
+                     cutoff=STUDENT_LP_CUTOFF/(SR/2),
+                     window="hamming",
+                     pass_zero=True).astype(np.float32)
+student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
 EPOCHS      = 2 #1000
 LR          = 1e-4
@@ -357,58 +366,99 @@ class DemoCallback(Callback):
         })
         return config
     
+# --------------------------------------------------------------------------------
+# 1) A trainable τ + trigger‐based decay envelope
+# --------------------------------------------------------------------------------
 @register_keras_serializable()
-class IRDecayFixed(Layer):
+class IRDecayTriggered(Layer):
     """
-    A fixed exponential‐decay layer: y[t] = x[t] * exp(–t / tau_secs).
+    y[t] = ir[t] * env[t]
+    where env is the convolution of
+       trigger[t] = ( |piezo[t]-piezo[t-1]| > threshold )
+    with the exponential kernel exp(-t/tau).
+    Tau is trainable.
     """
-    def __init__(self, sr=48000, tau_secs=0.1, **kwargs):
+    def __init__(self, sr=48000, init_tau=0.08, threshold=1e-3, **kwargs):
         super().__init__(**kwargs)
-        self.sr       = int(sr)
-        self.tau_secs = float(tau_secs)
-        # we store tau as a constant, not a trainable weight
-        self._tau = tf.constant(self.tau_secs, tf.float32)
+        self.sr        = float(sr)
+        self.init_tau  = float(init_tau)
+        self.threshold = float(threshold)
 
-    def call(self, x):
-        # x: (batch, T, C)
-        T = tf.shape(x)[1]
-        # build time‐axis [0,1,2…T-1] / sr
-        t = tf.cast(tf.range(T), tf.float32) / tf.cast(self.sr, tf.float32)
-        decay = tf.exp(-t / self._tau)             # (T,)
-        # broadcast to (batch, T, C)
-        return x * decay[None, :, None]
+    def build(self, input_shape):
+        self.tau = self.add_weight(
+            name="tau_secs",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.init_tau),
+            constraint=constraints.MinMaxNorm(
+                min_value=1e-4, max_value=1.0,
+                axis=0      # now valid because tau has dim-0
+            ),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs = [ir_branch, piezo_raw]  each shape (B, T, 1)
+        ir, piezo = inputs
+
+        # 1) compute abs‐diff envelope
+        d = tf.abs(piezo[:,1:,:] - piezo[:,:-1,:])
+        d = tf.pad(d, [[0,0],[1,0],[0,0]])  # back to (B,T,1)
+
+        # 2) simple hard threshold → impulses
+        triggers = tf.cast(d > self.threshold, tf.float32)  # (B,T,1)
+
+        # 3) build exponential kernel of length T
+        T = tf.shape(ir)[1]
+        t = tf.cast(tf.range(T), tf.float32) / self.sr        # (T,)
+        dec = tf.exp(-t / tf.reshape(self.tau, ()))           # (T,)
+        dec = tf.reshape(dec, (T,1,1))                        # (T,1,1)
+
+        # 4) convolve triggers with reversed exp-kernel (causal conv)
+        #    reverse the kernel so that dec[0] multiplies triggers[t],
+        #    dec[1] multiplies triggers[t-1], etc.
+        env = tf.nn.conv1d(triggers,
+                           filters=tf.reverse(dec, axis=[0]),
+                           stride=1, padding="SAME")
+        # 5) clamp to [0,1]
+        env = tf.clip_by_value(env, 0.0, 1.0)
+
+        # 6) apply envelope to IR branch
+        return ir * env
 
     def get_config(self):
         cfg = super().get_config()
         cfg.update({
             "sr": self.sr,
-            "tau_secs": self.tau_secs
+            "init_tau": self.init_tau,
+            "threshold": self.threshold
         })
         return cfg
-    
-@register_keras_serializable()
-class IRDecayTrainable(Layer):
-    def __init__(self, sr=48000, init_tau=0.08, min_tau=0.0, **kwargs):
-        super().__init__(**kwargs)
-        self.sr = sr
-        self.init_tau = init_tau
-        self.min_tau = min_tau
-    def build(self, input_shape):
-        self.tau = self.add_weight(
-            name="tau_secs",
-            shape=(1,),                  # <-- 1-D length-1, good
-            initializer=tf.keras.initializers.Constant(self.init_tau),
-            constraint=constraints.MinMaxNorm(min_value=self.min_tau, max_value=1.0),
-            trainable=True
-        )
-    def call(self, x):
-        T = tf.shape(x)[1]
-        t = tf.cast(tf.range(T), tf.float32) / tf.cast(self.sr, tf.float32)
-        decay = tf.exp(-t / self.tau)
-        return x * decay[None, :, None]
-    def get_config(self):
-        return {"sr":self.sr, "init_tau":self.init_tau, "min_tau":self.min_tau}
 
+@register_keras_serializable()
+class IRLowpass(Layer):
+    """
+    Simple causal FIR‐LPF: pad on the left, VALID conv.
+    """
+    def __init__(self, taps=student_lp_taps_tf, **kwargs):
+        super().__init__(**kwargs)
+        # taps should be shape (N_taps, 1, 1)
+        self.taps = tf.Variable(taps, trainable=False, dtype=tf.float32)
+        self.N    = int(taps.shape[0])
+
+    def call(self, x):
+        # x: (B, T, 1)
+        # pad left by N-1
+        pad_amt = self.N - 1
+        x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
+        # VALID conv
+        return tf.nn.conv1d(x_pad, filters=self.taps,
+                            stride=1, padding="VALID")
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"N": self.N})
+        return cfg
 
 @register_keras_serializable()
 class IrScale(Layer):
@@ -1310,13 +1360,8 @@ def build_student_model(
             name=f"stu_ir_sep_{i}"
         )(ir)
 
-    #    *optional*  total-IR-scale → keeps it from growing too loud
+    # total-IR-scale → keeps it from growing too loud
     ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
-
-    #    *optional*  fast envelope → kills the “reverb tail”
-    #  Problematic right now because it triggers from the start of the demo sample and never resets.
-    #  So you only hear the first 0.1 seconds.
-    #ir = IRDecayFixed(sr=SR, tau_secs=0.1, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
@@ -1333,6 +1378,16 @@ def build_student_model(
 
     ir = StuIrAlign(offset=total_delay + STUDENT_IR_ALIGN_OFFSET_CORRECTION,
                     name='stu_ir_align')([ir, inp])
+    
+    # --- now only trigger the IR tail on pick transients ---
+    # extract the raw piezo channel
+    piezo_raw = Lambda(slice_piezo, name="stu_ir_piezo_raw")(inp)
+    ir = IRDecayTriggered(sr=SR,
+                          init_tau=0.08,
+                          threshold=1e-3,
+                          name="stu_ir_decay_trig")([ir, piezo_raw])
+
+    ir = IRLowpass(name="stu_ir_lowpass")(ir)
 
     #    7.7) fuse it back in
     y_student = Add(name="stu_with_ir")([y_student, ir])
