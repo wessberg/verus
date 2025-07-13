@@ -10,7 +10,7 @@ import os, glob, random, shutil, sys, re, math
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from scipy.signal import butter, sosfilt, find_peaks, hilbert, firwin
+from scipy.signal import butter, sosfilt, find_peaks, hilbert, minimum_phase
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
@@ -752,26 +752,26 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     
     print(f"✅ Demo saved to {prediction_filepath}")
     
-def make_kaiser_fir():
-    """
-    cutoff: normalized (Nyquist=0.5), e.g. 1/8=0.125
-    num_taps: odd or even, your choice
-    beta≈14 gives ~–70 dB sidelobes, ≈18 gives ~–90 dB.
-    """
-    # firwin fs=1.0 → Nyquist=0.5
-    h = firwin(
-        numtaps=STUDENT_IR_FIR_SIZE,
-        cutoff=STUDENT_IR_CUTOFF,
-        window=('kaiser', 14.0),
-        fs=1.0
-    )
-    # normalize DC gain
-    return (h / np.sum(h)).astype(np.float32)
+def make_sinc_filter():
+    t = np.arange(STUDENT_IR_FIR_SIZE) - (STUDENT_IR_FIR_SIZE - 1)/2.0
+    h = np.sinc(2 * STUDENT_IR_CUTOFF * t)
+    w = np.hamming(STUDENT_IR_FIR_SIZE)
+    h = h * w
+    h = h / np.sum(h)
+    return h.astype(np.float32)
 
-_ir_fir     = make_kaiser_fir()
-_ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)
-_ir_fir_fwd = _ir_fir.    reshape(-1,1,1)
+_ir_fir     = make_sinc_filter()
 
+h_lin = _ir_fir
+
+# convert to minimum‐phase
+h_min = minimum_phase(h_lin, method='homomorphic')
+# re-normalize just in case
+h_min /= np.sum(h_min)
+h_min = h_min.astype(np.float32)
+
+_ir_fir_rev = h_min[::-1].reshape(-1,1,1)
+_ir_fir_fwd = h_min.    reshape(-1,1,1)
 _ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
 _ir_fir_up  = tf.constant(_ir_fir_fwd, dtype=tf.float32)
 
