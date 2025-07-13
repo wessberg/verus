@@ -105,7 +105,7 @@ STUDENT_IR_DOWNSAMPLE_FACTOR = 8
 STUDENT_IR_FIR_SIZE          = 65    # odd for a symmetric window
 STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
 STUDENT_IR_KERNEL    = 33
-STUDENT_IR_DILATIONS = (1,2,4,8,16,32)
+STUDENT_IR_DILATIONS = (1,2,4,8,16)
 STUDENT_IR_ALIGN_OFFSET_CORRECTION = -63
 STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_SIZE - 1)//2)
 
@@ -113,7 +113,7 @@ STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_S
 coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
 IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
-EPOCHS      = 15 #1000
+EPOCHS      = 3 #1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -1294,15 +1294,15 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-6),
-            pointwise_regularizer=regularizers.l2(1e-6),
-            #depthwise_constraint=constraints.NonNeg(),
-            #pointwise_constraint=constraints.NonNeg(),
+            # depthwise_regularizer=regularizers.l2(1e-6),
+            # pointwise_regularizer=regularizers.l2(1e-6),
+            depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+            pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             name=f"stu_ir_sep_{i}"
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.1, name="stu_ir_scale")(ir)
+    ir = IrScale(init=50.0, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
     #  Problematic right now because it triggers from the start of the demo sample and never resets.
