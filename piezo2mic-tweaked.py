@@ -768,8 +768,7 @@ def make_kaiser_fir():
     # normalize DC gain
     return (h / np.sum(h)).astype(np.float32)
 
-_ir_fir     = make_kaiser_fir(STUDENT_IR_CUTOFF,
-                              STUDENT_IR_FIR_SIZE)
+_ir_fir     = make_kaiser_fir()
 _ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)
 _ir_fir_fwd = _ir_fir.    reshape(-1,1,1)
 
