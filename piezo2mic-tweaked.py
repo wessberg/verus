@@ -122,7 +122,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 2 #1000
+EPOCHS      = 15 #1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -440,23 +440,34 @@ class IRLowpass(Layer):
     """
     Simple causal FIR‐LPF: pad on the left, VALID conv.
     """
-    def __init__(self, taps=student_lp_taps_tf, **kwargs):
+    def __init__(self,
+                 taps=student_lp_taps_tf,   # we keep using the global taps
+                 N=None,
+                 **kwargs):
+        # pop off the auto-inserted N so that base Layer doesn't choke
+        kwargs.pop('N', None)
         super().__init__(**kwargs)
-        # taps should be shape (N_taps, 1, 1)
-        self.taps = tf.Variable(taps, trainable=False, dtype=tf.float32)
-        self.N    = int(taps.shape[0])
+
+        # store the FIR taps as a non-trainable variable
+        # (always the same global student_lp_taps_tf)
+        self.taps = tf.Variable(taps,
+                                trainable=False,
+                                dtype=tf.float32)
+        # keep track of its length
+        self.N = int(self.taps.shape[0])
 
     def call(self, x):
-        # x: (B, T, 1)
-        # pad left by N-1
+        # x: (batch, T, 1)
         pad_amt = self.N - 1
         x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
-        # VALID conv
-        return tf.nn.conv1d(x_pad, filters=self.taps,
-                            stride=1, padding="VALID")
+        return tf.nn.conv1d(x_pad,
+                            filters=self.taps,
+                            stride=1,
+                            padding='VALID')
 
     def get_config(self):
         cfg = super().get_config()
+        # put N back into the config so future saves still carry the right length
         cfg.update({"N": self.N})
         return cfg
 
