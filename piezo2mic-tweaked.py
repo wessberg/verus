@@ -10,7 +10,7 @@ import os, glob, random, shutil, sys, re, math
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from scipy.signal import butter, sosfilt, find_peaks, hilbert
+from scipy.signal import butter, sosfilt, find_peaks, hilbert, firwin
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
@@ -752,21 +752,28 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     
     print(f"✅ Demo saved to {prediction_filepath}")
     
-def make_sinc_filter(cutoff, num_taps):
-    # time axis, centered
-    t = np.arange(num_taps) - (num_taps - 1)/2.0
-    # ideal sinc low-pass
-    h = np.sinc(2 * cutoff * t)
-    # use a Blackman window instead of Hamming
-    w = np.blackman(num_taps)
-    h *= w
-    # normalize to unity DC gain
-    h /= np.sum(h)
-    return h.astype(np.float32)
+def make_kaiser_fir():
+    """
+    cutoff: normalized (Nyquist=0.5), e.g. 1/8=0.125
+    num_taps: odd or even, your choice
+    beta≈14 gives ~–70 dB sidelobes, ≈18 gives ~–90 dB.
+    """
+    # firwin fs=1.0 → Nyquist=0.5
+    h = firwin(
+        numtaps=STUDENT_IR_FIR_SIZE,
+        cutoff=STUDENT_IR_CUTOFF,
+        window=('kaiser', 14.0),
+        fs=1.0
+    )
+    # normalize DC gain
+    return (h / np.sum(h)).astype(np.float32)
 
-_ir_fir     = make_sinc_filter(STUDENT_IR_CUTOFF, STUDENT_IR_FIR_SIZE)           # (65,)
-_ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)                      # (65,1,1)
-_ir_fir_fwd = _ir_fir.reshape(-1,1,1)                            # (65,1,1)
+_ir_fir     = make_kaiser_fir(STUDENT_IR_CUTOFF,
+                              STUDENT_IR_FIR_SIZE,
+                              beta=14.0)
+_ir_fir_rev = _ir_fir[::-1].reshape(-1,1,1)
+_ir_fir_fwd = _ir_fir.    reshape(-1,1,1)
+
 _ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
 _ir_fir_up  = tf.constant(_ir_fir_fwd, dtype=tf.float32)
 
