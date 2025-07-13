@@ -1302,10 +1302,12 @@ def build_student_model(
         )(ir)
 
     #    *optional*  total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.3, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.1, name="stu_ir_scale")(ir)
 
     #    *optional*  fast envelope → kills the “reverb tail”
-    ir = IRDecayFixed(sr=SR, tau_secs=0.1, name="stu_ir_decay")(ir)
+    #  Problematic right now because it triggers from the start of the demo sample and never resets.
+    #  So you only hear the first 0.1 seconds.
+    #ir = IRDecayFixed(sr=SR, tau_secs=0.1, name="stu_ir_decay")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
