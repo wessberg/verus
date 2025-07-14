@@ -114,7 +114,7 @@ coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTO
 IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
 STUDENT_LP_ORDER   = 65
-STUDENT_LP_CUTOFF  = 4000    # Hz
+STUDENT_LP_CUTOFF  = 5000    # Hz
 
 student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      cutoff=STUDENT_LP_CUTOFF/(SR/2),
@@ -1283,7 +1283,6 @@ def build_student_model(
 
     # ── 2) Style + Piezo and Style‐Embedding ───────────────────────────────
     style        = Lambda(slice_style,   name="stu_slice_style")(inp)       # (B,T,1)
-    piezo        = Lambda(slice_piezo,   name="stu_slice_piezo")(inp)       # (B,T,1)
     style_scalar = Lambda(extract_style_scalar, name="stu_style_scalar")(style)  # (B,1,1)
     style_embed  = Dense(STUDENT_EMBED_DIM,
                          activation="linear",
@@ -1372,7 +1371,7 @@ def build_student_model(
         )(ir)
 
     # total-IR-scale → keeps it from growing too loud
-    ir = IrScale(init=0.5, name="stu_ir_scale")(ir)
+    ir = IrScale(init=0.6, name="stu_ir_scale")(ir)
 
     #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
@@ -1392,11 +1391,11 @@ def build_student_model(
     
     # --- now only trigger the IR tail on pick transients ---
     # extract the raw piezo channel
-    piezo_raw = Lambda(slice_piezo, name="stu_ir_piezo_raw")(inp)
-    ir = IRDecayTriggered(sr=SR,
-                          init_tau=0.08,
-                          threshold=1e-3,
-                          name="stu_ir_decay_trig")([ir, piezo_raw])
+    # piezo_raw = Lambda(slice_piezo, name="stu_ir_piezo_raw")(inp)
+    # ir = IRDecayTriggered(sr=SR,
+    #                       init_tau=0.1,
+    #                       threshold=1e-3,
+    #                       name="stu_ir_decay_trig")([ir, piezo_raw])
 
     ir = IRLowpass(name="stu_ir_lowpass")(ir)
 
