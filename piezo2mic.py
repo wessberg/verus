@@ -6,19 +6,25 @@ and a 2nd “style” channel so one model can handle finger vs pick.
 It is designed to be ultra-low latency for real-time inference for live-use.
 This is why dilations and kernel_size are small, and the model is causal.
 """
-import os, glob, random, shutil, sys, re
+import os, glob, random, shutil, sys, re, math
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from scipy.signal import butter, sosfilt, find_peaks, hilbert
+from scipy.signal import butter, sosfilt, find_peaks, hilbert, minimum_phase, firwin
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
+from tensorflow.keras import regularizers, constraints
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D,
     Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
 )
+
+# Turn off GPU acceleration for inference, as it is more reliable.
+# We need to do this before doing any TensorFlow stuff at root level
+if len(sys.argv)>1 and sys.argv[1]=="--demo":
+    tf.config.set_visible_devices([], 'GPU')
 
 # Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
 SEED = 42
@@ -51,7 +57,6 @@ TEACHER_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_teacher.keras"
 TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_teacher_dynamic.keras"
 
 # Student params
-
 STUDENT_FILTERS          = 48       # number of channels in the student
 STUDENT_KERNEL_SIZE      = 25       # (25−1)*(1+2+4+8)=24*15=360 +1 ≃361 samples ≃7.5 ms RF
 STUDENT_DILATIONS        = (1,2,4,8)
@@ -87,8 +92,35 @@ FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model w
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3    # absolute floor on the piezo signal itself
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3           # absolute floor on the piezo signal itself, for the attack segment generator
+SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-3           # absolute floor on the piezo signal itself, for the standard segment generator
+
+# Pick-attack band pass filters
+SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
+SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 #───────────────────────────────────────────────────────────────────────────────
+
+# ─── IR branch FIR FILTER DESIGN ────────────────────────────────────────────
+STUDENT_IR_DOWNSAMPLE_FACTOR = 8
+STUDENT_IR_FIR_SIZE          = 129    # odd for a symmetric window
+STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
+STUDENT_IR_KERNEL    = 33
+STUDENT_IR_DILATIONS = (1,2,4,8)
+STUDENT_IR_ALIGN_OFFSET_CORRECTION = -64
+STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_SIZE - 1)//2)
+
+# how many *coarse* steps until the FIR is “fully” onto the input?
+coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
+IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
+
+STUDENT_LP_ORDER   = 65
+STUDENT_LP_CUTOFF  = 4000    # Hz
+
+student_lp_taps_np = firwin(STUDENT_LP_ORDER,
+                     cutoff=STUDENT_LP_CUTOFF/(SR/2),
+                     window="hamming",
+                     pass_zero=True).astype(np.float32)
+student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
 EPOCHS      = 1000
 LR          = 1e-4
@@ -139,9 +171,9 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 30
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_PAIR_INDEX = 5
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
@@ -191,6 +223,49 @@ def build_chunks(pairs_list, seg_len):
             chunks.append((src,tgt,n_full*chunk_len,rem))
     return chunks
 
+def validate_ir_delay(dynamic_student_model):
+    """
+    Measure the group-delay of the two FIRs in your IR branch
+    (downsampler + post-LP) and check it against the offset
+    in StuIrAlign.
+    """
+
+    # grab the two FIR layers out of your model
+    fir_down = dynamic_student_model.get_layer("stu_ir_downsample")
+    fir_post = dynamic_student_model.get_layer("stu_ir_post_lp")
+    # grab the align layer so we can read back its offset
+    align   = dynamic_student_model.get_layer("stu_ir_align")
+    expected = int(align.offset)  # what you told it to crop
+
+    # how many samples to test? make sure > expected and a multiple of factor
+    factor = STUDENT_IR_DOWNSAMPLE_FACTOR
+    N = expected + factor
+    N = int(math.ceil(N / factor) * factor)
+
+    # build a single‐impulse test signal:
+    # shape = (batch=1, time=N, channels=2)
+    # channel 0 = impulse, channel 1 = style flag (we can set to 0)
+    x = np.zeros((1, N, 2), dtype=np.float32)
+    x[0, 0, 0] = 1.0
+
+    # run it through down-sample FIR
+    y_down = fir_down(x)          # -> (1, ceil(N/factor), 1)
+    # then up-sample back
+    y_up   = UpSampling1D(size=factor)(y_down)  # -> (1, ~N, 1)
+    # then the post-LP FIR
+    y_fir  = fir_post(y_up)       # -> (1, T_fir, 1)
+    ir     = y_fir.numpy()[0, :, 0]
+
+    # find first non-zero (above a tiny threshold)
+    thresh = 1e-6
+    nz     = np.where(np.abs(ir) > thresh)[0]
+    measured = int(nz[0]) if len(nz) else None
+
+    print(f"FIR-only → expected delay {expected}, measured {measured}")
+    if measured != expected:
+        print("⚠️  MISMATCH!  adjust StuIrAlign.offset to", measured)
+    else:
+        print("✅ FIR-delay lines up.")
 
 class DemoCallback(Callback):
     def __init__(self, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
@@ -290,6 +365,133 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
+    
+# --------------------------------------------------------------------------------
+# 1) A trainable τ + trigger‐based decay envelope
+# --------------------------------------------------------------------------------
+@register_keras_serializable()
+class IRDecayTriggered(Layer):
+    """
+    y[t] = ir[t] * env[t]
+    where env is the convolution of
+       trigger[t] = ( |piezo[t]-piezo[t-1]| > threshold )
+    with the exponential kernel exp(-t/tau).
+    Tau is trainable.
+    """
+    def __init__(self, sr=48000, init_tau=0.08, threshold=1e-3, **kwargs):
+        super().__init__(**kwargs)
+        self.sr        = float(sr)
+        self.init_tau  = float(init_tau)
+        self.threshold = float(threshold)
+
+    def build(self, input_shape):
+        self.tau = self.add_weight(
+            name="tau_secs",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.init_tau),
+            constraint=constraints.MinMaxNorm(
+                min_value=1e-4, max_value=1.0,
+                axis=0      # now valid because tau has dim-0
+            ),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs = [ir_branch, piezo_raw]  each shape (B, T, 1)
+        ir, piezo = inputs
+
+        # 1) compute abs‐diff envelope
+        d = tf.abs(piezo[:,1:,:] - piezo[:,:-1,:])
+        d = tf.pad(d, [[0,0],[1,0],[0,0]])  # back to (B,T,1)
+
+        # 2) simple hard threshold → impulses
+        triggers = tf.cast(d > self.threshold, tf.float32)  # (B,T,1)
+
+        # 3) build exponential kernel of length T
+        T = tf.shape(ir)[1]
+        t = tf.cast(tf.range(T), tf.float32) / self.sr        # (T,)
+        dec = tf.exp(-t / tf.reshape(self.tau, ()))           # (T,)
+        dec = tf.reshape(dec, (T,1,1))                        # (T,1,1)
+
+        # 4) convolve triggers with reversed exp-kernel (causal conv)
+        #    reverse the kernel so that dec[0] multiplies triggers[t],
+        #    dec[1] multiplies triggers[t-1], etc.
+        env = tf.nn.conv1d(triggers,
+                           filters=tf.reverse(dec, axis=[0]),
+                           stride=1, padding="SAME")
+        # 5) clamp to [0,1]
+        env = tf.clip_by_value(env, 0.0, 1.0)
+
+        # 6) apply envelope to IR branch
+        return ir * env
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sr": self.sr,
+            "init_tau": self.init_tau,
+            "threshold": self.threshold
+        })
+        return cfg
+
+@register_keras_serializable()
+class IRLowpass(Layer):
+    """
+    Simple causal FIR‐LPF: pad on the left, VALID conv.
+    """
+    def __init__(self,
+                 taps=student_lp_taps_tf,   # we keep using the global taps
+                 N=None,
+                 **kwargs):
+        # pop off the auto-inserted N so that base Layer doesn't choke
+        kwargs.pop('N', None)
+        super().__init__(**kwargs)
+
+        # store the FIR taps as a non-trainable variable
+        # (always the same global student_lp_taps_tf)
+        self.taps = tf.Variable(taps,
+                                trainable=False,
+                                dtype=tf.float32)
+        # keep track of its length
+        self.N = int(self.taps.shape[0])
+
+    def call(self, x):
+        # x: (batch, T, 1)
+        pad_amt = self.N - 1
+        x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
+        return tf.nn.conv1d(x_pad,
+                            filters=self.taps,
+                            stride=1,
+                            padding='VALID')
+
+    def get_config(self):
+        cfg = super().get_config()
+        # put N back into the config so future saves still carry the right length
+        cfg.update({"N": self.N})
+        return cfg
+
+@register_keras_serializable()
+class IrScale(Layer):
+    """A tiny trainable scalar (<1) to keep the IR branch subtle."""
+    def __init__(self, init=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.init = init
+    def build(self, input_shape):
+        self.scale = self.add_weight(
+            name="ir_scale",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.init),
+            trainable=True
+        )
+    def call(self, x):
+        return x * self.scale
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"init": self.init})
+        return cfg
+
+
     
 @register_keras_serializable()
 class DistillLoss(Layer):
@@ -430,9 +632,6 @@ def pack_for_rnn(x):
     # no-op but forces TensorFlow to materialize a contiguous buffer
     return tf.identity(x)
 
-# 1) redefine your band-passes at the top of the file:
-SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
-SOS_LF = butter(4, [300, 2000],  fs=SR, btype='bandpass', output='sos')
 
 def find_attack_spikes(window,
                      pct_diff=99.0,    # diff-percentile
@@ -525,6 +724,10 @@ def segment_generator(seg_len, chunks, is_pick_chunks):
         read_start = cstart + off
         x = src_wav[read_start : read_start + seg_len]
         y = tgt_wav[read_start : read_start + seg_len]
+        
+        # Skip if too quiet
+        if np.max(np.abs(x[:,0])) < SEGMENT_GENERATOR_MIN_AMP_THRESH:
+            continue
 
         if x.shape[0] < seg_len:
             p = seg_len - x.shape[0]
@@ -550,13 +753,21 @@ def analyze_loss_scales(model, dataset ):
     env_val = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
     hf_val = tf.reduce_mean(hf_loss(y_true, y_pred)).numpy()
 
-    print(f"Initial L1 Loss: {l1_val}")
-    print(f"Initial STFT Loss: {stft_val}")
-    print(f"Initial Mel Loss: {mel_val}")
-    print(f"Initial RMS Env Loss: {env_val}")
-    print(f"Initial HF Loss: {hf_val}")
-
     return {'l1': l1_val, 'stft': stft_val, 'mel': mel_val, 'env': env_val, 'hf': hf_val}
+
+def calibrate_loss_weights(model, dataset, n_batches=5):
+    sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
+    for i, (x,y,sw) in enumerate(dataset.take(n_batches)):
+        scales = analyze_loss_scales(model, tf.data.Dataset.from_tensors((x,y,sw)))
+        for k,v in scales.items():
+            sums[k] += v
+            
+    # Print the average loss scales
+    print("Average loss scales over", n_batches, "batches:")
+    for k,v in sums.items():
+        print(f"Initial {k} loss: {v:.4f}")
+        
+    return {k: sums[k]/n_batches for k in sums}
         
 def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=False):
     print("\nGenerating demo…")
@@ -602,18 +813,144 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     
     print(f"✅ Demo saved to {prediction_filepath}")
     
-@register_keras_serializable()
-def stu_ir_downsample(x, D):
-    # pull off channel-0 (piezo) and stride by D
-    # x.shape = (batch, time, 2) → out.shape = (batch, time//D, 1)
-    return x[:, ::D, 0:1]
+def make_sinc_filter():
+    t = np.arange(STUDENT_IR_FIR_SIZE) - (STUDENT_IR_FIR_SIZE - 1)/2.0
+    h = np.sinc(2 * STUDENT_IR_CUTOFF * t)
+    w = np.hamming(STUDENT_IR_FIR_SIZE)
+    h = h * w
+    h = h / np.sum(h)
+    return h.astype(np.float32)
+
+_ir_fir     = make_sinc_filter()
+
+h_lin = _ir_fir
+
+# convert to minimum‐phase
+h_min = minimum_phase(h_lin, method='homomorphic')
+# re-normalize just in case
+h_min /= np.sum(h_min)
+h_min = h_min.astype(np.float32)
+
+_ir_fir_rev = h_min[::-1].reshape(-1,1,1)
+_ir_fir_fwd = h_min.    reshape(-1,1,1)
+_ir_fir_tf  = tf.constant(_ir_fir_rev, dtype=tf.float32)
+_ir_fir_up  = tf.constant(_ir_fir_fwd, dtype=tf.float32)
 
 @register_keras_serializable()
-def stu_ir_trim(inputs):
-    # inputs = [ir_lowrate, y_main], we crop ir_lowrate to y_main’s length
-    ir, y_main = inputs
-    # tf.shape(y_main)[1] is the true time-length
-    return ir[:, : tf.shape(y_main)[1], :]
+class StuIrAlign(Layer):
+    """
+    1) Pads the end of the IR branch if it's too short
+    2) Crops off exactly `offset` samples from the front
+    3) Then takes exactly as many samples as the main-branch (so Add(…,ir) always lines up)
+    """
+    def __init__(self,
+                 offset,        # total group-delay in *input* samples
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.offset = int(offset)
+
+    def call(self, inputs):
+        ir, main = inputs
+        # main shape = (batch, T, 2)  →  we only care about T
+        T = tf.shape(main)[1]
+
+        # after all your ↓→dilate→↑→postLP,  ir.shape = (batch, T′, 1)
+        T_ir = tf.shape(ir)[1]
+
+        # we need at least offset + T samples; pad if we ran short
+        needed = self.offset + T
+        pad_end = needed - T_ir
+        # if pad_end>0, pad zeros on the right; else do nothing
+        ir = tf.cond(
+            pad_end>0,
+            lambda: tf.pad(ir, [[0,0],[0,pad_end],[0,0]]),
+            lambda: ir
+        )
+
+        # now crop out the first `offset` samples and take exactly T
+        return ir[:, self.offset : self.offset + T, :]
+
+    def compute_output_shape(self, input_shape):
+        # input_shape = [ (batch, T′,1), (batch, T,2) ]
+        b, T, _ = input_shape[1]
+        return (b, T, 1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"offset": self.offset})
+        return cfg
+
+@register_keras_serializable()
+class StuIrDownsampleFIR(Layer):
+    """
+    Causal FIR+decimate on the piezo channel.
+    Input:  (batch, T, 2)
+    Output: (batch, ceil(T/ factor), 1)
+    """
+    def __init__(self, factor=STUDENT_IR_DOWNSAMPLE_FACTOR, **kwargs):
+        super().__init__(**kwargs)
+        self.factor = factor
+        self.kernel_size = STUDENT_IR_FIR_SIZE
+
+    def call(self, x):
+        # x[...,0:1] is (batch, T, 1)
+        p = x[...,0:1]
+        # pad on left by kernel_size-1
+        pad = self.kernel_size - 1
+        p_pad = tf.pad(p, [[0,0], [pad,0], [0,0]])
+        # VALID conv1d + stride = decimate
+        return tf.nn.conv1d(
+            p_pad,
+            filters=_ir_fir_tf,
+            stride=self.factor,
+            padding='VALID'
+        )
+
+    def compute_output_shape(self, input_shape):
+        b, T, _ = input_shape
+        if T is None:
+            return (b, None, 1)
+        # after pad left by K-1, length = T + (K-1)
+        padded = T + (self.kernel_size - 1)
+        # VALID conv length = padded - (K-1) = T
+        # then stride -> ceil(T/factor)
+        out_T = (T + self.factor - 1) // self.factor
+        return (b, out_T, 1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'factor': self.factor})
+        return cfg
+
+
+@register_keras_serializable()
+class StuIrPostLP(Layer):
+    """
+    Causal FIR smooth after upsampling.
+    Input:  (batch, T, 1)
+    Output: (batch, T, 1)
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.kernel_size = STUDENT_IR_FIR_SIZE
+
+    def call(self, x):
+        # pad left by K-1
+        pad = self.kernel_size - 1
+        x_pad = tf.pad(x, [[0,0], [pad,0], [0,0]])
+        return tf.nn.conv1d(
+            x_pad,
+            filters=_ir_fir_up,
+            stride=1,
+            padding='VALID'
+        )
+
+    def compute_output_shape(self, input_shape):
+        # stays exactly (batch, T, 1)
+        return input_shape
+
+    def get_config(self):
+        return super().get_config()
 
 @register_keras_serializable()
 def waveform_l1_loss(y_true, y_pred):
@@ -935,9 +1272,8 @@ def build_student_model(
     teacher=None,
     dynamic_time=False
 ):
+    
     # ── 1) Input ────────────────────────────────────────────────────────────
-    #    - dynamic_time=False (training): variable batch‐size, fixed time‐length
-    #    - dynamic_time=True  (inference): batch_size=1, variable time‐length
     if dynamic_time:
         inp = Input(batch_shape=(1, None, 2),
                     name="stu_piezo_plus_style")
@@ -947,7 +1283,6 @@ def build_student_model(
 
     # ── 2) Style + Piezo and Style‐Embedding ───────────────────────────────
     style        = Lambda(slice_style,   name="stu_slice_style")(inp)       # (B,T,1)
-    piezo        = Lambda(slice_piezo,   name="stu_slice_piezo")(inp)       # (B,T,1)
     style_scalar = Lambda(extract_style_scalar, name="stu_style_scalar")(style)  # (B,1,1)
     style_embed  = Dense(STUDENT_EMBED_DIM,
                          activation="linear",
@@ -1003,7 +1338,7 @@ def build_student_model(
         # collect this feature if we're hinting at it
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
-            student_feats.append(x)   # will be (B,T,STUDENT_FILTERS)
+            student_feats.append(x)   # (B,T,STUDENT_FILTERS)
 
     # ── 6) Final Style-conditioned 1×1 pick/finger outputs ──────────────────
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
@@ -1015,13 +1350,64 @@ def build_student_model(
                 ])
     y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
 
-    # ── 7) Distillation Losses (if teacher is provided) ──────────────────────
+    # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
+    #    7.1) anti-alias & decimate
+    ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)   # → (B,≈T/8,1)
+
+    #    7.2) linear dilated conv stack (no non-linearity)
+    for i, d in enumerate(STUDENT_IR_DILATIONS):
+        pad = (STUDENT_IR_KERNEL - 1) * d
+        ir = ZeroPadding1D((pad, 0), name=f"stu_ir_pad_{i}")(ir)
+        ir = SeparableConv1D(
+            filters=1,
+            kernel_size=STUDENT_IR_KERNEL,
+            dilation_rate=d,
+            padding="valid",
+            depthwise_regularizer=regularizers.l2(1e-4),
+            pointwise_regularizer=regularizers.l2(1e-4),
+            depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+            pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+            name=f"stu_ir_sep_{i}"
+        )(ir)
+
+    # total-IR-scale → keeps it from growing too loud
+    ir = IrScale(init=0.6, name="stu_ir_scale")(ir)
+
+    #    7.3) zero-order hold upsample
+    ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
+
+    #    7.4) FIR-smooth the steps
+    ir = StuIrPostLP(name="stu_ir_post_lp")(ir)
+
+    # 7.5) align IR to main-branch: remove the total FIR delay,
+    # pad at end if we overshot, then grab exactly T_main samples
+    # compute total group-delay:
+    #   first FIR (downsample) = IR_FIR_SIZE-1,
+    #   second FIR (postLP)     = floor((IR_FIR_SIZE-1)/2)
+    total_delay = STUDENT_TOTAL_EXPECTED_IR_DELAY
+
+    ir = StuIrAlign(offset=total_delay + STUDENT_IR_ALIGN_OFFSET_CORRECTION,
+                    name='stu_ir_align')([ir, inp])
+    
+    # --- now only trigger the IR tail on pick transients ---
+    # extract the raw piezo channel
+    # piezo_raw = Lambda(slice_piezo, name="stu_ir_piezo_raw")(inp)
+    # ir = IRDecayTriggered(sr=SR,
+    #                       init_tau=0.1,
+    #                       threshold=1e-3,
+    #                       name="stu_ir_decay_trig")([ir, piezo_raw])
+
+    ir = IRLowpass(name="stu_ir_lowpass")(ir)
+
+    #    7.7) fuse it back in
+    y_student = Add(name="stu_with_ir")([y_student, ir])
+
+    # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
         teacher.trainable = False
 
         # a) intermediate-feature distillation
         if STUDENT_TEACHER_FEAT_LAYERS:
-            # build a mini-model to pull out teacher internals
             teacher_feat_model = tf.keras.models.Model(
                 inputs = teacher.input,
                 outputs= [teacher.get_layer(n).output
@@ -1032,22 +1418,18 @@ def build_student_model(
                 T_feats = [T_feats]
 
             for idx, (T_f, S_f) in enumerate(zip(T_feats, student_feats)):
-                # get channel count statically
                 chan = int(T_f.shape[-1])
-                proj = Conv1D(filters   = chan,
-                              kernel_size=1,
-                              padding   ="same",
-                              name      =f"stu_proj_feat_{idx}"
-                             )(S_f)
+                proj = Conv1D(chan, 1, padding="same",
+                              name=f"stu_proj_feat_{idx}")(S_f)
                 _ = DistillLoss(alpha=STUDENT_FEAT_DISTILL_ALPHA,
-                                name =f"feat_distill_{idx}")([T_f, proj])
+                                name=f"feat_distill_{idx}")([T_f, proj])
 
-        # b) final-waveform distillation
+        # b) final‐waveform distillation
         Y_t = teacher(inp)  # (B,T,1)
         y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA,
                                 name="distillation")([Y_t, y_student])
 
-    # ── 8) Final model ───────────────────────────────────────────────────────
+    # ── 9) Final model ───────────────────────────────────────────────────────
     return tf.keras.models.Model(
         inputs = inp,
         outputs= y_student,
@@ -1169,7 +1551,7 @@ def train_shared(
         initial_epoch = 0
     
      # Measure raw scales of each loss term on one batch of val_ds
-    baseline = analyze_loss_scales(static_model, val_ds)
+    baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
     
     ref_scale = float(baseline['l1'])
     user_w    = {
@@ -1293,16 +1675,15 @@ def train_student(resume=False, resume_ckpt_path=None):
         sys.exit(1)
     teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
     
+    print("Loaded teacher from", teacher_dynamic_model_filepath)
     
-    teacher_feature_model = tf.keras.Model(
-        inputs=teacher.input,
-        outputs=[
-            teacher.get_layer("slice_content_2").output,   # e.g. after dilation=4
-            teacher.get_layer("slice_content_4").output,   # e.g. after dilation=16
-        ]
+    tmp_dynamic_model = build_student_model(
+        teacher=teacher,
+        dynamic_time=True
     )
     
-    print("Loaded teacher from", teacher_dynamic_model_filepath)
+    # Validate the final group delay
+    validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
         resume=resume,
@@ -1405,9 +1786,6 @@ def main ():
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         
-        # Turn off GPU acceleration for inference, as it is more reliable
-        tf.config.set_visible_devices([], 'GPU')
-        
         teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(teacher_dynamic_model_filepath):
             print("Teacher model not found, run --train-teacher first")
@@ -1415,27 +1793,29 @@ def main ():
         teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
         
         print("Generating demo audio files...")
-
-        prepare_and_generate_demo(
-            demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
-            dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
-            build_model_fn=build_teacher_model,
-        )
         
-        prepare_and_generate_demo(
-            demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
-            dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
-            checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
-            build_model_fn=build_student_model,
-            build_model_fn_args={
-                'teacher': teacher
-            }
-        )
-    elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--student-only"):
+            prepare_and_generate_demo(
+                demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
+                dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+                checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
+                build_model_fn=build_teacher_model,
+            )
+            
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--teacher-only"):
+            prepare_and_generate_demo(
+                demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
+                dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
+                checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
+                build_model_fn=build_student_model,
+                build_model_fn_args={
+                    'teacher': teacher
+                }
+            )
+    elif len(sys.argv) > 1 and sys.argv[1]=="--dump-pick-attacks":
         dump_pick_attacks()
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--dump-finger-attacks":
+    elif len(sys.argv) > 1 and sys.argv[1]=="--dump-finger-attacks":
         dump_finger_attacks()
         sys.exit(0)
     else:
