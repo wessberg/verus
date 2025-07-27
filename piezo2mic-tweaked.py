@@ -171,9 +171,9 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 30
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_PAIR_INDEX = 5
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
@@ -1794,7 +1794,7 @@ def main ():
         
         print("Generating demo audio files...")
         
-        if (len(sys.argv)< 2 or sys.argv[2] !="--student-only"):
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--student-only"):
             prepare_and_generate_demo(
                 demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
                 dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
@@ -1802,7 +1802,7 @@ def main ():
                 build_model_fn=build_teacher_model,
             )
             
-        if (len(sys.argv)< 2 or sys.argv[2] !="--teacher-only"):
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--teacher-only"):
             prepare_and_generate_demo(
                 demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
                 dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
@@ -1812,10 +1812,10 @@ def main ():
                     'teacher': teacher
                 }
             )
-    elif len(sys.argv)>1 and sys.argv[1]=="--dump-pick-attacks":
+    elif len(sys.argv) > 1 and sys.argv[1]=="--dump-pick-attacks":
         dump_pick_attacks()
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--dump-finger-attacks":
+    elif len(sys.argv) > 1 and sys.argv[1]=="--dump-finger-attacks":
         dump_finger_attacks()
         sys.exit(0)
     else:
