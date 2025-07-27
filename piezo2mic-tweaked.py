@@ -114,7 +114,7 @@ coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTO
 IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
 
 STUDENT_LP_ORDER   = 65
-STUDENT_LP_CUTOFF  = 5000    # Hz
+STUDENT_LP_CUTOFF  = 4000    # Hz
 
 student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      cutoff=STUDENT_LP_CUTOFF/(SR/2),
@@ -122,7 +122,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 15 #1000
+EPOCHS      = 1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
