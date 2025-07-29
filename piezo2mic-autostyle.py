@@ -40,7 +40,7 @@ tf.random.set_seed(SEED)
 SR                  = 48000 
 
 # Debugging params
-DEBUG               = False
+DEBUG               = True
 
 # Batch params
 BATCH_SIZE          = 32
@@ -1835,23 +1835,29 @@ def fine_tune():
 
     def make_mixed_ds(seg_len):
         chunks = build_chunks(all_pairs, seg_len)
-        spec_x = tf.TensorSpec((seg_len,1), tf.float32)
-        spec_y = tf.TensorSpec((seg_len,1), tf.float32)
-
+        
+        spec_x       = tf.TensorSpec((seg_len,1), tf.float32)
+        spec_y_audio = tf.TensorSpec((seg_len,1), tf.float32)
+        spec_y_style = tf.TensorSpec((),       tf.float32)   # or (1,) if you prefer
+        spec_y       = (spec_y_audio, spec_y_style)
+        
         def pa_gen():
-            for x,(y_audio,_) in attack_segment_generator(seg_len, chunks, True):
-                yield x, y_audio
+            for x,(y_audio, style_flag) in attack_segment_generator(seg_len, chunks, True):
+                yield x, (y_audio, style_flag)
+
         def pu_gen():
-            for x,(y_audio,_) in segment_generator(seg_len, chunks, True):
-                yield x, y_audio
+            for x,(y_audio, style_flag) in segment_generator(seg_len, chunks, True):
+                yield x, (y_audio, style_flag)
+        
         def fa_gen():
-            for x,(y_audio,_) in attack_segment_generator(seg_len, chunks, False):
-                yield x, y_audio
+            for x,(y_audio,style_flag) in attack_segment_generator(seg_len, chunks, False):
+                yield x, (y_audio, style_flag)
         def fu_gen():
-            for x,(y_audio,_) in segment_generator(seg_len, chunks, False):
-                yield x, y_audio
+            for x,(y_audio,style_flag) in segment_generator(seg_len, chunks, False):
+                yield x, (y_audio, style_flag)
 
         ds_pa = tf.data.Dataset.from_generator(pa_gen, output_signature=(spec_x, spec_y))
+        
         ds_pu = tf.data.Dataset.from_generator(pu_gen, output_signature=(spec_x, spec_y))
         ds_fa = tf.data.Dataset.from_generator(fa_gen, output_signature=(spec_x, spec_y))
         ds_fu = tf.data.Dataset.from_generator(fu_gen, output_signature=(spec_x, spec_y))
@@ -1880,11 +1886,24 @@ def fine_tune():
             layer.trainable = True    # allow these to adapt
         else:
             layer.trainable = False   # everything else stays frozen
-
+    
     teacher.compile(
-        optimizer=tf.keras.optimizers.Adam(FINETUNE_TEACHER_LR),
-        loss=combined_loss
+        optimizer = tf.keras.optimizers.Adam(FINETUNE_TEACHER_LR),
+        loss        = [ combined_loss, "binary_crossentropy" ],
+        loss_weights= [ 1.0,             λ_STYLE_RATIO      ],
+        metrics     = [
+        # metrics for the audio head
+        [ "mae",
+            log_mel_loss,
+            mean_hf_metric,
+            multi_scale_stft_loss,
+            rms_env_loss
+        ],
+        # metrics for the style head
+        [ "accuracy" ]
+        ]
     )
+    
     
     dsT = make_mixed_ds(TEACHER_SEG_LEN)
     
@@ -1936,12 +1955,25 @@ def fine_tune():
         or layer.name.startswith("stu_ir_scale"):
             layer.trainable = True    # allow these to adapt
         else:
-            layer.trainable = False   # everything else stays frozen
-
+            layer.trainable = False   # everything else stays frozen    
+    
     student.compile(
-        optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
-        loss=combined_loss
+        optimizer = tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
+        loss        = [ combined_loss, "binary_crossentropy" ],
+        loss_weights= [ 1.0,             λ_STYLE_RATIO      ],
+        metrics     = [
+        # metrics for the audio head
+        [ "mae",
+            log_mel_loss,
+            mean_hf_metric,
+            multi_scale_stft_loss,
+            rms_env_loss
+        ],
+        # metrics for the style head
+        [ "accuracy" ]
+        ]
     )
+    
     
     dsS = make_mixed_ds(STUDENT_SEG_LEN)
     
