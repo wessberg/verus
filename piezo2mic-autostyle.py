@@ -40,7 +40,7 @@ tf.random.set_seed(SEED)
 SR                  = 48000 
 
 # Debugging params
-DEBUG               = True
+DEBUG               = False
 
 # Batch params
 BATCH_SIZE          = 32
