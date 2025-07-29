@@ -74,6 +74,20 @@ STUDENT_FEAT_DISTILL_ALPHA    = 1.0
 STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_student.keras"
 STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
 
+# Finetune params
+
+FINETUNE_TEACHER_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_teacher.keras"
+FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_teacher_dynamic.keras"
+FINETUNE_STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_student.keras"
+FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_student_dynamic.keras"
+
+FINETUNE_TEACHER_EPOCHS      = 6
+FINETUNE_STUDENT_EPOCHS      = 6
+FINETUNE_TEACHER_LR          = 1e-5
+FINETUNE_STUDENT_LR          = 1e-4
+
+FINE_TUNE_DEMO_SEC = 60
+
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
@@ -137,6 +151,8 @@ PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
+FINETUNE_SRC_DIR   = "./input/finetune"
+
 OUT_DIR        = "./out"
 
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
@@ -161,6 +177,8 @@ LONG_DEMOS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "long")
 LONG_DEMOS_TEACHER_OUT_DIR = os.path.join(LONG_DEMOS_OUT_DIR, "teacher")
 LONG_DEMOS_STUDENT_OUT_DIR = os.path.join(LONG_DEMOS_OUT_DIR, "student")
 
+FINETUNE_DEMOS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "finetune")
+
 DEMO_GENERATOR_OUTPUTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "generator-outputs")
 
 DEMO_CHECKPOINTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "checkpoints")
@@ -171,14 +189,14 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 30
-LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 5
+LONG_DEMO_SEC        = 60
+LONG_DEMO_OFFSET_SEC = 60
+LONG_DEMO_PAIR_INDEX = 6
 
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
-for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR, CSV_LOGS_TEACHER_OUT_DIR, CSV_LOGS_STUDENT_OUT_DIR]:
+for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR, CSV_LOGS_TEACHER_OUT_DIR, CSV_LOGS_STUDENT_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
@@ -769,6 +787,56 @@ def calibrate_loss_weights(model, dataset, n_batches=5):
         
     return {k: sums[k]/n_batches for k in sums}
         
+# ────────────────────── Pair-based demo helper ────────────────────────────
+def generate_fine_tune_demo(
+    model,                 # your dynamic model
+    src_path,              # "./finetune/source.wav"
+    tgt_path,              # "./finetune/target.wav"
+    out_dir,               # where to write .wav files
+    prediction_name="pred",# e.g. "teacher_pred" or "student_pred"
+    style_flag=0.0         # 0.0=finger, 1.0=pick
+):
+    os.makedirs(out_dir, exist_ok=True)
+    # 1) load full signals
+    x_full, _ = sf.read(src_path,
+                        dtype='float32',
+                        always_2d=True)  # shape=(N,2) or (N,1 but we always had 2 channels)
+    y_ref,  _ = sf.read(tgt_path,
+                        dtype='float32',
+                        always_2d=True)  # shape=(N, nch)
+
+    # 2) Truncate to first FINE_TUNE_DEMO_SEC seconds
+    max_frames = int(FINE_TUNE_DEMO_SEC * SR)
+    
+    if x_full.shape[0] > max_frames:
+        x_full = x_full[:max_frames]
+        y_ref  = y_ref[:max_frames]
+    
+    # 2) build style‐channel
+    N = x_full.shape[0]
+    style = np.full((N,1), style_flag, dtype='float32')
+    # If your source is mono+style, x_full may be (N,1), so:
+    if x_full.shape[1]==1:
+        x_full = np.concatenate([x_full, style], axis=-1)
+    else:
+        x_full = np.concatenate([x_full[:,:1], style], axis=-1)
+
+    # 3) batch =1, dynamic_time expects shape (1,N,2)
+    x_in = x_full[np.newaxis,...]  # (1,N,2)
+
+    # 4) predict
+    y_pred = model.predict(x_in, batch_size=1)[0,:,0]  # (N,)
+
+    # 5) write files
+    sf.write(os.path.join(out_dir, "demo_source.wav"),
+             x_full[:,0], SR, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "demo_target.wav"),
+             y_ref[:,0], SR, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, f"{prediction_name}.wav"),
+             y_pred,    SR, subtype='FLOAT')
+    print(f"   → Wrote: {out_dir}/{prediction_name}.wav")
+
+
 def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=False):
     print("\nGenerating demo…")
     FRAMES      = LONG_DEMO_SEC * SR
@@ -1441,7 +1509,8 @@ def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
     print("TODO")
 
 
-
+def approx_steps(durs, seg_len):
+        return sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
 
 def train_shared(
     seg_len,
@@ -1476,13 +1545,10 @@ def train_shared(
     val_pick_chunks     = [c for c in val_chunks   if c in pick_chunks]
     val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
     
-
-    def approx_steps(durs):
-        return sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
     train_durs = [dur for (_,_,_,dur) in train_chunks]
     val_durs   = [dur for (_,_,_,dur) in val_chunks]
-    steps_per_epoch  = max(approx_steps(train_durs),1)
-    validation_steps = max(approx_steps(val_durs),1)
+    steps_per_epoch  = max(approx_steps(durs=train_durs, seg_len=seg_len),1)
+    validation_steps = max(approx_steps(durs=val_durs, seg_len=seg_len),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     # datasets
@@ -1701,6 +1767,171 @@ def train_student(resume=False, resume_ckpt_path=None):
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR
     )
 
+def generate_fine_tune_demo_from_models (teacher_dyn, student_dyn):
+    print("\n▶ Generating finetune demos…")
+    for tag, model_dyn in [("teacher", teacher_dyn),
+                        ("student", student_dyn)]:
+        demo_dir = os.path.join(FINETUNE_DEMOS_OUT_DIR, f"demo_{tag}")
+        # write two style‐variants so you can audition both
+        for style_flag, style_name in [(0.0, "finger"), (1.0, "pick")]:
+            sub = os.path.join(demo_dir, style_name)
+            generate_fine_tune_demo(
+                model           = model_dyn,
+                src_path        = os.path.join(FINETUNE_SRC_DIR, "source.wav"),
+                tgt_path        = os.path.join(FINETUNE_SRC_DIR, "target.wav"),
+                out_dir         = sub,
+                prediction_name = f"{tag}_pred_{style_name}",
+                style_flag      = style_flag
+            )
+    print("✅ Fine-tune complete, demos in ./finetune/demo_{teacher,student}/{finger,pick}/")
+
+def fine_tune():
+
+    src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+    tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+    if not os.path.exists(src) or not os.path.exists(tgt):
+        print("ERROR: finetune source/target not found in", FINETUNE_SRC_DIR)
+        sys.exit(1)
+
+    global picked_pairs, finger_pairs, all_pairs, audio_cache
+    picked_pairs = [(src, tgt)]
+    finger_pairs = [(src, tgt)]
+    all_pairs    = picked_pairs + finger_pairs
+
+    # reload cache
+    audio_cache.clear()
+    audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
+    audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+
+    # 3) Build a "mixed" dataset exactly like train_shared does
+    def make_mixed_ds(seg_len):
+        chunks = build_chunks(all_pairs, seg_len)
+        if len(chunks)==0:
+            raise RuntimeError(f"finetune clip too short for seg_len={seg_len}")
+        sig_x = tf.TensorSpec((seg_len,2), tf.float32)
+        sig_y = tf.TensorSpec((seg_len,1), tf.float32)
+
+        # four streams: pick_attack, pick_uniform, finger_attack, finger_uniform
+        ds_pa = tf.data.Dataset.from_generator(
+            lambda: attack_segment_generator(seg_len, chunks, is_pick_chunks=True),
+            output_signature=(sig_x,sig_y)
+        )
+        ds_pu = tf.data.Dataset.from_generator(
+            lambda: segment_generator(seg_len, chunks, is_pick_chunks=True),
+            output_signature=(sig_x,sig_y)
+        )
+        ds_fa = tf.data.Dataset.from_generator(
+            lambda: attack_segment_generator(seg_len, chunks, is_pick_chunks=False),
+            output_signature=(sig_x,sig_y)
+        )
+        ds_fu = tf.data.Dataset.from_generator(
+            lambda: segment_generator(seg_len, chunks, is_pick_chunks=False),
+            output_signature=(sig_x,sig_y)
+        )
+
+        mixed = tf.data.Dataset.sample_from_datasets(
+            [ds_pa, ds_pu, ds_fa, ds_fu],
+            weights=[
+                PICK_ATTACK_CHUNK_RATIO,
+                PICK_UNIFORM_CHUNK_RATIO,
+                FINGER_ATTACK_CHUNK_RATIO,
+                FINGER_UNIFORM_CHUNK_RATIO
+            ],
+            seed=SEED
+        )
+        
+        return mixed \
+           .batch(BATCH_SIZE) \
+           .map(add_sw, num_parallel_calls=tf.data.AUTOTUNE) \
+           .repeat() \
+           .prefetch(tf.data.AUTOTUNE)
+
+    # ─── Fine-tune TEACHER ────────────────────────────────────────────────
+    print("\n🔧 Fine-tuning TEACHER on new pair…")
+    base_teacher = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
+    teacher = tf.keras.models.load_model(base_teacher, compile=False)
+
+    # Freeze all but style_embed, film_dense_* and final_*
+    for layer in teacher.layers:
+        name = layer.name
+        ok = (
+            name=="style_embed"
+            or name.startswith("film_dense_")
+            or name.startswith("final_")
+        )
+        layer.trainable = ok
+
+    teacher.compile(
+        optimizer=tf.keras.optimizers.Adam(FINETUNE_TEACHER_LR),
+        loss=combined_loss
+    )
+    dsT = make_mixed_ds(TEACHER_SEG_LEN)
+    
+    ft_chunks_T = build_chunks([(src,tgt)], TEACHER_SEG_LEN)
+    stepsT = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=TEACHER_SEG_LEN), 1)
+    
+    teacher.fit(dsT, epochs=FINETUNE_TEACHER_EPOCHS, steps_per_epoch=stepsT, verbose=1)
+
+    # Save new teacher
+    ft_t_static = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_STATIC_MODEL_FILENAME)
+    teacher.save(ft_t_static)
+    print("✅ Saved finetuned teacher:", ft_t_static)
+
+    teacher_dyn = build_teacher_model(dynamic_time=True)
+    teacher_dyn.set_weights(teacher.get_weights())
+    ft_t_dyn = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
+    teacher_dyn.save(ft_t_dyn)
+    print("✅ Saved finetuned teacher dynamic:", ft_t_dyn)
+
+    # ─── Fine-tune STUDENT ────────────────────────────────────────────────
+    print("\n🔧 Fine-tuning STUDENT on new pair…")
+    # reload finetuned teacher for distillation
+    teacher_dyn = tf.keras.models.load_model(ft_t_dyn, compile=False)
+
+    # load the _baseline_ student to grab its weights
+    base_student = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME)
+    student_bp   = tf.keras.models.load_model(base_student, compile=False)
+
+    # rebuild student with teacher for distillation
+    student = build_student_model(teacher=teacher_dyn, dynamic_time=False)
+    student.set_weights(student_bp.get_weights())
+
+    # freeze all but stu_style_embed, stu_film_dense_*, stu_final_*, stu_ir_scale
+    for layer in student.layers:
+        n = layer.name
+        ok = (
+            n=="stu_style_embed"
+            or n.startswith("stu_film_dense_")
+            or n.startswith("stu_final_")
+            or n=="stu_ir_scale"
+        )
+        layer.trainable = ok
+
+    student.compile(
+        optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
+        loss=combined_loss
+    )
+    dsS = make_mixed_ds(STUDENT_SEG_LEN)
+    
+    
+    ft_chunks_S = build_chunks([(src,tgt)], STUDENT_SEG_LEN)
+    stepsS = max(approx_steps(durs=[dur for (_,_,_,dur) in ft_chunks_S], seg_len=STUDENT_SEG_LEN), 1)
+    
+    student.fit(dsS, epochs=FINETUNE_STUDENT_EPOCHS, steps_per_epoch=stepsS, verbose=1)
+
+    # Save new student
+    ft_s_static = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_STATIC_MODEL_FILENAME)
+    student.save(ft_s_static)
+    print("✅ Saved finetuned student:", ft_s_static)
+
+    student_dyn = build_student_model(teacher=teacher_dyn, dynamic_time=True)
+    student_dyn.set_weights(student.get_weights())
+    ft_s_dyn = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
+    student_dyn.save(ft_s_dyn)
+    print("✅ Saved finetuned student dynamic:", ft_s_dyn)
+    
+    return (teacher_dyn, student_dyn)
+
 def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     # Clean logs and checkpoints
         for dir_path in [logs_out_dir, csv_logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
@@ -1817,6 +2048,23 @@ def main ():
         sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1]=="--dump-finger-attacks":
         dump_finger_attacks()
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune":
+        teacher_dyn, student_dyn = fine_tune()
+        generate_fine_tune_demo_from_models(teacher_dyn=teacher_dyn, student_dyn=student_dyn)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune-demo":
+        
+        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
+        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
+        if not os.path.exists(teacher_dyn_path) or not os.path.exists(student_dyn_path):
+            print("Fine-tuned teacher/student dynamic models not found, run --fine-tune first")
+            sys.exit(1)
+        
+        teacher_dyn = tf.keras.models.load_model(teacher_dyn_path, compile=False)
+        student_dyn = tf.keras.models.load_model(student_dyn_path, compile=False)
+        
+        generate_fine_tune_demo_from_models(teacher_dyn=teacher_dyn, student_dyn=student_dyn)
         sys.exit(0)
     else:
         print("No command given.")
