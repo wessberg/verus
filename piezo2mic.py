@@ -154,7 +154,7 @@ FINGER_TGT_DIR = "./input/fingerpicked/target"
 
 FINETUNE_SRC_DIR   = "./input/finetune"
 
-OUT_DIR        = "./out-autostyle"
+OUT_DIR        = "./out"
 
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
 CHECKPOINT_TEACHER_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "teacher")
@@ -1816,22 +1816,49 @@ def generate_fine_tune_demo_from_models(teacher_dyn, student_dyn):
           ]))
 
 def fine_tune():
-
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
     tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     if not os.path.exists(src) or not os.path.exists(tgt):
         print("ERROR: finetune source/target not found in", FINETUNE_SRC_DIR)
         sys.exit(1)
 
+    # 1) load raw waveforms
+    x_full, sr_x = sf.read(src, dtype='float32', always_2d=True)
+    y_full, sr_y = sf.read(tgt, dtype='float32', always_2d=True)
+    assert sr_x == sr_y == SR, f"Sample rate mismatch: {sr_x} vs {sr_y} vs {SR}"
+
+    # 2) measure RMS on piezo channel (assumed channel 0)
+    def compute_rms(sig):
+        return np.sqrt(np.mean(sig**2))
+    rms_x = compute_rms(x_full[:,0])
+    rms_y = compute_rms(y_full[:,0])
+    print(f"[fine_tune] input RMS: source={rms_x:.6f}, target={rms_y:.6f}")
+
+    # 3) compute target RMS (–23 dBFS) and gains
+    target_rms = 10 ** ( -23.0 / 20.0 )   # ≃0.0708
+    gain_x     = target_rms / (rms_x + 1e-12)
+    gain_y     = target_rms / (rms_y + 1e-12)
+    print(f"[fine_tune] applying gains: source×{gain_x:.3f}, target×{gain_y:.3f}")
+
+    # 4) normalize
+    x_norm = x_full * gain_x
+    y_norm = y_full * gain_y
+
+    # re‐measure RMS to double‐check
+    rms_x2 = compute_rms(x_norm[:,0])
+    rms_y2 = compute_rms(y_norm[:,0])
+    print(f"[fine_tune] post‐norm RMS: source={rms_x2:.6f} ({20*np.log10(rms_x2):.2f} dB),"
+          f" target={rms_y2:.6f} ({20*np.log10(rms_y2):.2f} dB)")
+
+    # 6) repopulate your caches so the rest of fine-tune uses the normalized versions
     global picked_pairs, finger_pairs, all_pairs, audio_cache
     picked_pairs = [(src, tgt)]
     finger_pairs = [(src, tgt)]
     all_pairs    = picked_pairs + finger_pairs
 
-    # reload cache
     audio_cache.clear()
-    audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
-    audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+    audio_cache[src] = x_norm      # shape=(frames,2) or (frames,1)
+    audio_cache[tgt] = y_norm
 
     def make_mixed_ds(seg_len):
         chunks = build_chunks(all_pairs, seg_len)
