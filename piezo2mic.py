@@ -2658,8 +2658,8 @@ def main ():
     
     elif len(sys.argv)>1 and sys.argv[1]=="--profile-base-model-style-flag-flips":
         
-        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
+        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME)
+        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME)
 
         if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
             print("Fine-tuned teacher/student dynamic models not found, run --train-teacher and --train-student first")
