@@ -69,5 +69,6 @@
         "vector": "cpp",
         "algorithm": "cpp",
         "*.inc": "cpp"
-    }
+    },
+    "cmake.sourceDirectory": "/Users/ideanote/Developer/tf-audio-experiment/cpp2"
 }

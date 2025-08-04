@@ -18,7 +18,8 @@ from tensorflow.keras import regularizers, constraints
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
+    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D,
+    RNN
 )
 
 # Turn off GPU acceleration for inference, as it is more reliable.
@@ -37,7 +38,9 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Audio channel configuration
-SR                  = 48000 
+SR                  = 48000
+INPUT_AVG_RMS_DBFS_TARGET = -23.0
+STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # Debugging params
 DEBUG               = False
@@ -85,15 +88,18 @@ FINETUNE_TEACHER_EPOCHS      = 10
 FINETUNE_STUDENT_EPOCHS      = 10
 FINETUNE_TEACHER_LR          = 1e-5
 FINETUNE_STUDENT_LR          = 1e-4
+FINETUNE_L1_WEIGHT           = 15.0
+FINETUNE_MEL_WEIGHT          = 15.0
 
 FINE_TUNE_DEMO_SEC = 60
+FINE_TUNE_DEMO_OFFSET_SEC = 0
 
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
-L1_WEIGHT                 = 1.0 # waveform l1 loss
-HF_WEIGHT                 = 1.0  # scale of the high-pass loss
-STFT_WEIGHT               = 1.0    # weight of the spectral loss
+L1_WEIGHT                 = 1.0   # waveform l1 loss
+HF_WEIGHT                 = 1.0   # scale of the high-pass loss
+STFT_WEIGHT               = 1.0   # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 λ_STYLE_RATIO             = 0.5
@@ -105,10 +111,10 @@ FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model wil
 FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
-ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-3    # absolute floor on |Δ| spikes
-ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-3    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-3           # absolute floor on the piezo signal itself, for the attack segment generator
-SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-3           # absolute floor on the piezo signal itself, for the standard segment generator
+ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6    # absolute floor on |Δ| spikes
+ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-5    # absolute floor on HF envelope
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-6    # absolute floor on the piezo signal itself, for the attack segment generator
+SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-5    # absolute floor on the piezo signal itself, for the standard segment generator
 
 # Pick-attack band pass filters
 SOS_HF = butter(4, [6000, 20000], fs=SR, btype='bandpass', output='sos')
@@ -147,11 +153,21 @@ LR_PLATEAU_PATIENCE = 5
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
+DEMO_SEC        = 10
+DEMO_OFFSET_SEC = 0
+DEMO_PAIR_INDEX = 0
+
+LONG_DEMO_SEC        = 30
+LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_PAIR_INDEX = 0
+
 PICK_SRC_DIR   = "./input/picked/source"
 PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
+PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR   = "./input/style-classification/pick"
+PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR   = "./input/style-classification/finger"
 FINETUNE_SRC_DIR   = "./input/finetune"
 
 OUT_DIR        = "./out"
@@ -186,14 +202,6 @@ DEMO_CHECKPOINTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "checkpoints")
 DEMO_CHECKPOINTS_TEACHER_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "teacher")
 DEMO_CHECKPOINTS_STUDENT_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "student")
 
-DEMO_SEC        = 10
-DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 0
-
-LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 60
-LONG_DEMO_PAIR_INDEX = 6
-
 
 SAVE_WEIGHTS           = False  # set to True to dump .npy weights
 
@@ -201,7 +209,6 @@ for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHE
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── DATA LOADING ───────────────────────────────────
-print("Looking for audio pairs…")
 picked_pairs = []
 for src in sorted(glob.glob(os.path.join(PICK_SRC_DIR, "*_source.wav"))):
     tgt = src.replace("_source.wav","_target.wav").replace(PICK_SRC_DIR, PICK_TGT_DIR)
@@ -216,13 +223,30 @@ for src in sorted(glob.glob(os.path.join(FINGER_SRC_DIR, "*_source.wav"))):
         finger_pairs.append((src, tgt))
     else:
         print("Warning: no target for", src)
-print(f"  → {len(picked_pairs)} picked‐attack pairs, {len(finger_pairs)} finger‐picked pairs")
+
 all_pairs = picked_pairs + finger_pairs
 
+# normalize all files to target RMS once
+target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
+
+# normalize all files to target RMS once
+target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
+
 audio_cache = {}
-for (src,tgt) in all_pairs:
-    audio_cache[src] = sf.read(src, dtype='float32', always_2d=True)[0]
-    audio_cache[tgt] = sf.read(tgt, dtype='float32', always_2d=True)[0]
+for src, tgt in all_pairs:
+    for path in (src, tgt):
+        # 1) load
+        data, _ = sf.read(path,
+                          dtype='float32',
+                          always_2d=True)          # shape = (frames, channels)
+        # 2) measure RMS on channel-0
+        mono = data[:,0]
+        rms = np.sqrt(np.mean(mono**2) + 1e-12)
+        # 3) compute and apply gain
+        gain = target_rms / rms
+        data_norm = data * gain
+        # 4) cache normalized audio
+        audio_cache[path] = data_norm
 
 def build_chunks(pairs_list, seg_len):
     """
@@ -348,7 +372,7 @@ class DemoCallback(Callback):
         y_out, style_out = self.dynamic_model.predict(x_demo, batch_size=1)
         y_pred   = y_out[0,:,0]
         style_p  = float(style_out[0,0])
-        style_nm = 'pick' if style_p>0.5 else 'finger'
+        style_nm = 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
 
         # 4) write to disk
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{friendly_epoch:03d}")
@@ -385,10 +409,7 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
-    
-# --------------------------------------------------------------------------------
-# 1) A trainable τ + trigger‐based decay envelope
-# --------------------------------------------------------------------------------
+
 @register_keras_serializable()
 class IRDecayTriggered(Layer):
     """
@@ -568,7 +589,7 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     total = n_segments or len(pick_chunks)
 
     for i in range(total):
-        x, y = next(gen)
+        x, (y, style_flag) = next(gen)
         # x.shape = (SEG_LEN,2),  x[:,0]=piezo,  y.shape=(SEG_LEN,1)
         piezo = x[:,0]       # (SEG_LEN,)
         mic   = y[:,0]       # (SEG_LEN,)
@@ -682,6 +703,7 @@ def find_attack_spikes(window,
                 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH)
     thr_h = max(np.percentile(env_hf, pct_hf),
                 ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH)
+    
     thr_r = max(np.percentile(ratio, pct_ratio), 1.0)  # at least 1×
 
     # 5) find all diff‐peaks
@@ -803,7 +825,7 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     y_out, style_out = model.predict(x_in, batch_size=1)
     y_pred_dyn   = y_out[0,:,0]
     style_p  = float(style_out[0,0])
-    style_nm = 'pick' if style_p>0.5 else 'finger'
+    style_nm = 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
     print(f"[generate_demo] detected style {style_nm} ({style_p:.3f})")
     
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
@@ -1683,11 +1705,12 @@ def train_shared(
     )
     
     # trained_epochs = len(history.history["loss"])
-
-    # Save FP32 static and dynamic models
+    
+    # 1) save & inject static
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
 
+    # 2) build, save & inject dynamic
     dynamic_model = build_model_fn(**build_model_fn_args, dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
     dynamic_model.save(dynamic_model_filepath)
@@ -1779,9 +1802,72 @@ def generate_fine_tune_demo(
     (y_out, style_out) = model.predict(x_in, batch_size=1)
     y_pred  = y_out[0, :, 0]         # shape (N,)
     style_p = float(style_out[0,0]) # scalar in [0,1]
-    style_nm = "pick"   if style_p>0.5 else "finger"
+    style_nm = "pick"   if style_p>STYLE_FLAG_PROB_THRESHOLD else "finger"
 
     print(f"[generate_fine_tune_demo] detected style = {style_nm} ({style_p:.3f})")
+    
+    
+    # ────────── NEW: SLIDING WINDOW STYLE SCAN ──────────
+    # Build a sub‐model that only runs the style head
+    #    (we know model.output[1] is the style_prob)
+    # style_model = tf.keras.Model(
+    #     inputs  = model.input,
+    #     outputs = model.output[1],
+    #     name    = "only_style_head"
+    # )
+    # style_model.compile()  # no-op, just to avoid TF warnings
+
+    # # Choose window & hop in samples:
+    # # you can pick your student receptive field or something shorter
+    # win_len = STUDENT_SEG_LEN     # e.g. 4096 samples
+    # hop     = win_len // 2        # 50% overlap
+
+    # N = x_piezo.shape[0]
+    # # how many windows
+    # n_wins = max(1, (N - win_len)//hop + 1)
+
+    # # accumulate the thresholded flags
+    # flags = []
+    # for i in range(n_wins):
+    #     start = i * hop
+    #     end   = start + win_len
+    #     if end > N:
+    #         # pad last window with zeros
+    #         pad_amt = end - N
+    #         win = np.pad(x_piezo[start:N], ((0,pad_amt),(0,0)))
+    #     else:
+    #         win = x_piezo[start:end]
+
+    #     # batch it
+    #     win_batched = win[None,...]  # shape (1, win_len,1)
+
+    #     # predict only style prob
+    #     p = style_model.predict(win_batched, batch_size=1)[0,0]
+    #     flags.append( 1 if p>STYLE_FLAG_PROB_THRESHOLD else 0 )
+    
+    
+    #     # ────────── detect flips & record from→to ──────────
+    # style_names = {0:'finger', 1:'pick'}
+    # flip_events = []
+
+    # for win_i in range(1, len(flags)):
+    #     prev_flag = flags[win_i-1]
+    #     new_flag  = flags[win_i]
+    #     if new_flag != prev_flag:
+    #         sample_offset = win_i * hop
+    #         flip_events.append((sample_offset,
+    #                             style_names[prev_flag],
+    #                             style_names[new_flag]))
+
+    # if flip_events:
+    #     print("STYLE FLIPS:")
+    #     for samp, frm, to in flip_events:
+    #         print(f"  at {samp:6d} samples  ({samp/SR:.3f}s):  {frm} → {to}")
+    #     total_time = N / SR
+    #     print(f"  → {len(flip_events)} flips over {total_time:.1f}s"
+    #           f"  ({len(flip_events)/total_time:.2f} flips/sec)")
+    # else:
+    #     print("No style flips detected.")
 
     # 5) Write to disk
     sf.write(os.path.join(out_dir, "demo_source.wav"),
@@ -1792,13 +1878,42 @@ def generate_fine_tune_demo(
              y_pred,      SR, subtype='FLOAT')
 
     print(f"   → Wrote: {out_dir}/{prediction_name}.wav\n")
+    
+    # Now also write demos with forced style flags to hear how they sound when the style is consistent
+    # get the style‐logit layer
+    logit_layer = model.get_layer("stu_style_logit")
+    W, b = logit_layer.get_weights()
+    
+    def force_style(pick: bool):
+        # zero out the weights so the input piezo never changes the logit…
+        W_zero = np.zeros_like(W)
+        # …and set bias to +10 for pick (sigmoid(10)≈0.99995) or -10 for finger (sigmoid(-10)≈4.5e-5)
+        b_force = np.array([+10.0]) if pick else np.array([-10.0])
+        logit_layer.set_weights([W_zero, b_force])
+    
+    # force pick everywhere
+    force_style(pick=True)
+    (y_out, style_out) = model.predict(x_in, batch_size=1)
+    print("forced pick, style_out:", style_out[0,0])
+    sf.write(os.path.join(out_dir, f"{prediction_name}_forced_pick.wav"), y_out[0,:,0], 48000, subtype='FLOAT')
+
+    # force finger everywhere
+    force_style(pick=False)
+    (y_out, style_out) = model.predict(x_in, batch_size=1)
+    print("forced finger, style_out:", style_out[0,0])
+    sf.write(os.path.join(out_dir, f"{prediction_name}_forced_finger.wav"), y_out[0,:,0], 48000, subtype='FLOAT')
 
 
-def generate_fine_tune_demo_from_models(teacher_dyn, student_dyn):
+def generate_fine_tune_demo_from_models(teacher_dyn=None, student_dyn=None):
     print("\n▶ Generating finetune demos…")
 
-    for tag, model_dyn in [("teacher", teacher_dyn),
-                           ("student", student_dyn)]:
+    # for tag, model_dyn in [("teacher", teacher_dyn),
+    #                        ("student", student_dyn)]:
+    for tag, model_dyn in [("student", student_dyn)]:
+        # Skip if model is None
+        if model_dyn is None:
+            continue
+
         demo_dir = os.path.join(FINETUNE_DEMOS_OUT_DIR, f"demo_{tag}")
         # only one pass per model now, no hard-coded style flags
         generate_fine_tune_demo(
@@ -1816,6 +1931,17 @@ def generate_fine_tune_demo_from_models(teacher_dyn, student_dyn):
           ]))
 
 def fine_tune():
+    global picked_pairs, finger_pairs, all_pairs, audio_cache
+    global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
+    
+    corrected_weights = {
+        'l1': FINETUNE_L1_WEIGHT,
+        'hf': HF_WEIGHT,
+        'stft': STFT_WEIGHT,
+        'mel': FINETUNE_MEL_WEIGHT,
+        'env': RMS_ENV_WEIGHT
+    }
+    
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
     tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     if not os.path.exists(src) or not os.path.exists(tgt):
@@ -1828,14 +1954,12 @@ def fine_tune():
     assert sr_x == sr_y == SR, f"Sample rate mismatch: {sr_x} vs {sr_y} vs {SR}"
 
     # 2) measure RMS on piezo channel (assumed channel 0)
-    def compute_rms(sig):
-        return np.sqrt(np.mean(sig**2))
     rms_x = compute_rms(x_full[:,0])
     rms_y = compute_rms(y_full[:,0])
     print(f"[fine_tune] input RMS: source={rms_x:.6f}, target={rms_y:.6f}")
 
     # 3) compute target RMS (–23 dBFS) and gains
-    target_rms = 10 ** ( -23.0 / 20.0 )   # ≃0.0708
+    target_rms = 10 ** ( INPUT_AVG_RMS_DBFS_TARGET / 20.0 )   # ≃0.0708
     gain_x     = target_rms / (rms_x + 1e-12)
     gain_y     = target_rms / (rms_y + 1e-12)
     print(f"[fine_tune] applying gains: source×{gain_x:.3f}, target×{gain_y:.3f}")
@@ -1851,7 +1975,6 @@ def fine_tune():
           f" target={rms_y2:.6f} ({20*np.log10(rms_y2):.2f} dB)")
 
     # 6) repopulate your caches so the rest of fine-tune uses the normalized versions
-    global picked_pairs, finger_pairs, all_pairs, audio_cache
     picked_pairs = [(src, tgt)]
     finger_pairs = [(src, tgt)]
     all_pairs    = picked_pairs + finger_pairs
@@ -1899,129 +2022,503 @@ def fine_tune():
         )
 
         return mixed.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+    
+    finetuned_teacher = None
+    finetuned_teacher_dyn = None
+    finetuned_student = None
+    finetuned_student_dyn = None
+    
+    # if len(sys.argv) <= 2 or sys.argv[2] !="--student-only":
 
-    # ─── Fine-tune TEACHER ────────────────────────────────────────────────
-    print("\n🔧 Fine-tuning TEACHER on new pair…")
-    base_teacher = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
-    teacher = tf.keras.models.load_model(base_teacher, compile=False)
-    
-    for layer in teacher.layers:
-        if layer.name.startswith("tch_style_"):
-            layer.trainable = False   # keep your original classifier
-        elif layer.name.startswith("tch_film_dense_") \
-        or layer.name.startswith("tch_final_"):
-            layer.trainable = True    # allow these to adapt
-        else:
-            layer.trainable = False   # everything else stays frozen
-    
-    teacher.compile(
-        optimizer = tf.keras.optimizers.Adam(FINETUNE_TEACHER_LR),
-        loss        = [ combined_loss, "binary_crossentropy" ],
-        loss_weights= [ 1.0,             λ_STYLE_RATIO      ],
-        metrics     = [
-        # metrics for the audio head
-        [ "mae",
-            log_mel_loss,
-            mean_hf_metric,
-            multi_scale_stft_loss,
-            rms_env_loss
-        ],
-        # metrics for the style head
-        [ "accuracy" ]
-        ]
-    )
-    
-    
-    dsT = make_mixed_ds(TEACHER_SEG_LEN)
-    
-    ft_chunks_T = build_chunks([(src,tgt)], TEACHER_SEG_LEN)
-    stepsT = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=TEACHER_SEG_LEN), 1)
-    
-    teacher.fit(dsT, epochs=FINETUNE_TEACHER_EPOCHS, steps_per_epoch=stepsT, verbose=1)
-
-    # Save new teacher
-    ft_t_static = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_STATIC_MODEL_FILENAME)
-    teacher.save(ft_t_static)
-    print("✅ Saved finetuned teacher:", ft_t_static)
-
-    teacher_dyn = build_teacher_model(dynamic_time=True)
-    teacher_dyn.set_weights(teacher.get_weights())
-    ft_t_dyn = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
-    teacher_dyn.save(ft_t_dyn)
-    print("✅ Saved finetuned teacher dynamic:", ft_t_dyn)
-
-    # ─── Fine-tune STUDENT ────────────────────────────────────────────────
-    print("\n🔧 Fine-tuning STUDENT on new pair…")
-    # reload finetuned teacher for distillation
-    teacher_dyn = tf.keras.models.load_model(ft_t_dyn, compile=False)
-
-    # load the _baseline_ student to grab its weights
-    base_student = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME)
-    student_bp   = tf.keras.models.load_model(base_student, compile=False)
-
-    # rebuild student with teacher for distillation
-    student = build_student_model(teacher=teacher_dyn, dynamic_time=False)
-    student.set_weights(student_bp.get_weights())
-    
-    for layer in student.layers:
-        name = layer.name
-        train_me = (
-            name.startswith("stu_style_")     or
-            name.startswith("stu_film_dense_") or
-            name.startswith("stu_final_")     or
-            name ==        "stu_ir_scale"
-        )
-        layer.trainable = train_me
+    #     # ─── Fine-tune TEACHER ────────────────────────────────────────────────
+    #     print("\n🔧 Fine-tuning TEACHER on new pair…")
+    #     base_teacher_path = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
+    #     teacher = tf.keras.models.load_model(base_teacher_path, compile=False)
         
+    #     # We'll base the finetuned teacher on the original teacher with some frozen layers
+    #     finetuned_teacher = teacher
+        
+    #     LAST_TEACHER_DILATION = len(TEACHER_DILATIONS) - 1
+    #     NEXT_LAST_TEACHER_DILATION = len(TEACHER_DILATIONS) - 2
+
+    #     for layer in finetuned_teacher.layers:
+    #         name = layer.name
+    #         layer.trainable = \
+    #             name.startswith("tch_film_dense_") \
+    #             or name.startswith("tch_final_") \
+    #             or name == f"sep_{LAST_TEACHER_DILATION}" \
+    #             or name == f"sep_{NEXT_LAST_TEACHER_DILATION}" \
+    #             or name == f"pw_{LAST_TEACHER_DILATION}" \
+    #             or name == f"pw_{NEXT_LAST_TEACHER_DILATION}" \
+        
+    #     # build a tiny "val" dataset of mixed segments (already batched)
+    #     dsT_val = make_mixed_ds(TEACHER_SEG_LEN)
+    #     # now attach your sample‐weight map exactly as in train_shared()
+    #     dsT_val = dsT_val.map(add_sw)
+    #     # only take 2 batches (you just need a few to get stable scales)
+    #     dsT_val = dsT_val.take(5)
+
+    #     # measure each loss term on that small ds
+    #     baseline_T = calibrate_loss_weights(finetuned_teacher,
+    #                                         dsT_val,
+    #                                         n_batches=5)
+
+    #     # pick L1 as our reference scale
+    #     ref = float(baseline_T['l1'])
+
+    #     # globally re-scale your HF/STFT/MEL/ENV weights        
+    #     L1_WEIGHT      = corrected_weights['l1']   / baseline_T['l1']   * ref
+    #     HF_WEIGHT      = corrected_weights['hf']   / baseline_T['hf']   * ref
+    #     STFT_WEIGHT    = corrected_weights['stft'] / baseline_T['stft'] * ref
+    #     MEL_WEIGHT     = corrected_weights['mel']  / baseline_T['mel']  * ref
+    #     RMS_ENV_WEIGHT = corrected_weights['env']  / baseline_T['env']  * ref
+
+    #     print("→ finetune-teacher loss weights recalibrated:"
+    #         f"  HF={HF_WEIGHT:.4f}"
+    #         f"  STFT={STFT_WEIGHT:.4f}"
+    #         f"  MEL={MEL_WEIGHT:.4f}"
+    #         f"  ENV={RMS_ENV_WEIGHT:.4f}")
+        
+    #     finetuned_teacher.compile(
+    #         optimizer = tf.keras.optimizers.Adam(FINETUNE_TEACHER_LR),
+    #         loss        = [ combined_loss, "binary_crossentropy" ],
+    #         loss_weights= [ 1.0,             λ_STYLE_RATIO      ],
+    #         metrics     = [
+    #         # metrics for the audio head - we keep them at a minimum to for performance
+    #         [ "mae"
+    #         ],
+    #         # metrics for the style head (we don't need any, as the style layer is frozen)
+    #         []
+    #         ]
+    #     )
+        
+    #     dsT = make_mixed_ds(TEACHER_SEG_LEN)
+        
+    #     ft_chunks_T = build_chunks([(src,tgt)], TEACHER_SEG_LEN)
+    #     stepsT = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=TEACHER_SEG_LEN), 1)
+        
+    #     # Print the model summary
+    #     print("Finetune teacher model summary:")
+    #     finetuned_teacher.summary()
+        
+    #     finetuned_teacher.fit(dsT, epochs=FINETUNE_TEACHER_EPOCHS, steps_per_epoch=stepsT, verbose=1)
+
+    #     # Save new teacher
+    #     ft_t_static = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_STATIC_MODEL_FILENAME)
+    #     finetuned_teacher.save(ft_t_static)
+    #     print("✅ Saved finetuned teacher:", ft_t_static)
+
+    #     finetuned_teacher_dyn = build_teacher_model(dynamic_time=True)
+    #     finetuned_teacher_dyn.set_weights(finetuned_teacher.get_weights())
+    #     ft_t_dyn = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
+    #     finetuned_teacher_dyn.save(ft_t_dyn)
+    #     print("✅ Saved finetuned teacher dynamic:", ft_t_dyn)
+
+    if len(sys.argv) <= 2 or sys.argv[2] !="--teacher-only":
+        # ─── Fine-tune STUDENT ────────────────────────────────────────────────
+        print("\n🔧 Fine-tuning STUDENT on new pair…")
+        
+        # load the PRE-TRAINED (base) teacher dynamic model
+        # teacher_dyn = tf.keras.models.load_model(
+        #     os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
+        #     compile=False
+        # )
+        # teacher_dyn.trainable = False
+
+        # This is the full original base student model with the teacher weights baked in + distillation layers
+        base_student_full = tf.keras.models.load_model(
+            os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
+            compile=False
+        )
+
+        finetuned_student_small = build_student_model(teacher=None, dynamic_time=False)
+
+        # Copy over all of the 'stu_' weights from the full original base student model,
+        # while making the FILM and final layers trainable
+        for layer in finetuned_student_small.layers:
+            if layer.name.startswith("stu_"):
+                try:
+                    layer.set_weights(
+                        base_student_full.get_layer(layer.name).get_weights()
+                    )
+                except ValueError:
+                    # some layers have no weights
+                    pass
+
+        LAST_STUDENT_DILATION = len(STUDENT_DILATIONS) - 1
+        for layer in finetuned_student_small.layers:
+            name = layer.name
+            layer.trainable = \
+                name.startswith("stu_film_dense_") \
+                or name.startswith("stu_final_") \
+                or name == "stu_ir_scale" \
+                or name == f"stu_sep_{LAST_STUDENT_DILATION}" \
+                or name == f"stu_ir_sep_{LAST_STUDENT_DILATION}" \
+                or name == f"stu_pw_{LAST_STUDENT_DILATION}"
+
+        dsS_val = make_mixed_ds(STUDENT_SEG_LEN)
+        dsS_val = dsS_val.map(add_sw)
+        dsS_val = dsS_val.take(5)
+
+        baseline_S = calibrate_loss_weights(finetuned_student_small,
+                                            dsS_val,
+                                            n_batches=5)
+        
+        ref = float(baseline_S['l1'])
+
+        L1_WEIGHT      = corrected_weights['l1']   / baseline_S['l1']   * ref
+        HF_WEIGHT      = corrected_weights['hf']   / baseline_S['hf']   * ref
+        STFT_WEIGHT    = corrected_weights['stft'] / baseline_S['stft'] * ref
+        MEL_WEIGHT     = corrected_weights['mel']  / baseline_S['mel']  * ref
+        RMS_ENV_WEIGHT = corrected_weights['env']  / baseline_S['env']  * ref
+
+        print("→ finetune-student loss weights recalibrated:"
+            f"  L1={L1_WEIGHT:.4f}"
+            f"  HF={HF_WEIGHT:.4f}"
+            f"  STFT={STFT_WEIGHT:.4f}"
+            f"  MEL={MEL_WEIGHT:.4f}"
+            f"  ENV={RMS_ENV_WEIGHT:.4f}")
+
+        
+        # 5) compile & fit
+        finetuned_student_small.compile(
+            optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
+            loss=[combined_loss, "binary_crossentropy"],
+            loss_weights=[1.0, λ_STYLE_RATIO],
+            metrics=[
+            # audio‐head metrics - we keep them at a minimum to for performance
+            ["mae"],
+            # style‐head metric is not relevant here, as the style layer is frozen
+            []
+            ]
+        )
+        dsS = make_mixed_ds(STUDENT_SEG_LEN)
+        
+        ft_chunks_T = build_chunks([(src,tgt)], STUDENT_SEG_LEN)
+        stepsS = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=STUDENT_SEG_LEN), 1)
+        
+        # Print the model summary
+        print("Finetune student model summary:")
+        finetuned_student_small.summary()
+        
+        finetuned_student_small.fit(dsS,
+                        epochs=FINETUNE_STUDENT_EPOCHS,
+                        steps_per_epoch=stepsS,
+                        verbose=1)
+
+        # 6) save the new static student
+        ft_s_static = os.path.join(MODELS_STUDENT_OUT_DIR,
+                                FINETUNE_STUDENT_STATIC_MODEL_FILENAME)
+        finetuned_student_small.save(ft_s_static)
+
+        # 7) build a dynamic‐time‐friendly student (without the teacher!)
+        finetuned_student_dyn = build_student_model(teacher=None, dynamic_time=True)
+        finetuned_student_dyn.set_weights(finetuned_student_small.get_weights())
+        ft_s_dyn = os.path.join(MODELS_STUDENT_OUT_DIR,
+                                FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
+        finetuned_student_dyn.save(ft_s_dyn)
     
-    for layer in student.layers:
-        if layer.name.startswith("stu_style_"):
-            layer.trainable = False   # keep your original classifier
-        elif layer.name.startswith("stu_film_dense_") \
-        or layer.name.startswith("stu_final_") \
-        or layer.name.startswith("stu_ir_scale"):
-            layer.trainable = True    # allow these to adapt
+    return (finetuned_teacher_dyn, finetuned_student_dyn)
+
+# 2) measure RMS on piezo channel (assumed channel 0)
+def compute_rms(sig):
+    return np.sqrt(np.mean(sig**2))
+
+def train_style_classification(
+    epochs: int = 5,
+    style_lr: float = 1e-4
+):
+    """
+    Re-train only the style‐head of teacher & student,
+    sampling ONLY from your attack_segment_generator
+    on pick- vs finger-attack windows.
+    We preload & normalize all style-classification files
+    into audio_cache so no disk I/O occurs in the loop.
+    """
+
+    # ─── 1) Preload & normalize WAVs ─────────────────────────────────────────
+    pick_dir   = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR
+    finger_dir = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR
+
+    pick_files   = sorted(glob.glob(os.path.join(pick_dir,   "*.wav")))
+    finger_files = sorted(glob.glob(os.path.join(finger_dir, "*.wav")))
+
+    # normalize all files to target RMS once
+    target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
+    for fp in pick_files + finger_files:
+        if fp not in audio_cache:
+            data, _ = sf.read(fp, dtype="float32", always_2d=True)
+            mono = data[:,0]
+            rms = np.sqrt(np.mean(mono**2) + 1e-12)
+            mono = mono * (target_rms / rms)
+            audio_cache[fp] = mono[:,None]  # store shape=(N,1)
+
+    # ─── 2) Build “fake” (src,tgt) pairs for chunk-building ──────────────────
+    pick_pairs   = [(fp, fp) for fp in pick_files]
+    finger_pairs = [(fp, fp) for fp in finger_files]
+
+    seg_t = TEACHER_SEG_LEN
+    seg_s = STUDENT_SEG_LEN
+
+    teach_pick_chunks = build_chunks(pairs_list=pick_pairs,   seg_len=seg_t)
+    teach_fing_chunks = build_chunks(pairs_list=finger_pairs, seg_len=seg_t)
+    stud_pick_chunks  = build_chunks(pairs_list=pick_pairs,   seg_len=seg_s)
+    stud_fing_chunks  = build_chunks(pairs_list=finger_pairs, seg_len=seg_s)
+
+    # ─── 3) Wrap your attack_segment_generator to only emit (x, style_flag) ─
+    def style_attack_gen(seg_len, chunks, is_pick):
+        gen = attack_segment_generator(seg_len=seg_len,
+                                       chunks=chunks,
+                                       is_pick_chunks=is_pick)
+        for x, (_y, flag) in gen:
+            yield x, flag
+
+    # ─── 4) Build pick-vs-finger tf.data for TEACHER style head ────────────
+    sig_x_t = tf.TensorSpec((seg_t,1), tf.float32)
+    sig_y_t = tf.TensorSpec((),      tf.float32)
+
+    ds_t_pa = tf.data.Dataset.from_generator(
+        lambda: style_attack_gen(seg_t, teach_pick_chunks, True),
+        output_signature=(sig_x_t, sig_y_t)
+    )
+    ds_t_fa = tf.data.Dataset.from_generator(
+        lambda: style_attack_gen(seg_t, teach_fing_chunks, False),
+        output_signature=(sig_x_t, sig_y_t)
+    )
+
+    ds_t = tf.data.Dataset.sample_from_datasets(
+        [ds_t_pa, ds_t_fa],
+        weights=[0.5, 0.5],    # equal pick vs finger
+        seed=SEED
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True
+    ).repeat(
+    ).batch(BATCH_SIZE
+    ).prefetch(tf.data.AUTOTUNE)
+
+    # steps_per_epoch = total attack windows // batch
+    total_pa = sum((d + seg_t - 1)//seg_t for (_s,_t,_o,d) in teach_pick_chunks)
+    total_fa = sum((d + seg_t - 1)//seg_t for (_s,_t,_o,d) in teach_fing_chunks)
+    steps_t  = max(1, (total_pa + total_fa)//BATCH_SIZE)
+
+    # ─── 5) Retrain TEACHER style head ───────────────────────────────────────
+    tch_static = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
+    teacher = tf.keras.models.load_model(tch_static, compile=False)
+
+    style_teacher = tf.keras.models.Model(
+        inputs = teacher.input,
+        outputs= teacher.get_layer("tch_style_prob").output,
+        name   = "style_head_teacher"
+    )
+    style_teacher.compile(
+        optimizer = tf.keras.optimizers.Adam(style_lr),
+        loss      = "binary_crossentropy",
+        metrics   = ["accuracy"]
+    )
+
+    print(f"\n🔧 Retraining TEACHER style head: "
+          f"{epochs} epochs × {steps_t} steps/epoch …")
+    style_teacher.fit(
+        ds_t,
+        epochs=epochs,
+        steps_per_epoch=steps_t,
+        verbose=1
+    )
+
+    # overwrite & save full teacher
+    teacher.save(os.path.join(
+        MODELS_TEACHER_OUT_DIR,
+        "retrained_" + TEACHER_STATIC_MODEL_FILENAME
+    ))
+    dyn_t = build_teacher_model(dynamic_time=True)
+    dyn_t.set_weights(teacher.get_weights())
+    dyn_t.save(os.path.join(
+        MODELS_TEACHER_OUT_DIR,
+        "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME
+    ))
+    print("✅ Saved retrained teacher.")
+
+    # ─── 6) Retrain STUDENT style head (exact same logic) ─────────────────
+    sig_x_s = tf.TensorSpec((seg_s,1), tf.float32)
+    sig_y_s = tf.TensorSpec((),      tf.float32)
+
+    ds_s_pa = tf.data.Dataset.from_generator(
+        lambda: style_attack_gen(seg_s, stud_pick_chunks, True),
+        output_signature=(sig_x_s, sig_y_s)
+    )
+    ds_s_fa = tf.data.Dataset.from_generator(
+        lambda: style_attack_gen(seg_s, stud_fing_chunks, False),
+        output_signature=(sig_x_s, sig_y_s)
+    )
+
+    ds_s = tf.data.Dataset.sample_from_datasets(
+        [ds_s_pa, ds_s_fa],
+        weights=[0.5, 0.5],
+        seed=SEED
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True
+    ).repeat(
+    ).batch(BATCH_SIZE
+    ).prefetch(tf.data.AUTOTUNE)
+
+    total_sp = sum((d + seg_s - 1)//seg_s for (_s,_t,_o,d) in stud_pick_chunks)
+    total_sf = sum((d + seg_s - 1)//seg_s for (_s,_t,_o,d) in stud_fing_chunks)
+    steps_s  = max(1, (total_sp + total_sf)//BATCH_SIZE)
+
+    stu_static = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME)
+    student = tf.keras.models.load_model(stu_static, compile=False)
+
+    style_student = tf.keras.models.Model(
+        inputs = student.input,
+        outputs= student.get_layer("stu_style_prob").output,
+        name   = "style_head_student"
+    )
+    style_student.compile(
+        optimizer = tf.keras.optimizers.Adam(style_lr),
+        loss      = "binary_crossentropy",
+        metrics   = ["accuracy"]
+    )
+
+    print(f"\n🔧 Retraining STUDENT style head: "
+          f"{epochs} epochs × {steps_s} steps/epoch …")
+    style_student.fit(
+        ds_s,
+        epochs=epochs,
+        steps_per_epoch=steps_s,
+        verbose=1
+    )
+
+    # overwrite & save full student
+    student.save(os.path.join(
+        MODELS_STUDENT_OUT_DIR,
+        "retrained_" + STUDENT_STATIC_MODEL_FILENAME
+    ))
+    dyn_s = build_student_model(teacher=dyn_t, dynamic_time=True)
+    dyn_s.set_weights(student.get_weights())
+    dyn_s.save(os.path.join(
+        MODELS_STUDENT_OUT_DIR,
+        "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME
+    ))
+    print("✅ Saved retrained student.")
+
+def _detect_and_print_flips(
+    model,
+    name: str,
+    audio_piezo: np.ndarray,
+    sr: int,
+    seg_len: int,
+    threshold: float = STYLE_FLAG_PROB_THRESHOLD
+):
+    """
+    Slide a window of length=seg_len, hop=seg_len over audio_piezo,
+    call model.predict on each chunk, pull out the style‐prob,
+    threshold→binary, and print all flips.
+    """
+    N = audio_piezo.shape[0]
+    hop = seg_len
+
+    # helper to get raw pick‐prob at a given start index
+    def get_prob(start):
+        end = start + seg_len
+        if end <= N:
+            chunk = audio_piezo[start:end]
         else:
-            layer.trainable = False   # everything else stays frozen    
+            # pad the last chunk to full length
+            pad_amt = end - N
+            chunk = np.pad(audio_piezo[start:N],
+                           ((0, pad_amt),(0,0)),
+                           mode='constant')
+        # model.predict → [waveform, style_prob]
+        style_out = model.predict(chunk[None, ...], batch_size=1, verbose=0)[1]
+        return float(style_out[0,0])
+
+    # first window
+    p0 = get_prob(0)
+    s0 = int(p0 > threshold)
+    last_state = s0
+
+    flips = []
+    # iterate
+    for start in range(hop, N, hop):
+        p = get_prob(start)
+        s = int(p > threshold)
+        if s != last_state:
+            t_sec = start / sr
+            fr = 'pick'   if last_state else 'finger'
+            to = 'pick'   if s          else 'finger'
+            flips.append((t_sec, fr, to, p))
+            last_state = s
+
+    # print
+    print(f"\n=== {name} style‐flip report ===")
+    if len(flips) == 0:
+        print("  no flips detected")
+    else:
+        for (t,fr,to,p) in flips:
+            print(f"  at {t:6.3f}s : {fr} → {to}   (P(pick)={p:.3f})")
+    print(f"  TOTAL FLIPS: {len(flips)}")
+
+
+def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
+    FRAMES      = LONG_DEMO_SEC * SR
+    START_FRAME = LONG_DEMO_OFFSET_SEC * SR
+    pth_src, _ = all_pairs[LONG_DEMO_PAIR_INDEX]
+
+    x_long,_ = sf.read(pth_src,
+                      start=START_FRAME,
+                      frames=FRAMES,
+                      dtype='float32',
+                      always_2d=True)
     
-    student.compile(
-        optimizer = tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
-        loss        = [ combined_loss, "binary_crossentropy" ],
-        loss_weights= [ 1.0,             λ_STYLE_RATIO      ],
-        metrics     = [
-        # metrics for the audio head
-        [ "mae",
-            log_mel_loss,
-            mean_hf_metric,
-            multi_scale_stft_loss,
-            rms_env_loss
-        ],
-        # metrics for the style head
-        [ "accuracy" ]
-        ]
+    # only piezo
+    x_piezo = x_long[:,0:1]             # (FRAMES,1)
+
+    # 3) run for teacher & student
+    _detect_and_print_flips(
+        model   = teacher_dyn,
+        name    = "TEACHER",
+        audio_piezo = x_piezo,
+        sr      = SR,
+        seg_len = TEACHER_SEG_LEN,
+        threshold=STYLE_FLAG_PROB_THRESHOLD
+    )
+    _detect_and_print_flips(
+        model   = student_dyn,
+        name    = "STUDENT",
+        audio_piezo = x_piezo,
+        sr      = SR,
+        seg_len = STUDENT_SEG_LEN,
+        threshold=STYLE_FLAG_PROB_THRESHOLD
     )
     
-    
-    dsS = make_mixed_ds(STUDENT_SEG_LEN)
-    
-    
-    ft_chunks_S = build_chunks([(src,tgt)], STUDENT_SEG_LEN)
-    stepsS = max(approx_steps(durs=[dur for (_,_,_,dur) in ft_chunks_S], seg_len=STUDENT_SEG_LEN), 1)
-    
-    student.fit(dsS, epochs=FINETUNE_STUDENT_EPOCHS, steps_per_epoch=stepsS, verbose=1)
+def profile_finetune_model_style_flag_flips(teacher_dyn, student_dyn):
+    FRAMES      = FINE_TUNE_DEMO_SEC * SR
+    START_FRAME = FINE_TUNE_DEMO_OFFSET_SEC * SR
 
-    # Save new student
-    ft_s_static = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_STATIC_MODEL_FILENAME)
-    student.save(ft_s_static)
-    print("✅ Saved finetuned student:", ft_s_static)
-
-    student_dyn = build_student_model(teacher=teacher_dyn, dynamic_time=True)
-    student_dyn.set_weights(student.get_weights())
-    ft_s_dyn = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
-    student_dyn.save(ft_s_dyn)
-    print("✅ Saved finetuned student dynamic:", ft_s_dyn)
+    x_long,_ = sf.read(os.path.join(FINETUNE_SRC_DIR, "source.wav"),
+                      start=START_FRAME,
+                      frames=FRAMES,
+                      dtype='float32',
+                      always_2d=True)
     
-    return (teacher_dyn, student_dyn)
+    # only piezo
+    x_piezo = x_long[:,0:1]             # (FRAMES,1)
+
+    # # 3) run for teacher & student
+    # _detect_and_print_flips(
+    #     model   = teacher_dyn,
+    #     name    = "TEACHER",
+    #     audio_piezo = x_piezo,
+    #     sr      = SR,
+    #     seg_len = TEACHER_SEG_LEN,
+    #     threshold=STYLE_FLAG_PROB_THRESHOLD
+    # )
+    _detect_and_print_flips(
+        model   = student_dyn,
+        name    = "STUDENT",
+        audio_piezo = x_piezo,
+        sr      = SR,
+        seg_len = STUDENT_SEG_LEN,
+        threshold=STYLE_FLAG_PROB_THRESHOLD
+    )
 
 def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     # Clean logs and checkpoints
@@ -2148,14 +2645,57 @@ def main ():
         
         teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
         student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(teacher_dyn_path) or not os.path.exists(student_dyn_path):
+
+        if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
             print("Fine-tuned teacher/student dynamic models not found, run --fine-tune first")
             sys.exit(1)
         
-        teacher_dyn = tf.keras.models.load_model(teacher_dyn_path, compile=False)
-        student_dyn = tf.keras.models.load_model(student_dyn_path, compile=False)
+        teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
+        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
         
         generate_fine_tune_demo_from_models(teacher_dyn=teacher_dyn, student_dyn=student_dyn)
+        sys.exit(0)
+    
+    elif len(sys.argv)>1 and sys.argv[1]=="--profile-base-model-style-flag-flips":
+        
+        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
+        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
+
+        if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
+            print("Fine-tuned teacher/student dynamic models not found, run --train-teacher and --train-student first")
+            sys.exit(1)
+        
+        teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
+        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
+        
+        profile_base_model_style_flag_flips(
+            teacher_dyn=teacher_dyn,
+            student_dyn=student_dyn
+        )
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--profile-finetune-model-style-flag-flips":
+        
+        #teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
+        #student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
+        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
+
+        #if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
+        if not os.path.exists(student_dyn_path):
+            print("Fine-tuned dynamic models not found, run --fine-tune first")
+            sys.exit(1)
+        
+        #teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
+        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
+        
+        profile_finetune_model_style_flag_flips(
+            #teacher_dyn=teacher_dyn,
+            teacher_dyn=None,
+            student_dyn=student_dyn
+        )
+        sys.exit(0)
+        
+    elif len(sys.argv)>1 and sys.argv[1]=="--train-style-classification":
+        train_style_classification()
         sys.exit(0)
     else:
         print("No command given.")
