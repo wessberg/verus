@@ -2225,89 +2225,122 @@ def compute_rms(sig):
     return np.sqrt(np.mean(sig**2))
 
 def train_style_classification(
-    epochs: int = 5,
-    style_lr: float = 1e-4
+    epochs: int = 50,
+    style_lr: float = 1e-4,
+    batch_size: int = BATCH_SIZE
 ):
-    """
-    Re-train only the style‐head of teacher & student,
-    sampling ONLY from your attack_segment_generator
-    on pick- vs finger-attack windows.
-    We preload & normalize all style-classification files
-    into audio_cache so no disk I/O occurs in the loop.
-    """
-
-    # ─── 1) Preload & normalize WAVs ─────────────────────────────────────────
+    # 1) preload & normalize your extra guitars exactly as before
     pick_dir   = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR
     finger_dir = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR
-
     pick_files   = sorted(glob.glob(os.path.join(pick_dir,   "*.wav")))
     finger_files = sorted(glob.glob(os.path.join(finger_dir, "*.wav")))
-
-    # normalize all files to target RMS once
     target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
     for fp in pick_files + finger_files:
         if fp not in audio_cache:
             data, _ = sf.read(fp, dtype="float32", always_2d=True)
             mono = data[:,0]
             rms = np.sqrt(np.mean(mono**2) + 1e-12)
-            mono = mono * (target_rms / rms)
-            audio_cache[fp] = mono[:,None]  # store shape=(N,1)
+            audio_cache[fp] = (mono * (target_rms/rms))[:,None]
 
-    # ─── 2) Build “fake” (src,tgt) pairs for chunk-building ──────────────────
+    # 2) build chunk lists
     pick_pairs   = [(fp, fp) for fp in pick_files]
     finger_pairs = [(fp, fp) for fp in finger_files]
 
     seg_t = TEACHER_SEG_LEN
     seg_s = STUDENT_SEG_LEN
 
-    teach_pick_chunks = build_chunks(pairs_list=pick_pairs,   seg_len=seg_t)
-    teach_fing_chunks = build_chunks(pairs_list=finger_pairs, seg_len=seg_t)
-    stud_pick_chunks  = build_chunks(pairs_list=pick_pairs,   seg_len=seg_s)
-    stud_fing_chunks  = build_chunks(pairs_list=finger_pairs, seg_len=seg_s)
+    tch_pick_chunks, tch_fing_chunks = build_chunks(pick_pairs, seg_t), build_chunks(finger_pairs, seg_t)
+    stu_pick_chunks, stu_fing_chunks = build_chunks(pick_pairs, seg_s), build_chunks(finger_pairs, seg_s)
 
-    # ─── 3) Wrap your attack_segment_generator to only emit (x, style_flag) ─
-    def style_attack_gen(seg_len, chunks, is_pick):
-        gen = attack_segment_generator(seg_len=seg_len,
-                                       chunks=chunks,
-                                       is_pick_chunks=is_pick)
-        for x, (_y, flag) in gen:
+    # 3) split into train/val for pick & finger separately
+    tp_pick, vp_pick = train_test_split(tch_pick_chunks,   test_size=0.2, random_state=SEED)
+    tp_fing, vp_fing = train_test_split(tch_fing_chunks,   test_size=0.2, random_state=SEED)
+    sp_pick, vp2_pick = train_test_split(stu_pick_chunks,  test_size=0.2, random_state=SEED)
+    sp_fing, vp2_fing = train_test_split(stu_fing_chunks,  test_size=0.2, random_state=SEED)
+
+    # 4) helper to yield (x,style_flag) only
+    def style_only_gen(seg_len, chunks, is_pick, attack=False):
+        src = attack_segment_generator if attack else segment_generator
+        for x, (_y, flag) in src(seg_len=seg_len, chunks=chunks, is_pick_chunks=is_pick):
             yield x, flag
 
-    # ─── 4) Build pick-vs-finger tf.data for TEACHER style head ────────────
+    # 5) build TRAIN datasets (mix attack+uniform, pick+finger)
+    weights = [PICK_ATTACK_CHUNK_RATIO, PICK_UNIFORM_CHUNK_RATIO,
+               FINGER_ATTACK_CHUNK_RATIO, FINGER_UNIFORM_CHUNK_RATIO]
+    # teacher‐head
     sig_x_t = tf.TensorSpec((seg_t,1), tf.float32)
     sig_y_t = tf.TensorSpec((),      tf.float32)
+    ds_t_pa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_t, tp_pick, True,  attack=True),
+                                              output_signature=(sig_x_t, sig_y_t))
+    ds_t_pu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_t, tp_pick, True,  attack=False),
+                                              output_signature=(sig_x_t, sig_y_t))
+    ds_t_fa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_t, tp_fing, False, attack=True),
+                                              output_signature=(sig_x_t, sig_y_t))
+    ds_t_fu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_t, tp_fing, False, attack=False),
+                                              output_signature=(sig_x_t, sig_y_t))
+    ds_train_t = tf.data.Dataset.sample_from_datasets(
+        [ds_t_pa, ds_t_pu, ds_t_fa, ds_t_fu],
+        weights=weights, seed=SEED
+    ).shuffle(SHUFFLE_BUF, seed=SEED).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-    ds_t_pa = tf.data.Dataset.from_generator(
-        lambda: style_attack_gen(seg_t, teach_pick_chunks, True),
-        output_signature=(sig_x_t, sig_y_t)
+    # student‐head
+    sig_x_s = tf.TensorSpec((seg_s,1), tf.float32)
+    sig_y_s = tf.TensorSpec((),      tf.float32)
+    ds_s_pa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_s, sp_pick, True,  attack=True),
+                                              output_signature=(sig_x_s, sig_y_s))
+    ds_s_pu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_s, sp_pick, True,  attack=False),
+                                              output_signature=(sig_x_s, sig_y_s))
+    ds_s_fa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_s, sp_fing, False, attack=True),
+                                              output_signature=(sig_x_s, sig_y_s))
+    ds_s_fu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_s, sp_fing, False, attack=False),
+                                              output_signature=(sig_x_s, sig_y_s))
+    ds_train_s = tf.data.Dataset.sample_from_datasets(
+        [ds_s_pa, ds_s_pu, ds_s_fa, ds_s_fu],
+        weights=weights, seed=SEED
+    ).shuffle(SHUFFLE_BUF, seed=SEED).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    # 6) build VALIDATION datasets (same mix, but no .repeat())
+    def build_val_ds(pa, pu, fa, fu, seg_len, spec_x, spec_y):
+        ds_pa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_len, pa, True,  attack=True),
+                                               output_signature=(spec_x, spec_y))
+        ds_pu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_len, pu, True,  attack=False),
+                                               output_signature=(spec_x, spec_y))
+        ds_fa = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_len, fa, False, attack=True),
+                                               output_signature=(spec_x, spec_y))
+        ds_fu = tf.data.Dataset.from_generator(lambda: style_only_gen(seg_len, fu, False, attack=False),
+                                               output_signature=(spec_x, spec_y))
+        return tf.data.Dataset.sample_from_datasets(
+            [ds_pa, ds_pu, ds_fa, ds_fu],
+            weights=weights, seed=SEED
+        ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    ds_val_t = build_val_ds(vp_pick, vp_pick, vp_fing, vp_fing, seg_t, sig_x_t, sig_y_t)
+    ds_val_s = build_val_ds(vp2_pick, vp2_pick, vp2_fing, vp2_fing, seg_s, sig_x_s, sig_y_s)
+
+    # compute steps:
+    total_t = sum((d+seg_t-1)//seg_t for (_,_,_,d) in tp_pick + tp_fing)
+    steps_t = max(1, total_t // batch_size)
+    total_s = sum((d+seg_s-1)//seg_s for (_,_,_,d) in sp_pick + sp_fing)
+    steps_s = max(1, total_s // batch_size)
+
+    # 7) load & freeze full teacher, extract its style‐head
+    teacher = tf.keras.models.load_model(
+        os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
+        compile=False
     )
-    ds_t_fa = tf.data.Dataset.from_generator(
-        lambda: style_attack_gen(seg_t, teach_fing_chunks, False),
-        output_signature=(sig_x_t, sig_y_t)
-    )
+    # first, freeze everything...
+    for layer in teacher.layers:
+        layer.trainable = False
 
-    ds_t = tf.data.Dataset.sample_from_datasets(
-        [ds_t_pa, ds_t_fa],
-        weights=[0.5, 0.5],    # equal pick vs finger
-        seed=SEED
-    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True
-    ).repeat(
-    ).batch(BATCH_SIZE
-    ).prefetch(tf.data.AUTOTUNE)
+    # then unfreeze only the style‐head layers
+    for name in ["tch_style_conv","tch_style_gap","tch_style_logit","tch_style_prob"]:
+        teacher.get_layer(name).trainable = True
 
-    # steps_per_epoch = total attack windows // batch
-    total_pa = sum((d + seg_t - 1)//seg_t for (_s,_t,_o,d) in teach_pick_chunks)
-    total_fa = sum((d + seg_t - 1)//seg_t for (_s,_t,_o,d) in teach_fing_chunks)
-    steps_t  = max(1, (total_pa + total_fa)//BATCH_SIZE)
-
-    # ─── 5) Retrain TEACHER style head ───────────────────────────────────────
-    tch_static = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME)
-    teacher = tf.keras.models.load_model(tch_static, compile=False)
-
+    # style‐only model
     style_teacher = tf.keras.models.Model(
-        inputs = teacher.input,
-        outputs= teacher.get_layer("tch_style_prob").output,
-        name   = "style_head_teacher"
+        inputs  = teacher.input,
+        outputs = teacher.get_layer("tch_style_prob").output,
+        name    = "style_only_teacher"
     )
     style_teacher.compile(
         optimizer = tf.keras.optimizers.Adam(style_lr),
@@ -2315,89 +2348,84 @@ def train_style_classification(
         metrics   = ["accuracy"]
     )
 
-    print(f"\n🔧 Retraining TEACHER style head: "
-          f"{epochs} epochs × {steps_t} steps/epoch …")
+    # 8) callbacks
+    cb = [
+      EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
+      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1),
+      ModelCheckpoint("best_style_teacher.keras",
+                      monitor="val_accuracy", mode="max",
+                      save_best_only=True, verbose=1)
+    ]
+
+    print(f"\nTraining TEACHER style‐head: {epochs} epochs × ~{steps_t} steps/epoch …")
     style_teacher.fit(
-        ds_t,
+        ds_train_t,
+        validation_data=ds_val_t,
         epochs=epochs,
         steps_per_epoch=steps_t,
+        callbacks=cb,
         verbose=1
     )
 
-    # overwrite & save full teacher
-    teacher.save(os.path.join(
-        MODELS_TEACHER_OUT_DIR,
-        "retrained_" + TEACHER_STATIC_MODEL_FILENAME
-    ))
+    # 9) copy the newly trained style‐head weights back into the full model and re‐save
+    for name in ["tch_style_conv","tch_style_gap","tch_style_logit","tch_style_prob"]:
+        teacher.get_layer(name).set_weights(
+            style_teacher.get_layer(name).get_weights()
+        )
+    teacher.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_style_" + TEACHER_STATIC_MODEL_FILENAME))
     dyn_t = build_teacher_model(dynamic_time=True)
     dyn_t.set_weights(teacher.get_weights())
-    dyn_t.save(os.path.join(
-        MODELS_TEACHER_OUT_DIR,
-        "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME
-    ))
-    print("✅ Saved retrained teacher.")
+    dyn_t.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_style_" + TEACHER_DYNAMIC_MODEL_FILENAME))
+    print("✅ Saved retrained‐style teacher.")
 
-    # ─── 6) Retrain STUDENT style head (exact same logic) ─────────────────
-    sig_x_s = tf.TensorSpec((seg_s,1), tf.float32)
-    sig_y_s = tf.TensorSpec((),      tf.float32)
-
-    ds_s_pa = tf.data.Dataset.from_generator(
-        lambda: style_attack_gen(seg_s, stud_pick_chunks, True),
-        output_signature=(sig_x_s, sig_y_s)
+    # 10) exactly the same for STUDENT style‐head
+    student = tf.keras.models.load_model(
+        os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
+        compile=False
     )
-    ds_s_fa = tf.data.Dataset.from_generator(
-        lambda: style_attack_gen(seg_s, stud_fing_chunks, False),
-        output_signature=(sig_x_s, sig_y_s)
-    )
+    
+    for layer in student.layers:
+        layer.trainable = False
 
-    ds_s = tf.data.Dataset.sample_from_datasets(
-        [ds_s_pa, ds_s_fa],
-        weights=[0.5, 0.5],
-        seed=SEED
-    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True
-    ).repeat(
-    ).batch(BATCH_SIZE
-    ).prefetch(tf.data.AUTOTUNE)
-
-    total_sp = sum((d + seg_s - 1)//seg_s for (_s,_t,_o,d) in stud_pick_chunks)
-    total_sf = sum((d + seg_s - 1)//seg_s for (_s,_t,_o,d) in stud_fing_chunks)
-    steps_s  = max(1, (total_sp + total_sf)//BATCH_SIZE)
-
-    stu_static = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME)
-    student = tf.keras.models.load_model(stu_static, compile=False)
-
+    # then unfreeze only the style‐head layers
+    for name in ["stu_style_conv","stu_style_gap","stu_style_logit","stu_style_prob"]:
+        student.get_layer(name).trainable = True
+    
     style_student = tf.keras.models.Model(
-        inputs = student.input,
-        outputs= student.get_layer("stu_style_prob").output,
-        name   = "style_head_student"
+        inputs  = student.input,
+        outputs = student.get_layer("stu_style_prob").output,
+        name    = "style_only_student"
     )
     style_student.compile(
         optimizer = tf.keras.optimizers.Adam(style_lr),
         loss      = "binary_crossentropy",
         metrics   = ["accuracy"]
     )
-
-    print(f"\n🔧 Retraining STUDENT style head: "
-          f"{epochs} epochs × {steps_s} steps/epoch …")
+    cb2 = [
+      EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
+      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1),
+      ModelCheckpoint("best_style_student.keras",
+                      monitor="val_accuracy", mode="max",
+                      save_best_only=True, verbose=1)
+    ]
+    print(f"\nTraining STUDENT style‐head: {epochs} epochs × ~{steps_s} steps/epoch …")
     style_student.fit(
-        ds_s,
+        ds_train_s,
+        validation_data=ds_val_s,
         epochs=epochs,
         steps_per_epoch=steps_s,
+        callbacks=cb2,
         verbose=1
     )
-
-    # overwrite & save full student
-    student.save(os.path.join(
-        MODELS_STUDENT_OUT_DIR,
-        "retrained_" + STUDENT_STATIC_MODEL_FILENAME
-    ))
+    for name in ["stu_style_conv","stu_style_gap","stu_style_logit","stu_style_prob"]:
+        student.get_layer(name).set_weights(
+            style_student.get_layer(name).get_weights()
+        )
+    student.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_style_" + STUDENT_STATIC_MODEL_FILENAME))
     dyn_s = build_student_model(teacher=dyn_t, dynamic_time=True)
     dyn_s.set_weights(student.get_weights())
-    dyn_s.save(os.path.join(
-        MODELS_STUDENT_OUT_DIR,
-        "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME
-    ))
-    print("✅ Saved retrained student.")
+    dyn_s.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_style_" + STUDENT_DYNAMIC_MODEL_FILENAME))
+    print("✅ Saved retrained‐style student.")
 
 def _detect_and_print_flips(
     model,
