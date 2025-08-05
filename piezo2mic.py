@@ -92,20 +92,20 @@ FINETUNE_MEL_WEIGHT          = 15.0
 FINE_TUNE_DEMO_SEC = 60
 FINE_TUNE_DEMO_OFFSET_SEC = 0
 
-CLICK_THRESH       = 1e-3     # same threshold you use for attack detection
+CLICK_THRESH       = 8e-3     # same threshold you use for attack detection
 CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
 
-TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
+TRANSIENT_UPWEIGHT_RATIO  = 0.5   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
-L1_WEIGHT                 = 2.0   # waveform l1 loss
+L1_WEIGHT                 = 1.0   # waveform l1 loss
 HF_WEIGHT                 = 1.0   # scale of the high-pass loss
 STFT_WEIGHT               = 1.0   # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
-PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
-PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will see
+PICK_ATTACK_CHUNK_RATIO = 0.4 # How many pick attack segments the model will see
+PICK_UNIFORM_CHUNK_RATIO = 0.1 # How many general pick segments the model will see
 
 FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
 FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
@@ -858,21 +858,7 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     x_piezo = x_long[:,0:1]             # (FRAMES,1)
     x_in    = x_piezo[None,...]         # (1,FRAMES,1)
     print("Running inference…")
-    
-    
-    
-    # 2) pick a boost factor (3×, 5×, whatever)
-    boost = 5.0
 
-    # 3) grab the click_shape layer
-    shape_layer = model.get_layer("tch_click_shape")
-
-    # 4) scale its kernel (and bias) in place
-    kernel, bias = shape_layer.get_weights()
-    shape_layer.set_weights([kernel * boost,
-                            bias   * boost])
-    
-    
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]    
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
@@ -1398,6 +1384,7 @@ def build_teacher_model(dynamic_time=False):
                          kernel_size=CLICK_KERNEL_SIZE,
                          padding="same",
                          name="tch_click_shape")(piezo_raw)
+    
     click_resid = Multiply(name="tch_click_resid")(
                       [click_shape, click_env]
                   )
@@ -1542,7 +1529,7 @@ def build_student_model(
                          padding="same",
                          name="stu_click_shape")(piezo_raw)
     click_resid = Multiply(name="stu_click_resid")(
-                      [click_shape, click_env]
+               x       [click_shape, click_env]
                   )
     
     click_resid = ClickScale(init=3.0, name="stu_click_scale")(click_resid)
@@ -2295,6 +2282,7 @@ def main ():
         else:
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
+        
         
         teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(teacher_dynamic_model_filepath):
