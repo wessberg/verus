@@ -2378,10 +2378,7 @@ def train_style_classification(
     # 9) callbacks for teacher-style training
     cb = [
       EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
-      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1),
-      ModelCheckpoint("best_style_teacher.keras",
-                      monitor="val_accuracy", mode="max",
-                      save_best_only=True, verbose=1)
+      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1)
     ]
 
     print(f"\nTraining TEACHER style‐head: {epochs} epochs × ~{steps_t} train steps, ~{val_steps_t} val steps each …")
@@ -2400,10 +2397,10 @@ def train_style_classification(
         teacher.get_layer(name).set_weights(
             style_teacher.get_layer(name).get_weights()
         )
-    teacher.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_style_" + TEACHER_STATIC_MODEL_FILENAME))
+    teacher.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_STATIC_MODEL_FILENAME))
     dyn_t = build_teacher_model(dynamic_time=True)
     dyn_t.set_weights(teacher.get_weights())
-    dyn_t.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_style_" + TEACHER_DYNAMIC_MODEL_FILENAME))
+    dyn_t.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME))
     print("✅ Saved retrained‐style teacher.")
 
     # 11) now repeat for STUDENT style‐head
@@ -2428,10 +2425,7 @@ def train_style_classification(
     )
     cb2 = [
       EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
-      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1),
-      ModelCheckpoint("best_style_student.keras",
-                      monitor="val_accuracy", mode="max",
-                      save_best_only=True, verbose=1)
+      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1)
     ]
 
     print(f"\nTraining STUDENT style‐head: {epochs} epochs × ~{steps_s} train steps, ~{val_steps_s} val steps each …")
@@ -2450,10 +2444,10 @@ def train_style_classification(
         student.get_layer(name).set_weights(
             style_student.get_layer(name).get_weights()
         )
-    student.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_style_" + STUDENT_STATIC_MODEL_FILENAME))
+    student.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_STATIC_MODEL_FILENAME))
     dyn_s = build_student_model(teacher=dyn_t, dynamic_time=True)
     dyn_s.set_weights(student.get_weights())
-    dyn_s.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_style_" + STUDENT_DYNAMIC_MODEL_FILENAME))
+    dyn_s.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME))
     print("✅ Saved retrained‐style student.")
 
 def _detect_and_print_flips(
