@@ -98,7 +98,7 @@ CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
-L1_WEIGHT                 = 1.0   # waveform l1 loss
+L1_WEIGHT                 = 2.0   # waveform l1 loss
 HF_WEIGHT                 = 1.0   # scale of the high-pass loss
 STFT_WEIGHT               = 1.0   # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
