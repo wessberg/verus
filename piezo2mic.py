@@ -419,6 +419,34 @@ class DemoCallback(Callback):
             "logs_out_dir":  self.logs_out_dir
         })
         return config
+    
+@register_keras_serializable()
+class ClickScale(Layer):
+    """
+    A tiny trainable scalar to scale the click residual.
+    init: starting value (e.g. 3.0 to be 3× louder at graph‐init).
+    """
+    def __init__(self, init=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.init = float(init)
+
+    def build(self, input_shape):
+        # one scalar weight
+        self.scale = self.add_weight(
+            name="click_scale",
+            shape=(),
+            initializer=tf.keras.initializers.Constant(self.init),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        return x * self.scale
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"init": self.init})
+        return cfg
 
 @register_keras_serializable()
 class IRDecayTriggered(Layer):
@@ -830,6 +858,20 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     x_piezo = x_long[:,0:1]             # (FRAMES,1)
     x_in    = x_piezo[None,...]         # (1,FRAMES,1)
     print("Running inference…")
+    
+    
+    
+    # 2) pick a boost factor (3×, 5×, whatever)
+    boost = 5.0
+
+    # 3) grab the click_shape layer
+    shape_layer = model.get_layer("tch_click_shape")
+
+    # 4) scale its kernel (and bias) in place
+    kernel, bias = shape_layer.get_weights()
+    shape_layer.set_weights([kernel * boost,
+                            bias   * boost])
+    
     
     y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]    
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
@@ -1359,7 +1401,10 @@ def build_teacher_model(dynamic_time=False):
     click_resid = Multiply(name="tch_click_resid")(
                       [click_shape, click_env]
                   )
-    out         = Add(name="tch_with_click")([out, click_resid])
+    
+    click_resid = ClickScale(init=3.0, name="tch_click_scale")(click_resid)
+
+    out = Add(name="tch_with_click")([out, click_resid])
  
     return tf.keras.models.Model(
         inputs  = inp,
@@ -1499,6 +1544,9 @@ def build_student_model(
     click_resid = Multiply(name="stu_click_resid")(
                       [click_shape, click_env]
                   )
+    
+    click_resid = ClickScale(init=3.0, name="stu_click_scale")(click_resid)
+    
     y_student   = Add(name="stu_with_click")([y_student, click_resid])
     
 
