@@ -18,8 +18,7 @@ from tensorflow.keras import regularizers, constraints
 
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D,
-    RNN
+    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
 )
 
 # Turn off GPU acceleration for inference, as it is more reliable.
@@ -38,9 +37,8 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # Audio channel configuration
-SR                  = 48000
+SR                        = 48000
 INPUT_AVG_RMS_DBFS_TARGET = -23.0
-STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # Debugging params
 DEBUG               = False
@@ -94,6 +92,9 @@ FINETUNE_MEL_WEIGHT          = 15.0
 FINE_TUNE_DEMO_SEC = 60
 FINE_TUNE_DEMO_OFFSET_SEC = 0
 
+CLICK_THRESH       = 1e-3     # same threshold you use for attack detection
+CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
+
 TRANSIENT_UPWEIGHT_RATIO  = 0.05   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
@@ -102,7 +103,6 @@ HF_WEIGHT                 = 1.0   # scale of the high-pass loss
 STFT_WEIGHT               = 1.0   # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
-λ_STYLE_RATIO             = 0.5
 
 PICK_ATTACK_CHUNK_RATIO = 0.15 # How many pick attack segments the model will see
 PICK_UNIFORM_CHUNK_RATIO = 0.35 # How many general pick segments the model will see
@@ -143,7 +143,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 1000
+EPOCHS      = 1
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -166,8 +166,7 @@ PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
-PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR   = "./input/style-classification/pick"
-PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR   = "./input/style-classification/finger"
+PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_SRC_DIR   = "./input/style-classification"
 FINETUNE_SRC_DIR   = "./input/finetune"
 
 OUT_DIR        = "./out"
@@ -247,6 +246,20 @@ for src, tgt in all_pairs:
         data_norm = data * gain
         # 4) cache normalized audio
         audio_cache[path] = data_norm
+
+def make_click_decay_kernel(tau_secs=0.002, sr=48000, length=None):
+    # build a 1–3 ms exponential decay kernel for the click envelope
+    if length is None:
+        length = int(sr * 0.003)   # ~3 ms
+    t = np.arange(length, dtype=np.float32) / sr
+    dec = np.exp(-t / tau_secs)
+    dec = dec / np.sum(dec)       # normalize
+    return dec.astype(np.float32)
+
+# one TensorFlow constant filter (shape = [L,1,1])
+_click_decay_np = make_click_decay_kernel()
+_click_decay_tf = tf.constant(_click_decay_np.reshape(-1,1,1),
+                              dtype=tf.float32)
 
 def build_chunks(pairs_list, seg_len):
     """
@@ -368,11 +381,8 @@ class DemoCallback(Callback):
         x_piezo = x_long[:,0:1]             # (T,1)
         x_demo  = x_piezo[None,...]         # (1, T,1)
 
-        # 3) predict both waveform and style
-        y_out, style_out = self.dynamic_model.predict(x_demo, batch_size=1)
-        y_pred   = y_out[0,:,0]
-        style_p  = float(style_out[0,0])
-        style_nm = 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        
+        y_pred = self.dynamic_model.predict(x_demo, batch_size=1)[0,:,0]
 
         # 4) write to disk
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{friendly_epoch:03d}")
@@ -400,7 +410,7 @@ class DemoCallback(Callback):
                              sample_rate=self.sr,
                              step=friendly_epoch)
             self.writer.flush()
-        print(f"[DemoCallback] epoch {friendly_epoch}: style={style_nm} ({style_p:.3f}) → demo written to {epoch_dir}")
+        print(f"[DemoCallback] epoch {friendly_epoch}: demo written to {epoch_dir}")
 
     def get_config(self):
         config = super().get_config()
@@ -582,7 +592,7 @@ def dump_pick_attacks(gap_sec=0.1, n_segments=None):
     gap      = int(gap_sec * SR)
     gap_arr  = np.zeros((gap,), dtype='float32')
 
-    gen      = attack_segment_generator(seg_len=seg_len, chunks=pick_chunks, is_pick_chunks=True)
+    gen      = attack_segment_generator(seg_len=seg_len, chunks=pick_chunks)
     collected_piezo = []
     collected_mic   = []
 
@@ -632,7 +642,7 @@ def dump_finger_attacks(gap_sec=0.1, n_segments=None):
     seg_len = TEACHER_SEG_LEN
     
     finger_chunks   = build_chunks(pairs_list=finger_pairs, seg_len=seg_len)
-    gen      = attack_segment_generator(seg_len=seg_len, chunks=finger_chunks, is_pick_chunks=False)
+    gen      = attack_segment_generator(seg_len=seg_len, chunks=finger_chunks)
     collected_piezo = []
     collected_mic   = []
 
@@ -723,7 +733,7 @@ def hp_diff_env(window, α=0.8):
     return np.abs(np.diff(hp))
 
 
-def attack_segment_generator(seg_len, chunks, is_pick_chunks, context_pre=1024):
+def attack_segment_generator(seg_len, chunks, context_pre=1024):
     while True:
         src, tgt, cstart, cdur = random.choice(chunks)
         mono = audio_cache[src][:,0]
@@ -742,12 +752,11 @@ def attack_segment_generator(seg_len, chunks, is_pick_chunks, context_pre=1024):
             continue
 
         x = piezo_seg.astype('float32')[:,None]  # (seg_len,1)
-        y_audio = mic_seg.astype('float32')[:,None]
-        style_flag = 1.0 if is_pick_chunks else 0.0
+        y = mic_seg.astype('float32')[:,None]
 
-        yield x, (y_audio, style_flag)
+        yield x, y
 
-def segment_generator(seg_len, chunks, is_pick_chunks):
+def segment_generator(seg_len, chunks):
     """Uniform random windows, style=1.0 if pick-path else 0.0."""
     while True:
         src, tgt, cstart, cdur = random.choice(chunks)
@@ -767,23 +776,22 @@ def segment_generator(seg_len, chunks, is_pick_chunks):
             mic_seg   = np.pad(mic_seg,    (0,p))
 
         x = piezo_seg.astype('float32')[:,None]  # (seg_len,1)
-        y_audio = mic_seg.astype('float32')[:,None]
-        style_flag = 1.0 if is_pick_chunks else 0.0
+        y = mic_seg.astype('float32')[:,None]
 
-        yield x, (y_audio, style_flag)
+        yield x, y
 
 def analyze_loss_scales(model, dataset):
     # Take one batch from your validation dataset
-    (x, (y_true_audio, style_flag), sw) = next(iter(dataset))
+    (x, y, sw) = next(iter(dataset))
     
-    y_pred_audio, y_pred_style = model(x, training=False)
+    y_pred_audio = model(x, training=False)
 
     # now all five of your losses only get the pure audio streams
-    l1_val   = tf.reduce_mean(waveform_l1_loss(y_true_audio, y_pred_audio)).numpy()
-    stft_val = tf.reduce_mean(multi_scale_stft_loss(y_true_audio, y_pred_audio)).numpy()
-    mel_val  = tf.reduce_mean(log_mel_loss(y_true_audio, y_pred_audio)).numpy()
-    env_val  = tf.reduce_mean(rms_env_loss(y_true_audio, y_pred_audio)).numpy()
-    hf_val   = tf.reduce_mean(hf_loss(y_true_audio, y_pred_audio)).numpy()
+    l1_val   = tf.reduce_mean(waveform_l1_loss(y, y_pred_audio)).numpy()
+    stft_val = tf.reduce_mean(multi_scale_stft_loss(y, y_pred_audio)).numpy()
+    mel_val  = tf.reduce_mean(log_mel_loss(y, y_pred_audio)).numpy()
+    env_val  = tf.reduce_mean(rms_env_loss(y, y_pred_audio)).numpy()
+    hf_val   = tf.reduce_mean(hf_loss(y, y_pred_audio)).numpy()
 
     return {'l1':l1_val, 'stft':stft_val, 'mel':mel_val, 'env':env_val, 'hf':hf_val}
 
@@ -822,12 +830,8 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     x_piezo = x_long[:,0:1]             # (FRAMES,1)
     x_in    = x_piezo[None,...]         # (1,FRAMES,1)
     print("Running inference…")
-    y_out, style_out = model.predict(x_in, batch_size=1)
-    y_pred_dyn   = y_out[0,:,0]
-    style_p  = float(style_out[0,0])
-    style_nm = 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
-    print(f"[generate_demo] detected style {style_nm} ({style_p:.3f})")
     
+    y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]    
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
     
@@ -1147,27 +1151,15 @@ def mean_hf_metric(y_true, y_pred):
 
 @register_keras_serializable()
 def add_sw(x, y):
-    # x: (batch, T, 1) → raw piezo
-    # y: (y_audio, style_flag)
-    y_audio, style_flag = y               # y_audio:(batch,T,1), style_flag:(batch,)
     piezo = tf.squeeze(x, axis=-1)       # (batch, T)
-
-    # 1) base‐scalar from the style‐flag (1.0 = pick, 0.0 = finger)
-    pick_weight   = 1.0
-    finger_weight = 1.0
-    base_scalar   = pick_weight*style_flag + finger_weight*(1.0 - style_flag)  # (batch,)
 
     # 2) transient upweight wn exactly as before
     Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])              # (batch, T-1)
     Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)     # (batch, T)
     m = tf.maximum(tf.reduce_max(Δ, axis=1, keepdims=True), 1e-6)  # avoid div0
-    wn = 1.0 + TRANSIENT_UPWEIGHT_RATIO*(Δ/m)            # (batch, T)
-
-    # 3) combine
-    sw = base_scalar[:,None] * wn                       # (batch, T)
-    sw = tf.expand_dims(sw, axis=-1)                    # (batch, T, 1)
-
-    return x, (y_audio, style_flag), sw
+    wn = 1.0 + TRANSIENT_UPWEIGHT_RATIO * (Δ / m)
+    sw = wn[...,None]                           # (batch, T, 1)
+    return x, y, sw
 
 @register_keras_serializable()
 class TileStyle(Layer):
@@ -1188,6 +1180,63 @@ class InvertStyle(Layer):
         return 1.0 - style_time
     def compute_output_shape(self, input_shape):
         return input_shape
+
+@register_keras_serializable()
+class ClickDelta(Layer):
+    def call(self, x):
+        # |piezo[t] - piezo[t-1]| with a leading zero
+        d = tf.abs(x[:,1:,:] - x[:,:-1,:])
+        return tf.pad(d, [[0,0],[1,0],[0,0]])
+    def get_config(self):
+        return super().get_config()
+
+@register_keras_serializable()
+class ClickTrigger(Layer):
+    def __init__(self, threshold=CLICK_THRESH, **kwargs):
+        super().__init__(**kwargs)
+        self.threshold = float(threshold)
+    def call(self, delta):
+        return tf.cast(delta > self.threshold, tf.float32)
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'threshold': self.threshold})
+        return cfg
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+@register_keras_serializable()
+class ClickEnv(Layer):
+    def __init__(self, click_decay, **kwargs):
+        super().__init__(**kwargs)
+        # store decay kernel as numpy array
+        self.click_decay = np.array(click_decay, dtype=np.float32)
+    def build(self, input_shape):
+        L = self.click_decay.shape[0]
+        # one non-trainable kernel weight
+        self.kernel = self.add_weight(
+            name='kernel',
+            shape=(L,1,1),
+            initializer=tf.keras.initializers.Constant(
+                self.click_decay.reshape(-1,1,1)
+            ),
+            trainable=False
+        )
+        super().build(input_shape)
+    def call(self, inputs):
+        L = self.click_decay.shape[0]
+        # pad left by L−1 → VALID conv gives causal convolution
+        x_pad = tf.pad(inputs, [[0,0],[L-1,0],[0,0]])
+        return tf.nn.conv1d(x_pad, self.kernel, stride=1, padding='VALID')
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'click_decay': self.click_decay.tolist()})
+        return cfg
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
 
 @register_keras_serializable()
 def get_piezo(x):
@@ -1253,17 +1302,11 @@ def build_teacher_model(dynamic_time=False):
     T   = None if dynamic_time else TEACHER_SEG_LEN
     inp = Input(shape=(T,1), name="tch_piezo_input")
     
-    cls         = Conv1D(16,3, padding="same",
-                         activation="relu",
-                         name="tch_style_conv")(inp)       # (B,T,16)
-    cls         = GlobalAveragePooling1D(name="tch_style_gap")(cls)    # (B,16)
-    style_logit = Dense(1, name="tch_style_logit")(cls)                # (B,1)
-    style_prob  = Activation("sigmoid", name="tch_style_prob")(style_logit)  # (B,1)
-
-    # 3) Embed it exactly as you used to:
+    cls         = Conv1D(16,3,padding="same", activation="relu", name="tch_style_conv")(inp)
+    cls         = GlobalAveragePooling1D(name="tch_style_gap")(cls)
     style_embed = Dense(TEACHER_EMBED_DIM,
                         activation="linear",
-                        name="tch_style_embed")(style_prob)
+                        name="tch_style_embed")(cls)
     
     x = Conv1D(TEACHER_FILTERS, 1,
                padding="same",
@@ -1301,23 +1344,26 @@ def build_teacher_model(dynamic_time=False):
             Multiply(name=f"film_scale_{idx}")([x, gamma]),
             beta
         ])
-        
-    # 5) Final pick/finger outputs
-    main_pick   = Conv1D(1,1,padding="same",name="tch_final_pick")(x)
-    main_finger = Conv1D(1,1,padding="same",name="tch_final_finger")(x)
-
-    # 6) Tile the scalar style_prob to (B,T,1) and gate
-    style_time = TileStyle(name="tch_style_time")([style_prob, inp]) 
-    inv_style  = InvertStyle(name="tch_invert_style")(style_time)
-
-    pick_c   = Multiply(name="tch_pick_contrib")([style_time,   main_pick])
-    finger_c = Multiply(name="tch_finger_contrib")([inv_style,   main_finger])
-    out      = Add(name="tch_mix_main")([pick_c, finger_c])
-
-    # 7) Two outputs: the mapped audio + the style‐prob
+    
+    out = Conv1D(1,1,padding="same", name="tch_mix_main")(x)
+    
+    piezo_raw   = inp  # (B, T, 1)
+    delta       = ClickDelta(name="tch_click_delta")(piezo_raw)
+    attack_trig = ClickTrigger(name="tch_click_trig")(delta)
+    click_env   = ClickEnv(click_decay=_click_decay_np,
+                           name="tch_click_env")(attack_trig)
+    click_shape = Conv1D(1,
+                         kernel_size=CLICK_KERNEL_SIZE,
+                         padding="same",
+                         name="tch_click_shape")(piezo_raw)
+    click_resid = Multiply(name="tch_click_resid")(
+                      [click_shape, click_env]
+                  )
+    out         = Add(name="tch_with_click")([out, click_resid])
+ 
     return tf.keras.models.Model(
         inputs  = inp,
-        outputs = [out, style_prob],
+        outputs = out,
         name    = "piezo2mic_teacher"
     )
 
@@ -1329,19 +1375,11 @@ def build_student_model(
     T   = None if dynamic_time else STUDENT_SEG_LEN
     inp = Input(shape=(T,1), name="stu_piezo_input")
 
-    # 2) Style‐head on that piezo
-    cls         = Conv1D(16, 3,
-                         padding="same",
-                         activation="relu",
-                         name="stu_style_conv")(inp)       # (B,T,16)
-    cls         = GlobalAveragePooling1D(name="stu_style_gap")(cls)    # (B,16)
-    style_logit = Dense(1, name="stu_style_logit")(cls)                # (B,1)
-    style_prob  = Activation("sigmoid", name="stu_style_prob")(style_logit)  # (B,1)
-
-    # 3) Embed it
+    cls         = Conv1D(16,3,padding="same", activation="relu", name="stu_style_conv")(inp)
+    cls         = GlobalAveragePooling1D(name="stu_style_gap")(cls)
     style_embed = Dense(STUDENT_EMBED_DIM,
                         activation="linear",
-                        name="stu_style_embed")(style_prob)   # (B,EMB)
+                        name="stu_style_embed")(cls)
     
     x = Conv1D(STUDENT_FILTERS,
                kernel_size=1,
@@ -1394,18 +1432,7 @@ def build_student_model(
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
             student_feats.append(x)   # (B,T,STUDENT_FILTERS)
     
-    # ── N) Final style‐gated pick/finger blend ────────────────────────────
-    out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
-    out_finger = Conv1D(1,1,padding="same", name="stu_final_finger")(x)
-
-    # tile the scalar style_prob → (B,T,1)
-    style_time = TileStyle(name="stu_style_time")([style_prob, inp])
-    inv_style  = InvertStyle(name="stu_invert_style")(style_time)
-
-    pick_c     = Multiply(name="stu_pick_contrib")([style_time, out_pick])
-    finger_c   = Multiply(name="stu_finger_contrib")([inv_style, out_finger])
-
-    y_student = Add(name="stu_out")([pick_c, finger_c])  # (B,T,1)
+    y_student  = Conv1D(1,1,padding="same", name="stu_out")(x)
 
     # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
     #    7.1) anti-alias & decimate
@@ -1458,6 +1485,22 @@ def build_student_model(
 
     #    7.7) fuse it back in
     y_student = Add(name="stu_with_ir")([y_student, ir])
+    
+    
+    piezo_raw   = inp
+    delta       = ClickDelta(name="stu_click_delta")(piezo_raw)
+    attack_trig = ClickTrigger(name="stu_click_trig")(delta)
+    click_env   = ClickEnv(click_decay=_click_decay_np,
+                           name="stu_click_env")(attack_trig)
+    click_shape = Conv1D(1,
+                         kernel_size=CLICK_KERNEL_SIZE,
+                         padding="same",
+                         name="stu_click_shape")(piezo_raw)
+    click_resid = Multiply(name="stu_click_resid")(
+                      [click_shape, click_env]
+                  )
+    y_student   = Add(name="stu_with_click")([y_student, click_resid])
+    
 
     # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
@@ -1492,7 +1535,7 @@ def build_student_model(
     # ── 9) Final model ───────────────────────────────────────────────────────
     return tf.keras.models.Model(
         inputs  = inp,
-        outputs = [y_student, style_prob],
+        outputs = y_student,
         name    ="piezo2mic_student"
     )
 
@@ -1544,26 +1587,23 @@ def train_shared(
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     # datasets
-    sig_x = tf.TensorSpec((seg_len,1), tf.float32)
-    sig_y = (
-    tf.TensorSpec((seg_len,1), tf.float32),   # the waveform target
-    tf.TensorSpec((),       tf.float32)       # the style‐flag (0.0 or 1.0)
-    )
+    sig_x = tf.TensorSpec((seg_len,1), tf.float32)    
+    sig_y = tf.TensorSpec((seg_len,1), tf.float32)
 
     pick_attack_ds    = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_pick_chunks, is_pick_chunks=True), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_pick_chunks), output_signature=(sig_x,sig_y)
     )
     
     pick_uniform_ds    = tf.data.Dataset.from_generator(
-        lambda: segment_generator(seg_len=seg_len, chunks=train_pick_chunks, is_pick_chunks=True), output_signature=(sig_x,sig_y)
+        lambda: segment_generator(seg_len=seg_len, chunks=train_pick_chunks), output_signature=(sig_x,sig_y)
     )
     
     finger_attack_ds  = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=train_finger_chunks), output_signature=(sig_x,sig_y)
     )
     
     finger_uniform_ds  = tf.data.Dataset.from_generator(
-        lambda: segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
+        lambda: segment_generator(seg_len=seg_len, chunks=train_finger_chunks), output_signature=(sig_x,sig_y)
     )
 
     train_ds = tf.data.Dataset.sample_from_datasets(
@@ -1574,22 +1614,22 @@ def train_shared(
 
     # validation streams
     val_pick_attack_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_pick_chunks, is_pick_chunks=True),
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_pick_chunks),
         output_signature=(sig_x, sig_y)
     )
     
     val_pick_uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(seg_len=seg_len, chunks=val_pick_chunks, is_pick_chunks=True),
+        lambda: segment_generator(seg_len=seg_len, chunks=val_pick_chunks),
         output_signature=(sig_x, sig_y)
     )
     
     val_finger_attack_ds = tf.data.Dataset.from_generator(
-        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_finger_chunks, is_pick_chunks=False),
+        lambda: attack_segment_generator(seg_len=seg_len, chunks=val_finger_chunks),
         output_signature=(sig_x, sig_y)
     )
     
     val_finger_uniform_ds = tf.data.Dataset.from_generator(
-        lambda: segment_generator(seg_len=seg_len, chunks=val_finger_chunks, is_pick_chunks=False),
+        lambda: segment_generator(seg_len=seg_len, chunks=val_finger_chunks),
         output_signature=(sig_x, sig_y)
     )
     
@@ -1648,17 +1688,13 @@ def train_shared(
     
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(LR),
-        loss=[ combined_loss, "binary_crossentropy" ],
-        loss_weights = [ 1.0,  λ_STYLE_RATIO ],
+        loss=combined_loss,
         metrics = [
-            # <-- metrics for output #1 (audio)
-            [ 'mae',
+            'mae',
             log_mel_loss,
             mean_hf_metric,
             multi_scale_stft_loss,
-            rms_env_loss ],
-            # <-- metrics for output #2 (style_prob)
-            [ 'accuracy' ]
+            rms_env_loss
         ]
     )
     static_model.summary()
@@ -1799,75 +1835,8 @@ def generate_fine_tune_demo(
     x_in    = x_piezo[None, ...]    # shape (1, N, 1)
 
     # 4) Run inference → y_out=(1,N,1), style_out=(1,1)
-    (y_out, style_out) = model.predict(x_in, batch_size=1)
-    y_pred  = y_out[0, :, 0]         # shape (N,)
-    style_p = float(style_out[0,0]) # scalar in [0,1]
-    style_nm = "pick"   if style_p>STYLE_FLAG_PROB_THRESHOLD else "finger"
-
-    print(f"[generate_fine_tune_demo] detected style = {style_nm} ({style_p:.3f})")
+    y_pred = model.predict(x_in, batch_size=1)[0,:,0]
     
-    
-    # ────────── NEW: SLIDING WINDOW STYLE SCAN ──────────
-    # Build a sub‐model that only runs the style head
-    #    (we know model.output[1] is the style_prob)
-    # style_model = tf.keras.Model(
-    #     inputs  = model.input,
-    #     outputs = model.output[1],
-    #     name    = "only_style_head"
-    # )
-    # style_model.compile()  # no-op, just to avoid TF warnings
-
-    # # Choose window & hop in samples:
-    # # you can pick your student receptive field or something shorter
-    # win_len = STUDENT_SEG_LEN     # e.g. 4096 samples
-    # hop     = win_len // 2        # 50% overlap
-
-    # N = x_piezo.shape[0]
-    # # how many windows
-    # n_wins = max(1, (N - win_len)//hop + 1)
-
-    # # accumulate the thresholded flags
-    # flags = []
-    # for i in range(n_wins):
-    #     start = i * hop
-    #     end   = start + win_len
-    #     if end > N:
-    #         # pad last window with zeros
-    #         pad_amt = end - N
-    #         win = np.pad(x_piezo[start:N], ((0,pad_amt),(0,0)))
-    #     else:
-    #         win = x_piezo[start:end]
-
-    #     # batch it
-    #     win_batched = win[None,...]  # shape (1, win_len,1)
-
-    #     # predict only style prob
-    #     p = style_model.predict(win_batched, batch_size=1)[0,0]
-    #     flags.append( 1 if p>STYLE_FLAG_PROB_THRESHOLD else 0 )
-    
-    
-    #     # ────────── detect flips & record from→to ──────────
-    # style_names = {0:'finger', 1:'pick'}
-    # flip_events = []
-
-    # for win_i in range(1, len(flags)):
-    #     prev_flag = flags[win_i-1]
-    #     new_flag  = flags[win_i]
-    #     if new_flag != prev_flag:
-    #         sample_offset = win_i * hop
-    #         flip_events.append((sample_offset,
-    #                             style_names[prev_flag],
-    #                             style_names[new_flag]))
-
-    # if flip_events:
-    #     print("STYLE FLIPS:")
-    #     for samp, frm, to in flip_events:
-    #         print(f"  at {samp:6d} samples  ({samp/SR:.3f}s):  {frm} → {to}")
-    #     total_time = N / SR
-    #     print(f"  → {len(flip_events)} flips over {total_time:.1f}s"
-    #           f"  ({len(flip_events)/total_time:.2f} flips/sec)")
-    # else:
-    #     print("No style flips detected.")
 
     # 5) Write to disk
     sf.write(os.path.join(out_dir, "demo_source.wav"),
@@ -1878,30 +1847,6 @@ def generate_fine_tune_demo(
              y_pred,      SR, subtype='FLOAT')
 
     print(f"   → Wrote: {out_dir}/{prediction_name}.wav\n")
-    
-    # Now also write demos with forced style flags to hear how they sound when the style is consistent
-    # get the style‐logit layer
-    logit_layer = model.get_layer("stu_style_logit")
-    W, b = logit_layer.get_weights()
-    
-    def force_style(pick: bool):
-        # zero out the weights so the input piezo never changes the logit…
-        W_zero = np.zeros_like(W)
-        # …and set bias to +10 for pick (sigmoid(10)≈0.99995) or -10 for finger (sigmoid(-10)≈4.5e-5)
-        b_force = np.array([+10.0]) if pick else np.array([-10.0])
-        logit_layer.set_weights([W_zero, b_force])
-    
-    # force pick everywhere
-    force_style(pick=True)
-    (y_out, style_out) = model.predict(x_in, batch_size=1)
-    print("forced pick, style_out:", style_out[0,0])
-    sf.write(os.path.join(out_dir, f"{prediction_name}_forced_pick.wav"), y_out[0,:,0], 48000, subtype='FLOAT')
-
-    # force finger everywhere
-    force_style(pick=False)
-    (y_out, style_out) = model.predict(x_in, batch_size=1)
-    print("forced finger, style_out:", style_out[0,0])
-    sf.write(os.path.join(out_dir, f"{prediction_name}_forced_finger.wav"), y_out[0,:,0], 48000, subtype='FLOAT')
 
 
 def generate_fine_tune_demo_from_models(teacher_dyn=None, student_dyn=None):
@@ -1987,24 +1932,22 @@ def fine_tune():
         chunks = build_chunks(all_pairs, seg_len)
         
         spec_x       = tf.TensorSpec((seg_len,1), tf.float32)
-        spec_y_audio = tf.TensorSpec((seg_len,1), tf.float32)
-        spec_y_style = tf.TensorSpec((),       tf.float32)   # or (1,) if you prefer
-        spec_y       = (spec_y_audio, spec_y_style)
+        spec_y       = tf.TensorSpec((seg_len,1), tf.float32)
         
         def pa_gen():
-            for x,(y_audio, style_flag) in attack_segment_generator(seg_len, chunks, True):
-                yield x, (y_audio, style_flag)
+            for x,y in attack_segment_generator(seg_len, chunks):
+                yield x, y
 
         def pu_gen():
-            for x,(y_audio, style_flag) in segment_generator(seg_len, chunks, True):
-                yield x, (y_audio, style_flag)
+            for x,y in segment_generator(seg_len, chunks):
+                yield x, y
         
         def fa_gen():
-            for x,(y_audio,style_flag) in attack_segment_generator(seg_len, chunks, False):
-                yield x, (y_audio, style_flag)
+            for x,y in attack_segment_generator(seg_len, chunks):
+                yield x,y
         def fu_gen():
-            for x,(y_audio,style_flag) in segment_generator(seg_len, chunks, False):
-                yield x, (y_audio, style_flag)
+            for x,y in segment_generator(seg_len, chunks):
+                yield x,y
 
         ds_pa = tf.data.Dataset.from_generator(pa_gen, output_signature=(spec_x, spec_y))
         
@@ -2183,13 +2126,9 @@ def fine_tune():
         # 5) compile & fit
         finetuned_student_small.compile(
             optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
-            loss=[combined_loss, "binary_crossentropy"],
-            loss_weights=[1.0, λ_STYLE_RATIO],
+            loss=combined_loss,
             metrics=[
-            # audio‐head metrics - we keep them at a minimum to for performance
-            ["mae"],
-            # style‐head metric is not relevant here, as the style layer is frozen
-            []
+            "mae"
             ]
         )
         dsS = make_mixed_ds(STUDENT_SEG_LEN)
@@ -2223,353 +2162,6 @@ def fine_tune():
 # 2) measure RMS on piezo channel (assumed channel 0)
 def compute_rms(sig):
     return np.sqrt(np.mean(sig**2))
-
-def train_style_classification(
-    epochs: int = 50,
-    style_lr: float = 1e-4,
-    batch_size: int = BATCH_SIZE
-):
-    # 1) preload & normalize your extra guitars exactly as before
-    pick_dir   = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR
-    finger_dir = PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR
-    pick_files   = sorted(glob.glob(os.path.join(pick_dir,   "*.wav")))
-    finger_files = sorted(glob.glob(os.path.join(finger_dir, "*.wav")))
-    target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
-    for fp in pick_files + finger_files:
-        if fp not in audio_cache:
-            data, _ = sf.read(fp, dtype="float32", always_2d=True)
-            mono = data[:,0]
-            rms = np.sqrt(np.mean(mono**2) + 1e-12)
-            audio_cache[fp] = (mono * (target_rms/rms))[:,None]
-
-    # 2) build chunk lists
-    pick_pairs   = [(fp, fp) for fp in pick_files]
-    finger_pairs = [(fp, fp) for fp in finger_files]
-
-    seg_t = TEACHER_SEG_LEN
-    seg_s = STUDENT_SEG_LEN
-
-    tch_pick_chunks, tch_fing_chunks = build_chunks(pick_pairs, seg_t), build_chunks(finger_pairs, seg_t)
-    stu_pick_chunks, stu_fing_chunks = build_chunks(pick_pairs, seg_s), build_chunks(finger_pairs, seg_s)
-
-    # 3) split into train/val for pick & finger separately
-    tp_pick, vp_pick   = train_test_split(tch_pick_chunks, test_size=0.2, random_state=SEED)
-    tp_fing, vp_fing   = train_test_split(tch_fing_chunks, test_size=0.2, random_state=SEED)
-    sp_pick, vp2_pick  = train_test_split(stu_pick_chunks, test_size=0.2, random_state=SEED)
-    sp_fing, vp2_fing  = train_test_split(stu_fing_chunks, test_size=0.2, random_state=SEED)
-
-    # 4) helper to yield (x, style_flag) only
-    def style_only_gen(seg_len, chunks, is_pick, attack=False):
-        src = attack_segment_generator if attack else segment_generator
-        for x, (_y, flag) in src(seg_len=seg_len, chunks=chunks, is_pick_chunks=is_pick):
-            yield x, flag
-
-    # 5) build TRAIN datasets (mix attack+uniform, pick+finger)
-    weights = [PICK_ATTACK_CHUNK_RATIO, PICK_UNIFORM_CHUNK_RATIO,
-               FINGER_ATTACK_CHUNK_RATIO, FINGER_UNIFORM_CHUNK_RATIO]
-
-    # --- teacher-head train ds
-    sig_x_t = tf.TensorSpec((seg_t,1), tf.float32)
-    sig_y_t = tf.TensorSpec((),      tf.float32)
-    ds_t_pa = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_t, tp_pick, True,  attack=True),
-        output_signature=(sig_x_t, sig_y_t)
-    )
-    ds_t_pu = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_t, tp_pick, True,  attack=False),
-        output_signature=(sig_x_t, sig_y_t)
-    )
-    ds_t_fa = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_t, tp_fing, False, attack=True),
-        output_signature=(sig_x_t, sig_y_t)
-    )
-    ds_t_fu = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_t, tp_fing, False, attack=False),
-        output_signature=(sig_x_t, sig_y_t)
-    )
-    ds_train_t = tf.data.Dataset.sample_from_datasets(
-        [ds_t_pa, ds_t_pu, ds_t_fa, ds_t_fu],
-        weights=weights, seed=SEED
-    ).shuffle(SHUFFLE_BUF, seed=SEED).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    # --- student-head train ds
-    sig_x_s = tf.TensorSpec((seg_s,1), tf.float32)
-    sig_y_s = tf.TensorSpec((),      tf.float32)
-    ds_s_pa = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_s, sp_pick, True,  attack=True),
-        output_signature=(sig_x_s, sig_y_s)
-    )
-    ds_s_pu = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_s, sp_pick, True,  attack=False),
-        output_signature=(sig_x_s, sig_y_s)
-    )
-    ds_s_fa = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_s, sp_fing, False, attack=True),
-        output_signature=(sig_x_s, sig_y_s)
-    )
-    ds_s_fu = tf.data.Dataset.from_generator(
-        lambda: style_only_gen(seg_s, sp_fing, False, attack=False),
-        output_signature=(sig_x_s, sig_y_s)
-    )
-    ds_train_s = tf.data.Dataset.sample_from_datasets(
-        [ds_s_pa, ds_s_pu, ds_s_fa, ds_s_fu],
-        weights=weights, seed=SEED
-    ).shuffle(SHUFFLE_BUF, seed=SEED).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    # 6) build VALIDATION datasets (same mix, but no .repeat())
-    def build_val_ds(pa, pu, fa, fu, seg_len, spec_x, spec_y):
-        ds_pa = tf.data.Dataset.from_generator(
-            lambda: style_only_gen(seg_len, pa,   True,  attack=True),
-            output_signature=(spec_x, spec_y)
-        )
-        ds_pu = tf.data.Dataset.from_generator(
-            lambda: style_only_gen(seg_len, pu,   True,  attack=False),
-            output_signature=(spec_x, spec_y)
-        )
-        ds_fa = tf.data.Dataset.from_generator(
-            lambda: style_only_gen(seg_len, fa,   False, attack=True),
-            output_signature=(spec_x, spec_y)
-        )
-        ds_fu = tf.data.Dataset.from_generator(
-            lambda: style_only_gen(seg_len, fu,   False, attack=False),
-            output_signature=(spec_x, spec_y)
-        )
-        return tf.data.Dataset.sample_from_datasets(
-            [ds_pa, ds_pu, ds_fa, ds_fu],
-            weights=weights, seed=SEED
-        ).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
-    ds_val_t = build_val_ds(vp_pick, vp_pick, vp_fing, vp_fing, seg_t, sig_x_t, sig_y_t)
-    ds_val_s = build_val_ds(vp2_pick, vp2_pick, vp2_fing, vp2_fing, seg_s, sig_x_s, sig_y_s)
-
-    # 7) compute steps for both train and val
-    # teacher
-    total_train_t = sum((d + seg_t - 1) // seg_t for (_,_,_,d) in tp_pick + tp_fing)
-    steps_t       = max(1, total_train_t // batch_size)
-    total_val_t   = sum((d + seg_t - 1) // seg_t for (_,_,_,d) in vp_pick + vp_fing)
-    val_steps_t   = max(1, total_val_t   // batch_size)
-    # student
-    total_train_s = sum((d + seg_s - 1) // seg_s for (_,_,_,d) in sp_pick + sp_fing)
-    steps_s       = max(1, total_train_s // batch_size)
-    total_val_s   = sum((d + seg_s - 1) // seg_s for (_,_,_,d) in vp2_pick + vp2_fing)
-    val_steps_s   = max(1, total_val_s   // batch_size)
-
-    # 8) load & freeze full teacher, extract its style‐head
-    teacher = tf.keras.models.load_model(
-        os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
-        compile=False
-    )
-    for layer in teacher.layers:
-        layer.trainable = False
-    for name in ["tch_style_conv","tch_style_gap","tch_style_logit","tch_style_prob"]:
-        teacher.get_layer(name).trainable = True
-
-    style_teacher = tf.keras.models.Model(
-        inputs  = teacher.input,
-        outputs = teacher.get_layer("tch_style_prob").output,
-        name    = "style_only_teacher"
-    )
-    style_teacher.compile(
-        optimizer = tf.keras.optimizers.Adam(style_lr),
-        loss      = "binary_crossentropy",
-        metrics   = ["accuracy"]
-    )
-
-    # 9) callbacks for teacher-style training
-    cb = [
-      EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
-      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1)
-    ]
-
-    print(f"\nTraining TEACHER style‐head: {epochs} epochs × ~{steps_t} train steps, ~{val_steps_t} val steps each …")
-    style_teacher.fit(
-        ds_train_t,
-        epochs=epochs,
-        steps_per_epoch=steps_t,
-        validation_data=ds_val_t,
-        validation_steps=val_steps_t,
-        callbacks=cb,
-        verbose=1
-    )
-
-    # 10) copy back into full model & re-save teacher
-    for name in ["tch_style_conv","tch_style_gap","tch_style_logit","tch_style_prob"]:
-        teacher.get_layer(name).set_weights(
-            style_teacher.get_layer(name).get_weights()
-        )
-    teacher.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_STATIC_MODEL_FILENAME))
-    dyn_t = build_teacher_model(dynamic_time=True)
-    dyn_t.set_weights(teacher.get_weights())
-    dyn_t.save(os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME))
-    print("✅ Saved retrained‐style teacher.")
-
-    # 11) now repeat for STUDENT style‐head
-    student = tf.keras.models.load_model(
-        os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
-        compile=False
-    )
-    for layer in student.layers:
-        layer.trainable = False
-    for name in ["stu_style_conv","stu_style_gap","stu_style_logit","stu_style_prob"]:
-        student.get_layer(name).trainable = True
-
-    style_student = tf.keras.models.Model(
-        inputs  = student.input,
-        outputs = student.get_layer("stu_style_prob").output,
-        name    = "style_only_student"
-    )
-    style_student.compile(
-        optimizer = tf.keras.optimizers.Adam(style_lr),
-        loss      = "binary_crossentropy",
-        metrics   = ["accuracy"]
-    )
-    cb2 = [
-      EarlyStopping(monitor="val_accuracy", mode="max", patience=5, verbose=1, restore_best_weights=True),
-      ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, verbose=1)
-    ]
-
-    print(f"\nTraining STUDENT style‐head: {epochs} epochs × ~{steps_s} train steps, ~{val_steps_s} val steps each …")
-    style_student.fit(
-        ds_train_s,
-        epochs=epochs,
-        steps_per_epoch=steps_s,
-        validation_data=ds_val_s,
-        validation_steps=val_steps_s,
-        callbacks=cb2,
-        verbose=1
-    )
-
-    # 12) copy back into full student & re-save
-    for name in ["stu_style_conv","stu_style_gap","stu_style_logit","stu_style_prob"]:
-        student.get_layer(name).set_weights(
-            style_student.get_layer(name).get_weights()
-        )
-    student.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_STATIC_MODEL_FILENAME))
-    dyn_s = build_student_model(teacher=dyn_t, dynamic_time=True)
-    dyn_s.set_weights(student.get_weights())
-    dyn_s.save(os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME))
-    print("✅ Saved retrained‐style student.")
-
-def _detect_and_print_flips(
-    model,
-    name: str,
-    audio_piezo: np.ndarray,
-    sr: int,
-    seg_len: int,
-    threshold: float = STYLE_FLAG_PROB_THRESHOLD
-):
-    """
-    Slide a window of length=seg_len, hop=seg_len over audio_piezo,
-    call model.predict on each chunk, pull out the style‐prob,
-    threshold→binary, and print all flips.
-    """
-    N = audio_piezo.shape[0]
-    hop = seg_len
-
-    # helper to get raw pick‐prob at a given start index
-    def get_prob(start):
-        end = start + seg_len
-        if end <= N:
-            chunk = audio_piezo[start:end]
-        else:
-            # pad the last chunk to full length
-            pad_amt = end - N
-            chunk = np.pad(audio_piezo[start:N],
-                           ((0, pad_amt),(0,0)),
-                           mode='constant')
-        # model.predict → [waveform, style_prob]
-        style_out = model.predict(chunk[None, ...], batch_size=1, verbose=0)[1]
-        return float(style_out[0,0])
-
-    # first window
-    p0 = get_prob(0)
-    s0 = int(p0 > threshold)
-    last_state = s0
-
-    flips = []
-    # iterate
-    for start in range(hop, N, hop):
-        p = get_prob(start)
-        s = int(p > threshold)
-        if s != last_state:
-            t_sec = start / sr
-            fr = 'pick'   if last_state else 'finger'
-            to = 'pick'   if s          else 'finger'
-            flips.append((t_sec, fr, to, p))
-            last_state = s
-
-    # print
-    print(f"\n=== {name} style‐flip report ===")
-    if len(flips) == 0:
-        print("  no flips detected")
-    else:
-        for (t,fr,to,p) in flips:
-            print(f"  at {t:6.3f}s : {fr} → {to}   (P(pick)={p:.3f})")
-    print(f"  TOTAL FLIPS: {len(flips)}")
-
-
-def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
-    FRAMES      = LONG_DEMO_SEC * SR
-    START_FRAME = LONG_DEMO_OFFSET_SEC * SR
-    pth_src, _ = all_pairs[LONG_DEMO_PAIR_INDEX]
-
-    x_long,_ = sf.read(pth_src,
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-    
-    # only piezo
-    x_piezo = x_long[:,0:1]             # (FRAMES,1)
-
-    # 3) run for teacher & student
-    _detect_and_print_flips(
-        model   = teacher_dyn,
-        name    = "TEACHER",
-        audio_piezo = x_piezo,
-        sr      = SR,
-        seg_len = TEACHER_SEG_LEN,
-        threshold=STYLE_FLAG_PROB_THRESHOLD
-    )
-    _detect_and_print_flips(
-        model   = student_dyn,
-        name    = "STUDENT",
-        audio_piezo = x_piezo,
-        sr      = SR,
-        seg_len = STUDENT_SEG_LEN,
-        threshold=STYLE_FLAG_PROB_THRESHOLD
-    )
-    
-def profile_finetune_model_style_flag_flips(teacher_dyn, student_dyn):
-    FRAMES      = FINE_TUNE_DEMO_SEC * SR
-    START_FRAME = FINE_TUNE_DEMO_OFFSET_SEC * SR
-
-    x_long,_ = sf.read(os.path.join(FINETUNE_SRC_DIR, "source.wav"),
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-    
-    # only piezo
-    x_piezo = x_long[:,0:1]             # (FRAMES,1)
-
-    # # 3) run for teacher & student
-    # _detect_and_print_flips(
-    #     model   = teacher_dyn,
-    #     name    = "TEACHER",
-    #     audio_piezo = x_piezo,
-    #     sr      = SR,
-    #     seg_len = TEACHER_SEG_LEN,
-    #     threshold=STYLE_FLAG_PROB_THRESHOLD
-    # )
-    _detect_and_print_flips(
-        model   = student_dyn,
-        name    = "STUDENT",
-        audio_piezo = x_piezo,
-        sr      = SR,
-        seg_len = STUDENT_SEG_LEN,
-        threshold=STYLE_FLAG_PROB_THRESHOLD
-    )
 
 def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     # Clean logs and checkpoints
@@ -2707,47 +2299,6 @@ def main ():
         generate_fine_tune_demo_from_models(teacher_dyn=teacher_dyn, student_dyn=student_dyn)
         sys.exit(0)
     
-    elif len(sys.argv)>1 and sys.argv[1]=="--profile-base-model-style-flag-flips":
-        
-        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME)
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME)
-
-        if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
-            print("Fine-tuned teacher/student dynamic models not found, run --train-teacher and --train-student first")
-            sys.exit(1)
-        
-        teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
-        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
-        
-        profile_base_model_style_flag_flips(
-            teacher_dyn=teacher_dyn,
-            student_dyn=student_dyn
-        )
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--profile-finetune-model-style-flag-flips":
-        
-        #teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, FINETUNE_TEACHER_DYNAMIC_MODEL_FILENAME)
-        #student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
-
-        #if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
-        if not os.path.exists(student_dyn_path):
-            print("Fine-tuned dynamic models not found, run --fine-tune first")
-            sys.exit(1)
-        
-        #teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
-        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
-        
-        profile_finetune_model_style_flag_flips(
-            #teacher_dyn=teacher_dyn,
-            teacher_dyn=None,
-            student_dyn=student_dyn
-        )
-        sys.exit(0)
-        
-    elif len(sys.argv)>1 and sys.argv[1]=="--train-style-classification":
-        train_style_classification()
-        sys.exit(0)
     else:
         print("No command given.")
         sys.exit(1)
