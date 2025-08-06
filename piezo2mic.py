@@ -1376,21 +1376,19 @@ def build_teacher_model(dynamic_time=False):
     out = Conv1D(1,1,padding="same", name="tch_mix_main")(x)
     
     piezo_raw   = inp  # (B, T, 1)
-    delta       = ClickDelta(name="tch_click_delta")(piezo_raw)
-    attack_trig = ClickTrigger(name="tch_click_trig")(delta)
-    click_env   = ClickEnv(click_decay=_click_decay_np,
-                           name="tch_click_env")(attack_trig)
-    click_shape = Conv1D(1,
-                         kernel_size=CLICK_KERNEL_SIZE,
-                         padding="same",
-                         name="tch_click_shape")(piezo_raw)
     
-    click_resid = Multiply(name="tch_click_resid")(
-                      [click_shape, click_env]
-                  )
-    
-    click_resid = ClickScale(init=3.0, name="tch_click_scale")(click_resid)
-
+    # 1) trigger: 1 at t=pluck, 0 elsewhere
+    attack_trig = ClickTrigger(name="tch_click_trig")( 
+                    ClickDelta(name="tch_click_delta")(piezo_raw)
+                )
+    # 2) learnable IR: convolve that impulse
+    click_ir = Conv1D(1,
+                    kernel_size=CLICK_KERNEL_SIZE,
+                    padding="same",
+                    name="tch_click_ir")(attack_trig)
+    # 3) small trainable gain
+    click_resid = ClickScale(init=1.0, name="tch_click_scale")(click_ir)
+    # 4) just add on top
     out = Add(name="tch_with_click")([out, click_resid])
  
     return tf.keras.models.Model(
@@ -1520,22 +1518,19 @@ def build_student_model(
     
     
     piezo_raw   = inp
-    delta       = ClickDelta(name="stu_click_delta")(piezo_raw)
-    attack_trig = ClickTrigger(name="stu_click_trig")(delta)
-    click_env   = ClickEnv(click_decay=_click_decay_np,
-                           name="stu_click_env")(attack_trig)
-    click_shape = Conv1D(1,
-                         kernel_size=CLICK_KERNEL_SIZE,
-                         padding="same",
-                         name="stu_click_shape")(piezo_raw)
-    click_resid = Multiply(name="stu_click_resid")(
-               x       [click_shape, click_env]
-                  )
-    
-    click_resid = ClickScale(init=3.0, name="stu_click_scale")(click_resid)
-    
-    y_student   = Add(name="stu_with_click")([y_student, click_resid])
-    
+    # 1) trigger: 1 at t=pluck, 0 elsewhere
+    attack_trig = ClickTrigger(name="stu_click_trig")( 
+                    ClickDelta(name="stu_click_delta")(piezo_raw)
+                )
+    # 2) learnable IR: convolve that impulse
+    click_ir = Conv1D(1,
+                    kernel_size=CLICK_KERNEL_SIZE,
+                    padding="same",
+                    name="stu_click_ir")(attack_trig)
+    # 3) small trainable gain
+    click_resid = ClickScale(init=1.0, name="stu_click_scale")(click_ir)
+    # 4) just add on top
+    y_student = Add(name="stu_with_click")([y_student, click_resid])
 
     # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
     if teacher is not None:
@@ -2283,13 +2278,6 @@ def main ():
             train_student()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         
-        
-        teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(teacher_dynamic_model_filepath):
-            print("Teacher model not found, run --train-teacher first")
-            sys.exit(1)
-        teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
-        
         print("Generating demo audio files...")
         
         if (len(sys.argv) <= 2 or sys.argv[2] !="--student-only"):
@@ -2301,6 +2289,12 @@ def main ():
             )
             
         if (len(sys.argv) <= 2 or sys.argv[2] !="--teacher-only"):
+            teacher_dynamic_model_filepath = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
+            if not os.path.exists(teacher_dynamic_model_filepath):
+                print("Teacher model not found, run --train-teacher first")
+                sys.exit(1)
+            teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
+
             prepare_and_generate_demo(
                 demo_out_dir=LONG_DEMOS_STUDENT_OUT_DIR,
                 dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
