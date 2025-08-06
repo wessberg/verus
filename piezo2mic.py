@@ -820,7 +820,7 @@ def segment_generator(seg_len, chunks):
 
 def analyze_loss_scales(model, dataset):
     # pull out one batch
-    (x, y, sw) = next(iter(dataset))
+    (x, y) = next(iter(dataset))
 
     # run inference; may get a list of two outputs
     y_pred = model(x, training=False)
@@ -849,8 +849,8 @@ def analyze_loss_scales(model, dataset):
 
 def calibrate_loss_weights(model, dataset, n_batches=5):
     sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
-    for i, (x,y,sw) in enumerate(dataset.take(n_batches)):
-        scales = analyze_loss_scales(model, tf.data.Dataset.from_tensors((x,y,sw)))
+    for i, (x,y) in enumerate(dataset.take(n_batches)):
+        scales = analyze_loss_scales(model, tf.data.Dataset.from_tensors((x,y)))
         for k,v in scales.items():
             sums[k] += v
             
@@ -1768,7 +1768,7 @@ def train_shared(
     csv_logger = CSVLogger(os.path.join(csv_logs_out_dir, "training.csv"), append=False)
 
     # ── split each batch into tone/pick targets and sample‐weights ───────────
-    def split_targets(x, y, sw):
+    def split_targets(x, y):
         # x: (B,T,1) piezo, y: (B,T,1) mic, sw: (B,T,1) unused here
         # 1) build a pluck‐mask m(t)
         d = tf.abs(x[:,1:,:] - x[:,:-1,:])
@@ -1784,7 +1784,7 @@ def train_shared(
         sw_pick = m
 
         # return [tone_target, pick_target] and [tone_mask, pick_mask]
-        return x, (y_tone, y_pick), (sw_tone, sw_pick)
+        return x, (y_tone, y_pick)
 
     # map your train/val datasets:
     train_multi = train_ds.map(split_targets)
