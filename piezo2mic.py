@@ -1779,12 +1779,8 @@ def train_shared(
         y_tone = y * (1.0 - m)
         y_pick = y * m
 
-        # 3) masks for sample‐weighting each head
-        sw_tone = 1.0 - m
-        sw_pick = m
-
         # return [tone_target, pick_target] and [tone_mask, pick_mask]
-        return x, (y_tone, y_pick), (sw_tone, sw_pick)
+        return x, (y_tone, y_pick)
 
     # map your train/val datasets:
     train_multi = train_ds.map(split_targets)
