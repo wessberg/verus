@@ -100,7 +100,6 @@ FINE_TUNE_DEMO_OFFSET_SEC = 0
 CLICK_THRESH       = 1e-3     # same threshold you use for attack detection
 CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
 
-TRANSIENT_UPWEIGHT_RATIO  = 0.3   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0   # waveform l1 loss
@@ -1227,18 +1226,6 @@ def mean_hf_metric(y_true, y_pred):
     return tf.reduce_mean(hf_loss(y_true, y_pred))
 
 @register_keras_serializable()
-def add_sw(x, y):
-    piezo = tf.squeeze(x, axis=-1)       # (batch, T)
-
-    # 2) transient upweight wn exactly as before
-    Δ = tf.abs(piezo[:,1:] - piezo[:,:-1])              # (batch, T-1)
-    Δ = tf.pad(Δ, [[0,0],[1,0]], constant_values=0)     # (batch, T)
-    m = tf.maximum(tf.reduce_max(Δ, axis=1, keepdims=True), 1e-6)  # avoid div0
-    wn = 1.0 + TRANSIENT_UPWEIGHT_RATIO * (Δ / m)
-    sw = wn[...,None]                           # (batch, T, 1)
-    return x, y, sw
-
-@register_keras_serializable()
 class TileStyle(Layer):
     def call(self, inputs):
         style_scalar, ref = inputs    # (batch,1), (batch,T,C)
@@ -1653,8 +1640,8 @@ def train_shared(
     train_ds = tf.data.Dataset.sample_from_datasets(
         [pick_attack_ds, pick_uniform_ds, finger_attack_ds, finger_uniform_ds], weights=[PICK_ATTACK_CHUNK_RATIO, PICK_UNIFORM_CHUNK_RATIO, FINGER_ATTACK_CHUNK_RATIO, FINGER_UNIFORM_CHUNK_RATIO]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
-
-    train_ds = train_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+    
+    train_ds = train_ds.repeat().prefetch(tf.data.AUTOTUNE)
 
     # validation streams
     val_pick_attack_ds = tf.data.Dataset.from_generator(
@@ -1683,7 +1670,7 @@ def train_shared(
         seed=SEED
     ).batch(BATCH_SIZE)
     
-    val_ds = val_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+    val_ds   = val_ds.repeat().prefetch(tf.data.AUTOTUNE)
 
     # build or load model
     if resume and resume_ckpt_path:
@@ -2075,7 +2062,6 @@ def fine_tune():
     #     # build a tiny "val" dataset of mixed segments (already batched)
     #     dsT_val = make_mixed_ds(TEACHER_SEG_LEN)
     #     # now attach your sample‐weight map exactly as in train_shared()
-    #     dsT_val = dsT_val.map(add_sw)
     #     # only take 2 batches (you just need a few to get stable scales)
     #     dsT_val = dsT_val.take(5)
 
@@ -2178,7 +2164,6 @@ def fine_tune():
                 or name == f"stu_pw_{LAST_STUDENT_DILATION}"
 
         dsS_val = make_mixed_ds(STUDENT_SEG_LEN)
-        dsS_val = dsS_val.map(add_sw)
         dsS_val = dsS_val.take(5)
 
         baseline_S = calibrate_loss_weights(finetuned_student_small,
