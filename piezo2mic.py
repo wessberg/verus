@@ -100,7 +100,7 @@ FINE_TUNE_DEMO_OFFSET_SEC = 0
 CLICK_THRESH       = 1e-3     # same threshold you use for attack detection
 CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
 
-TRANSIENT_UPWEIGHT_RATIO  = 1.0   # how strongly to up-weight the ∣Δx∣ spikes
+TRANSIENT_UPWEIGHT_RATIO  = 0.3   # how strongly to up-weight the ∣Δx∣ spikes
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
 L1_WEIGHT                 = 1.0   # waveform l1 loss
