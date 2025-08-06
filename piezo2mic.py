@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
 Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
-to the equivalent mic’d signal, with pick‐attack oversampling ramp,
-and a 2nd “style” channel so one model can handle finger vs pick.
+to the equivalent mic’d signal.
+
+The model has a tone-head and a pick-head, so they can have separate losses,
+and can be trained separately.
+
+Everything is fully Keras serializable.
+
 It is designed to be ultra-low latency for real-time inference for live-use.
 This is why dilations and kernel_size are small, and the model is causal.
 """
@@ -380,9 +385,15 @@ class DemoCallback(Callback):
         # 2) only piezo
         x_piezo = x_long[:,0:1]             # (T,1)
         x_demo  = x_piezo[None,...]         # (1, T,1)
-
         
-        y_pred = self.dynamic_model.predict(x_demo, batch_size=1)[0,:,0]
+        preds = self.dynamic_model.predict(x_demo, batch_size=1)
+        if isinstance(preds, (list, tuple)):
+            tone_pred, pick_pred = preds
+            demo_pred = tone_pred + pick_pred     # sum the two heads
+        else:
+            demo_pred = preds
+        y_pred = demo_pred[0, :, 0]
+        
 
         # 4) write to disk
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{friendly_epoch:03d}")
@@ -809,19 +820,33 @@ def segment_generator(seg_len, chunks):
         yield x, y
 
 def analyze_loss_scales(model, dataset):
-    # Take one batch from your validation dataset
+    # pull out one batch
     (x, y, sw) = next(iter(dataset))
-    
-    y_pred_audio = model(x, training=False)
 
-    # now all five of your losses only get the pure audio streams
-    l1_val   = tf.reduce_mean(waveform_l1_loss(y, y_pred_audio)).numpy()
-    stft_val = tf.reduce_mean(multi_scale_stft_loss(y, y_pred_audio)).numpy()
-    mel_val  = tf.reduce_mean(log_mel_loss(y, y_pred_audio)).numpy()
-    env_val  = tf.reduce_mean(rms_env_loss(y, y_pred_audio)).numpy()
-    hf_val   = tf.reduce_mean(hf_loss(y, y_pred_audio)).numpy()
+    # run inference; may get a list of two outputs
+    y_pred = model(x, training=False)
 
-    return {'l1':l1_val, 'stft':stft_val, 'mel':mel_val, 'env':env_val, 'hf':hf_val}
+    # if it’s a list/tuple, sum the two heads
+    if isinstance(y_pred, (list, tuple)):
+        y_pred_audio = tf.add_n(y_pred)   # tone + pick
+    else:
+        y_pred_audio = y_pred
+
+    # now y_pred_audio is shape (batch, T, 1)
+    # and we can safely call each of your single‐headed losses:
+    l1_val   = float(tf.reduce_mean(waveform_l1_loss(   y, y_pred_audio)))
+    stft_val = float(tf.reduce_mean(multi_scale_stft_loss(y, y_pred_audio)))
+    mel_val  = float(tf.reduce_mean(log_mel_loss(       y, y_pred_audio)))
+    env_val  = float(tf.reduce_mean(rms_env_loss(       y, y_pred_audio)))
+    hf_val   = float(tf.reduce_mean(hf_loss(            y, y_pred_audio)))
+
+    return {
+      'l1':   l1_val,
+      'stft': stft_val,
+      'mel':  mel_val,
+      'env':  env_val,
+      'hf':   hf_val
+    }
 
 def calibrate_loss_weights(model, dataset, n_batches=5):
     sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
@@ -858,8 +883,15 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     x_piezo = x_long[:,0:1]             # (FRAMES,1)
     x_in    = x_piezo[None,...]         # (1,FRAMES,1)
     print("Running inference…")
-
-    y_pred_dyn = model.predict(x_in, batch_size=1)[0,:,0]    
+    
+    preds = model.predict(x_in, batch_size=1)
+    if isinstance(preds, (list, tuple)):
+        tone_pred, pick_pred = preds
+        demo_pred = tone_pred + pick_pred
+    else:
+        demo_pred = preds
+    y_pred_dyn = demo_pred[0, :, 0]
+    
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred_dyn, SR, subtype='FLOAT')
     
@@ -1029,54 +1061,54 @@ def hf_loss(y_true, y_pred):
 @register_keras_serializable()
 def multi_scale_stft_loss(y_true, y_pred):
     """
-    Per-sample, multi-scale L1 loss between |STFT(y_true)| and |STFT(y_pred)|.
-    Returns shape (batch,1,1) so it broadcasts in your combined_loss.
+    Multi‐scale STFT L1 loss, averaged across time, frequency, and scale.
+    Returns a tensor of shape (batch, 1, 1).
     """
-    scales = [
-        (256,   64,  256),
-        (512,  128,  512),
-        (1024, 256, 1024),
-        (2048, 512, 2048),
-        (8192, 2048, 8192)
-    ]
-
-    # squeeze off the channel dim → (batch, T)
+    # 1) remove channel dim → (batch, T)
     y_true_s = tf.squeeze(y_true, axis=-1)
     y_pred_s = tf.squeeze(y_pred, axis=-1)
 
-    per_scale_losses = []
+    # 2) STFT parameters for each scale
+    scales = [
+        (256,   64,   256),
+        (512,  128,   512),
+        (1024, 256,  1024),
+        (2048, 512,  2048),
+        (8192, 2048, 8192),
+    ]
+
+    losses = []
     for n_fft, hop, win in scales:
-        # 1) frame & pad
-        frames_true = tf.signal.frame(y_true_s, frame_length=win,
-                                      frame_step=hop, pad_end=True)
-        frames_pred = tf.signal.frame(y_pred_s, frame_length=win,
-                                      frame_step=hop, pad_end=True)
+        # 2a) framing & windowing
+        frames_true = tf.signal.frame(
+            y_true_s, frame_length=win, frame_step=hop, pad_end=True
+        )  # → (batch, frames, win)
+        frames_pred = tf.signal.frame(
+            y_pred_s, frame_length=win, frame_step=hop, pad_end=True
+        )
+        hann   = tf.signal.hann_window(win, periodic=True)          # (win,)
+        window = tf.reshape(hann, (1, 1, win))                     # (1,1,win)
+        win_t  = frames_true * window
+        win_p  = frames_pred * window
 
-        # 2) window
-        window = tf.signal.hann_window(win, periodic=True)        # (win,)
-        window = tf.reshape(window, (1,1,win))                    # → (1,1,win)
-        win_true = frames_true * window
-        win_pred = frames_pred * window
+        # 2b) FFT & magnitude
+        fft_len = tf.constant([n_fft], dtype=tf.int32)
+        st_t    = tf.signal.rfft(win_t,    fft_length=fft_len)     # (batch,frames,nbins)
+        st_p    = tf.signal.rfft(win_p,    fft_length=fft_len)
+        mag_t   = tf.abs(st_t)
+        mag_p   = tf.abs(st_p)
 
-        # 3) rFFT  ← here is the change:
-        fft_len = tf.constant([n_fft], dtype=tf.int32)            # MUST be 1-D
-        st_true = tf.signal.rfft(win_true,    fft_length=fft_len)
-        st_pred = tf.signal.rfft(win_pred,    fft_length=fft_len)
+        # 2c) L1 difference & mean over time+freq → (batch,)
+        diff    = tf.abs(mag_t - mag_p)
+        loss_sf = tf.reduce_mean(diff, axis=[1,2])  # now a 1‐D tensor
+        losses.append(loss_sf)
 
-        # 4) mag-L1 per frame, then avg over time & freq → (batch,)
-        mag_true = tf.abs(st_true)
-        mag_pred = tf.abs(st_pred)
-        loss_sf  = tf.reduce_mean(
-                       tf.abs(mag_true - mag_pred),
-                       axis=[1,2]
-                   )  # → (batch,)
-        per_scale_losses.append(loss_sf)
+    # 3) sum across scales and average → (batch,)
+    total = tf.add_n(losses)
+    avg   = total / float(len(scales))
 
-    # stack over scales → mean → (batch,)
-    loss_stack = tf.stack(per_scale_losses, axis=0)  # (n_scales, batch)
-    loss_batch = tf.reduce_mean(loss_stack, axis=0)
-
-    return loss_batch[:, None, None]
+    # 4) reshape → (batch,1,1)
+    return tf.reshape(avg, (-1, 1, 1))
 
 @register_keras_serializable()
 def log_mel_loss(y_true, y_pred):
@@ -1084,78 +1116,95 @@ def log_mel_loss(y_true, y_pred):
     Compute L1 between log‐mel‐spectra of y_true and y_pred.
     Returns shape (batch,1,1).
     """
-    # parameters
+    # 1) STFT / mel‐spectrogram parameters
     n_fft   = 1024
     hop     = 256
     win     = 1024
     n_mels  = 64
     fmin    = 20.0
-    fmax    = float(SR//2)
+    fmax    = float(SR // 2)
 
-    # squeeze off the channel → (batch, T)
-    t   = tf.squeeze(y_true, axis=-1)
-    p   = tf.squeeze(y_pred, axis=-1)
+    # 2) remove channel dim → (batch, T)
+    t = tf.squeeze(y_true, axis=-1)
+    p = tf.squeeze(y_pred, axis=-1)
 
-    # STFT magnitudes
-    st_t = tf.signal.stft(t,   frame_length=win, frame_step=hop,
-                          fft_length=n_fft, pad_end=True)
-    st_p = tf.signal.stft(p,   frame_length=win, frame_step=hop,
-                          fft_length=n_fft, pad_end=True)
-    mag_t = tf.abs(st_t)    # (batch, frames, freq_bins)
+    # 3) STFT magnitudes → (batch, frames, freq_bins)
+    st_t  = tf.signal.stft(t,
+                           frame_length=win,
+                           frame_step=hop,
+                           fft_length=n_fft,
+                           pad_end=True)
+    st_p  = tf.signal.stft(p,
+                           frame_length=win,
+                           frame_step=hop,
+                           fft_length=n_fft,
+                           pad_end=True)
+    mag_t = tf.abs(st_t)   # (batch, frames, n_fft//2+1)
     mag_p = tf.abs(st_p)
 
-    # build a (freq_bins × n_mels) mel‐weight matrix
+    # 4) build mel‐filterbank → (freq_bins, n_mels)
     fb = tf.signal.linear_to_mel_weight_matrix(
         num_mel_bins=n_mels,
         num_spectrogram_bins=n_fft//2+1,
         sample_rate=SR,
         lower_edge_hertz=fmin,
         upper_edge_hertz=fmax
-    )  # shape (freq_bins, n_mels)
+    )
 
-    # mel spectrograms → (batch, frames, n_mels)
-    mel_t = tf.tensordot(mag_t, fb,   axes=[[2],[0]])
-    mel_p = tf.tensordot(mag_p, fb,   axes=[[2],[0]])
+    # 5) apply mel‐filterbank: contract freq_bins
+    #    mag_*: (batch, frames, freq_bins)
+    #    fb:     (freq_bins, n_mels)
+    # → mel_*: (batch, frames, n_mels)
+    mel_t = tf.matmul(mag_t, fb)
+    mel_p = tf.matmul(mag_p, fb)
 
-    # log compress
+    # 6) log compress
     log_t = tf.math.log(mel_t + 1e-6)
     log_p = tf.math.log(mel_p + 1e-6)
 
-    # L1 & mean over time+mel‐bins → (batch,)
+    # 7) L1 over time+mel → (batch,)
     mel_diff = tf.reduce_mean(tf.abs(log_t - log_p), axis=[1,2])
 
-    # shape to (batch,1,1)
-    return mel_diff[:,None,None]
-
+    # 8) reshape → (batch,1,1)
+    return mel_diff[:, None, None]
 
 @register_keras_serializable()
 def rms_env_loss(y_true, y_pred):
     """
-    Compute L1 between slow RMS envelopes.
-    Returns shape (batch,1,1).
+    Compute L1 between slow RMS envelopes of y_true and y_pred.
+    Returns a tensor of shape (batch, 1, 1).
     """
-    # envelope params
-    env_win  = 1024
-    env_hop  = 512
+    # window & hop for the slow‐RMS envelope
+    env_win = 1024
+    env_hop = 512
 
-    # squeeze → (batch, T)
+    # 1) remove the channel dim → (batch, T)
     t = tf.squeeze(y_true, axis=-1)
     p = tf.squeeze(y_pred, axis=-1)
 
-    # frame → (batch, frames, env_win)
-    ft   = tf.signal.frame(t, frame_length=env_win,
-                           frame_step=env_hop, pad_end=True)
-    fp   = tf.signal.frame(p, frame_length=env_win,
-                           frame_step=env_hop, pad_end=True)
+    # 2) frame into (batch, num_frames, env_win)
+    ft = tf.signal.frame(t,
+                         frame_length=env_win,
+                         frame_step=env_hop,
+                         pad_end=True)
+    fp = tf.signal.frame(p,
+                         frame_length=env_win,
+                         frame_step=env_hop,
+                         pad_end=True)
 
-    # RMS per frame → (batch, frames)
-    rms_t = tf.sqrt(tf.reduce_mean(ft**2, axis=2) + 1e-12)
-    rms_p = tf.sqrt(tf.reduce_mean(fp**2, axis=2) + 1e-12)
+    # 3) compute per‐frame RMS → (batch, num_frames)
+    #    mean over the last axis (the env_win dim)
+    rms_t = tf.sqrt(tf.reduce_mean(tf.square(ft), axis=-1) + 1e-12)
+    rms_p = tf.sqrt(tf.reduce_mean(tf.square(fp), axis=-1) + 1e-12)
 
-    # L1 & mean over frames → (batch,)
-    env_diff = tf.reduce_mean(tf.abs(rms_t - rms_p), axis=1)
+    # 4) L1 difference frame‐by‐frame → (batch, num_frames)
+    diff = tf.abs(rms_t - rms_p)
 
-    return env_diff[:,None,None]
+    # 5) mean across frames → (batch,)
+    env_diff = tf.reduce_mean(diff, axis=-1)
+
+    # 6) reshape to (batch,1,1) to match your other losses
+    return tf.reshape(env_diff, (-1, 1, 1))
 
 @register_keras_serializable()
 def combined_loss(y_true, y_pred):
@@ -1373,27 +1422,23 @@ def build_teacher_model(dynamic_time=False):
             beta
         ])
     
-    out = Conv1D(1,1,padding="same", name="tch_mix_main")(x)
-    
-    piezo_raw   = inp  # (B, T, 1)
-    
-    # 1) trigger: 1 at t=pluck, 0 elsewhere
-    attack_trig = ClickTrigger(name="tch_click_trig")( 
+    # 1) tone head (everything except pick clicks)
+    tone_out = Conv1D(1,1, padding="same", name="tch_tone_out")(x)
+
+    # 2) pick head (the pluck‐transient only)
+    piezo_raw = inp
+    attack_trig = ClickTrigger(name="tch_click_trig")(
                     ClickDelta(name="tch_click_delta")(piezo_raw)
                 )
-    # 2) learnable IR: convolve that impulse
-    click_ir = Conv1D(1,
-                    kernel_size=CLICK_KERNEL_SIZE,
-                    padding="same",
-                    name="tch_click_ir")(attack_trig)
-    # 3) small trainable gain
-    click_resid = ClickScale(init=1.0, name="tch_click_scale")(click_ir)
-    # 4) just add on top
-    out = Add(name="tch_with_click")([out, click_resid])
- 
+    click_ir   = Conv1D(1,
+                        kernel_size=CLICK_KERNEL_SIZE,
+                        padding="same",
+                        name="tch_click_ir")(attack_trig)
+    pick_out   = ClickScale(init=1.0, name="tch_pick_out")(click_ir)
+
     return tf.keras.models.Model(
         inputs  = inp,
-        outputs = out,
+        outputs = [tone_out, pick_out],
         name    = "piezo2mic_teacher"
     )
 
@@ -1402,50 +1447,55 @@ def build_student_model(
     teacher=None,
     dynamic_time=False
 ):
-    T   = None if dynamic_time else STUDENT_SEG_LEN
-    inp = Input(shape=(T,1), name="stu_piezo_input")
+    # 1) input length: fixed for training, variable for inference
+    T = None if dynamic_time else STUDENT_SEG_LEN
+    inp = Input(shape=(T, 1), name="stu_piezo_input")
 
-    cls         = Conv1D(16,3,padding="same", activation="relu", name="stu_style_conv")(inp)
-    cls         = GlobalAveragePooling1D(name="stu_style_gap")(cls)
+    # 2) style‐head (same as teacher)
+    cls = Conv1D(16, 3, padding="same", activation="relu", name="stu_style_conv")(inp)
+    cls = GlobalAveragePooling1D(name="stu_style_gap")(cls)
     style_embed = Dense(STUDENT_EMBED_DIM,
                         activation="linear",
                         name="stu_style_embed")(cls)
-    
+
+    # 3) initial pointwise projection
     x = Conv1D(STUDENT_FILTERS,
                kernel_size=1,
                padding="same",
                name="stu_init_pw")(inp)
 
-    # ── 4) Dilated TCN Blocks (gated SeparableConv + FiLM) ─────────────────
+    # 4) Dilated TCN Blocks + FiLM
     student_feats = []
     for i, d in enumerate(STUDENT_DILATIONS):
         res = x
         pad = (STUDENT_KERNEL_SIZE - 1) * d
-        x   = ZeroPadding1D((pad, 0), name=f"stu_pad_{i}")(x)
-        g   = SeparableConv1D(2*STUDENT_FILTERS,
-                              STUDENT_KERNEL_SIZE,
-                              dilation_rate=d,
-                              padding="valid",
-                              name=f"stu_sep_{i}")(x)
-        c   = Lambda(slice_content,
-                     arguments={"filters": STUDENT_FILTERS},
-                     name=f"stu_slice_c_{i}")(g)
-        g2  = Lambda(slice_gate,
-                     arguments={"filters": STUDENT_FILTERS},
-                     name=f"stu_slice_g_{i}")(g)
-        x   = Multiply(name=f"stu_gate_mul_{i}")([
-                  Activation("tanh",    name=f"stu_tanh_{i}")(c),
-                  Activation("sigmoid", name=f"stu_sigmoid_{i}")(g2)
-              ])
-        x   = Conv1D(STUDENT_FILTERS,
-                     kernel_size=1,
-                     padding="same",
-                     name=f"stu_pw_{i}")(x)
-        x   = Add(name=f"stu_res_add_{i}")([x, res])
+        x = ZeroPadding1D((pad, 0), name=f"stu_pad_{i}")(x)
+        g = SeparableConv1D(2 * STUDENT_FILTERS,
+                            STUDENT_KERNEL_SIZE,
+                            dilation_rate=d,
+                            padding="valid",
+                            name=f"stu_sep_{i}")(x)
 
-        # FiLM
-        film  = Dense(2*STUDENT_FILTERS,
-                      name=f"stu_film_dense_{i}")(style_embed)
+        c  = Lambda(slice_content,
+                    arguments={"filters": STUDENT_FILTERS},
+                    name=f"stu_slice_c_{i}")(g)
+        g2 = Lambda(slice_gate,
+                    arguments={"filters": STUDENT_FILTERS},
+                    name=f"stu_slice_g_{i}")(g)
+
+        x = Multiply(name=f"stu_gate_mul_{i}")([
+            Activation("tanh",    name=f"stu_tanh_{i}")(c),
+            Activation("sigmoid", name=f"stu_sigmoid_{i}")(g2)
+        ])
+        x = Conv1D(STUDENT_FILTERS,
+                   kernel_size=1,
+                   padding="same",
+                   name=f"stu_pw_{i}")(x)
+        x = Add(name=f"stu_res_add_{i}")([x, res])
+
+        # FiLM modulation
+        film = Dense(2 * STUDENT_FILTERS,
+                     name=f"stu_film_dense_{i}")(style_embed)
         gamma = Lambda(slice_film_gamma,
                        arguments={"filters": STUDENT_FILTERS},
                        name=f"stu_film_gamma_{i}")(film)
@@ -1453,22 +1503,20 @@ def build_student_model(
                        arguments={"filters": STUDENT_FILTERS},
                        name=f"stu_film_beta_{i}")(film)
         x     = Add(name=f"stu_film_apply_{i}")([
-                    Multiply(name=f"stu_film_scale_{i}")([x, gamma]),
-                    beta
-                ])
+            Multiply(name=f"stu_film_scale_{i}")([x, gamma]),
+            beta
+        ])
 
-        # collect this feature if we're hinting at it
+        # collect for feature-distill if needed
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
-            student_feats.append(x)   # (B,T,STUDENT_FILTERS)
-    
-    y_student  = Conv1D(1,1,padding="same", name="stu_out")(x)
+            student_feats.append(x)
 
-    # ── 7) Low-rate IR Branch ───────────────────────────────────────────────
-    #    7.1) anti-alias & decimate
-    ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)   # → (B,≈T/8,1)
+    # 5) tone head (before click)
+    tone_out = Conv1D(1, 1, padding="same", name="stu_tone_out")(x)
 
-    #    7.2) linear dilated conv stack (no non-linearity)
+    # 6) low-rate IR branch
+    ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)
     for i, d in enumerate(STUDENT_IR_DILATIONS):
         pad = (STUDENT_IR_KERNEL - 1) * d
         ir = ZeroPadding1D((pad, 0), name=f"stu_ir_pad_{i}")(ir)
@@ -1477,96 +1525,62 @@ def build_student_model(
             kernel_size=STUDENT_IR_KERNEL,
             dilation_rate=d,
             padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-4),
-            pointwise_regularizer=regularizers.l2(1e-4),
-            depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
-            pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             name=f"stu_ir_sep_{i}"
         )(ir)
-
-    # total-IR-scale → keeps it from growing too loud
     ir = IrScale(init=0.6, name="stu_ir_scale")(ir)
-
-    #    7.3) zero-order hold upsample
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
-
-    #    7.4) FIR-smooth the steps
     ir = StuIrPostLP(name="stu_ir_post_lp")(ir)
-
-    # 7.5) align IR to main-branch: remove the total FIR delay,
-    # pad at end if we overshot, then grab exactly T_main samples
-    # compute total group-delay:
-    #   first FIR (downsample) = IR_FIR_SIZE-1,
-    #   second FIR (postLP)     = floor((IR_FIR_SIZE-1)/2)
     total_delay = STUDENT_TOTAL_EXPECTED_IR_DELAY
-
     ir = StuIrAlign(offset=total_delay + STUDENT_IR_ALIGN_OFFSET_CORRECTION,
-                    name='stu_ir_align')([ir, inp])
-    
-    # --- now only trigger the IR tail on pick transients ---
-    # extract the raw piezo channel
-    # piezo_raw = Lambda(slice_piezo, name="stu_ir_piezo_raw")(inp)
-    # ir = IRDecayTriggered(sr=SR,
-    #                       init_tau=0.1,
-    #                       threshold=1e-3,
-    #                       name="stu_ir_decay_trig")([ir, piezo_raw])
-
+                    name="stu_ir_align")([ir, inp])
     ir = IRLowpass(name="stu_ir_lowpass")(ir)
 
-    #    7.7) fuse it back in
-    y_student = Add(name="stu_with_ir")([y_student, ir])
-    
-    
-    piezo_raw   = inp
-    # 1) trigger: 1 at t=pluck, 0 elsewhere
-    attack_trig = ClickTrigger(name="stu_click_trig")( 
-                    ClickDelta(name="stu_click_delta")(piezo_raw)
-                )
-    # 2) learnable IR: convolve that impulse
-    click_ir = Conv1D(1,
-                    kernel_size=CLICK_KERNEL_SIZE,
-                    padding="same",
-                    name="stu_click_ir")(attack_trig)
-    # 3) small trainable gain
-    click_resid = ClickScale(init=1.0, name="stu_click_scale")(click_ir)
-    # 4) just add on top
-    y_student = Add(name="stu_with_click")([y_student, click_resid])
+    # fuse IR into the tone head
+    tone_out = Add(name="stu_tone_with_ir")([tone_out, ir])
 
-    # ── 8) Distillation Losses (if teacher is provided) ──────────────────────
+    # 7) pick head (click-transient)
+    raw = inp
+    trig = ClickTrigger(name="stu_click_trig")(
+             ClickDelta(name="stu_click_delta")(raw)
+           )
+    click_ir = Conv1D(1,
+                      kernel_size=CLICK_KERNEL_SIZE,
+                      padding="same",
+                      name="stu_click_ir")(trig)
+    pick_out = ClickScale(init=1.0, name="stu_pick_out")(click_ir)
+
+    # 8) distillation losses (unchanged)
     if teacher is not None:
         teacher.trainable = False
 
         # a) intermediate-feature distillation
         if STUDENT_TEACHER_FEAT_LAYERS:
             teacher_feat_model = tf.keras.models.Model(
-                inputs = teacher.input,
-                outputs= [teacher.get_layer(n).output
-                          for n in STUDENT_TEACHER_FEAT_LAYERS]
+                inputs  = teacher.input,
+                outputs = [teacher.get_layer(n).output
+                           for n in STUDENT_TEACHER_FEAT_LAYERS]
             )
             T_feats = teacher_feat_model(inp)
             if not isinstance(T_feats, list):
                 T_feats = [T_feats]
-
             for idx, (T_f, S_f) in enumerate(zip(T_feats, student_feats)):
                 chan = int(T_f.shape[-1])
-                proj = Conv1D(chan, 1, padding="same",
+                proj = Conv1D(chan, 1,
+                              padding="same",
                               name=f"stu_proj_feat_{idx}")(S_f)
                 _ = DistillLoss(alpha=STUDENT_FEAT_DISTILL_ALPHA,
                                 name=f"feat_distill_{idx}")([T_f, proj])
-        
-        # b) final‐waveform distillation
-        teacher_audio, teacher_style = teacher(inp)
-        y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA,
-                                name="distillation")(
-                                [ teacher_audio,    # <-- (B,T,1)
-                                    y_student         # <-- (B,T,1)
-                                ])
 
-    # ── 9) Final model ───────────────────────────────────────────────────────
+        # b) final-waveform distillation on the _sum_ of our two heads
+        teacher_audio, _ = teacher(inp)
+        combined = Add()([tone_out, pick_out])
+        _ = DistillLoss(alpha=STUDENT_DISTILL_ALPHA,
+                        name="distillation")([teacher_audio, combined])
+
     return tf.keras.models.Model(
         inputs  = inp,
-        outputs = y_student,
-        name    ="piezo2mic_student"
+        outputs = [tone_out, pick_out],
+        name    = "piezo2mic_student"
     )
 
 def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
@@ -1681,7 +1695,7 @@ def train_shared(
         static_model = build_model_fn(**build_model_fn_args, dynamic_time=False)
         initial_epoch = 0
     
-     # Measure raw scales of each loss term on one batch of val_ds
+    # Measure raw scales of each loss term on one batch of val_ds
     baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
     
     ref_scale = float(baseline['l1'])
@@ -1713,20 +1727,26 @@ def train_shared(
           f"  MEL={MEL_WEIGHT:.6f}"
           f"  ENV={RMS_ENV_WEIGHT:.6f}"
           f"  HF={HF_WEIGHT:.6f}")
-    
-    
-    
+
     static_model.compile(
-        optimizer=tf.keras.optimizers.Adam(LR),
-        loss=combined_loss,
-        metrics = [
-            'mae',
-            log_mel_loss,
-            mean_hf_metric,
-            multi_scale_stft_loss,
-            rms_env_loss
-        ]
+        optimizer   = tf.keras.optimizers.Adam(LR),
+        loss        = [combined_loss, waveform_l1_loss],
+        loss_weights= [1.0, 1.0],
+        metrics     = [
+                [
+                    "mae",
+                    log_mel_loss,
+                    mean_hf_metric,
+                    multi_scale_stft_loss,
+                    rms_env_loss
+                ],
+                [
+                    "mae"
+                ]
+            
+            ]
     )
+
     static_model.summary()
     
     # Early stopping callback
@@ -1760,16 +1780,39 @@ def train_shared(
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
     csv_logger = CSVLogger(os.path.join(csv_logs_out_dir, "training.csv"), append=False)
 
+    # ── split each batch into tone/pick targets and sample‐weights ───────────
+    def split_targets(x, y, sw):
+        # x: (B,T,1) piezo, y: (B,T,1) mic, sw: (B,T,1) unused here
+        # 1) build a pluck‐mask m(t)
+        d = tf.abs(x[:,1:,:] - x[:,:-1,:])
+        d = tf.pad(d, [[0,0],[1,0],[0,0]])
+        m = tf.cast(d > CLICK_THRESH, tf.float32)  # 1=pluck, 0=sustain
+
+        # 2) carve your mic into tone vs pick
+        y_tone = y * (1.0 - m)
+        y_pick = y * m
+
+        # 3) masks for sample‐weighting each head
+        sw_tone = 1.0 - m
+        sw_pick = m
+
+        # return [tone_target, pick_target] and [tone_mask, pick_mask]
+        return x, (y_tone, y_pick), (sw_tone, sw_pick)
+
+    # map your train/val datasets:
+    train_multi = train_ds.map(split_targets)
+    val_multi   = val_ds.map(split_targets)
+
     static_model.fit(
-        train_ds,
-        initial_epoch=initial_epoch,
-        epochs=1 if DEBUG else EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger]
+        train_multi,
+        initial_epoch   = initial_epoch,
+        epochs          = 1 if DEBUG else EPOCHS,
+        steps_per_epoch = steps_per_epoch,
+        validation_data   = val_multi,
+        validation_steps  = validation_steps,
+        callbacks       = [es, cp, reduce_lr, tb, demo_cb, csv_logger]
     )
-    
+
     # trained_epochs = len(history.history["loss"])
     
     # 1) save & inject static
@@ -1865,9 +1908,14 @@ def generate_fine_tune_demo(
     x_in    = x_piezo[None, ...]    # shape (1, N, 1)
 
     # 4) Run inference → y_out=(1,N,1), style_out=(1,1)
-    y_pred = model.predict(x_in, batch_size=1)[0,:,0]
+    preds = model.predict(x_in, batch_size=1)
+    if isinstance(preds, (list, tuple)):
+        tone_pred, pick_pred = preds
+        demo_pred = tone_pred + pick_pred
+    else:
+        demo_pred = preds
+    y_pred = demo_pred[0, :, 0]
     
-
     # 5) Write to disk
     sf.write(os.path.join(out_dir, "demo_source.wav"),
              x_full[:,0], SR, subtype='FLOAT')
@@ -2153,14 +2201,24 @@ def fine_tune():
             f"  ENV={RMS_ENV_WEIGHT:.4f}")
 
         
-        # 5) compile & fit
+        # 5) compile & fit   
         finetuned_student_small.compile(
-            optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
-            loss=combined_loss,
-            metrics=[
-            "mae"
-            ]
+            optimizer   = tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
+            loss        = [combined_loss, waveform_l1_loss],
+            loss_weights= [1.0, 1.0],
+            metrics     = [
+                    [
+                        "mae"
+                    ],
+                    [
+                        "mae"
+                    ]
+                
+                ]
         )
+        
+        
+        
         dsS = make_mixed_ds(STUDENT_SEG_LEN)
         
         ft_chunks_T = build_chunks([(src,tgt)], STUDENT_SEG_LEN)
