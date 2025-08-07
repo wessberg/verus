@@ -97,8 +97,15 @@ FINETUNE_MEL_WEIGHT          = 15.0
 FINE_TUNE_DEMO_SEC = 60
 FINE_TUNE_DEMO_OFFSET_SEC = 0
 
-CLICK_THRESH       = 1e-3     # same threshold you use for attack detection
+CLICK_THRESH       = 1e-4     # same threshold you use for attack detection
 CLICK_KERNEL_SIZE  = 31       # ~0.65 ms @48 kHz for spectral shaping
+CLICK_TAU_SEC      = 0.003       # a 3 ms time constant
+
+# build a causal exponential‐decay kernel of length DECAY_LENGTH
+t = tf.range(CLICK_KERNEL_SIZE, dtype=tf.float32) / SR
+decay = tf.exp(-t / CLICK_TAU_SEC)
+decay = decay / tf.reduce_sum(decay)      # normalize area = 1
+decay = tf.reshape(decay, (CLICK_KERNEL_SIZE, 1, 1))  # shape = [L,1,1]
 
 HP_PRE_EMPHASIS           = 0.8 # coefficient for 1-sample 1st-order high-pass
 
@@ -1789,26 +1796,31 @@ def train_shared(
 
     # ── split each batch into tone/pick targets and sample‐weights ───────────
     def split_targets(x, y):
-        # x: (B,T,1) piezo, y: (B,T,1) mic, sw: (B,T,1) unused here
-        # 1) build a pluck‐mask m(t)
-        d = tf.abs(x[:,1:,:] - x[:,:-1,:])
-        d = tf.pad(d, [[0,0],[1,0],[0,0]])
-        m = tf.cast(d > CLICK_THRESH, tf.float32)  # 1=pluck, 0=sustain
+        # x: (B,T,1) piezo,   y: (B,T,1) mic
+        # 1) detect raw click‐triggers just like you had
+        delta = tf.abs(x[:,1:,:] - x[:,:-1,:])
+        delta = tf.pad(delta, [[0,0],[1,0],[0,0]])
+        triggers = tf.cast(delta > CLICK_THRESH, tf.float32)  # (B,T,1)
 
-        # 2) carve your mic into tone vs pick
-        y_tone = y * (1.0 - m)
-        y_pick = y * m
+        # 2) convolve with our small exp-decay kernel → a soft “pick” envelope
+        pick_env = tf.nn.conv1d(triggers,
+                                filters=decay,
+                                stride=1,
+                                padding='SAME')
+        pick_env = tf.clip_by_value(pick_env, 0.0, 1.0)        # still (B,T,1)
 
-        # 3) these become the sample weights for each head
-        sw_tone = 1.0 - m       # (B, T, 1)
-        sw_pick = m
+        # 3) carve teacher-targets for tone vs pick
+        tone_env = 1.0 - pick_env                          # (B,T,1)
+        y_tone = y * tone_env
+        y_pick = y * pick_env
 
-        # 4) optionally squeeze off the last dim so weights are shape (B, T)
-        #    Keras will broadcast them back to (B, T, 1) to match y if needed
-        sw_tone = tf.squeeze(sw_tone, axis=-1)  # now (B, T)
-        sw_pick = tf.squeeze(sw_pick, axis=-1)
+        # 4) sample-weights for each head
+        #    Keras wants shape (B,T), so we squeeze:
+        sw_tone = tf.squeeze(tone_env, axis=-1)   # (B,T)
+        sw_pick = tf.squeeze(pick_env,  axis=-1)  # (B,T)
 
-        # 5) return x, (tone_target, pick_target), (tone_weights, pick_weights)
+        # 5) return exactly the same signature as before:
+        #    x_in, (y_tone,y_pick), (sw_tone,sw_pick)
         return x, (y_tone, y_pick), (sw_tone, sw_pick)
 
     # map your train/val datasets:
