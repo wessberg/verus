@@ -238,9 +238,6 @@ all_pairs = picked_pairs + finger_pairs
 # normalize all files to target RMS once
 target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
 
-# normalize all files to target RMS once
-target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
-
 audio_cache = {}
 for src, tgt in all_pairs:
     for path in (src, tgt):
