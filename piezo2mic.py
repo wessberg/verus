@@ -1747,7 +1747,6 @@ def train_shared(
         optimizer   = tf.keras.optimizers.Adam(LR),
         loss        = [combined_loss, waveform_l1_loss],
         loss_weights= [1.0, 1.0],
-        sample_weight_mode  = ['temporal','temporal'],
         metrics     = [
                 [
                     "mae"
