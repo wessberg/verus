@@ -170,7 +170,6 @@ PICK_TGT_DIR   = "./input/picked/target"
 FINGER_SRC_DIR = "./input/fingerpicked/source"
 FINGER_TGT_DIR = "./input/fingerpicked/target"
 
-PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_SRC_DIR   = "./input/style-classification"
 FINETUNE_SRC_DIR   = "./input/finetune"
 
 OUT_DIR        = "./out"
@@ -887,6 +886,15 @@ def generate_demo (model, out_dir, prediction_name="demo_pred", only_prediction=
     if isinstance(preds, (list, tuple)):
         tone_pred, pick_pred = preds
         demo_pred = tone_pred + pick_pred
+        
+        tone_prediction_filepath = os.path.join(out_dir, "tone_" + prediction_name + ".wav")
+        pick_prediction_filepath = os.path.join(out_dir, "pick_" + prediction_name + ".wav")
+        sf.write(tone_prediction_filepath, tone_pred[0, :, 0], SR, subtype='FLOAT')
+        sf.write(pick_prediction_filepath, pick_pred[0, :, 0], SR, subtype='FLOAT')
+
+        print(f"✅ Tone-Demo saved to {tone_prediction_filepath}")
+        print(f"✅ Pick-Demo saved to {pick_prediction_filepath}")
+
     else:
         demo_pred = preds
     y_pred_dyn = demo_pred[0, :, 0]
@@ -1417,10 +1425,19 @@ def build_teacher_model(dynamic_time=False):
     attack_trig = ClickTrigger(name="tch_click_trig")(
                     ClickDelta(name="tch_click_delta")(piezo_raw)
                 )
-    click_ir   = Conv1D(1,
+    
+    # now learn, say, 8 different 31-tap impulse responses
+    click_bank = Conv1D(8,
                         kernel_size=CLICK_KERNEL_SIZE,
                         padding="same",
-                        name="tch_click_ir")(attack_trig)
+                        name="tch_click_bank")(attack_trig)
+    click_bank = Activation("linear")(click_bank)       # optional non-linearity
+    # collapse them back to 1 channel with a zero-latency 1×1
+    click_ir   = Conv1D(1,
+                        kernel_size=1,
+                        padding="same",
+                        name="tch_click_ir")(click_bank)
+    
     pick_out   = ClickScale(init=1.0, name="tch_pick_out")(click_ir)
 
     return tf.keras.models.Model(
@@ -1530,10 +1547,17 @@ def build_student_model(
     trig = ClickTrigger(name="stu_click_trig")(
              ClickDelta(name="stu_click_delta")(raw)
            )
-    click_ir = Conv1D(1,
-                      kernel_size=CLICK_KERNEL_SIZE,
-                      padding="same",
-                      name="stu_click_ir")(trig)
+    # now learn, say, 8 different 31-tap impulse responses
+    click_bank = Conv1D(8,
+                        kernel_size=CLICK_KERNEL_SIZE,
+                        padding="same",
+                        name="stu_click_bank")(trig)
+    click_bank = Activation("linear")(click_bank)       # optional non-linearity
+    # collapse them back to 1 channel with a zero-latency 1×1
+    click_ir   = Conv1D(1,
+                        kernel_size=1,
+                        padding="same",
+                        name="stu_click_ir")(click_bank)
     pick_out = ClickScale(init=1.0, name="stu_pick_out")(click_ir)
 
     # 8) distillation losses (unchanged)
@@ -1683,49 +1707,45 @@ def train_shared(
         initial_epoch = 0
     
     # Measure raw scales of each loss term on one batch of val_ds
-    baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
+    # baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
     
-    ref_scale = float(baseline['l1'])
-    user_w    = {
-        'l1':  L1_WEIGHT,
-        'stft': STFT_WEIGHT,
-        'mel':  MEL_WEIGHT,
-        'env':  RMS_ENV_WEIGHT,
-        'hf':   HF_WEIGHT
-    }
+    # ref_scale = float(baseline['l1'])
+    # user_w    = {
+    #     'l1':  L1_WEIGHT,
+    #     'stft': STFT_WEIGHT,
+    #     'mel':  MEL_WEIGHT,
+    #     'env':  RMS_ENV_WEIGHT,
+    #     'hf':   HF_WEIGHT
+    # }
 
-    new_w = {}
-    for key, uw in user_w.items():
-        bs = float(baseline[key])
-        if bs > 0.0:
-            new_w[key] = uw / bs * ref_scale
-        else:
-            new_w[key] = 0.0
+    # new_w = {}
+    # for key, uw in user_w.items():
+    #     bs = float(baseline[key])
+    #     if bs > 0.0:
+    #         new_w[key] = uw / bs * ref_scale
+    #     else:
+    #         new_w[key] = 0.0
 
-    L1_WEIGHT       = new_w['l1']
-    STFT_WEIGHT     = new_w['stft']
-    MEL_WEIGHT      = new_w['mel']
-    RMS_ENV_WEIGHT  = new_w['env']
-    HF_WEIGHT       = new_w['hf']
+    # L1_WEIGHT       = new_w['l1']
+    # STFT_WEIGHT     = new_w['stft']
+    # MEL_WEIGHT      = new_w['mel']
+    # RMS_ENV_WEIGHT  = new_w['env']
+    # HF_WEIGHT       = new_w['hf']
     
-    print(f"→ normalized loss weights:"
-          f"  L1={L1_WEIGHT:.6f}"
-          f"  STFT={STFT_WEIGHT:.6f}"
-          f"  MEL={MEL_WEIGHT:.6f}"
-          f"  ENV={RMS_ENV_WEIGHT:.6f}"
-          f"  HF={HF_WEIGHT:.6f}")
+    # print(f"→ normalized loss weights:"
+    #       f"  L1={L1_WEIGHT:.6f}"
+    #       f"  STFT={STFT_WEIGHT:.6f}"
+    #       f"  MEL={MEL_WEIGHT:.6f}"
+    #       f"  ENV={RMS_ENV_WEIGHT:.6f}"
+    #       f"  HF={HF_WEIGHT:.6f}")
 
     static_model.compile(
         optimizer   = tf.keras.optimizers.Adam(LR),
-        loss        = [combined_loss, waveform_l1_loss],
+        loss        = [combined_loss, combined_loss],
         loss_weights= [1.0, 1.0],
         metrics     = [
                 [
-                    "mae",
-                    log_mel_loss,
-                    mean_hf_metric,
-                    multi_scale_stft_loss,
-                    rms_env_loss
+                    "mae"
                 ],
                 [
                     "mae"
@@ -1779,12 +1799,17 @@ def train_shared(
         y_tone = y * (1.0 - m)
         y_pick = y * m
 
-        # 3) masks for sample‐weighting each head
-        sw_tone = 1.0 - m
+        # 3) these become the sample weights for each head
+        sw_tone = 1.0 - m       # (B, T, 1)
         sw_pick = m
 
-        # return [tone_target, pick_target] and [tone_mask, pick_mask]
-        return x, (y_tone, y_pick)
+        # 4) optionally squeeze off the last dim so weights are shape (B, T)
+        #    Keras will broadcast them back to (B, T, 1) to match y if needed
+        sw_tone = tf.squeeze(sw_tone, axis=-1)  # now (B, T)
+        sw_pick = tf.squeeze(sw_pick, axis=-1)
+
+        # 5) return x, (tone_target, pick_target), (tone_weights, pick_weights)
+        return x, (y_tone, y_pick), (sw_tone, sw_pick)
 
     # map your train/val datasets:
     train_multi = train_ds.map(split_targets)
