@@ -115,11 +115,11 @@ STFT_WEIGHT               = 1.0   # weight of the spectral loss
 MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
 RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
 
-PICK_ATTACK_CHUNK_RATIO = 0.4 # How many pick attack segments the model will see
+PICK_ATTACK_CHUNK_RATIO = 0.5 # How many pick attack segments the model will see
 PICK_UNIFORM_CHUNK_RATIO = 0.1 # How many general pick segments the model will see
 
-FINGER_ATTACK_CHUNK_RATIO = 0.15 # How many finger attack segments the model will see
-FINGER_UNIFORM_CHUNK_RATIO = 0.35 # How many general finger segments the model will see
+FINGER_ATTACK_CHUNK_RATIO = 0.2 # How many finger attack segments the model will see
+FINGER_UNIFORM_CHUNK_RATIO = 0.2 # How many general finger segments the model will see
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6    # absolute floor on |Δ| spikes
@@ -1424,25 +1424,24 @@ def build_teacher_model(dynamic_time=False):
     # 1) tone head (everything except pick clicks)
     tone_out = Conv1D(1,1, padding="same", name="tch_tone_out")(x)
 
-    # 2) pick head (the pluck‐transient only)
-    piezo_raw = inp
-    attack_trig = ClickTrigger(name="tch_click_trig")(
-                    ClickDelta(name="tch_click_delta")(piezo_raw)
-                )
-    
-    # now learn, say, 8 different 31-tap impulse responses
-    click_bank = Conv1D(8,
-                        kernel_size=CLICK_KERNEL_SIZE,
-                        padding="same",
-                        name="tch_click_bank")(attack_trig)
-    click_bank = Activation("linear")(click_bank)       # optional non-linearity
-    # collapse them back to 1 channel with a zero-latency 1×1
-    click_ir   = Conv1D(1,
-                        kernel_size=1,
-                        padding="same",
-                        name="tch_click_ir")(click_bank)
-    
-    pick_out   = ClickScale(init=1.0, name="tch_pick_out")(click_ir)
+    # === PICK HEAD ===
+    piezo_raw   = inp
+    delta       = ClickDelta( name="tch_click_delta" )( piezo_raw )
+    click_trig  = ClickTrigger( name="tch_click_trig" )( delta )
+    click_bank  = Conv1D(8,
+                         kernel_size=CLICK_KERNEL_SIZE,
+                         padding="same",
+                         name="tch_click_bank")(click_trig)
+    click_ir    = Conv1D(1,
+                         kernel_size=1,
+                         padding="same",
+                         name="tch_click_ir"  )(click_bank)
+    click_scaled= ClickScale(init=1.0,
+                             name="tch_click_scale")(click_ir)
+    pick_out    = Multiply(name="tch_pick_out")([
+                      click_scaled,
+                      click_trig
+                  ])
 
     return tf.keras.models.Model(
         inputs  = inp,
@@ -1546,23 +1545,24 @@ def build_student_model(
     # fuse IR into the tone head
     tone_out = Add(name="stu_tone_with_ir")([tone_out, ir])
 
-    # 7) pick head (click-transient)
-    raw = inp
-    trig = ClickTrigger(name="stu_click_trig")(
-             ClickDelta(name="stu_click_delta")(raw)
-           )
-    # now learn, say, 8 different 31-tap impulse responses
-    click_bank = Conv1D(8,
-                        kernel_size=CLICK_KERNEL_SIZE,
-                        padding="same",
-                        name="stu_click_bank")(trig)
-    click_bank = Activation("linear")(click_bank)       # optional non-linearity
-    # collapse them back to 1 channel with a zero-latency 1×1
-    click_ir   = Conv1D(1,
-                        kernel_size=1,
-                        padding="same",
-                        name="stu_click_ir")(click_bank)
-    pick_out = ClickScale(init=1.0, name="stu_pick_out")(click_ir)
+    # === PICK HEAD ===
+    raw         = inp
+    delta       = ClickDelta( name="stu_click_delta" )( raw )
+    click_trig  = ClickTrigger( name="stu_click_trig" )( delta )
+    click_bank  = Conv1D(8,
+                         kernel_size=CLICK_KERNEL_SIZE,
+                         padding="same",
+                         name="stu_click_bank")(click_trig)
+    click_ir    = Conv1D(1,
+                         kernel_size=1,
+                         padding="same",
+                         name="stu_click_ir"  )(click_bank)
+    click_scaled= ClickScale(init=1.0,
+                             name="stu_click_scale")(click_ir)
+    pick_out    = Multiply(name="stu_pick_out")([
+                      click_scaled,
+                      click_trig
+                  ])
 
     # 8) distillation losses (unchanged)
     if teacher is not None:
@@ -1745,8 +1745,9 @@ def train_shared(
 
     static_model.compile(
         optimizer   = tf.keras.optimizers.Adam(LR),
-        loss        = [combined_loss, combined_loss],
+        loss        = [combined_loss, waveform_l1_loss],
         loss_weights= [1.0, 1.0],
+        sample_weight_mode  = ['temporal','temporal'],
         metrics     = [
                 [
                     "mae"
@@ -1793,33 +1794,19 @@ def train_shared(
 
     # ── split each batch into tone/pick targets and sample‐weights ───────────
     def split_targets(x, y):
-        # x: (B,T,1) piezo,   y: (B,T,1) mic
-        # 1) detect your hard click-impulses exactly as before
-        delta    = tf.abs(x[:,1:,:] - x[:,:-1,:])
-        delta    = tf.pad(delta, [[0,0],[1,0],[0,0]])
-        triggers = tf.cast(delta > CLICK_THRESH, tf.float32)  # shape=(B,T,1)
+        # x=(B,T,1), y=(B,T,1)
+        d        = tf.abs(x[:,1:,:] - x[:,:-1,:])
+        d        = tf.pad(d, [[0,0],[1,0],[0,0]])
+        triggers = tf.cast(d > CLICK_THRESH, tf.float32)  # (B,T,1)
 
-        # 2) build a little causal decay envelope
-        #    conv1d with your L-tap exponential (same as IRDecayTriggered does)
-        pick_env = tf.nn.conv1d(
-        triggers,
-        filters=_click_decay_tf,      # [L,1,1]
-        stride=1,
-        padding='SAME'
-        )
-        pick_env = tf.clip_by_value(pick_env, 0.0, 1.0)  # now 1.0 at attack, decays to 0
+        # Tone head sees everything
+        y_tone  = y                                 # (B,T,1)
+        sw_tone = tf.ones_like(triggers[...,0])     # (B,T)
 
-        # 3) carve out tone vs pick signals
-        tone_env = 1.0 - pick_env               # the complement
-        y_tone   = y * tone_env                 # y_tone=(B,T,1)
-        y_pick   = y * pick_env                 # y_pick=(B,T,1)
+        # Pick head only cares on the exact trigger
+        y_pick  = y                                 # (B,T,1)
+        sw_pick = tf.squeeze(triggers, axis=-1)     # (B,T)
 
-        # 4) sample-weight masks for each head (Keras wants shape (B,T))
-        sw_tone  = tf.squeeze(tone_env, axis=-1)  # (B,T)
-        sw_pick  = tf.squeeze(pick_env,  axis=-1) # (B,T)
-
-        # 5) return exactly the same tuple signature that your fit(...) expects:
-        #    features, (tone_target, pick_target), (tone_sw, pick_sw)
         return x, (y_tone, y_pick), (sw_tone, sw_pick)
 
     # map your train/val datasets:
