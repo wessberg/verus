@@ -1711,37 +1711,37 @@ def train_shared(
         initial_epoch = 0
     
     # Measure raw scales of each loss term on one batch of val_ds
-    # baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
+    baseline = calibrate_loss_weights(static_model, val_ds, n_batches=5)
     
-    # ref_scale = float(baseline['l1'])
-    # user_w    = {
-    #     'l1':  L1_WEIGHT,
-    #     'stft': STFT_WEIGHT,
-    #     'mel':  MEL_WEIGHT,
-    #     'env':  RMS_ENV_WEIGHT,
-    #     'hf':   HF_WEIGHT
-    # }
+    ref_scale = float(baseline['l1'])
+    user_w    = {
+        'l1':  L1_WEIGHT,
+        'stft': STFT_WEIGHT,
+        'mel':  MEL_WEIGHT,
+        'env':  RMS_ENV_WEIGHT,
+        'hf':   HF_WEIGHT
+    }
 
-    # new_w = {}
-    # for key, uw in user_w.items():
-    #     bs = float(baseline[key])
-    #     if bs > 0.0:
-    #         new_w[key] = uw / bs * ref_scale
-    #     else:
-    #         new_w[key] = 0.0
+    new_w = {}
+    for key, uw in user_w.items():
+        bs = float(baseline[key])
+        if bs > 0.0:
+            new_w[key] = uw / bs * ref_scale
+        else:
+            new_w[key] = 0.0
 
-    # L1_WEIGHT       = new_w['l1']
-    # STFT_WEIGHT     = new_w['stft']
-    # MEL_WEIGHT      = new_w['mel']
-    # RMS_ENV_WEIGHT  = new_w['env']
-    # HF_WEIGHT       = new_w['hf']
+    L1_WEIGHT       = new_w['l1']
+    STFT_WEIGHT     = new_w['stft']
+    MEL_WEIGHT      = new_w['mel']
+    RMS_ENV_WEIGHT  = new_w['env']
+    HF_WEIGHT       = new_w['hf']
     
-    # print(f"→ normalized loss weights:"
-    #       f"  L1={L1_WEIGHT:.6f}"
-    #       f"  STFT={STFT_WEIGHT:.6f}"
-    #       f"  MEL={MEL_WEIGHT:.6f}"
-    #       f"  ENV={RMS_ENV_WEIGHT:.6f}"
-    #       f"  HF={HF_WEIGHT:.6f}")
+    print(f"→ normalized loss weights:"
+          f"  L1={L1_WEIGHT:.6f}"
+          f"  STFT={STFT_WEIGHT:.6f}"
+          f"  MEL={MEL_WEIGHT:.6f}"
+          f"  ENV={RMS_ENV_WEIGHT:.6f}"
+          f"  HF={HF_WEIGHT:.6f}")
 
     static_model.compile(
         optimizer   = tf.keras.optimizers.Adam(LR),
@@ -1794,30 +1794,32 @@ def train_shared(
     # ── split each batch into tone/pick targets and sample‐weights ───────────
     def split_targets(x, y):
         # x: (B,T,1) piezo,   y: (B,T,1) mic
-        # 1) detect raw click‐triggers just like you had
-        delta = tf.abs(x[:,1:,:] - x[:,:-1,:])
-        delta = tf.pad(delta, [[0,0],[1,0],[0,0]])
-        triggers = tf.cast(delta > CLICK_THRESH, tf.float32)  # (B,T,1)
+        # 1) detect your hard click-impulses exactly as before
+        delta    = tf.abs(x[:,1:,:] - x[:,:-1,:])
+        delta    = tf.pad(delta, [[0,0],[1,0],[0,0]])
+        triggers = tf.cast(delta > CLICK_THRESH, tf.float32)  # shape=(B,T,1)
 
-        # 2) convolve with our small exp-decay kernel → a soft “pick” envelope
-        pick_env = tf.nn.conv1d(triggers,
-                                filters=decay,
-                                stride=1,
-                                padding='SAME')
-        pick_env = tf.clip_by_value(pick_env, 0.0, 1.0)        # still (B,T,1)
+        # 2) build a little causal decay envelope
+        #    conv1d with your L-tap exponential (same as IRDecayTriggered does)
+        pick_env = tf.nn.conv1d(
+        triggers,
+        filters=_click_decay_tf,      # [L,1,1]
+        stride=1,
+        padding='SAME'
+        )
+        pick_env = tf.clip_by_value(pick_env, 0.0, 1.0)  # now 1.0 at attack, decays to 0
 
-        # 3) carve teacher-targets for tone vs pick
-        tone_env = 1.0 - pick_env                          # (B,T,1)
-        y_tone = y * tone_env
-        y_pick = y * pick_env
+        # 3) carve out tone vs pick signals
+        tone_env = 1.0 - pick_env               # the complement
+        y_tone   = y * tone_env                 # y_tone=(B,T,1)
+        y_pick   = y * pick_env                 # y_pick=(B,T,1)
 
-        # 4) sample-weights for each head
-        #    Keras wants shape (B,T), so we squeeze:
-        sw_tone = tf.squeeze(tone_env, axis=-1)   # (B,T)
-        sw_pick = tf.squeeze(pick_env,  axis=-1)  # (B,T)
+        # 4) sample-weight masks for each head (Keras wants shape (B,T))
+        sw_tone  = tf.squeeze(tone_env, axis=-1)  # (B,T)
+        sw_pick  = tf.squeeze(pick_env,  axis=-1) # (B,T)
 
-        # 5) return exactly the same signature as before:
-        #    x_in, (y_tone,y_pick), (sw_tone,sw_pick)
+        # 5) return exactly the same tuple signature that your fit(...) expects:
+        #    features, (tone_target, pick_target), (tone_sw, pick_sw)
         return x, (y_tone, y_pick), (sw_tone, sw_pick)
 
     # map your train/val datasets:
