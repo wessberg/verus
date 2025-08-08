@@ -169,8 +169,6 @@ PICK_TGT_DIR   = "./input/pick/target"
 FINGER_SRC_DIR = "./input/finger/source"
 FINGER_TGT_DIR = "./input/finger/target"
 
-PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_PICK_SRC_DIR   = "./input/style-classification/pick"
-PIEZO_ONLY_STYLE_CLASSIFICATION_EXTENSION_FINGER_SRC_DIR   = "./input/style-classification/finger"
 FINETUNE_SRC_DIR   = "./input/finetune"
 
 OUT_DIR        = "./out"
@@ -1927,7 +1925,8 @@ def _detect_and_print_flips(
 
 
 def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
-    for model, seg_len, sample_rate in [(teacher_dyn, TEACHER_SEG_LEN, TEACHER_SAMPLE_RATE), (student_dyn, STUDENT_SEG_LEN, STUDENT_SAMPLE_RATE)]:
+    for model, seg_len, sample_rate, name in [(teacher_dyn, TEACHER_SEG_LEN, TEACHER_SAMPLE_RATE, "TEACHER"), (student_dyn, STUDENT_SEG_LEN, STUDENT_SAMPLE_RATE, "STUDENT")]:
+        if (model is None): continue
         FRAMES      = LONG_DEMO_SEC * sample_rate
         START_FRAME = LONG_DEMO_OFFSET_SEC * sample_rate
         pth_src, _ = all_pairs[LONG_DEMO_PAIR_INDEX]
@@ -1952,7 +1951,7 @@ def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
 
         _detect_and_print_flips(
             model   = model,
-            name    = "TEACHER",
+            name    = name,
             audio_piezo = x_demo,
             sr      = sample_rate,
             seg_len = seg_len,
@@ -2112,8 +2111,8 @@ def main ():
     
     elif len(sys.argv)>1 and sys.argv[1]=="--profile-base-model-style-flag-flips":
         
-        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, "retrained_" + TEACHER_DYNAMIC_MODEL_FILENAME)
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, "retrained_" + STUDENT_DYNAMIC_MODEL_FILENAME)
+        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
+        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
 
         if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
             print("Fine-tuned teacher/student dynamic models not found, run --train-teacher and --train-student first")
