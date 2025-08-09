@@ -146,7 +146,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 2
+EPOCHS      = 1000
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
