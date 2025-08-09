@@ -1,21 +1,16 @@
-#!/usr/bin/env python3
 """
 Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
 to the equivalent mic’d signal.
 
 Updated to:
-- Align mic target to piezo using GCC-PHAT (high-frequency emphasized) so transients
-  don't require the network to "predict the future."
-- Add a small onset-gated HF branch in both teacher and student to specialize
-  in pick sparkle without harming sustain.
-- Stabilize FiLM (gamma≈1, beta≈0) to avoid early gating collapse.
-- Use onset-gated, band-weighted MR-STFT and a small complex STFT and second-derivative
-  losses; only the HF-related terms are emphasized during onsets.
-- Provide per-output sample weights dict so style head is not impacted by audio sample weights.
-
-It is still designed to be ultra-low latency for real-time inference for live-use.
+- Automatic mic→piezo alignment using GCC-PHAT and fractional (sub-sample) shift
+- Look-ahead (bounded, acausal) teacher to better model pick onsets
+- Onset-gated HF branch in both teacher and student
+- Stabilized FiLM (gamma≈1, beta≈0)
+- Pre-dilation micro-kernel blocks for local HF structure
+- Onset/HF-focused spectral and time-domain loss shaping
+- Per-output sample weights provided as a 2-item list [audio_sw, style_sw]
 """
-
 
 import os, glob, random, shutil, sys, re, math
 import numpy as np
@@ -27,27 +22,23 @@ from tensorflow.keras.utils import register_keras_serializable
 from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
 from tensorflow.keras import regularizers, constraints
 from tensorflow.keras.losses import Loss
-
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
     Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
 )
 
-# Turn off GPU acceleration for inference, as it is more reliable.
-# We need to do this before doing any TensorFlow stuff at root level
+# Turn off GPU acceleration for inference in demo mode (more reliable on many systems)
 if len(sys.argv)>1 and sys.argv[1]=="--demo":
     tf.config.set_visible_devices([], 'GPU')
 
-# Try to enforce locked seeds so we can more reliably change config options and trust that the change in results was an effect of the change.
+# Determinism
 SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
-os.environ['TF_DETERMINISTIC_OPS']  = '1'      # try to force TF→deterministic kernels
-os.environ['TF_CUDNN_DETERMINISTIC'] = '1'     # on some TF versions also needed
-
+os.environ['TF_DETERMINISTIC_OPS']  = '1'
+os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
-
 
 # Audio sample‐rates
 TEACHER_SAMPLE_RATE = 96000
@@ -58,10 +49,11 @@ INPUT_AVG_RMS_DBFS_TARGET = -23.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # Alignment (piezo→mic) settings
-ALIGN_ENABLE          = True
-ALIGN_MAX_MS          = 5.0   # search range ± this many ms
-ALIGN_PREEMPH_ALPHA   = 0.98  # emphasize HF before GCC-PHAT
-ALIGN_WIN_SEC         = 1.0   # use up to this many seconds for alignment estimation
+ALIGN_ENABLE            = False
+ALIGN_MAX_MS            = 5.0     # search range ± this many ms
+ALIGN_PREEMPH_ALPHA     = 0.98    # emphasize HF before GCC-PHAT
+ALIGN_WIN_SEC           = 1.0     # seconds used for alignment estimation
+ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 
 # Debugging params
 DEBUG               = False
@@ -77,9 +69,11 @@ FINGER_CHUNK_RATIO = 0.5
 TEACHER_FILTERS                = 128
 TEACHER_KERNEL_SIZE            = 51
 TEACHER_DILATIONS              = (1,2,4,8,16,32,64,128)
-# Small pre-blocks to capture very local HF detail before dilation ladder
 TEACHER_PRE_BLOCKS             = 2
 TEACHER_PRE_KERNEL             = 7
+# Bounded look-ahead per layer (in ms):
+TEACHER_LOOKAHEAD_MS           = 1.0
+TEACHER_LOOKAHEAD_SAMPLES      = int(round(TEACHER_SAMPLE_RATE * TEACHER_LOOKAHEAD_MS / 1000.0))
 TEACHER_RECEPTIVE_FIELD        = 1 + (TEACHER_KERNEL_SIZE - 1) * sum(TEACHER_DILATIONS)
 TEACHER_TRAIN_BLOCK_SIZE       = 4096
 TEACHER_SEG_LEN                = TEACHER_RECEPTIVE_FIELD + TEACHER_TRAIN_BLOCK_SIZE
@@ -88,23 +82,18 @@ TEACHER_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_teacher.keras"
 TEACHER_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_teacher_dynamic.keras"
 
 # Student params
-STUDENT_FILTERS          = 48       # number of channels in the student
-STUDENT_KERNEL_SIZE      = 25       # (25−1)*(1+2+4+8)=24*15=360 +1 ≃361 samples ≃7.5 ms RF
+STUDENT_FILTERS          = 48
+STUDENT_KERNEL_SIZE      = 25
 STUDENT_DILATIONS        = (1,2,4,8)
-# Small pre-blocks
 STUDENT_PRE_BLOCKS       = 1
 STUDENT_PRE_KERNEL       = 5
 STUDENT_RECEPTIVE_FIELD  = 1 + (STUDENT_KERNEL_SIZE - 1) * sum(STUDENT_DILATIONS)
 STUDENT_TRAIN_BLOCK_SIZE = 4096
 STUDENT_SEG_LEN          = STUDENT_RECEPTIVE_FIELD + STUDENT_TRAIN_BLOCK_SIZE
-STUDENT_EMBED_DIM        = 16       # style‐embedding dim for the student
-STUDENT_DISTILL_ALPHA    = 5.0      # weight on the distillation loss
-
-# which teacher‐layers to use for intermediate‐feature hints:
+STUDENT_EMBED_DIM        = 16
+STUDENT_DISTILL_ALPHA    = 5.0
 STUDENT_TEACHER_FEAT_LAYERS   = ["res_add_2", "res_add_3"]
-# how strongly to weight each of those feature‐distill losses
 STUDENT_FEAT_DISTILL_ALPHA    = 1.0
-
 STUDENT_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_student.keras"
 STUDENT_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_student_dynamic.keras"
 
@@ -125,46 +114,45 @@ FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 # Onset/HF loss shaping
-TRANSIENT_UPWEIGHT_RATIO  = 0.0   # we now use surgical onset gating inside loss; keep dataset SW at 1.0
-HP_PRE_EMPHASIS           = 0.8   # legacy mild pre-emphasis
-HP_PRE_EMPHASIS_HF        = 0.98  # stronger emphasis for HF loss
-ONSET_SMOOTH_MS           = 12.0  # envelope smoothing window (ms)
-HF_ONSET_GAIN             = 3.0   # extra weight on hf_loss during onsets
-STFT_HF_ONSET_GAIN        = 2.0   # extra weight on MR-STFT during onsets (applied per-frame)
-STFT_HIGH_SPLIT_HZ        = 3500.0 # split where HF emphasis starts
-STFT_HIGH_BOOST           = 3.0    # boost factor for HF bins in MR-STFT
+TRANSIENT_UPWEIGHT_RATIO  = 0.0   # we now do onset-weighting inside the loss
+HP_PRE_EMPHASIS           = 0.8
+HP_PRE_EMPHASIS_HF        = 0.98
+ONSET_SMOOTH_MS           = 12.0
+HF_ONSET_GAIN             = 3.0
+STFT_HF_ONSET_GAIN        = 2.0
+STFT_HIGH_SPLIT_HZ        = 3500.0
+STFT_HIGH_BOOST           = 3.0
 
-L1_WEIGHT                 = 1.0   # waveform l1 loss
-HF_WEIGHT                 = 1.0   # scale of the high-pass loss
-STFT_WEIGHT               = 1.0   # weight of the spectral loss
-MEL_WEIGHT                = 1.0   # weight of the log‐mel‐spectrogram L1 loss
-RMS_ENV_WEIGHT            = 1.0   # weight of the RMS‐envelope L1 loss
-COMPLEX_STFT_WEIGHT       = 0.2   # small complex STFT on short window (helps phase on onsets)
-D2_WEIGHT                 = 0.1   # small L1 on second difference on onsets
+L1_WEIGHT                 = 1.0
+HF_WEIGHT                 = 1.0
+STFT_WEIGHT               = 1.0
+MEL_WEIGHT                = 1.0
+RMS_ENV_WEIGHT            = 1.0
+COMPLEX_STFT_WEIGHT       = 0.2
+D2_WEIGHT                 = 0.1
 λ_STYLE_RATIO             = 0.5
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
-ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6    # absolute floor on |Δ| spikes
-ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-5    # absolute floor on HF envelope
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-6    # absolute floor on the piezo signal itself, for the attack segment generator
-SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-5    # absolute floor on the piezo signal itself, for the standard segment generator
+ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6
+ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-5
+ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-6
+SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-5
 #───────────────────────────────────────────────────────────────────────────────
 
 # ─── IR branch FIR FILTER DESIGN ────────────────────────────────────────────
 STUDENT_IR_DOWNSAMPLE_FACTOR = 8
-STUDENT_IR_FIR_SIZE          = 129    # odd for a symmetric window
-STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR  # normalized cutoff (Nyquist=0.5→fc at 0.5/D)
+STUDENT_IR_FIR_SIZE          = 129
+STUDENT_IR_CUTOFF            = 1.0 / STUDENT_IR_DOWNSAMPLE_FACTOR
 STUDENT_IR_KERNEL    = 33
 STUDENT_IR_DILATIONS = (1,2,4,8)
 STUDENT_IR_ALIGN_OFFSET_CORRECTION = -64
 STUDENT_TOTAL_EXPECTED_IR_DELAY = (STUDENT_IR_FIR_SIZE - 1) + ((STUDENT_IR_FIR_SIZE - 1)//2)
 
-# how many *coarse* steps until the FIR is “fully” onto the input?
 coarse_steps = math.ceil((STUDENT_IR_FIR_SIZE - 1) / STUDENT_IR_DOWNSAMPLE_FACTOR)
-IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR   # = 8 * 8 = 64
+IR_PREDELAY = coarse_steps * STUDENT_IR_DOWNSAMPLE_FACTOR
 
 STUDENT_LP_ORDER   = 65
-STUDENT_LP_CUTOFF  = 4000    # Hz
+STUDENT_LP_CUTOFF  = 4000
 
 student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      cutoff=STUDENT_LP_CUTOFF/(STUDENT_SAMPLE_RATE/2),
@@ -172,7 +160,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 1000
+EPOCHS      = 2
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -229,8 +217,7 @@ DEMO_CHECKPOINTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "checkpoints")
 DEMO_CHECKPOINTS_TEACHER_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "teacher")
 DEMO_CHECKPOINTS_STUDENT_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "student")
 
-
-SAVE_WEIGHTS           = False  # set to True to dump .npy weights
+SAVE_WEIGHTS           = False
 
 for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR, CSV_LOGS_TEACHER_OUT_DIR, CSV_LOGS_STUDENT_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
@@ -248,10 +235,13 @@ def pre_emphasis_np(x, α=0.98):
     y[1:] = x[1:] - α * x[:-1]
     return y
 
+def next_pow2(n):
+    return 1<<(int(n-1).bit_length())
+
 def gcc_phat_delay(sig, ref, sr, max_ms=5.0):
     """
     Estimate delay (in samples) where 'ref' lags 'sig' by GCC-PHAT.
-    Positive return means ref occurs later (so ref should be advanced by delay).
+    Positive return means ref occurs later (so ref should be advanced).
     """
     n = len(sig)
     m = len(ref)
@@ -259,11 +249,9 @@ def gcc_phat_delay(sig, ref, sr, max_ms=5.0):
     sig = sig[:L]
     ref = ref[:L]
 
-    # Pre-emphasis to accentuate HF transients
     sig = pre_emphasis_np(sig, ALIGN_PREEMPH_ALPHA)
     ref = pre_emphasis_np(ref, ALIGN_PREEMPH_ALPHA)
 
-    # Zero-pad to next power-of-two for better interpolation
     nfft = int(2 ** np.ceil(np.log2(2*L - 1)))
     SIG = np.fft.rfft(sig, nfft)
     REF = np.fft.rfft(ref, nfft)
@@ -272,7 +260,6 @@ def gcc_phat_delay(sig, ref, sr, max_ms=5.0):
     R /= denom
 
     cc = np.fft.irfft(R, nfft)
-    # Shift so that zero lag is at the center
     cc = np.concatenate((cc[-(nfft//2):], cc[:(nfft//2)]))
     lags = np.arange(-nfft//2, nfft//2)
 
@@ -283,21 +270,18 @@ def gcc_phat_delay(sig, ref, sr, max_ms=5.0):
     k = np.argmax(np.abs(cc_sel))
     delay = lags_sel[k]
 
-    # Optional parabolic interpolation around the peak for sub-sample (limited precision)
     if 1 <= k < len(cc_sel)-1:
         y0, y1, y2 = cc_sel[k-1], cc_sel[k], cc_sel[k+1]
-        denom = (y0 - 2*y1 + y2)
-        if np.abs(denom) > 1e-12:
-            peak_adj = 0.5*(y0 - y2)/denom
+        denom2 = (y0 - 2*y1 + y2)
+        if np.abs(denom2) > 1e-12:
+            peak_adj = 0.5*(y0 - y2)/denom2
             delay = delay + peak_adj
 
     return float(delay)
 
 def shift_signal_int(sig, shift):
     """
-    Shift 1-D signal by integer samples. Positive shift advances the signal
-    (i.e., moves content earlier in time): sig_out[t] = sig[t+shift].
-    We pad zeros at the end (if shift>0) or at the start (if shift<0).
+    Shift 1-D signal by integer samples. Positive shift advances (moves earlier).
     """
     L = sig.shape[0]
     s = int(np.round(shift))
@@ -314,6 +298,22 @@ def shift_signal_int(sig, shift):
         return out
     else:
         return sig
+
+def shift_signal_frac(sig, delay):
+    """
+    Fractional shift using FFT phase ramp.
+    Positive delay advances the signal (earlier) by 'delay' samples.
+    """
+    if abs(delay) < 1e-8:
+        return sig.copy()
+    L = len(sig)
+    N = next_pow2(L + 2048)
+    X = np.fft.rfft(sig, N)
+    k = np.arange(0, len(X), dtype=np.float64)
+    phase = np.exp(+1j * 2.0 * np.pi * k * delay / N)
+    Y = X * phase
+    y = np.fft.irfft(Y, N)
+    return y[:L].astype(sig.dtype)
 
 def resample_to_model_sr(audio, audio_sample_rate: int, model_sample_rate: int):
     g = math.gcd(audio_sample_rate, model_sample_rate)
@@ -339,13 +339,12 @@ for src in sorted(glob.glob(os.path.join(FINGER_SRC_DIR, "*_source.wav"))):
 
 all_pairs = picked_pairs + finger_pairs
 
-# normalize all files to target RMS once and align mic to piezo
+# normalize files and align target to source
 target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
 
 audio_cache = {}
 for src, tgt in all_pairs:
-    # 1) load both
-    data_src, _ = sf.read(src, dtype='float32', always_2d=True)          # (frames, channels)
+    data_src, _ = sf.read(src, dtype='float32', always_2d=True)
     data_tgt, _ = sf.read(tgt, dtype='float32', always_2d=True)
     info_src = sf.info(src)
     info_tgt = sf.info(tgt)
@@ -353,7 +352,6 @@ for src, tgt in all_pairs:
         print(f"Warning: sample-rate mismatch for pair {src} vs {tgt}: {info_src.samplerate} vs {info_tgt.samplerate}")
     file_sr = info_src.samplerate
 
-    # 2) RMS normalize both independently (mono at ch0)
     mono_src = data_src[:,0]
     mono_tgt = data_tgt[:,0]
     rms_src = np.sqrt(np.mean(mono_src**2) + 1e-12)
@@ -363,40 +361,30 @@ for src, tgt in all_pairs:
     data_src = data_src * gain_src
     data_tgt = data_tgt * gain_tgt
 
-    # 3) Optional alignment: advance mic target so that pick transients sync with piezo
     if ALIGN_ENABLE:
-        # Use up to ALIGN_WIN_SEC seconds to estimate a robust delay.
         L = data_src.shape[0]
         M = min(L, int(ALIGN_WIN_SEC * file_sr))
         if M > 2048:
-            sig = data_src[:M,0]
-            ref = data_tgt[:M,0]
-            delay_samples = gcc_phat_delay(sig, ref, file_sr, max_ms=ALIGN_MAX_MS)
-            # A positive delay means mic (ref) lags and should be advanced by that many samples
+            delay_samples = gcc_phat_delay(data_src[:M,0], data_tgt[:M,0], file_sr, max_ms=ALIGN_MAX_MS)
             data_tgt_shifted = data_tgt.copy()
-            data_tgt_shifted[:,0] = shift_signal_int(data_tgt[:,0], delay_samples)
-            # If stereo target, shift both channels equally
-            if data_tgt.shape[1] > 1:
-                for c in range(1, data_tgt.shape[1]):
+            if ALIGN_USE_FRACTIONAL:
+                for c in range(data_tgt.shape[1]):
+                    data_tgt_shifted[:,c] = shift_signal_frac(data_tgt[:,c], delay_samples)
+            else:
+                for c in range(data_tgt.shape[1]):
                     data_tgt_shifted[:,c] = shift_signal_int(data_tgt[:,c], delay_samples)
             data_tgt = data_tgt_shifted
             if not DEBUG:
-                print(f"[ALIGN] {os.path.basename(src)}: shift target by {delay_samples:.2f} samples ({delay_samples/file_sr*1000:.3f} ms)")
+                print(f"[ALIGN] {os.path.basename(src)}: shift target by {delay_samples:.3f} samples ({delay_samples/file_sr*1000:.3f} ms)")
         else:
             print(f"[ALIGN] {os.path.basename(src)}: too short for alignment (L={L}), skipping.")
 
-    # 4) cache normalized (and aligned) audio
     audio_cache[src] = data_src
     audio_cache[tgt] = data_tgt
 
 def build_chunks(pairs_list, seg_len, sample_rate):
-    """
-    Turn a list of (src,tgt) into
-    [(src,tgt,chunk_start,chunk_len), …].
-    """
     chunks = []
     chunk_len = CHUNK_SEC * sample_rate
-
     for src,tgt in pairs_list:
         info  = sf.info(src)
         total = info.frames
@@ -409,32 +397,22 @@ def build_chunks(pairs_list, seg_len, sample_rate):
     return chunks
 
 def validate_ir_delay(dynamic_student_model):
-    """
-    Measure the group-delay of the two FIRs in your IR branch
-    (downsampler + post-LP) and check it against the offset
-    in StuIrAlign.
-    """
     fir_down = dynamic_student_model.get_layer("stu_ir_downsample")
     fir_post = dynamic_student_model.get_layer("stu_ir_post_lp")
     align   = dynamic_student_model.get_layer("stu_ir_align")
     expected = int(align.offset)
-
     factor = STUDENT_IR_DOWNSAMPLE_FACTOR
     N = expected + factor
     N = int(math.ceil(N / factor) * factor)
-    
     x = np.zeros((1, N, 1), dtype=np.float32)
     x[0, 0, 0] = 1.0
-
     y_down = fir_down(x)
     y_up   = UpSampling1D(size=factor)(y_down)
     y_fir  = fir_post(y_up)
     ir     = y_fir.numpy()[0, :, 0]
-
     thresh = 1e-6
     nz     = np.where(np.abs(ir) > thresh)[0]
     measured = int(nz[0]) if len(nz) else None
-
     print(f"FIR-only → expected delay {expected}, measured {measured}")
     if measured != expected:
         print("⚠️  MISMATCH!  adjust StuIrAlign.offset to", measured)
@@ -456,7 +434,6 @@ class DemoCallback(Callback):
         self.demos_out_dir = demo_checkpoints_out_dir
         os.makedirs(self.demos_out_dir, exist_ok=True)
         self.writer = tf.summary.create_file_writer(os.path.join(logs_out_dir,"demo"))
-
         self.demo_frames  = DEMO_SEC * sample_rate
         self.offset_frames = DEMO_OFFSET_SEC * sample_rate
 
@@ -470,10 +447,7 @@ class DemoCallback(Callback):
     def on_epoch_end(self, epoch, logs=None):
         if epoch % self.every != 0:
             return
-        
-        friendly_epoch = epoch + 1
         self.dynamic_model.set_weights(self.static_model.get_weights())
-
         x_long, x_src_sample_rate = sf.read(self.src_path,
                             start=self.offset_frames,
                             frames=self.demo_frames,
@@ -484,56 +458,30 @@ class DemoCallback(Callback):
                             frames=self.demo_frames,
                             dtype='float32',
                             always_2d=True)
-
         x_src = x_long[:,0]
         y_src = y_long[:,0]
-
         if x_src_sample_rate != self.sample_rate:
             x_mod = resample_to_model_sr(x_src, x_src_sample_rate, self.sample_rate)
             y_mod = resample_to_model_sr(y_src, x_src_sample_rate, self.sample_rate)
         else:
             x_mod = x_src
             y_mod = y_src
-
         x_demo = x_mod[None, :, None]
         y_out, style_out = self.dynamic_model.predict(x_demo, batch_size=1, verbose=0)
         y_pred = y_out[0,:,0]
         style_p = float(style_out[0,0])
         style_nm= 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
-
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{epoch+1:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
-        sf.write(os.path.join(epoch_dir,"demo_source.wav"),
-                 x_mod, self.sample_rate, subtype='FLOAT')
-        sf.write(os.path.join(epoch_dir,"demo_target.wav"),
-                 y_mod, self.sample_rate, subtype='FLOAT')
-        sf.write(os.path.join(epoch_dir,"demo_pred.wav"),
-                 y_pred, self.sample_rate, subtype='FLOAT')
-
+        sf.write(os.path.join(epoch_dir,"demo_source.wav"), x_mod, self.sample_rate, subtype='FLOAT')
+        sf.write(os.path.join(epoch_dir,"demo_target.wav"), y_mod, self.sample_rate, subtype='FLOAT')
+        sf.write(os.path.join(epoch_dir,"demo_pred.wav"),   y_pred, self.sample_rate, subtype='FLOAT')
         with self.writer.as_default():
-            tf.summary.audio("demo/source", x_demo,
-                             sample_rate=self.sample_rate,
-                             step=epoch+1)
-            tf.summary.audio("demo/target",
-                             y_mod[None,:,None],
-                             sample_rate=self.sample_rate,
-                             step=epoch+1)
-            tf.summary.audio("demo/pred",
-                             y_pred[None,:,None],
-                             sample_rate=self.sample_rate,
-                             step=epoch+1)
+            tf.summary.audio("demo/source", x_demo, sample_rate=self.sample_rate, step=epoch+1)
+            tf.summary.audio("demo/target", y_mod[None,:,None], sample_rate=self.sample_rate, step=epoch+1)
+            tf.summary.audio("demo/pred",   y_pred[None,:,None], sample_rate=self.sample_rate, step=epoch+1)
             self.writer.flush()
-
         print(f"[DemoCallback] epoch {epoch+1}: style={style_nm}, written to {epoch_dir}")
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "sample_rate": self.sample_rate,
-            "demos_out_dir": self.demos_out_dir,
-            "logs_out_dir":  self.logs_out_dir
-        })
-        return config
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
@@ -542,10 +490,8 @@ class CombinedLoss(Loss):
     def __init__(self, sample_rate, name="combined_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate = sample_rate
-
     def call(self, y_true, y_pred):
         return combined_loss(y_true, y_pred, self.sample_rate)
-
     def get_config(self):
         config = super().get_config()
         config.update({"sample_rate": self.sample_rate})
@@ -556,10 +502,8 @@ class LogMelLoss(Loss):
     def __init__(self, sample_rate, name="log_mel_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate = sample_rate
-
     def call(self, y_true, y_pred):
         return log_mel_loss(y_true, y_pred, self.sample_rate)
-
     def get_config(self):
         config = super().get_config()
         config.update({"sample_rate": self.sample_rate})
@@ -580,37 +524,26 @@ def hf_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=ONSET_SMOOTH_MS):
-    """
-    Compute a [0,1] onset envelope per-sample.
-    """
-    # pre-emphasis
     pe = y[:,1:,:] - pre_emph_alpha*y[:,:-1,:]
     pe = tf.pad(pe, [[0,0],[1,0],[0,0]])
     env = tf.abs(pe)
-    # smooth with moving average
     win = tf.cast(tf.maximum(1, tf.cast(smooth_ms * sample_rate / 1000.0, tf.int32)), tf.int32)
-    win = tf.maximum(win, 1)
-    # avg pool emulation via conv with ones
     ker = tf.ones((win,1,1), dtype=tf.float32) / tf.cast(win, tf.float32)
     env_sm = tf.nn.conv1d(env, ker, stride=1, padding='SAME')
-    # normalize per sample by max over time
     m = tf.reduce_max(env_sm, axis=1, keepdims=True) + 1e-6
     env_n = tf.clip_by_value(env_sm / m, 0.0, 1.0)
-    return env_n  # (B,T,1)
+    return env_n
 
 def _build_freq_weight(n_fft, sample_rate, split_hz, high_boost):
     freqs = np.linspace(0, sample_rate/2.0, n_fft//2 + 1, dtype=np.float32)
     w = np.ones_like(freqs, dtype=np.float32)
     w[freqs >= split_hz] = high_boost
-    return tf.constant(w[None, None, :], dtype=tf.float32)  # (1,1,F)
+    return tf.constant(w[None, None, :], dtype=tf.float32)
 
 @register_keras_serializable()
 def multi_scale_stft_loss(y_true, y_pred):
-    """
-    Unweighted MR-STFT magnitude L1, kept for metrics and calibration.
-    Returns (batch,1,1)
-    """
     scales = [
+        (128,   32,  128),
         (256,   64,  256),
         (512,  128,  512),
         (1024, 256, 1024),
@@ -643,13 +576,8 @@ def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
                                    high_boost=STFT_HIGH_BOOST,
                                    onset_env=None,
                                    onset_gain=STFT_HF_ONSET_GAIN):
-    """
-    MR-STFT magnitude L1 with:
-      - frequency weighting (boost high band)
-      - per-frame onset weighting if onset_env provided
-    Returns (batch,1,1)
-    """
     scales = [
+        (128,   32,  128),
         (256,   64,  256),
         (512,  128,  512),
         (1024, 256, 1024),
@@ -671,20 +599,14 @@ def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
         mag_t = tf.abs(st_t)
         mag_p = tf.abs(st_p)
         diff = tf.abs(mag_t - mag_p)  # (B, frames, F)
-
-        # Frequency weighting
-        wf = _build_freq_weight(n_fft, sample_rate, split_hz, high_boost)  # (1,1,F)
-        diff = diff * wf  # broadcast over freq
-
+        wf = _build_freq_weight(n_fft, sample_rate, split_hz, high_boost)
+        diff = diff * wf
         if onset_env is not None:
-            # frame the onset_env with same hop/win to get per-frame weights
-            env_f = tf.signal.frame(tf.squeeze(onset_env, axis=-1), frame_length=win, frame_step=hop, pad_end=True)  # (B, frames, win)
-            env_w = tf.reduce_mean(env_f, axis=-1, keepdims=True)  # (B, frames, 1)
-            # Weight frames: 1 + onset_gain * env_w
+            env_f = tf.signal.frame(tf.squeeze(onset_env, axis=-1), frame_length=win, frame_step=hop, pad_end=True)
+            env_w = tf.reduce_mean(env_f, axis=-1, keepdims=True)
             fw = 1.0 + onset_gain * env_w
-            diff = diff * fw  # broadcast over frames
-
-        loss_sf = tf.reduce_mean(diff, axis=[1,2])  # (B,)
+            diff = diff * fw
+        loss_sf = tf.reduce_mean(diff, axis=[1,2])
         per_scale_losses.append(loss_sf)
     loss_stack = tf.stack(per_scale_losses, axis=0)
     loss_batch = tf.reduce_mean(loss_stack, axis=0)
@@ -692,10 +614,6 @@ def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
 
 @register_keras_serializable()
 def complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=None, onset_gain=STFT_HF_ONSET_GAIN):
-    """
-    Small weight complex STFT L1 to stabilize phase on onsets.
-    Returns (batch,1,1)
-    """
     t = tf.squeeze(y_true, axis=-1)
     p = tf.squeeze(y_pred, axis=-1)
     frames_t = tf.signal.frame(t, frame_length=win, frame_step=hop, pad_end=True)
@@ -706,24 +624,17 @@ def complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=
     win_p = frames_p * window
     st_t = tf.signal.rfft(win_t, fft_length=[n_fft])
     st_p = tf.signal.rfft(win_p, fft_length=[n_fft])
-
     diff = tf.abs(tf.math.real(st_t - st_p)) + tf.abs(tf.math.imag(st_t - st_p))
-
     if onset_env is not None:
         env_f = tf.signal.frame(tf.squeeze(onset_env, axis=-1), frame_length=win, frame_step=hop, pad_end=True)
         env_w = tf.reduce_mean(env_f, axis=-1, keepdims=True)
         fw = 1.0 + onset_gain * env_w
         diff = diff * fw
-
     loss = tf.reduce_mean(diff, axis=[1,2])
     return loss[:, None, None]
 
 @register_keras_serializable()
 def second_diff_l1_onset(y_true, y_pred, onset_env=None):
-    """
-    Second-difference L1 focused on onsets to sharpen leading edges.
-    Returns (batch,T,1)
-    """
     def d2(x):
         return x[:,2:,:] - 2.0*x[:,1:-1,:] + x[:,:-2,:]
     t2 = d2(y_true)
@@ -744,10 +655,8 @@ def log_mel_loss(y_true, y_pred, sample_rate):
     fmax    = float(sample_rate//2)
     t   = tf.squeeze(y_true, axis=-1)
     p   = tf.squeeze(y_pred, axis=-1)
-    st_t = tf.signal.stft(t,   frame_length=win, frame_step=hop,
-                        fft_length=n_fft, pad_end=True)
-    st_p = tf.signal.stft(p,   frame_length=win, frame_step=hop,
-                        fft_length=n_fft, pad_end=True)
+    st_t = tf.signal.stft(t,   frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
+    st_p = tf.signal.stft(p,   frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
     mag_t = tf.abs(st_t)
     mag_p = tf.abs(st_p)
     fb = tf.signal.linear_to_mel_weight_matrix(
@@ -757,8 +666,8 @@ def log_mel_loss(y_true, y_pred, sample_rate):
         lower_edge_hertz=fmin,
         upper_edge_hertz=fmax
     )
-    mel_t = tf.tensordot(mag_t, fb,   axes=[[2],[0]])
-    mel_p = tf.tensordot(mag_p, fb,   axes=[[2],[0]])
+    mel_t = tf.tensordot(mag_t, fb, axes=[[2],[0]])
+    mel_p = tf.tensordot(mag_p, fb, axes=[[2],[0]])
     log_t = tf.math.log(mel_t + 1e-6)
     log_p = tf.math.log(mel_p + 1e-6)
     mel_diff = tf.reduce_mean(tf.abs(log_t - log_p), axis=[1,2])
@@ -779,13 +688,9 @@ def rms_env_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def combined_loss(y_true, y_pred, sample_rate):
-    # onset envelope from target to avoid peeking at input
     onset_env = onset_envelope(y_true, sample_rate=sample_rate, pre_emph_alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS)
-
-    td   = waveform_l1_loss(y_true, y_pred)      # (B,T,1)
-    # Emphasize HF at onsets
+    td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)
-    # Weighted MR-STFT with per-frame onset boosting
     spec = mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
                                           split_hz=STFT_HIGH_SPLIT_HZ,
                                           high_boost=STFT_HIGH_BOOST,
@@ -794,7 +699,6 @@ def combined_loss(y_true, y_pred, sample_rate):
     env  = rms_env_loss(y_true, y_pred)
     cplx = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=onset_env)
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=onset_env)
-
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
           + STFT_WEIGHT     * spec
@@ -803,7 +707,6 @@ def combined_loss(y_true, y_pred, sample_rate):
           + COMPLEX_STFT_WEIGHT * cplx
           + D2_WEIGHT       * d2)
 
-# 3) A proper named metric instead of a lambda:
 @register_keras_serializable()
 def mean_hf_metric(y_true, y_pred):
     return tf.reduce_mean(hf_loss(y_true, y_pred))
@@ -821,50 +724,38 @@ def hp_diff_env(window, α=0.8):
     return np.abs(np.diff(hp))
 
 def segment_generator(seg_len, chunks, is_pick_chunks):
-    """Uniform random windows, style=1.0 if pick-path else 0.0."""
     while True:
         src, tgt, cstart, cdur = random.choice(chunks)
         mono = audio_cache[src][:,0]
         off = random.randrange(max(cdur - seg_len,1))
         rs = cstart + off
-
         piezo_seg = mono[rs:rs+seg_len]
         mic_seg   = audio_cache[tgt][rs:rs+seg_len,0]
-
         if np.max(np.abs(piezo_seg)) < SEGMENT_GENERATOR_MIN_AMP_THRESH:
             continue
-
         if piezo_seg.shape[0] < seg_len:
             p = seg_len - piezo_seg.shape[0]
             piezo_seg = np.pad(piezo_seg,  (0,p))
             mic_seg   = np.pad(mic_seg,    (0,p))
-
-        x = piezo_seg.astype('float32')[:,None]  # (seg_len,1)
+        x = piezo_seg.astype('float32')[:,None]
         y_audio = mic_seg.astype('float32')[:,None]
         style_flag = 1.0 if is_pick_chunks else 0.0
-
         yield x, (y_audio, style_flag)
 
 def analyze_loss_scales(model, dataset, sample_rate):
     (x, (y_true_audio, style_flag), sw) = next(iter(dataset))
     y_pred_audio, y_pred_style = model(x, training=False)
-
     l1_val   = tf.reduce_mean(waveform_l1_loss(y_true_audio, y_pred_audio)).numpy()
     stft_val = tf.reduce_mean(multi_scale_stft_loss(y_true_audio, y_pred_audio)).numpy()
     mel_val  = tf.reduce_mean(log_mel_loss(y_true_audio, y_pred_audio, sample_rate)).numpy()
     env_val  = tf.reduce_mean(rms_env_loss(y_true_audio, y_pred_audio)).numpy()
     hf_val   = tf.reduce_mean(hf_loss(y_true_audio, y_pred_audio)).numpy()
-
     return {'l1':l1_val, 'stft':stft_val, 'mel':mel_val, 'env':env_val, 'hf':hf_val}
 
 def calibrate_loss_weights(model, dataset, sample_rate, n_batches=5):
     sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
     for i, (x,y,sw) in enumerate(dataset.take(n_batches)):
-        scales = analyze_loss_scales(
-            model=model,
-            sample_rate=sample_rate,
-            dataset=tf.data.Dataset.from_tensors((x,y,sw))
-        )
+        scales = analyze_loss_scales(model=model, sample_rate=sample_rate, dataset=tf.data.Dataset.from_tensors((x,y,sw)))
         for k,v in scales.items():
             sums[k] += v
     print("Average loss scales over", n_batches, "batches:")
@@ -888,47 +779,29 @@ def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target
     print("\nGenerating demo…")
     FRAMES      = sec * sample_rate
     START_FRAME = offset_sec * sample_rate
-
-    x_long,x_src_sample_rate = sf.read(path_src,
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-    y_long,_  = sf.read(path_target,
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-    
+    x_long,x_src_sample_rate = sf.read(path_src, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
+    y_long,_  = sf.read(path_target, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
     x_src = x_long[:,0]
     y_src = y_long[:,0]
-
     if x_src_sample_rate != sample_rate:
         x_mod = resample_to_model_sr(x_src, x_src_sample_rate, sample_rate)
         y_mod = resample_to_model_sr(y_src, x_src_sample_rate, sample_rate)
     else:
         x_mod = x_src
         y_mod = y_src
-
     x_demo = x_mod[None, :, None]
     y_out, style_out = model.predict(x_demo, batch_size=1, verbose=0)
     y_pred = y_out[0,:,0]
     style_p = float(style_out[0,0])
     style_nm= 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
-
     print(f"[generate_demo] detected style {style_nm} ({style_p:.3f})")
-    
     prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
     sf.write(prediction_filepath, y_pred, sample_rate, subtype='FLOAT')
-    
     if (not only_prediction):
         source_filepath = os.path.join(out_dir, "demo_source" +".wav")
         target_filepath = os.path.join(out_dir, "demo_target" + ".wav")
-        sf.write(source_filepath,
-             x_mod, sample_rate, subtype='FLOAT')
-        sf.write(target_filepath,
-                y_mod, sample_rate, subtype='FLOAT')
-    
+        sf.write(source_filepath, x_mod, sample_rate, subtype='FLOAT')
+        sf.write(target_filepath, y_mod, sample_rate, subtype='FLOAT')
     print(f"✅ Demo saved to {prediction_filepath}")
 
 def make_sinc_filter():
@@ -962,11 +835,7 @@ class StuIrAlign(Layer):
         T_ir = tf.shape(ir)[1]
         needed = self.offset + T
         pad_end = needed - T_ir
-        ir = tf.cond(
-            pad_end>0,
-            lambda: tf.pad(ir, [[0,0],[0,pad_end],[0,0]]),
-            lambda: ir
-        )
+        ir = tf.cond(pad_end>0, lambda: tf.pad(ir, [[0,0],[0,pad_end],[0,0]]), lambda: ir)
         return ir[:, self.offset : self.offset + T, :]
     def compute_output_shape(self, input_shape):
         b, T, _ = input_shape[1]
@@ -986,17 +855,11 @@ class StuIrDownsampleFIR(Layer):
         p = x[...,0:1]
         pad = self.kernel_size - 1
         p_pad = tf.pad(p, [[0,0], [pad,0], [0,0]])
-        return tf.nn.conv1d(
-            p_pad,
-            filters=_ir_fir_tf,
-            stride=self.factor,
-            padding='VALID'
-        )
+        return tf.nn.conv1d(p_pad, filters=_ir_fir_tf, stride=self.factor, padding='VALID')
     def compute_output_shape(self, input_shape):
         b, T, _ = input_shape
         if T is None:
             return (b, None, 1)
-        padded = T + (self.kernel_size - 1)
         out_T = (T + self.factor - 1) // self.factor
         return (b, out_T, 1)
     def get_config(self):
@@ -1012,12 +875,7 @@ class StuIrPostLP(Layer):
     def call(self, x):
         pad = self.kernel_size - 1
         x_pad = tf.pad(x, [[0,0], [pad,0], [0,0]])
-        return tf.nn.conv1d(
-            x_pad,
-            filters=_ir_fir_up,
-            stride=1,
-            padding='VALID'
-        )
+        return tf.nn.conv1d(x_pad, filters=_ir_fir_up, stride=1, padding='VALID')
     def compute_output_shape(self, input_shape):
         return input_shape
     def get_config(self):
@@ -1074,7 +932,6 @@ class DistillLoss(Layer):
         cfg.update({'alpha': self.alpha})
         return cfg
 
-# Style tiling and helpers
 @register_keras_serializable()
 class TileStyle(Layer):
     def call(self, inputs):
@@ -1093,7 +950,7 @@ class InvertStyle(Layer):
     def compute_output_shape(self, input_shape):
         return input_shape
 
-# Slices and ops
+# Slice helpers
 @register_keras_serializable()
 def slice_content(x, filters):
     return x[:, :, :filters]
@@ -1122,7 +979,7 @@ def slice_style(x):
 def invert(x):
     return 1.0 - x
 
-# Stabilized FiLM transforms: gamma≈1 + small, beta≈0 + small
+# Stabilized FiLM
 @register_keras_serializable()
 def film_gamma_stable(raw):
     return 1.0 + 0.1 * tf.tanh(raw)
@@ -1130,7 +987,6 @@ def film_gamma_stable(raw):
 def film_beta_stable(raw):
     return 0.1 * tf.tanh(raw)
 
-# Onset-gated HF branch components
 @register_keras_serializable()
 class OnsetGate(Layer):
     def __init__(self, sr, alpha=0.98, smooth_ms=ONSET_SMOOTH_MS, **kwargs):
@@ -1139,7 +995,6 @@ class OnsetGate(Layer):
         self.alpha = float(alpha)
         self.smooth_ms = float(smooth_ms)
     def call(self, x):
-        # x: (B,T,1)
         pe = x[:,1:,:] - self.alpha * x[:,:-1,:]
         pe = tf.pad(pe, [[0,0],[1,0],[0,0]])
         env = tf.abs(pe)
@@ -1154,10 +1009,16 @@ class OnsetGate(Layer):
         cfg.update({"sr": self.sr, "alpha": self.alpha, "smooth_ms": self.smooth_ms})
         return cfg
 
-def gated_sep_block(x, filters, kernel, dilation, prefix):
+def compute_pads(kernel, dilation, lookahead_samples):
+    P_tot = (kernel - 1) * dilation
+    pad_right = min(int(lookahead_samples), P_tot)
+    pad_left  = P_tot - pad_right
+    return pad_left, pad_right
+
+def gated_sep_block(x, filters, kernel, dilation, prefix, lookahead=0):
     res = x
-    pad = (kernel - 1) * dilation
-    x   = ZeroPadding1D((pad, 0), name=f"{prefix}_pad")(x)
+    pad_left, pad_right = compute_pads(kernel, dilation, lookahead)
+    x   = ZeroPadding1D((pad_left, pad_right), name=f"{prefix}_pad")(x)
     g   = SeparableConv1D(2*filters, kernel, dilation_rate=dilation, padding="valid", name=f"{prefix}_sep")(x)
     c   = Lambda(slice_content, arguments={"filters": filters}, name=f"{prefix}_slice_c")(g)
     g2  = Lambda(slice_gate,    arguments={"filters": filters}, name=f"{prefix}_slice_g")(g)
@@ -1186,32 +1047,27 @@ def build_teacher_model(dynamic_time=False):
     cls         = GlobalAveragePooling1D(name="tch_style_gap")(cls)
     style_logit = Dense(1, name="tch_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="tch_style_prob")(style_logit)
-
     style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="tch_style_embed")(style_prob)
 
-    # Initial pointwise
     x = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_init_pw")(inp)
 
-    # Pre-blocks (non-dilated) for very local detail
+    # Pre-blocks with look-ahead
     for i in range(TEACHER_PRE_BLOCKS):
-        x = gated_sep_block(x, TEACHER_FILTERS, TEACHER_PRE_KERNEL, 1, prefix=f"tch_pre_{i}")
+        x = gated_sep_block(x, TEACHER_FILTERS, TEACHER_PRE_KERNEL, 1, prefix=f"tch_pre_{i}", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
         x = film_apply(x, style_embed, TEACHER_FILTERS, prefix=f"tch_pre_{i}")
 
-    # Dilated stack
+    # Dilated stack with bounded look-ahead and preserved naming for distillation layers
     for idx, d in enumerate(TEACHER_DILATIONS):
         res = x
-        pad = (TEACHER_KERNEL_SIZE - 1) * d
-        x = ZeroPadding1D((pad,0), name=f"pad_{idx}")(x)
-        g = SeparableConv1D(TEACHER_FILTERS*2, TEACHER_KERNEL_SIZE, dilation_rate=d,
-                            padding='valid', name=f"sep_{idx}")(x)
+        pad_left, pad_right = compute_pads(TEACHER_KERNEL_SIZE, d, TEACHER_LOOKAHEAD_SAMPLES)
+        x = ZeroPadding1D((pad_left, pad_right), name=f"pad_{idx}")(x)
+        g = SeparableConv1D(TEACHER_FILTERS*2, TEACHER_KERNEL_SIZE, dilation_rate=d, padding='valid', name=f"sep_{idx}")(x)
         c = Lambda(slice_content, arguments={'filters':TEACHER_FILTERS}, name=f"slice_content_{idx}")(g)
         g2 = Lambda(slice_gate, arguments={'filters':TEACHER_FILTERS}, name=f"slice_gate_{idx}")(g)
         x = Multiply(name=f"gated_mul_{idx}")([Activation('tanh', name=f"tanh_{idx}")(c),
                                                Activation('sigmoid', name=f"sigmoid_{idx}")(g2)])
         x = Conv1D(TEACHER_FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
-
-        # FiLM (stabilized)
         film_params = Dense(TEACHER_FILTERS*2, name=f"film_dense_{idx}")(style_embed)
         gamma_raw = Lambda(slice_film_gamma, arguments={'filters': TEACHER_FILTERS}, name=f"film_gamma_raw_{idx}")(film_params)
         beta_raw  = Lambda(slice_film_beta,  arguments={'filters': TEACHER_FILTERS}, name=f"film_beta_raw_{idx}")(film_params)
@@ -1224,24 +1080,21 @@ def build_teacher_model(dynamic_time=False):
     main_finger = Conv1D(1,1,padding="same",name="tch_final_finger")(x)
 
     # Style gating
-    style_time = TileStyle(name="tch_style_time")([style_prob, inp]) 
+    style_time = TileStyle(name="tch_style_time")([style_prob, inp])
     inv_style  = InvertStyle(name="tch_invert_style")(style_time)
     pick_c   = Multiply(name="tch_pick_contrib")([style_time,   main_pick])
     finger_c = Multiply(name="tch_finger_contrib")([inv_style,   main_finger])
 
-    # Onset-gated HF branch (tiny)
+    # Onset-gated HF branch with look-ahead in its convs
     gate = OnsetGate(sr=TEACHER_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS, name="tch_onset_gate")(inp)
-    # small HF conv stack
     hf = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_hf_init")(inp)
-    hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b0")
-    hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b1")
+    hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b0", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
+    hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b1", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
     hf = Conv1D(1,1,padding="same", name="tch_hf_out")(hf)
     hf = Multiply(name="tch_hf_gate")([hf, gate])
     hf = IrScale(init=0.1, name="tch_hf_scale")(hf)
 
-    # Final mix includes HF addendum
     out = Add(name="tch_mix_main")([pick_c, finger_c, hf])
-
     return tf.keras.models.Model(inputs=inp, outputs=[out, style_prob], name="piezo2mic_teacher")
 
 @register_keras_serializable()
@@ -1254,22 +1107,21 @@ def build_student_model(teacher=None, dynamic_time=False):
     cls         = GlobalAveragePooling1D(name="stu_style_gap")(cls)
     style_logit = Dense(1, name="stu_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="stu_style_prob")(style_logit)
-
     style_embed = Dense(STUDENT_EMBED_DIM, activation="linear", name="stu_style_embed")(style_prob)
     
     x = Conv1D(STUDENT_FILTERS, kernel_size=1, padding="same", name="stu_init_pw")(inp)
 
-    # Pre-blocks
+    # Pre-blocks (causal)
     for i in range(STUDENT_PRE_BLOCKS):
-        x = gated_sep_block(x, STUDENT_FILTERS, STUDENT_PRE_KERNEL, 1, prefix=f"stu_pre_{i}")
+        x = gated_sep_block(x, STUDENT_FILTERS, STUDENT_PRE_KERNEL, 1, prefix=f"stu_pre_{i}", lookahead=0)
         x = film_apply(x, style_embed, STUDENT_FILTERS, prefix=f"stu_pre_{i}")
 
-    # Dilated TCN Blocks (gated SeparableConv + FiLM)
+    # Dilated TCN Blocks (causal)
     student_feats = []
     for i, d in enumerate(STUDENT_DILATIONS):
         res = x
-        pad = (STUDENT_KERNEL_SIZE - 1) * d
-        x   = ZeroPadding1D((pad, 0), name=f"stu_pad_{i}")(x)
+        pad_left, pad_right = compute_pads(STUDENT_KERNEL_SIZE, d, lookahead=0)
+        x   = ZeroPadding1D((pad_left, pad_right), name=f"stu_pad_{i}")(x)
         g   = SeparableConv1D(2*STUDENT_FILTERS, STUDENT_KERNEL_SIZE, dilation_rate=d, padding="valid", name=f"stu_sep_{i}")(x)
         c   = Lambda(slice_content, arguments={"filters": STUDENT_FILTERS}, name=f"stu_slice_c_{i}")(g)
         g2  = Lambda(slice_gate,    arguments={"filters": STUDENT_FILTERS}, name=f"stu_slice_g_{i}")(g)
@@ -1296,9 +1148,9 @@ def build_student_model(teacher=None, dynamic_time=False):
     inv_style  = InvertStyle(name="stu_invert_style")(style_time)
     pick_c     = Multiply(name="stu_pick_contrib")([style_time, out_pick])
     finger_c   = Multiply(name="stu_finger_contrib")([inv_style, out_finger])
-    y_student = Add(name="stu_main")([pick_c, finger_c])  # base main (without IR/HF)
+    y_student = Add(name="stu_main")([pick_c, finger_c])
 
-    # Low-rate IR Branch
+    # Low-rate IR Branch (causal)
     ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)
     for i, d in enumerate(STUDENT_IR_DILATIONS):
         pad = (STUDENT_IR_KERNEL - 1) * d
@@ -1314,28 +1166,25 @@ def build_student_model(teacher=None, dynamic_time=False):
             pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             name=f"stu_ir_sep_{i}"
         )(ir)
-
     ir = IrScale(init=0.6, name="stu_ir_scale")(ir)
     ir = UpSampling1D(size=STUDENT_IR_DOWNSAMPLE_FACTOR, name="stu_ir_upsample")(ir)
     ir = StuIrPostLP(name="stu_ir_post_lp")(ir)
-
     total_delay = STUDENT_TOTAL_EXPECTED_IR_DELAY
     ir = StuIrAlign(offset=total_delay + STUDENT_IR_ALIGN_OFFSET_CORRECTION, name='stu_ir_align')([ir, inp])
     ir = IRLowpass(name="stu_ir_lowpass")(ir)
 
-    # Onset-gated HF branch (tiny)
+    # Onset-gated HF branch (causal)
     gate = OnsetGate(sr=STUDENT_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS, name="stu_onset_gate")(inp)
     hf = Conv1D(STUDENT_FILTERS, 1, padding="same", name="stu_hf_init")(inp)
-    hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b0")
-    hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b1")
+    hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b0", lookahead=0)
+    hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b1", lookahead=0)
     hf = Conv1D(1,1,padding="same", name="stu_hf_out")(hf)
     hf = Multiply(name="stu_hf_gate")([hf, gate])
     hf = IrScale(init=0.1, name="stu_hf_scale")(hf)
 
-    # Fuse IR and HF into main
     y_student = Add(name="stu_with_ir")([y_student, ir, hf])
 
-    # Distillation Losses (if teacher is provided)
+    # Distillation
     if teacher is not None:
         teacher.trainable = False
         if STUDENT_TEACHER_FEAT_LAYERS:
@@ -1355,9 +1204,6 @@ def build_student_model(teacher=None, dynamic_time=False):
 
     return tf.keras.models.Model(inputs=inp, outputs=[y_student, style_prob], name="piezo2mic_student")
 
-def extract_and_save_int8_weights(tflite_model_buf, outdir, dilations, filters):
-    print("TODO")
-
 def approx_steps(durs, seg_len):
     return 10 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
 
@@ -1366,21 +1212,16 @@ def approx_steps(durs, seg_len):
 @register_keras_serializable()
 def add_sw(x, y):
     """
-    Return per-output sample weights dict so audio and style heads are separately weighted.
-    We keep audio weights = 1, style weights = 1 (we now do onset gating inside the loss).
+    Provide per-output sample weights as a 2-item list matching outputs:
+    [audio_sw (B,T,1), style_sw (B,1)].
+    We keep them at ones; onset emphasis is handled inside the loss.
     """
     y_audio, style_flag = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
-    sw_style = tf.ones((b, 1), dtype=tf.float32)  # style head is (B,1)
-    sample_weights = {
-        'tch_mix_main': sw_audio,
-        'tch_style_prob': sw_style,
-        'stu_with_ir': sw_audio,
-        'stu_style_prob': sw_style
-    }
-    return x, (y_audio, style_flag), sample_weights
+    sw_style = tf.ones((b, 1), dtype=tf.float32)
+    return x, (y_audio, style_flag), [sw_audio, sw_style]
 
 def train_shared(
     seg_len,
@@ -1463,26 +1304,16 @@ def train_shared(
     
     baseline = calibrate_loss_weights(model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5)
     ref_scale = float(baseline['l1'])
-    user_w    = {
-        'l1':  L1_WEIGHT,
-        'stft': STFT_WEIGHT,
-        'mel':  MEL_WEIGHT,
-        'env':  RMS_ENV_WEIGHT,
-        'hf':   HF_WEIGHT
-    }
+    user_w    = {'l1':L1_WEIGHT, 'stft':STFT_WEIGHT, 'mel':MEL_WEIGHT, 'env':RMS_ENV_WEIGHT, 'hf':HF_WEIGHT}
     new_w = {}
     for key, uw in user_w.items():
         bs = float(baseline[key])
-        if bs > 0.0:
-            new_w[key] = uw / bs * ref_scale
-        else:
-            new_w[key] = 0.0
+        new_w[key] = uw / bs * ref_scale if bs > 0.0 else 0.0
     L1_WEIGHT       = new_w['l1']
     STFT_WEIGHT     = new_w['stft']
     MEL_WEIGHT      = new_w['mel']
     RMS_ENV_WEIGHT  = new_w['env']
     HF_WEIGHT       = new_w['hf']
-    
     print(f"→ normalized loss weights:"
           f"  L1={L1_WEIGHT:.6f}"
           f"  STFT={STFT_WEIGHT:.6f}"
@@ -1498,52 +1329,31 @@ def train_shared(
         loss=[ _combined_loss, "binary_crossentropy" ],
         loss_weights = [ 1.0,  λ_STYLE_RATIO ],
         metrics = [
-            [ 'mae',
-              _log_mel_loss,
-              mean_hf_metric,
-              multi_scale_stft_loss,
-              rms_env_loss ],
+            [ 'mae', _log_mel_loss, mean_hf_metric, multi_scale_stft_loss, rms_env_loss ],
             [ 'accuracy' ]
         ]
     )
     static_model.summary()
     
     es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
-    reduce_lr = ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=LR_FACTOR,
-        patience=LR_PLATEAU_PATIENCE,
-        min_lr=MIN_LR,
-        mode='min',
-        verbose=1
-    )
-    cp = ModelCheckpoint(
-        filepath=os.path.join(checkpoint_out_dir,
-                            "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
-        monitor='val_loss',
-        mode='min',
-        save_best_only=True,
-        verbose=1
-    )
-    demo_cb = DemoCallback(
-        sample_rate=sample_rate,
-        build_model_fn=build_model_fn,
-        build_model_fn_args=build_model_fn_args,
-        logs_out_dir=logs_out_dir,
-        demo_checkpoints_out_dir=demo_checkpoints_out_dir
-    )
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=LR_FACTOR, patience=LR_PLATEAU_PATIENCE, min_lr=MIN_LR, mode='min', verbose=1)
+    cp = ModelCheckpoint(filepath=os.path.join(checkpoint_out_dir, "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
+                         monitor='val_loss', mode='min', save_best_only=True, verbose=1)
+    demo_cb = DemoCallback(sample_rate=sample_rate,
+                           build_model_fn=build_model_fn,
+                           build_model_fn_args=build_model_fn_args,
+                           logs_out_dir=logs_out_dir,
+                           demo_checkpoints_out_dir=demo_checkpoints_out_dir)
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
     csv_logger = CSVLogger(os.path.join(csv_logs_out_dir, "training.csv"), append=False)
 
-    static_model.fit(
-        train_ds,
-        initial_epoch=initial_epoch,
-        epochs=1 if DEBUG else EPOCHS,
-        steps_per_epoch=steps_per_epoch,
-        validation_data=val_ds,
-        validation_steps=validation_steps,
-        callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger]
-    )
+    static_model.fit(train_ds,
+                     initial_epoch=initial_epoch,
+                     epochs=1 if DEBUG else EPOCHS,
+                     steps_per_epoch=steps_per_epoch,
+                     validation_data=val_ds,
+                     validation_steps=validation_steps,
+                     callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger])
 
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
@@ -1552,9 +1362,6 @@ def train_shared(
     dynamic_model.set_weights(static_model.get_weights())
     dynamic_model.save(dynamic_model_filepath)
     print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
-
-    if SAVE_WEIGHTS:
-        pass
 
     return static_model, dynamic_model
 
@@ -1645,24 +1452,24 @@ def fine_tune():
     x_norm = x_full * gain_x
     y_norm = y_full * gain_y
 
-    # Align finetune target to source if enabled
     if ALIGN_ENABLE:
         L = x_norm.shape[0]
         M = min(L, int(ALIGN_WIN_SEC * FINETUNE_SAMPLE_RATE))
         if M > 2048:
             delay_samples = gcc_phat_delay(x_norm[:M,0], y_norm[:M,0], FINETUNE_SAMPLE_RATE, max_ms=ALIGN_MAX_MS)
             y_norm_shifted = y_norm.copy()
-            y_norm_shifted[:,0] = shift_signal_int(y_norm[:,0], delay_samples)
-            if y_norm.shape[1] > 1:
-                for c in range(1, y_norm.shape[1]):
+            if ALIGN_USE_FRACTIONAL:
+                for c in range(y_norm.shape[1]):
+                    y_norm_shifted[:,c] = shift_signal_frac(y_norm[:,c], delay_samples)
+            else:
+                for c in range(y_norm.shape[1]):
                     y_norm_shifted[:,c] = shift_signal_int(y_norm[:,c], delay_samples)
             y_norm = y_norm_shifted
-            print(f"[fine_tune ALIGN] shift target by {delay_samples:.2f} samples ({delay_samples/FINETUNE_SAMPLE_RATE*1000:.3f} ms)")
+            print(f"[fine_tune ALIGN] shift target by {delay_samples:.3f} samples ({delay_samples/FINETUNE_SAMPLE_RATE*1000:.3f} ms)")
 
     rms_x2 = compute_rms(x_norm[:,0])
     rms_y2 = compute_rms(y_norm[:,0])
-    print(f"[fine_tune] post‐norm RMS: source={rms_x2:.6f} ({20*np.log10(rms_x2):.2f} dB),"
-          f" target={rms_y2:.6f} ({20*np.log10(rms_y2):.2f} dB)")
+    print(f"[fine_tune] post‐norm RMS: source={rms_x2:.6f} ({20*np.log10(rms_x2):.2f} dB), target={rms_y2:.6f} ({20*np.log10(rms_y2):.2f} dB)")
 
     picked_pairs = [(src, tgt)]
     finger_pairs = [(src, tgt)]
@@ -1674,45 +1481,29 @@ def fine_tune():
 
     def make_mixed_ds(seg_len):
         chunks = build_chunks(pairs_list=all_pairs, seg_len=seg_len, sample_rate=FINETUNE_SAMPLE_RATE)
-        
         spec_x       = tf.TensorSpec((seg_len,1), tf.float32)
         spec_y_audio = tf.TensorSpec((seg_len,1), tf.float32)
         spec_y_style = tf.TensorSpec((),       tf.float32)
         spec_y       = (spec_y_audio, spec_y_style)
-
         def pu_gen():
             for x,(y_audio, style_flag) in segment_generator(seg_len=seg_len, chunks=chunks, is_pick_chunks=True):
                 yield x, (y_audio, style_flag)
         def fu_gen():
             for x,(y_audio,style_flag) in segment_generator(seg_len=seg_len, chunks=chunks, is_pick_chunks=False):
                 yield x, (y_audio, style_flag)
-        
         ds_pu = tf.data.Dataset.from_generator(pu_gen, output_signature=(spec_x, spec_y))
         ds_fu = tf.data.Dataset.from_generator(fu_gen, output_signature=(spec_x, spec_y))
-
-        mixed = tf.data.Dataset.sample_from_datasets(
-            [ds_pu, ds_fu],
-            weights=[PICK_CHUNK_RATIO,FINGER_CHUNK_RATIO],
-            seed=SEED
-        )
+        mixed = tf.data.Dataset.sample_from_datasets([ds_pu, ds_fu], weights=[PICK_CHUNK_RATIO,FINGER_CHUNK_RATIO], seed=SEED)
         return mixed.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     
-    finetuned_student_dyn = None
-
     print("\n🔧 Fine-tuning STUDENT on new pair…")
-    base_student_full = tf.keras.models.load_model(
-        os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
-        compile=False
-    )
-
+    base_student_full = tf.keras.models.load_model(os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME), compile=False)
     finetuned_student_small = build_student_model(teacher=None, dynamic_time=False)
 
     for layer in finetuned_student_small.layers:
         if layer.name.startswith("stu_"):
             try:
-                layer.set_weights(
-                    base_student_full.get_layer(layer.name).get_weights()
-                )
+                layer.set_weights(base_student_full.get_layer(layer.name).get_weights())
             except ValueError:
                 pass
 
@@ -1726,24 +1517,16 @@ def fine_tune():
             or name == f"stu_sep_{LAST_STUDENT_DILATION}" \
             or name == f"stu_ir_sep_{LAST_STUDENT_DILATION}" \
             or name == f"stu_pw_{LAST_STUDENT_DILATION}" \
-            or name.startswith("stu_hf_")  # allow HF branch to adapt
+            or name.startswith("stu_hf_")
 
-    dsS_val = make_mixed_ds(STUDENT_SEG_LEN)
-    dsS_val = dsS_val.map(add_sw)
-    dsS_val = dsS_val.take(5)
-
-    baseline_S = calibrate_loss_weights(model=finetuned_student_small,
-                                        dataset=dsS_val,
-                                        sample_rate=FINETUNE_SAMPLE_RATE,
-                                        n_batches=5)
-    
+    dsS_val = make_mixed_ds(STUDENT_SEG_LEN).map(add_sw).take(5)
+    baseline_S = calibrate_loss_weights(model=finetuned_student_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5)
     ref = float(baseline_S['l1'])
     L1_WEIGHT      = corrected_weights['l1']   / baseline_S['l1']   * ref
     HF_WEIGHT      = corrected_weights['hf']   / baseline_S['hf']   * ref
     STFT_WEIGHT    = corrected_weights['stft'] / baseline_S['stft'] * ref
     MEL_WEIGHT     = corrected_weights['mel']  / baseline_S['mel']  * ref
     RMS_ENV_WEIGHT = corrected_weights['env']  / baseline_S['env']  * ref
-
     print("→ finetune-student loss weights recalibrated:"
         f"  L1={L1_WEIGHT:.4f}"
         f"  HF={HF_WEIGHT:.4f}"
@@ -1752,69 +1535,45 @@ def fine_tune():
         f"  ENV={RMS_ENV_WEIGHT:.4f}")
     
     _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE)
-    
     finetuned_student_small.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
         loss=[_combined_loss, "binary_crossentropy"],
         loss_weights=[1.0, λ_STYLE_RATIO],
-        metrics=[
-            ["mae"],
-            []
-        ]
+        metrics=[["mae"], []]
     )
     dsS = make_mixed_ds(STUDENT_SEG_LEN)
-    
     ft_chunks_T = build_chunks(pairs_list=[(src,tgt)], seg_len=STUDENT_SEG_LEN, sample_rate=FINETUNE_SAMPLE_RATE)
     stepsS = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=STUDENT_SEG_LEN), 1)
-    
     print("Finetune student model summary:")
     finetuned_student_small.summary()
-    
-    finetuned_student_small.fit(dsS,
-                    epochs=FINETUNE_STUDENT_EPOCHS,
-                    steps_per_epoch=stepsS,
-                    verbose=1)
+    finetuned_student_small.fit(dsS, epochs=FINETUNE_STUDENT_EPOCHS, steps_per_epoch=stepsS, verbose=1)
 
     ft_s_static = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_STATIC_MODEL_FILENAME)
     finetuned_student_small.save(ft_s_static)
-
     finetuned_student_dyn = build_student_model(teacher=None, dynamic_time=True)
     finetuned_student_dyn.set_weights(finetuned_student_small.get_weights())
     ft_s_dyn = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
     finetuned_student_dyn.save(ft_s_dyn)
-
     return finetuned_student_dyn
 
 def compute_rms(sig):
     return np.sqrt(np.mean(sig**2))
 
-def _detect_and_print_flips(
-    model,
-    name: str,
-    audio_piezo: np.ndarray,
-    sr: int,
-    seg_len: int,
-    threshold: float = STYLE_FLAG_PROB_THRESHOLD
-):
+def _detect_and_print_flips(model, name: str, audio_piezo: np.ndarray, sr: int, seg_len: int, threshold: float = STYLE_FLAG_PROB_THRESHOLD):
     N = audio_piezo.shape[0]
     hop = seg_len
-
     def get_prob(start):
         end = start + seg_len
         if end <= N:
             chunk = audio_piezo[start:end]
         else:
             pad_amt = end - N
-            chunk = np.pad(audio_piezo[start:N],
-                           ((0, pad_amt),(0,0)),
-                           mode='constant')
+            chunk = np.pad(audio_piezo[start:N], ((0, pad_amt),(0,0)), mode='constant')
         style_out = model.predict(chunk[None, ...], batch_size=1, verbose=0)[1]
         return float(style_out[0,0])
-
     p0 = get_prob(0)
     s0 = int(p0 > threshold)
     last_state = s0
-
     flips = []
     for start in range(hop, N, hop):
         p = get_prob(start)
@@ -1825,7 +1584,6 @@ def _detect_and_print_flips(
             to = 'pick'   if s          else 'finger'
             flips.append((t_sec, fr, to, p))
             last_state = s
-
     print(f"\n=== {name} style‐flip report ===")
     if len(flips) == 0:
         print("  no flips detected")
@@ -1840,50 +1598,21 @@ def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
         FRAMES      = LONG_DEMO_SEC * sample_rate
         START_FRAME = LONG_DEMO_OFFSET_SEC * sample_rate
         pth_src, _ = all_pairs[LONG_DEMO_PAIR_INDEX]
-
-        x_long,x_src_sample_rate = sf.read(pth_src,
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-        
+        x_long,x_src_sample_rate = sf.read(pth_src, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
         x_src = x_long[:,0]
         if x_src_sample_rate != sample_rate:
             x_mod = resample_to_model_sr(x_src, x_src_sample_rate, sample_rate)
         else:
             x_mod = x_src
-
         x_demo = x_mod[None, :, None]
+        _detect_and_print_flips(model=model, name=name, audio_piezo=x_demo, sr=sample_rate, seg_len=seg_len, threshold=STYLE_FLAG_PROB_THRESHOLD)
 
-        _detect_and_print_flips(
-            model   = model,
-            name    = name,
-            audio_piezo = x_demo,
-            sr      = sample_rate,
-            seg_len = seg_len,
-            threshold=STYLE_FLAG_PROB_THRESHOLD
-        )
-    
 def profile_finetune_model_style_flag_flips(student_dyn):
     FRAMES      = FINETUNE_DEMO_SEC * FINETUNE_SAMPLE_RATE
     START_FRAME = FINETUNE_DEMO_OFFSET_SEC * FINETUNE_SAMPLE_RATE
-
-    x_long,_ = sf.read(os.path.join(FINETUNE_SRC_DIR, "source.wav"),
-                      start=START_FRAME,
-                      frames=FRAMES,
-                      dtype='float32',
-                      always_2d=True)
-    
+    x_long,_ = sf.read(os.path.join(FINETUNE_SRC_DIR, "source.wav"), start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
     x_piezo = x_long[:,0:1]
-
-    _detect_and_print_flips(
-        model   = student_dyn,
-        name    = "STUDENT",
-        audio_piezo = x_piezo,
-        sr      = FINETUNE_SAMPLE_RATE,
-        seg_len = STUDENT_SEG_LEN,
-        threshold=STYLE_FLAG_PROB_THRESHOLD
-    )
+    _detect_and_print_flips(model=student_dyn, name="STUDENT", audio_piezo=x_piezo, sr=FINETUNE_SAMPLE_RATE, seg_len=STUDENT_SEG_LEN, threshold=STYLE_FLAG_PROB_THRESHOLD)
 
 def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     for dir_path in [logs_out_dir, csv_logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
@@ -1904,7 +1633,6 @@ def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_d
         return (False, None)
 
 def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args={}):
-
     dpath = dynamic_model_filepath
     if not os.path.exists(dpath):
         checkpoints = sorted(glob.glob(os.path.join(checkpoint_out_dir, "*.keras")))
@@ -1922,7 +1650,6 @@ def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_o
     else:
         print("Loading dynamic model from:", dpath)
         dynamic_model = tf.keras.models.load_model(dpath, compile=False)
-
     generate_demo(model=dynamic_model, out_dir=demo_out_dir, sample_rate=sample_rate)
 
 def main ():
@@ -1941,7 +1668,7 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--train-student":
         resume, resume_ckpt = cleanup_and_prepare_train(
             logs_out_dir=LOGS_STUDENT_OUT_DIR,
-            csv_logs_out_dir=CSV_LOGS_STUDENT_OUT_DIR,
+            csv_logs_out_dir=LOGS_STUDENT_OUT_DIR,
             checkpoints_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
             demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR,
             demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
@@ -2008,7 +1735,5 @@ def main ():
         print("No command given.")
         sys.exit(1)
     
-
-# Main
 if __name__=="__main__":
     main()
