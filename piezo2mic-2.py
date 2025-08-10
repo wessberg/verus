@@ -1226,33 +1226,25 @@ def approx_steps(durs, seg_len):
 
 @register_keras_serializable()
 def add_sw_teacher(x, y):
-    """
-    Return labels and per-output sample weights dict for the TEACHER model.
-    Keys must match outputs: 'tch_mix_main' and 'tch_style_prob'.
-    """
     y_audio, style_flag = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
-    style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
-
-    return x, [y_audio, style_true], [sw_audio, sw_style]
+    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)   # (B,T,1)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)  # (B,1)
+    # Return tuples, not lists
+    return x, (y_audio, style_true), (sw_audio, sw_style)
 
 @register_keras_serializable()
 def add_sw_student(x, y):
-    """
-    Return labels and per-output sample weights dict for the STUDENT model.
-    Keys must match outputs: 'stu_with_ir' and 'stu_style_prob'.
-    """
     y_audio, style_flag = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
-    style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
-
-    return x, [y_audio, style_true], [sw_audio, sw_style]
+    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)   # (B,T,1)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)  # (B,1)
+    # Return tuples, not lists
+    return x, (y_audio, style_true), (sw_audio, sw_style)
 
 def train_shared(
     kind,
