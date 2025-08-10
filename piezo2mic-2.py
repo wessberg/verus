@@ -30,6 +30,7 @@ from tensorflow.keras.layers import (
 # Turn off GPU acceleration for inference in demo mode (more reliable on many systems)
 if len(sys.argv)>1 and sys.argv[1]=="--demo":
     tf.config.set_visible_devices([], 'GPU')
+tf.config.set_visible_devices([], 'GPU')
 
 # Determinism
 SEED = 42
@@ -1210,20 +1211,40 @@ def approx_steps(durs, seg_len):
 # ────────────────────────────── TRAINING ─────────────────────────────────────
 
 @register_keras_serializable()
-def add_sw(x, y):
+def add_sw_student(x, y):
     """
-    Provide per-output sample weights as a 2-item list matching outputs:
-    [audio_sw (B,T,1), style_sw (B,1)].
-    We keep them at ones; onset emphasis is handled inside the loss.
+    Return per-output sample weights dict for the STUDENT model.
+    Keys must match model outputs: 'stu_with_ir' and 'stu_style_prob'.
     """
     y_audio, style_flag = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
-    sw_style = tf.ones((b, 1), dtype=tf.float32)
-    return x, (y_audio, style_flag), [sw_audio, sw_style]
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32) # (B,T,1)
+    sw_style = tf.ones_like(style_flag, dtype=tf.float32) # (B,)
+    return x, (y_audio, style_flag), {
+        'stu_with_ir': sw_audio,
+        'stu_style_prob': sw_style
+    }
+
+@register_keras_serializable()
+def add_sw_teacher(x, y):
+    """
+    Return per-output sample weights dict for the TEACHER model.
+    Keys must match model outputs: 'tch_mix_main' and 'tch_style_prob'.
+    """
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32) # (B,T,1)
+    sw_style = tf.ones_like(style_flag, dtype=tf.float32) # (B,)
+    return x, (y_audio, style_flag), {
+        'tch_mix_main': sw_audio,
+        'tch_style_prob': sw_style
+    }
+
 
 def train_shared(
+    kind,
     seg_len,
     sample_rate,
     build_model_fn,
@@ -1274,10 +1295,14 @@ def train_shared(
     finger_ds  = tf.data.Dataset.from_generator(
         lambda: segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
     )
+    
     train_ds = tf.data.Dataset.sample_from_datasets(
         [pick_ds, finger_ds], weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
-    train_ds = train_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+    
+    sw_map_fn = add_sw_teacher if kind == 'teacher' else add_sw_student
+
+    train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     val_pick_ds = tf.data.Dataset.from_generator(
         lambda: segment_generator(seg_len=seg_len, chunks=val_pick_chunks, is_pick_chunks=True),
@@ -1292,7 +1317,8 @@ def train_shared(
         weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
         seed=SEED
     ).batch(BATCH_SIZE)
-    val_ds = val_ds.map(add_sw).repeat().prefetch(tf.data.AUTOTUNE)
+
+    val_ds = val_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     if resume and resume_ckpt_path:
         print(f"Resuming training from checkpoint: {resume_ckpt_path}")
@@ -1367,6 +1393,7 @@ def train_shared(
 
 def train_teacher(resume=False, resume_ckpt_path=None):
     train_shared(
+        kind="teacher",
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=TEACHER_SEG_LEN,
@@ -1392,6 +1419,7 @@ def train_student(resume=False, resume_ckpt_path=None):
     validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
+        kind="student",
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=STUDENT_SEG_LEN,
@@ -1519,7 +1547,7 @@ def fine_tune():
             or name == f"stu_pw_{LAST_STUDENT_DILATION}" \
             or name.startswith("stu_hf_")
 
-    dsS_val = make_mixed_ds(STUDENT_SEG_LEN).map(add_sw).take(5)
+    dsS_val = make_mixed_ds(STUDENT_SEG_LEN).map(add_sw_student).take(5)
     baseline_S = calibrate_loss_weights(model=finetuned_student_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5)
     ref = float(baseline_S['l1'])
     L1_WEIGHT      = corrected_weights['l1']   / baseline_S['l1']   * ref
