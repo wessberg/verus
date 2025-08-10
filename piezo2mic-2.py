@@ -40,6 +40,8 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+EPOCHS      = 1000
+
 # Audio sample‐rates
 TEACHER_SAMPLE_RATE = 96000
 STUDENT_SAMPLE_RATE = 48000
@@ -59,7 +61,7 @@ ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 DEBUG               = False
 
 # Batch params
-BATCH_SIZE          = 16
+BATCH_SIZE          = 8
 
 # Chunk ratios
 PICK_CHUNK_RATIO = 0.5
@@ -160,7 +162,7 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-EPOCHS      = 2
+
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
