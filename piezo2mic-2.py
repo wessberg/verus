@@ -1236,15 +1236,8 @@ def add_sw_teacher(x, y):
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
     style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
-    y_dict = {
-        'tch_mix_main': y_audio,
-        'tch_style_prob': style_true
-    }
-    sw_dict = {
-        'tch_mix_main': sw_audio,
-        'tch_style_prob': sw_style
-    }
-    return x, y_dict, sw_dict
+
+    return x, [y_audio, style_true], [sw_audio, sw_style]
 
 @register_keras_serializable()
 def add_sw_student(x, y):
@@ -1258,15 +1251,8 @@ def add_sw_student(x, y):
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
     style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
-    y_dict = {
-        'stu_with_ir': y_audio,
-        'stu_style_prob': style_true
-    }
-    sw_dict = {
-        'stu_with_ir': sw_audio,
-        'stu_style_prob': sw_style
-    }
-    return x, y_dict, sw_dict
+
+    return x, [y_audio, style_true], [sw_audio, sw_style]
 
 def train_shared(
     kind,
