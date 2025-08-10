@@ -30,7 +30,6 @@ from tensorflow.keras.layers import (
 # Turn off GPU acceleration for inference in demo mode (more reliable on many systems)
 if len(sys.argv)>1 and sys.argv[1]=="--demo":
     tf.config.set_visible_devices([], 'GPU')
-tf.config.set_visible_devices([], 'GPU')
 
 # Determinism
 SEED = 42
