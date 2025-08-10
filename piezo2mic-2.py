@@ -1269,6 +1269,7 @@ def add_sw_student(x, y):
     return x, y_dict, sw_dict
 
 def train_shared(
+    kind,
     seg_len,
     sample_rate,
     build_model_fn,
@@ -1324,7 +1325,7 @@ def train_shared(
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
 
     # Choose the correct mapper based on which model is being built
-    sw_map_fn = add_sw_teacher if build_model_fn.__name__ == 'build_teacher_model' else add_sw_student
+    sw_map_fn = add_sw_teacher if kind == 'teacher' else add_sw_student
     train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     val_pick_ds = tf.data.Dataset.from_generator(
@@ -1415,6 +1416,7 @@ def train_shared(
 
 def train_teacher(resume=False, resume_ckpt_path=None):
     train_shared(
+        kind='teacher',
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=TEACHER_SEG_LEN,
@@ -1440,6 +1442,7 @@ def train_student(resume=False, resume_ckpt_path=None):
     validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
+        kind='student',
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=STUDENT_SEG_LEN,
