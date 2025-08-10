@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
 to the equivalent mic’d signal.
@@ -9,7 +10,7 @@ Updated to:
 - Stabilized FiLM (gamma≈1, beta≈0)
 - Pre-dilation micro-kernel blocks for local HF structure
 - Onset/HF-focused spectral and time-domain loss shaping
-- Per-output sample weights provided as a 2-item list [audio_sw, style_sw]
+- Per-output labels and sample weights provided as dicts keyed by output names
 """
 
 import os, glob, random, shutil, sys, re, math
@@ -162,7 +163,6 @@ student_lp_taps_np = firwin(STUDENT_LP_ORDER,
                      pass_zero=True).astype(np.float32)
 student_lp_taps_tf = tf.constant(student_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
 
-
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -187,7 +187,7 @@ FINGER_TGT_DIR = "./input/finger/target"
 
 FINETUNE_SRC_DIR   = "./input/finetune"
 
-OUT_DIR        = "./out2"
+OUT_DIR        = "./out"
 
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
 CHECKPOINT_TEACHER_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "teacher")
@@ -745,8 +745,21 @@ def segment_generator(seg_len, chunks, is_pick_chunks):
         yield x, (y_audio, style_flag)
 
 def analyze_loss_scales(model, dataset, sample_rate):
-    (x, (y_true_audio, style_flag), sw) = next(iter(dataset))
-    y_pred_audio, y_pred_style = model(x, training=False)
+    # Take one batch from your validation dataset
+    batch = next(iter(dataset))
+    # Unpack batch: it can be (x, y_dict, sw_dict) OR (x, (y_audio, style), sw)
+    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+        x = batch[0]
+        y = batch[1]
+    else:
+        x, y = batch
+    # Extract the audio target
+    if isinstance(y, dict):
+        audio_key = model.output_names[0]
+        y_true_audio = y[audio_key]
+    else:
+        y_true_audio = y[0]
+    y_pred_audio, _ = model(x, training=False)
     l1_val   = tf.reduce_mean(waveform_l1_loss(y_true_audio, y_pred_audio)).numpy()
     stft_val = tf.reduce_mean(multi_scale_stft_loss(y_true_audio, y_pred_audio)).numpy()
     mel_val  = tf.reduce_mean(log_mel_loss(y_true_audio, y_pred_audio, sample_rate)).numpy()
@@ -1058,7 +1071,7 @@ def build_teacher_model(dynamic_time=False):
         x = gated_sep_block(x, TEACHER_FILTERS, TEACHER_PRE_KERNEL, 1, prefix=f"tch_pre_{i}", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
         x = film_apply(x, style_embed, TEACHER_FILTERS, prefix=f"tch_pre_{i}")
 
-    # Dilated stack with bounded look-ahead and preserved naming for distillation layers
+    # Dilated stack with bounded look-ahead
     for idx, d in enumerate(TEACHER_DILATIONS):
         res = x
         pad_left, pad_right = compute_pads(TEACHER_KERNEL_SIZE, d, TEACHER_LOOKAHEAD_SAMPLES)
@@ -1212,40 +1225,50 @@ def approx_steps(durs, seg_len):
 # ────────────────────────────── TRAINING ─────────────────────────────────────
 
 @register_keras_serializable()
-def add_sw_student(x, y):
-    """
-    Return per-output sample weights dict for the STUDENT model.
-    Keys must match model outputs: 'stu_with_ir' and 'stu_style_prob'.
-    """
-    y_audio, style_flag = y
-    b = tf.shape(x)[0]
-    T = tf.shape(x)[1]
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32) # (B,T,1)
-    sw_style = tf.ones_like(style_flag, dtype=tf.float32) # (B,)
-    return x, (y_audio, style_flag), {
-        'stu_with_ir': sw_audio,
-        'stu_style_prob': sw_style
-    }
-
-@register_keras_serializable()
 def add_sw_teacher(x, y):
     """
-    Return per-output sample weights dict for the TEACHER model.
-    Keys must match model outputs: 'tch_mix_main' and 'tch_style_prob'.
+    Return labels and per-output sample weights dict for the TEACHER model.
+    Keys must match outputs: 'tch_mix_main' and 'tch_style_prob'.
     """
     y_audio, style_flag = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32) # (B,T,1)
-    sw_style = tf.ones_like(style_flag, dtype=tf.float32) # (B,)
-    return x, (y_audio, style_flag), {
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
+    style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
+    y_dict = {
+        'tch_mix_main': y_audio,
+        'tch_style_prob': style_true
+    }
+    sw_dict = {
         'tch_mix_main': sw_audio,
         'tch_style_prob': sw_style
     }
+    return x, y_dict, sw_dict
 
+@register_keras_serializable()
+def add_sw_student(x, y):
+    """
+    Return labels and per-output sample weights dict for the STUDENT model.
+    Keys must match outputs: 'stu_with_ir' and 'stu_style_prob'.
+    """
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)           # (B,T,1)
+    style_true = tf.expand_dims(style_flag, axis=-1)          # (B,1)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)     # (B,1)
+    y_dict = {
+        'stu_with_ir': y_audio,
+        'stu_style_prob': style_true
+    }
+    sw_dict = {
+        'stu_with_ir': sw_audio,
+        'stu_style_prob': sw_style
+    }
+    return x, y_dict, sw_dict
 
 def train_shared(
-    kind,
     seg_len,
     sample_rate,
     build_model_fn,
@@ -1296,13 +1319,12 @@ def train_shared(
     finger_ds  = tf.data.Dataset.from_generator(
         lambda: segment_generator(seg_len=seg_len, chunks=train_finger_chunks, is_pick_chunks=False), output_signature=(sig_x,sig_y)
     )
-    
     train_ds = tf.data.Dataset.sample_from_datasets(
         [pick_ds, finger_ds], weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO]
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
-    
-    sw_map_fn = add_sw_teacher if kind == 'teacher' else add_sw_student
 
+    # Choose the correct mapper based on which model is being built
+    sw_map_fn = add_sw_teacher if build_model_fn.__name__ == 'build_teacher_model' else add_sw_student
     train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     val_pick_ds = tf.data.Dataset.from_generator(
@@ -1318,7 +1340,6 @@ def train_shared(
         weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
         seed=SEED
     ).batch(BATCH_SIZE)
-
     val_ds = val_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     if resume and resume_ckpt_path:
@@ -1394,7 +1415,6 @@ def train_shared(
 
 def train_teacher(resume=False, resume_ckpt_path=None):
     train_shared(
-        kind="teacher",
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=TEACHER_SEG_LEN,
@@ -1420,7 +1440,6 @@ def train_student(resume=False, resume_ckpt_path=None):
     validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
-        kind="student",
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
         seg_len=STUDENT_SEG_LEN,
@@ -1548,7 +1567,10 @@ def fine_tune():
             or name == f"stu_pw_{LAST_STUDENT_DILATION}" \
             or name.startswith("stu_hf_")
 
-    dsS_val = make_mixed_ds(STUDENT_SEG_LEN).map(add_sw_student).take(5)
+    dsS_val = make_mixed_ds(STUDENT_SEG_LEN)
+    dsS_val = dsS_val.map(add_sw_student)
+    dsS_val = dsS_val.take(5)
+
     baseline_S = calibrate_loss_weights(model=finetuned_student_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5)
     ref = float(baseline_S['l1'])
     L1_WEIGHT      = corrected_weights['l1']   / baseline_S['l1']   * ref
@@ -1571,6 +1593,7 @@ def fine_tune():
         metrics=[["mae"], []]
     )
     dsS = make_mixed_ds(STUDENT_SEG_LEN)
+    dsS = dsS.map(add_sw_student)
     ft_chunks_T = build_chunks(pairs_list=[(src,tgt)], seg_len=STUDENT_SEG_LEN, sample_rate=FINETUNE_SAMPLE_RATE)
     stepsS = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=STUDENT_SEG_LEN), 1)
     print("Finetune student model summary:")
@@ -1755,7 +1778,7 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--profile-finetune-model-style-flag-flips":
         student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(student_dyn_path):
-            print("Fine-tuned dynamic models not found, run --fine-tune first")
+            print("Fine-tuned dynamic model not found, run --fine-tune first")
             sys.exit(1)
         student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
         profile_finetune_model_style_flag_flips(student_dyn=student_dyn)
