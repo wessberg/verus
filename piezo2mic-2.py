@@ -187,7 +187,7 @@ FINGER_TGT_DIR = "./input/finger/target"
 
 FINETUNE_SRC_DIR   = "./input/finetune"
 
-OUT_DIR        = "./out"
+OUT_DIR        = "./out2"
 
 CHECKPOINT_OUT_DIR = os.path.join(OUT_DIR, "checkpoints")
 CHECKPOINT_TEACHER_OUT_DIR = os.path.join(CHECKPOINT_OUT_DIR, "teacher")
