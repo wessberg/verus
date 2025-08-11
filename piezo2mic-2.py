@@ -1201,19 +1201,7 @@ def build_teacher_model(dynamic_time=False):
                                                Activation('sigmoid', name=f"sigmoid_{idx}")(g2)])
         x = Conv1D(TEACHER_FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
-        
-        film_params = Dense(TEACHER_FILTERS*2, name=f"film_dense_{idx}")(style_embed)
-        gamma_raw = Lambda(slice_film_gamma, arguments={'filters': TEACHER_FILTERS}, name=f"film_gamma_raw_{idx}")(film_params)
-        beta_raw  = Lambda(slice_film_beta,  arguments={'filters': TEACHER_FILTERS}, name=f"film_beta_raw_{idx}")(film_params)
-        gamma = Lambda(film_gamma_stable, name=f"film_gamma_{idx}")(gamma_raw)
-        beta  = Lambda(film_beta_stable,  name=f"film_beta_{idx}")(beta_raw)
-        # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
-        gamma3 = Reshape((1, TEACHER_FILTERS), name=f"film_gamma_expand_{idx}")(gamma)
-        beta3  = Reshape((1, TEACHER_FILTERS), name=f"film_beta_expand_{idx}")(beta)
-        x = Add(name=f"film_apply_{idx}")([
-            Multiply(name=f"film_scale_{idx}")([x, gamma3]),
-            beta3
-        ])
+        x = film_apply(x, style_embed, TEACHER_FILTERS, prefix=f"tch_dil_{idx}")
         
     # Final pick/finger outputs
     main_pick   = Conv1D(1,1,padding="same",name="tch_final_pick")(x)
@@ -1289,19 +1277,8 @@ def build_student_model(teacher=None, dynamic_time=False):
                                                   Activation("sigmoid", name=f"stu_sigmoid_{i}")(g2)])
         x   = Conv1D(STUDENT_FILTERS, kernel_size=1, padding="same", name=f"stu_pw_{i}")(x)
         x   = Add(name=f"stu_res_add_{i}")([x, res])
-    
-        film  = Dense(2*STUDENT_FILTERS, name=f"stu_film_dense_{i}")(style_embed)
-        gamma_raw = Lambda(slice_film_gamma, arguments={"filters": STUDENT_FILTERS}, name=f"stu_film_gamma_raw_{i}")(film)
-        beta_raw  = Lambda(slice_film_beta,  arguments={"filters": STUDENT_FILTERS}, name=f"stu_film_beta_raw_{i}")(film)
-        gamma = Lambda(film_gamma_stable, name=f"stu_film_gamma_{i}")(gamma_raw)
-        beta  = Lambda(film_beta_stable,  name=f"stu_film_beta_{i}")(beta_raw)
-        # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
-        gamma3 = Reshape((1, STUDENT_FILTERS), name=f"stu_film_gamma_expand_{i}")(gamma)
-        beta3  = Reshape((1, STUDENT_FILTERS), name=f"stu_film_beta_expand_{i}")(beta)
-        x     = Add(name=f"stu_film_apply_{i}")([
-            Multiply(name=f"stu_film_scale_{i}")([x, gamma3]),
-            beta3
-        ])
+        
+        x = film_apply(x, style_embed, STUDENT_FILTERS, prefix=f"stu_dil_{idx}")
 
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
