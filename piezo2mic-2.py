@@ -939,7 +939,13 @@ class StuIrAlign(Layer):
         return ir[:, self.offset : self.offset + T, :]
     def compute_output_shape(self, input_shape):
         b, T, _ = input_shape[1]
-        return (b, T, 1)
+
+    def compute_output_shape(self, input_shape):
+        b, T, _ = input_shape
+        if T is None:
+            return (b, None, 1)
+        out_T = T // self.factor
+        return (b, out_T, 1)
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"offset": self.offset})
@@ -1166,7 +1172,6 @@ def build_teacher_model(dynamic_time=False):
     cls         = GlobalAveragePooling1D(name="tch_style_gap")(cls)
     style_logit = Dense(1, name="tch_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="tch_style_prob")(style_logit)
-    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="tch_style_embed")(style_prob)
 
     x = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_init_pw")(inp)
 
@@ -1212,8 +1217,8 @@ def build_teacher_model(dynamic_time=False):
         Multiply(name="tch_style_true_part")([style_force_in, style_true_in]),
     ])
     style_time_used = TileStyle(name="tch_style_time_used")([style_used_scalar, inp])
-
-    
+    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="tch_style_embed")(style_used_scalar)
+ 
     inv_style  = InvertStyle(name="tch_invert_style")(style_time_used)
     pick_c     = Multiply(name="tch_pick_contrib")([style_time_used, main_pick])
     finger_c   = Multiply(name="tch_finger_contrib")([inv_style,     main_finger])
@@ -1255,7 +1260,6 @@ def build_student_model(teacher=None, dynamic_time=False):
     cls         = GlobalAveragePooling1D(name="stu_style_gap")(cls)
     style_logit = Dense(1, name="stu_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="stu_style_prob")(style_logit)
-    style_embed = Dense(STUDENT_EMBED_DIM, activation="linear", name="stu_style_embed")(style_prob)
     
     x = Conv1D(STUDENT_FILTERS, kernel_size=1, padding="same", name="stu_init_pw")(inp)
 
@@ -1305,6 +1309,7 @@ def build_student_model(teacher=None, dynamic_time=False):
         Multiply(name="stu_style_true_part")([style_force_in, style_true_in]),
     ])
     style_time_used = TileStyle(name="stu_style_time_used")([style_used_scalar, inp])
+    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="stu_style_embed")(style_used_scalar)
 
     inv_style  = InvertStyle(name="stu_invert_style")(style_time_used)
     pick_c     = Multiply(name="stu_pick_contrib")([style_time_used, out_pick])
