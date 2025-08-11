@@ -1172,6 +1172,15 @@ def build_teacher_model(dynamic_time=False):
     cls         = GlobalAveragePooling1D(name="tch_style_gap")(cls)
     style_logit = Dense(1, name="tch_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="tch_style_prob")(style_logit)
+    
+    one_minus_force = Lambda(invert, name="tch_one_minus_force")(style_force_in)
+    # style_used_scalar = (1 - force)pred + forcetrue  → shape (B,1)
+    style_used_scalar = Add(name="tch_style_used_scalar")([
+        Multiply(name="tch_style_pred_part")([one_minus_force, style_prob]),
+        Multiply(name="tch_style_true_part")([style_force_in, style_true_in]),
+    ])
+    style_time_used = TileStyle(name="tch_style_time_used")([style_used_scalar, inp])
+    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="tch_style_embed")(style_used_scalar)
 
     x = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_init_pw")(inp)
 
@@ -1209,15 +1218,6 @@ def build_teacher_model(dynamic_time=False):
     # Final pick/finger outputs
     main_pick   = Conv1D(1,1,padding="same",name="tch_final_pick")(x)
     main_finger = Conv1D(1,1,padding="same",name="tch_final_finger")(x)
-    
-    one_minus_force = Lambda(invert, name="tch_one_minus_force")(style_force_in)
-    # style_used_scalar = (1 - force)pred + forcetrue  → shape (B,1)
-    style_used_scalar = Add(name="tch_style_used_scalar")([
-        Multiply(name="tch_style_pred_part")([one_minus_force, style_prob]),
-        Multiply(name="tch_style_true_part")([style_force_in, style_true_in]),
-    ])
-    style_time_used = TileStyle(name="tch_style_time_used")([style_used_scalar, inp])
-    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="tch_style_embed")(style_used_scalar)
  
     inv_style  = InvertStyle(name="tch_invert_style")(style_time_used)
     pick_c     = Multiply(name="tch_pick_contrib")([style_time_used, main_pick])
@@ -1261,6 +1261,14 @@ def build_student_model(teacher=None, dynamic_time=False):
     style_logit = Dense(1, name="stu_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="stu_style_prob")(style_logit)
     
+    one_minus_force = Lambda(invert, name="stu_one_minus_force")(style_force_in)
+    style_used_scalar = Add(name="stu_style_used_scalar")([
+        Multiply(name="stu_style_pred_part")([one_minus_force, style_prob]),
+        Multiply(name="stu_style_true_part")([style_force_in, style_true_in]),
+    ])
+    style_time_used = TileStyle(name="stu_style_time_used")([style_used_scalar, inp])
+    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="stu_style_embed")(style_used_scalar)
+    
     x = Conv1D(STUDENT_FILTERS, kernel_size=1, padding="same", name="stu_init_pw")(inp)
 
     # Pre-blocks (causal)
@@ -1302,14 +1310,6 @@ def build_student_model(teacher=None, dynamic_time=False):
     # Style-gated pick/finger blend
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
     out_finger = Conv1D(1,1,padding="same", name="stu_final_finger")(x)
-    
-    one_minus_force = Lambda(invert, name="stu_one_minus_force")(style_force_in)
-    style_used_scalar = Add(name="stu_style_used_scalar")([
-        Multiply(name="stu_style_pred_part")([one_minus_force, style_prob]),
-        Multiply(name="stu_style_true_part")([style_force_in, style_true_in]),
-    ])
-    style_time_used = TileStyle(name="stu_style_time_used")([style_used_scalar, inp])
-    style_embed = Dense(TEACHER_EMBED_DIM, activation="linear", name="stu_style_embed")(style_used_scalar)
 
     inv_style  = InvertStyle(name="stu_invert_style")(style_time_used)
     pick_c     = Multiply(name="stu_pick_contrib")([style_time_used, out_pick])
