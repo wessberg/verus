@@ -3,14 +3,17 @@
 Train a causal ResNet to map an acoustic‐guitar piezo pickup signal 
 to the equivalent mic’d signal.
 
-Updated to:
-- Automatic mic→piezo alignment using GCC-PHAT and fractional (sub-sample) shift
+- Automatic mic→piezo alignment using GCC-PHAT and fractional (sub-sample) shift (disabled by default because inputs are pre-aligned offline)
 - Look-ahead (bounded, acausal) teacher to better model pick onsets
 - Onset-gated HF branch in both teacher and student
 - Stabilized FiLM (gamma≈1, beta≈0)
 - Pre-dilation micro-kernel blocks for local HF structure
 - Onset/HF-focused spectral and time-domain loss shaping
 - Per-output labels and sample weights provided as dicts keyed by output names
+
+Everything is fully Keras serializable.
+- The teacher is a static offline model, and therefore non-causal and has look-ahead.
+- The student is a dynamic model, and therefore causal and has no look-ahead.
 """
 
 import os, glob, random, shutil, sys, re, math
@@ -20,7 +23,7 @@ import tensorflow as tf
 from scipy.signal import minimum_phase, firwin, resample_poly
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, CSVLogger, Callback, ReduceLROnPlateau
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau
 from tensorflow.keras import regularizers, constraints
 from tensorflow.keras.losses import Loss
 from tensorflow.keras.layers import (
@@ -118,7 +121,6 @@ FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 # Onset/HF loss shaping
-TRANSIENT_UPWEIGHT_RATIO  = 0.0   # we now do onset-weighting inside the loss
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
 ONSET_SMOOTH_MS           = 12.0
@@ -134,7 +136,7 @@ MEL_WEIGHT                = 1.0
 RMS_ENV_WEIGHT            = 1.0
 COMPLEX_STFT_WEIGHT       = 0.5
 D2_WEIGHT                 = 0.2
-λ_STYLE_RATIO             = 0.5
+LAMBDA_STYLE_RATIO        = 0.5
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
 ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6
@@ -202,10 +204,6 @@ LOGS_OUT_DIR = os.path.join(OUT_DIR, "logs")
 LOGS_TEACHER_OUT_DIR = os.path.join(LOGS_OUT_DIR, "teacher")
 LOGS_STUDENT_OUT_DIR = os.path.join(LOGS_OUT_DIR, "student")
 
-CSV_LOGS_OUT_DIR = os.path.join(OUT_DIR, "csv-logs")
-CSV_LOGS_TEACHER_OUT_DIR = os.path.join(CSV_LOGS_OUT_DIR, "teacher")
-CSV_LOGS_STUDENT_OUT_DIR = os.path.join(CSV_LOGS_OUT_DIR, "student")
-
 DEMOS_OUT_DIR = os.path.join(OUT_DIR, "demos")
 
 LONG_DEMOS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "long")
@@ -222,7 +220,7 @@ DEMO_CHECKPOINTS_STUDENT_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "stude
 
 SAVE_WEIGHTS           = False
 
-for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR, CSV_LOGS_TEACHER_OUT_DIR, CSV_LOGS_STUDENT_OUT_DIR]:
+for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_TEACHER_OUT_DIR, CHECKPOINT_STUDENT_OUT_DIR, LOGS_TEACHER_OUT_DIR, LOGS_STUDENT_OUT_DIR, DEMO_CHECKPOINTS_TEACHER_OUT_DIR, DEMO_CHECKPOINTS_STUDENT_OUT_DIR, LONG_DEMOS_TEACHER_OUT_DIR, LONG_DEMOS_STUDENT_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_TEACHER_OUT_DIR, MODELS_STUDENT_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── UTILITIES ───────────────────────────────────
@@ -490,14 +488,15 @@ class DemoCallback(Callback):
 
 @register_keras_serializable()
 class CombinedLoss(Loss):
-    def __init__(self, sample_rate, name="combined_loss", **kwargs):
+    def __init__(self, sample_rate, extra_small_cplx=False, name="combined_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate = sample_rate
+        self.extra_small_cplx = bool(extra_small_cplx)
     def call(self, y_true, y_pred):
-        return combined_loss(y_true, y_pred, self.sample_rate)
+        return combined_loss(y_true, y_pred, self.sample_rate, extra_small_cplx=self.extra_small_cplx)
     def get_config(self):
         config = super().get_config()
-        config.update({"sample_rate": self.sample_rate})
+        config.update({"sample_rate": self.sample_rate, "extra_small_cplx": self.extra_small_cplx})
         return config
 
 @register_keras_serializable()
@@ -690,7 +689,7 @@ def rms_env_loss(y_true, y_pred):
     return env_diff[:,None,None]
 
 @register_keras_serializable()
-def combined_loss(y_true, y_pred, sample_rate):
+def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
     onset_env = onset_envelope(y_true, sample_rate=sample_rate, pre_emph_alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS)
     td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)
@@ -700,7 +699,17 @@ def combined_loss(y_true, y_pred, sample_rate):
                                           onset_env=onset_env, onset_gain=STFT_HF_ONSET_GAIN)
     mel  = log_mel_loss(y_true, y_pred, sample_rate)
     env  = rms_env_loss(y_true, y_pred)
-    cplx = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=onset_env)
+
+    # Base complex STFT (existing)
+    cplx_base = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=onset_env)
+
+    # Extra tiny-window complex STFT to lock the first ms (teacher only)
+    if extra_small_cplx:
+        cplx_64 = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=64, hop=16, win=64, onset_env=onset_env)
+        cplx = 0.5 * (cplx_base + cplx_64)
+    else:
+        cplx = cplx_base
+
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=onset_env)
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
@@ -715,10 +724,6 @@ def mean_hf_metric(y_true, y_pred):
     return tf.reduce_mean(hf_loss(y_true, y_pred))
 
 # ────────────────────────────── DATA PIPELINE HELPERS ───────────────────────
-
-@register_keras_serializable()
-def pack_for_rnn(x):
-    return tf.identity(x)
 
 def hp_diff_env(window, α=0.8):
     hp = np.empty_like(window)
@@ -974,23 +979,14 @@ def slice_content(x, filters):
 def extract_style_scalar(x):
     return x[:, 0:1, 0:1]
 @register_keras_serializable()
-def expand_time_axis(x):
-    return tf.expand_dims(x, axis=1)
-@register_keras_serializable()
 def slice_gate(x, filters):
     return x[:, :, filters:]
-@register_keras_serializable()
-def slice_piezo(x):
-    return x[:, :, 0:1]
 @register_keras_serializable()
 def slice_film_gamma(x, filters):
     return x[..., :filters]
 @register_keras_serializable()
 def slice_film_beta(x, filters):
     return x[..., filters:]
-@register_keras_serializable()
-def slice_style(x):
-    return x[:, :, 1:2]
 @register_keras_serializable()
 def invert(x):
     return 1.0 - x
@@ -1059,9 +1055,12 @@ def film_apply(x, style_embed, filters, prefix):
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
-def build_teacher_model(dynamic_time=False):
+def build_teacher_model(dynamic_time=False, style_forcing = False):
     T   = None if dynamic_time else TEACHER_SEG_LEN
     inp = Input(shape=(T,1), name="tch_piezo_input")
+    
+    if style_forcing:
+        style_true_in = Input(shape=(1,), name="tch_style_true_input")
     
     # Style head
     cls         = Conv1D(16,3, padding="same", activation="relu", name="tch_style_conv")(inp)
@@ -1099,18 +1098,29 @@ def build_teacher_model(dynamic_time=False):
     # Final pick/finger outputs
     main_pick   = Conv1D(1,1,padding="same",name="tch_final_pick")(x)
     main_finger = Conv1D(1,1,padding="same",name="tch_final_finger")(x)
-
-    # Style gating
-    style_time = TileStyle(name="tch_style_time")([style_prob, inp])
     
-    inv_style  = InvertStyle(name="tch_invert_style")(style_time)
-    pick_c   = Multiply(name="tch_pick_contrib")([style_time,   main_pick])
-    finger_c = Multiply(name="tch_finger_contrib")([inv_style,   main_finger])
+    
+    # Style gating: predicted vs ground-truth
+    style_time_pred = TileStyle(name="tch_style_time_pred")([style_prob, inp])
+    if style_forcing:
+        style_time_true = TileStyle(name="tch_style_time_true")([style_true_in, inp])
+        style_time_used = style_time_true
+    else:
+        style_time_used = style_time_pred
+    
+    inv_style  = InvertStyle(name="tch_invert_style")(style_time_used)
+    pick_c     = Multiply(name="tch_pick_contrib")([style_time_used, main_pick])
+    finger_c   = Multiply(name="tch_finger_contrib")([inv_style,     main_finger])
 
-    # Onset-gated HF branch with look-ahead in its convs
+    # Onset-gated HF branch with look-ahead in its convs    
     gate = OnsetGate(sr=TEACHER_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=TEACHER_HF_ONSET_SMOOTH_MS, name="tch_onset_gate")(inp)
     gate = Lambda(onset_gate_shape, name="tch_onset_gate_shaped")(gate)
-
+    
+    g_feat = Conv1D(32, 5, padding="same", activation="relu", name="tch_gate_c1")(x)
+    g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="tch_gate_c2")(g_feat)
+    
+    gate = Multiply(name="tch_onset_gate_total")([gate, g_feat])
+    
     hf = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_hf_init")(inp)
     hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b0", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
     hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b1", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
@@ -1118,14 +1128,22 @@ def build_teacher_model(dynamic_time=False):
     hf = Conv1D(1,1,padding="same", name="tch_hf_out")(hf)
     hf = Multiply(name="tch_hf_gate")([hf, gate])
     hf = IrScale(init=0.25, name="tch_hf_scale")(hf)
-    
+
     out = Add(name="tch_mix_main")([pick_c, finger_c, hf])
-    return tf.keras.models.Model(inputs=inp, outputs=[out, style_prob], name="piezo2mic_teacher")
+    
+    
+    if style_forcing:
+        return tf.keras.models.Model(inputs=[inp, style_true_in], outputs=[out, style_prob], name="piezo2mic_teacher")
+    else:
+        return tf.keras.models.Model(inputs=inp, outputs=[out, style_prob], name="piezo2mic_teacher")
 
 @register_keras_serializable()
-def build_student_model(teacher=None, dynamic_time=False):
+def build_student_model(teacher=None, dynamic_time=False, style_forcing=False):
     T   = None if dynamic_time else STUDENT_SEG_LEN
     inp = Input(shape=(T,1), name="stu_piezo_input")
+    
+    if style_forcing:
+        style_true_in = Input(shape=(1,), name="stu_style_true_input")
 
     # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="stu_style_conv")(inp)
@@ -1169,11 +1187,18 @@ def build_student_model(teacher=None, dynamic_time=False):
     # Style-gated pick/finger blend
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
     out_finger = Conv1D(1,1,padding="same", name="stu_final_finger")(x)
-    style_time = TileStyle(name="stu_style_time")([style_prob, inp])
-    inv_style  = InvertStyle(name="stu_invert_style")(style_time)
-    pick_c     = Multiply(name="stu_pick_contrib")([style_time, out_pick])
-    finger_c   = Multiply(name="stu_finger_contrib")([inv_style, out_finger])
-    y_student = Add(name="stu_main")([pick_c, finger_c])
+    
+    style_time_pred = TileStyle(name="stu_style_time_pred")([style_prob, inp])
+    if style_forcing:
+        style_time_true = TileStyle(name="stu_style_time_true")([style_true_in, inp])
+        style_time_used = style_time_true
+    else:
+        style_time_used = style_time_pred
+
+    inv_style  = InvertStyle(name="stu_invert_style")(style_time_used)
+    pick_c     = Multiply(name="stu_pick_contrib")([style_time_used, out_pick])
+    finger_c   = Multiply(name="stu_finger_contrib")([inv_style,     out_finger])
+    y_student  = Add(name="stu_main")([pick_c, finger_c])
 
     # Low-rate IR Branch (causal)
     ir = StuIrDownsampleFIR(name="stu_ir_downsample")(inp)
@@ -1200,12 +1225,20 @@ def build_student_model(teacher=None, dynamic_time=False):
 
     # Onset-gated HF branch (causal)
     gate = OnsetGate(sr=STUDENT_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS, name="stu_onset_gate")(inp)
+    g_feat = Conv1D(32, 5, padding="same", activation="relu", name="stu_gate_c1")(x)
+    g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="stu_gate_c2")(g_feat)
+    
+    
+    
+    gate = Multiply(name="stu_onset_gate_total")([gate, g_feat])
+
     hf = Conv1D(STUDENT_FILTERS, 1, padding="same", name="stu_hf_init")(inp)
     hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b0", lookahead=0)
     hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=5, dilation=1, prefix="stu_hf_b1", lookahead=0)
+    hf = gated_sep_block(hf, STUDENT_FILTERS, kernel=3, dilation=1, prefix="stu_hf_b2", lookahead=0)
     hf = Conv1D(1,1,padding="same", name="stu_hf_out")(hf)
     hf = Multiply(name="stu_hf_gate")([hf, gate])
-    hf = IrScale(init=0.1, name="stu_hf_scale")(hf)
+    hf = IrScale(init=0.25, name="stu_hf_scale")(hf)
 
     y_student = Add(name="stu_with_ir")([y_student, ir, hf])
 
@@ -1227,7 +1260,10 @@ def build_student_model(teacher=None, dynamic_time=False):
         teacher_audio, teacher_style = teacher(inp)
         y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA, name="distillation")([teacher_audio, y_student])
 
-    return tf.keras.models.Model(inputs=inp, outputs=[y_student, style_prob], name="piezo2mic_student")
+    if style_forcing:
+        return tf.keras.models.Model(inputs=[inp, style_true_in], outputs=[y_student, style_prob], name="piezo2mic_student")
+    else:
+        return tf.keras.models.Model(inputs=inp, outputs=[y_student, style_prob], name="piezo2mic_student")
 
 def approx_steps(durs, seg_len):
     return 10 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
@@ -1256,6 +1292,30 @@ def add_sw_student(x, y):
     # Return tuples, not lists
     return x, (y_audio, style_true), (sw_audio, sw_style)
 
+
+
+@register_keras_serializable()
+def add_sw_teacher_tf(x, y):
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
+    inputs = {'tch_piezo_input': x, 'tch_style_true_input': style_true}
+    outputs = (y_audio, style_true)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
+def add_sw_student_tf(x, y):
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
+    inputs = {'stu_piezo_input': x, 'stu_style_true_input': style_true}
+    outputs = (y_audio, style_true)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
 def train_shared(
     kind,
     seg_len,
@@ -1263,7 +1323,6 @@ def train_shared(
     build_model_fn,
     checkpoint_out_dir,
     logs_out_dir,
-    csv_logs_out_dir,
     demo_checkpoints_out_dir,
     static_model_filepath,
     dynamic_model_filepath,
@@ -1295,6 +1354,8 @@ def train_shared(
     steps_per_epoch  = max(approx_steps(durs=train_durs, seg_len=seg_len),1)
     validation_steps = max(approx_steps(durs=val_durs, seg_len=seg_len),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
+    
+    style_forcing = bool(build_model_fn_args.get('style_forcing', False))
 
     sig_x = tf.TensorSpec((seg_len,1), tf.float32)
     sig_y = (
@@ -1313,7 +1374,12 @@ def train_shared(
     ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
 
     # Choose the correct mapper based on which model is being built
-    sw_map_fn = add_sw_teacher if kind == 'teacher' else add_sw_student
+    
+    if kind == 'teacher':
+        sw_map_fn = add_sw_teacher_tf if style_forcing else add_sw_teacher
+    else:
+        sw_map_fn = add_sw_student_tf if style_forcing else add_sw_student
+    
     train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     val_pick_ds = tf.data.Dataset.from_generator(
@@ -1357,14 +1423,14 @@ def train_shared(
           f"  MEL={MEL_WEIGHT:.6f}"
           f"  ENV={RMS_ENV_WEIGHT:.6f}"
           f"  HF={HF_WEIGHT:.6f}")
-    
-    _combined_loss = CombinedLoss(sample_rate)
+
+    _combined_loss = CombinedLoss(sample_rate, extra_small_cplx=(kind == 'teacher'))
     _log_mel_loss  = LogMelLoss(sample_rate)
     
     static_model.compile(
         optimizer=tf.keras.optimizers.Adam(LR),
         loss=[ _combined_loss, "binary_crossentropy" ],
-        loss_weights = [ 1.0,  λ_STYLE_RATIO ],
+        loss_weights = [ 1.0,  LAMBDA_STYLE_RATIO ],
         metrics = [
             [ 'mae', _log_mel_loss, mean_hf_metric, multi_scale_stft_loss, rms_env_loss ],
             [ 'accuracy' ]
@@ -1372,17 +1438,18 @@ def train_shared(
     )
     static_model.summary()
     
+    args_no_style_forcing = {k:v for k,v in build_model_fn_args.items() if k != 'style_forcing'}
+    
     es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=LR_FACTOR, patience=LR_PLATEAU_PATIENCE, min_lr=MIN_LR, mode='min', verbose=1)
     cp = ModelCheckpoint(filepath=os.path.join(checkpoint_out_dir, "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
                          monitor='val_loss', mode='min', save_best_only=True, verbose=1)
     demo_cb = DemoCallback(sample_rate=sample_rate,
                            build_model_fn=build_model_fn,
-                           build_model_fn_args=build_model_fn_args,
+                           build_model_fn_args=args_no_style_forcing,
                            logs_out_dir=logs_out_dir,
                            demo_checkpoints_out_dir=demo_checkpoints_out_dir)
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
-    csv_logger = CSVLogger(os.path.join(csv_logs_out_dir, "training.csv"), append=False)
 
     static_model.fit(train_ds,
                      initial_epoch=initial_epoch,
@@ -1390,12 +1457,12 @@ def train_shared(
                      steps_per_epoch=steps_per_epoch,
                      validation_data=val_ds,
                      validation_steps=validation_steps,
-                     callbacks=[es, cp, reduce_lr, tb, demo_cb, csv_logger])
+                     callbacks=[es, cp, reduce_lr, tb, demo_cb])
 
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
 
-    dynamic_model = build_model_fn(**build_model_fn_args, dynamic_time=True)
+    dynamic_model = build_model_fn(**args_no_style_forcing, dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
     dynamic_model.save(dynamic_model_filepath)
     print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
@@ -1412,9 +1479,9 @@ def train_teacher(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_teacher_model,
+        build_model_fn_args={'style_forcing': True},
         checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
         logs_out_dir=LOGS_TEACHER_OUT_DIR,
-        csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR
     )
 
@@ -1438,10 +1505,9 @@ def train_student(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_student_model,
-        build_model_fn_args={ 'teacher': teacher },
+        build_model_fn_args={ 'teacher': teacher, 'style_forcing': True },
         checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
         logs_out_dir=LOGS_STUDENT_OUT_DIR,
-        csv_logs_out_dir=CSV_LOGS_STUDENT_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR
     )
 
@@ -1580,7 +1646,7 @@ def fine_tune():
     finetuned_student_small.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
         loss=[_combined_loss, "binary_crossentropy"],
-        loss_weights=[1.0, λ_STYLE_RATIO],
+        loss_weights=[1.0, LAMBDA_STYLE_RATIO],
         metrics=[["mae"], []]
     )
     dsS = make_mixed_ds(STUDENT_SEG_LEN)
@@ -1657,8 +1723,8 @@ def profile_finetune_model_style_flag_flips(student_dyn):
     x_piezo = x_long[:,0:1]
     _detect_and_print_flips(model=student_dyn, name="STUDENT", audio_piezo=x_piezo, sr=FINETUNE_SAMPLE_RATE, seg_len=STUDENT_SEG_LEN, threshold=STYLE_FLAG_PROB_THRESHOLD)
 
-def cleanup_and_prepare_train (logs_out_dir, csv_logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
-    for dir_path in [logs_out_dir, csv_logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
+def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
+    for dir_path in [logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
         for sub in os.listdir(dir_path):
             sub_path = os.path.join(dir_path, sub)
             if os.path.isfile(sub_path):
@@ -1699,7 +1765,6 @@ def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-teacher":
         resume, resume_ckpt = cleanup_and_prepare_train(
             logs_out_dir=LOGS_TEACHER_OUT_DIR,
-            csv_logs_out_dir=CSV_LOGS_TEACHER_OUT_DIR,
             checkpoints_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
             demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR,
             demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
@@ -1711,7 +1776,6 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--train-student":
         resume, resume_ckpt = cleanup_and_prepare_train(
             logs_out_dir=LOGS_STUDENT_OUT_DIR,
-            csv_logs_out_dir=LOGS_STUDENT_OUT_DIR,
             checkpoints_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
             demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR,
             demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
