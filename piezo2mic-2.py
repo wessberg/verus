@@ -14,6 +14,21 @@ to the equivalent mic’d signal.
 Everything is fully Keras serializable.
 - The teacher is a static offline model, and therefore non-causal and has look-ahead.
 - The student is a dynamic model, and therefore causal and has no look-ahead.
+
+=============================================================
+Style forcing blend (base training) and clean finetuning:
+=============================================================
+
+During base training, both teacher and student expose two scalar style inputs (style_true_input and style_force_input)
+and use style_used = (1 - force) * style_pred + force * style_true for the pick/finger gate.
+We feed force=1 (teacher forcing) to stabilize learning of the heads while the classifier is still weak,
+and train the classifier with BCE.
+
+At inference we can feed force=0 so the model relies on its own classifier.
+
+For finetuning, we do not have any true style labels, as we accept general audio that may combine playing styles.
+We build the student without forcing the style and apply dummy-style inputs (force=0) to the model, so it always uses its own classifier.
+It inherits the style head by name from the base model, and disable the style BCE loss.
 """
 
 import os, glob, random, shutil, sys, re, math
@@ -28,7 +43,7 @@ from tensorflow.keras import regularizers, constraints
 from tensorflow.keras.losses import Loss
 from tensorflow.keras.layers import (
     Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D
+    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D, Reshape
 )
 
 # Turn off GPU acceleration for inference in demo mode (more reliable on many systems)
@@ -424,6 +439,16 @@ class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, logs_out_dir, build_model_fn, build_model_fn_args={}):
         super().__init__()
         demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
+        
+        # if demo_src includes "pick", use the 1.0 as style_flag, otherwise use 0.0
+        if "pick" in demo_src:
+            self.style_true_flag = 1.0
+        elif "finger" in demo_src:
+            self.style_true_flag = 0.0
+        else:
+            # It might be a blended chunk where the styles may be intermixed
+            self.style_true_flag = None
+        
         self.src_path = demo_src
         self.tgt_path = demo_tgt
         self.demo_sec = DEMO_SEC
@@ -468,21 +493,40 @@ class DemoCallback(Callback):
             x_mod = x_src
             y_mod = y_src
         x_demo = x_mod[None, :, None]
-        y_out, style_out = self.dynamic_model.predict(x_demo, batch_size=1, verbose=0)
-        y_pred = y_out[0,:,0]
-        style_p = float(style_out[0,0])
-        style_nm= 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        
+        # First predict the style using the dynamic model, not based on the true style flag, but on the classifier itself.
+        # This helps inform whether or not the model accurately predicts the correct style.
+        dummy_style = np.zeros((1, 1), dtype=np.float32)
+        force_zero  = np.zeros((1, 1), dtype=np.float32)
+        y_inf_style_pred, style_pred_out = self.dynamic_model.predict([x_demo, dummy_style, force_zero], batch_size=1, verbose=0)
+        y_inf_style_pred = y_inf_style_pred[0, :, 0]
+        style_pred = float(style_pred_out[0, 0])
+        style_pred_name = 'pick' if style_pred > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+
+        # Now, if the true style is known (such as is the case for the base models),
+        # also infer the audio, but guided by the true style flag
+        if self.style_true_flag is not None:
+            style_true = np.array([[self.style_true_flag]], dtype=np.float32)
+            force_one  = np.ones((1, 1), dtype=np.float32)
+            y_inf_style_true, _ = self.dynamic_model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
+            y_inf_style_true = y_inf_style_true[0, :, 0]
+            style_true_name = 'pick' if self.style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        else:
+            y_inf_style_true = None
+            style_true_name = None
+        
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{epoch+1:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
         sf.write(os.path.join(epoch_dir,"demo_source.wav"), x_mod, self.sample_rate, subtype='FLOAT')
         sf.write(os.path.join(epoch_dir,"demo_target.wav"), y_mod, self.sample_rate, subtype='FLOAT')
-        sf.write(os.path.join(epoch_dir,"demo_pred.wav"),   y_pred, self.sample_rate, subtype='FLOAT')
-        with self.writer.as_default():
-            tf.summary.audio("demo/source", x_demo, sample_rate=self.sample_rate, step=epoch+1)
-            tf.summary.audio("demo/target", y_mod[None,:,None], sample_rate=self.sample_rate, step=epoch+1)
-            tf.summary.audio("demo/pred",   y_pred[None,:,None], sample_rate=self.sample_rate, step=epoch+1)
-            self.writer.flush()
-        print(f"[DemoCallback] epoch {epoch+1}: style={style_nm}, written to {epoch_dir}")
+        
+        sf.write(os.path.join(epoch_dir,"demo_pred_style_pred.wav"),   y_inf_style_pred, self.sample_rate, subtype='FLOAT')
+        if y_inf_style_true is not None:
+            sf.write(os.path.join(epoch_dir,"demo_pred_style_true.wav"), y_inf_style_true, self.sample_rate, subtype='FLOAT')
+        
+        print(f"[DemoCallback] epoch {epoch+1}: predicted style={style_pred_name}, true style={style_true_name}, written to {epoch_dir}")
+
+        
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
@@ -800,6 +844,16 @@ def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target
     print("\nGenerating demo…")
     FRAMES      = sec * sample_rate
     START_FRAME = offset_sec * sample_rate
+    
+    # if demo_src includes "pick", use the 1.0 as style_flag, otherwise use 0.0
+    if "pick" in path_src:
+        style_true_flag = 1.0
+    elif "finger" in path_src:
+        style_true_flag = 0.0
+    else:
+        # It might be a blended chunk where the styles may be intermixed
+        style_true_flag = None
+    
     x_long,x_src_sample_rate = sf.read(path_src, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
     y_long,_  = sf.read(path_target, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
     x_src = x_long[:,0]
@@ -811,19 +865,44 @@ def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target
         x_mod = x_src
         y_mod = y_src
     x_demo = x_mod[None, :, None]
-    y_out, style_out = model.predict(x_demo, batch_size=1, verbose=0)
-    y_pred = y_out[0,:,0]
-    style_p = float(style_out[0,0])
-    style_nm= 'pick' if style_p>STYLE_FLAG_PROB_THRESHOLD else 'finger'
-    print(f"[generate_demo] detected style {style_nm} ({style_p:.3f})")
-    prediction_filepath = os.path.join(out_dir, prediction_name + ".wav")
-    sf.write(prediction_filepath, y_pred, sample_rate, subtype='FLOAT')
+    
+    # First predict the style using the dynamic model, not based on the true style flag, but on the classifier itself.
+    # This helps inform whether or not the model accurately predicts the correct style.
+    dummy_style = np.zeros((1, 1), dtype=np.float32)
+    force_zero  = np.zeros((1, 1), dtype=np.float32)
+    y_inf_style_pred, style_pred_out = model.predict([x_demo, dummy_style, force_zero], batch_size=1, verbose=0)
+    y_inf_style_pred = y_inf_style_pred[0, :, 0]
+    style_pred = float(style_pred_out[0, 0])
+    style_pred_name = 'pick' if style_pred > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+
+    # Now, if the true style is known (such as is the case for the base models),
+    # also infer the audio, but guided by the true style flag
+    if style_true_flag is not None:
+        style_true = np.array([[style_true_flag]], dtype=np.float32)
+        force_one  = np.ones((1, 1), dtype=np.float32)
+        y_inf_style_true, _ = model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
+        y_inf_style_true = y_inf_style_true[0, :, 0]
+        style_true_name = 'pick' if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
+    else:
+        y_inf_style_true = None
+        style_true_name = None    
+    
+    style_pred_filepath = os.path.join(out_dir, prediction_name + "_style_pred" + ".wav")
+    style_true_filepath = os.path.join(out_dir, prediction_name + "_style_true" + ".wav")
+
+    sf.write(style_pred_filepath, y_inf_style_pred, sample_rate, subtype='FLOAT')
+    print(f"✅ Demo saved to {style_pred_filepath}. Predicted style: {style_pred_name}")
+
+    if y_inf_style_true is not None:
+        sf.write(style_true_filepath, y_inf_style_true, sample_rate, subtype='FLOAT')
+        print(f"✅ Demo saved to {style_true_filepath}. True style: {style_true_name}")
+
     if (not only_prediction):
         source_filepath = os.path.join(out_dir, "demo_source" +".wav")
         target_filepath = os.path.join(out_dir, "demo_target" + ".wav")
         sf.write(source_filepath, x_mod, sample_rate, subtype='FLOAT')
         sf.write(target_filepath, y_mod, sample_rate, subtype='FLOAT')
-    print(f"✅ Demo saved to {prediction_filepath}")
+    
 
 def make_sinc_filter():
     t = np.arange(STUDENT_IR_FIR_SIZE) - (STUDENT_IR_FIR_SIZE - 1)/2.0
@@ -975,21 +1054,31 @@ class InvertStyle(Layer):
 @register_keras_serializable()
 def slice_content(x, filters):
     return x[:, :, :filters]
+
 @register_keras_serializable()
 def extract_style_scalar(x):
     return x[:, 0:1, 0:1]
+
 @register_keras_serializable()
 def slice_gate(x, filters):
     return x[:, :, filters:]
+
 @register_keras_serializable()
 def slice_film_gamma(x, filters):
     return x[..., :filters]
+
 @register_keras_serializable()
 def slice_film_beta(x, filters):
     return x[..., filters:]
+
 @register_keras_serializable()
 def invert(x):
     return 1.0 - x
+
+@register_keras_serializable()
+def batch_zeros_like_style(x):
+    # Return a (B,1) zeros tensor using batch size from a reference tensor x
+    return tf.zeros((tf.shape(x)[0], 1), dtype=tf.float32)
 
 # Stabilized FiLM
 @register_keras_serializable()
@@ -1051,16 +1140,26 @@ def film_apply(x, style_embed, filters, prefix):
     beta_raw  = Lambda(slice_film_beta,  arguments={'filters': filters}, name=f"{prefix}_film_beta_raw")(film_params)
     gamma = Lambda(film_gamma_stable, name=f"{prefix}_film_gamma")(gamma_raw)
     beta  = Lambda(film_beta_stable,  name=f"{prefix}_film_beta")(beta_raw)
-    return Add(name=f"{prefix}_film_apply")([Multiply(name=f"{prefix}_film_scale")([x, gamma]), beta])
+    
+    
+    # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
+    gamma3 = Reshape((1, filters), name=f"{prefix}_film_gamma_expand")(gamma)
+    beta3  = Reshape((1, filters), name=f"{prefix}_film_beta_expand")(beta)
+    return Add(name=f"{prefix}_film_apply")([
+        Multiply(name=f"{prefix}_film_scale")([x, gamma3]),
+        beta3
+    ])
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
-def build_teacher_model(dynamic_time=False, style_forcing = False):
+def build_teacher_model(dynamic_time=False):
     T   = None if dynamic_time else TEACHER_SEG_LEN
     inp = Input(shape=(T,1), name="tch_piezo_input")
-    
-    if style_forcing:
-        style_true_in = Input(shape=(1,), name="tch_style_true_input")
+        
+    # The known, true style of the input (may or may not be known)
+    style_true_in  = Input(shape=(1,), name="tch_style_true_input")
+    # Whether to use the style prediction or the true style for training
+    style_force_in = Input(shape=(1,), name="tch_style_force_input")  # 0=predict, 1=ground-truth
     
     # Style head
     cls         = Conv1D(16,3, padding="same", activation="relu", name="tch_style_conv")(inp)
@@ -1088,25 +1187,32 @@ def build_teacher_model(dynamic_time=False, style_forcing = False):
                                                Activation('sigmoid', name=f"sigmoid_{idx}")(g2)])
         x = Conv1D(TEACHER_FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
+        
         film_params = Dense(TEACHER_FILTERS*2, name=f"film_dense_{idx}")(style_embed)
         gamma_raw = Lambda(slice_film_gamma, arguments={'filters': TEACHER_FILTERS}, name=f"film_gamma_raw_{idx}")(film_params)
         beta_raw  = Lambda(slice_film_beta,  arguments={'filters': TEACHER_FILTERS}, name=f"film_beta_raw_{idx}")(film_params)
         gamma = Lambda(film_gamma_stable, name=f"film_gamma_{idx}")(gamma_raw)
         beta  = Lambda(film_beta_stable,  name=f"film_beta_{idx}")(beta_raw)
-        x = Add(name=f"film_apply_{idx}")([Multiply(name=f"film_scale_{idx}")([x, gamma]), beta])
+        # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
+        gamma3 = Reshape((1, TEACHER_FILTERS), name=f"film_gamma_expand_{idx}")(gamma)
+        beta3  = Reshape((1, TEACHER_FILTERS), name=f"film_beta_expand_{idx}")(beta)
+        x = Add(name=f"film_apply_{idx}")([
+            Multiply(name=f"film_scale_{idx}")([x, gamma3]),
+            beta3
+        ])
         
     # Final pick/finger outputs
     main_pick   = Conv1D(1,1,padding="same",name="tch_final_pick")(x)
     main_finger = Conv1D(1,1,padding="same",name="tch_final_finger")(x)
     
-    
-    # Style gating: predicted vs ground-truth
-    style_time_pred = TileStyle(name="tch_style_time_pred")([style_prob, inp])
-    if style_forcing:
-        style_time_true = TileStyle(name="tch_style_time_true")([style_true_in, inp])
-        style_time_used = style_time_true
-    else:
-        style_time_used = style_time_pred
+    one_minus_force = Lambda(invert, name="tch_one_minus_force")(style_force_in)
+    # style_used_scalar = (1 - force)pred + forcetrue  → shape (B,1)
+    style_used_scalar = Add(name="tch_style_used_scalar")([
+        Multiply(name="tch_style_pred_part")([one_minus_force, style_prob]),
+        Multiply(name="tch_style_true_part")([style_force_in, style_true_in]),
+    ])
+    style_time_used = TileStyle(name="tch_style_time_used")([style_used_scalar, inp])
+
     
     inv_style  = InvertStyle(name="tch_invert_style")(style_time_used)
     pick_c     = Multiply(name="tch_pick_contrib")([style_time_used, main_pick])
@@ -1130,20 +1236,19 @@ def build_teacher_model(dynamic_time=False, style_forcing = False):
     hf = IrScale(init=0.25, name="tch_hf_scale")(hf)
 
     out = Add(name="tch_mix_main")([pick_c, finger_c, hf])
-    
-    
-    if style_forcing:
-        return tf.keras.models.Model(inputs=[inp, style_true_in], outputs=[out, style_prob], name="piezo2mic_teacher")
-    else:
-        return tf.keras.models.Model(inputs=inp, outputs=[out, style_prob], name="piezo2mic_teacher")
+
+    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name="piezo2mic_teacher")
 
 @register_keras_serializable()
-def build_student_model(teacher=None, dynamic_time=False, style_forcing=False):
+def build_student_model(teacher=None, dynamic_time=False):
     T   = None if dynamic_time else STUDENT_SEG_LEN
     inp = Input(shape=(T,1), name="stu_piezo_input")
     
-    if style_forcing:
-        style_true_in = Input(shape=(1,), name="stu_style_true_input")
+    
+    # The known, true style of the input (may or may not be known)
+    style_true_in  = Input(shape=(1,), name="stu_style_true_input")
+    # Whether to use the style prediction or the true style for training
+    style_force_in = Input(shape=(1,), name="stu_style_force_input")  # 0=predict, 1=ground-truth
 
     # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="stu_style_conv")(inp)
@@ -1172,13 +1277,19 @@ def build_student_model(teacher=None, dynamic_time=False, style_forcing=False):
                                                   Activation("sigmoid", name=f"stu_sigmoid_{i}")(g2)])
         x   = Conv1D(STUDENT_FILTERS, kernel_size=1, padding="same", name=f"stu_pw_{i}")(x)
         x   = Add(name=f"stu_res_add_{i}")([x, res])
-
+    
         film  = Dense(2*STUDENT_FILTERS, name=f"stu_film_dense_{i}")(style_embed)
         gamma_raw = Lambda(slice_film_gamma, arguments={"filters": STUDENT_FILTERS}, name=f"stu_film_gamma_raw_{i}")(film)
         beta_raw  = Lambda(slice_film_beta,  arguments={"filters": STUDENT_FILTERS}, name=f"stu_film_beta_raw_{i}")(film)
         gamma = Lambda(film_gamma_stable, name=f"stu_film_gamma_{i}")(gamma_raw)
         beta  = Lambda(film_beta_stable,  name=f"stu_film_beta_{i}")(beta_raw)
-        x     = Add(name=f"stu_film_apply_{i}")([Multiply(name=f"stu_film_scale_{i}")([x, gamma]), beta])
+        # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
+        gamma3 = Reshape((1, STUDENT_FILTERS), name=f"stu_film_gamma_expand_{i}")(gamma)
+        beta3  = Reshape((1, STUDENT_FILTERS), name=f"stu_film_beta_expand_{i}")(beta)
+        x     = Add(name=f"stu_film_apply_{i}")([
+            Multiply(name=f"stu_film_scale_{i}")([x, gamma3]),
+            beta3
+        ])
 
         layer_name = f"res_add_{i}"
         if STUDENT_TEACHER_FEAT_LAYERS and layer_name in STUDENT_TEACHER_FEAT_LAYERS:
@@ -1188,12 +1299,12 @@ def build_student_model(teacher=None, dynamic_time=False, style_forcing=False):
     out_pick   = Conv1D(1,1,padding="same", name="stu_final_pick")(x)
     out_finger = Conv1D(1,1,padding="same", name="stu_final_finger")(x)
     
-    style_time_pred = TileStyle(name="stu_style_time_pred")([style_prob, inp])
-    if style_forcing:
-        style_time_true = TileStyle(name="stu_style_time_true")([style_true_in, inp])
-        style_time_used = style_time_true
-    else:
-        style_time_used = style_time_pred
+    one_minus_force = Lambda(invert, name="stu_one_minus_force")(style_force_in)
+    style_used_scalar = Add(name="stu_style_used_scalar")([
+        Multiply(name="stu_style_pred_part")([one_minus_force, style_prob]),
+        Multiply(name="stu_style_true_part")([style_force_in, style_true_in]),
+    ])
+    style_time_used = TileStyle(name="stu_style_time_used")([style_used_scalar, inp])
 
     inv_style  = InvertStyle(name="stu_invert_style")(style_time_used)
     pick_c     = Multiply(name="stu_pick_contrib")([style_time_used, out_pick])
@@ -1250,20 +1361,19 @@ def build_student_model(teacher=None, dynamic_time=False, style_forcing=False):
                 inputs = teacher.input,
                 outputs= [teacher.get_layer(n).output for n in STUDENT_TEACHER_FEAT_LAYERS]
             )
-            T_feats = teacher_feat_model(inp)
+            T_feats = teacher_feat_model(([inp, style_true_in, style_force_in]))
             if not isinstance(T_feats, list):
                 T_feats = [T_feats]
             for idx, (T_f, S_f) in enumerate(zip(T_feats, student_feats)):
                 chan = int(T_f.shape[-1])
                 proj = Conv1D(chan, 1, padding="same", name=f"stu_proj_feat_{idx}")(S_f)
                 _ = DistillLoss(alpha=STUDENT_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f, proj])
-        teacher_audio, teacher_style = teacher(inp)
+        
+        teacher_audio, teacher_style = teacher([inp, style_true_in, style_force_in])
+        
         y_student = DistillLoss(alpha=STUDENT_DISTILL_ALPHA, name="distillation")([teacher_audio, y_student])
 
-    if style_forcing:
-        return tf.keras.models.Model(inputs=[inp, style_true_in], outputs=[y_student, style_prob], name="piezo2mic_student")
-    else:
-        return tf.keras.models.Model(inputs=inp, outputs=[y_student, style_prob], name="piezo2mic_student")
+    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[y_student, style_prob], name="piezo2mic_student")
 
 def approx_steps(durs, seg_len):
     return 10 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
@@ -1292,14 +1402,17 @@ def add_sw_student(x, y):
     # Return tuples, not lists
     return x, (y_audio, style_true), (sw_audio, sw_style)
 
-
-
 @register_keras_serializable()
 def add_sw_teacher_tf(x, y):
     y_audio, style_flag = y
     b = tf.shape(x)[0]; T = tf.shape(x)[1]
-    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
-    inputs = {'tch_piezo_input': x, 'tch_style_true_input': style_true}
+    style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
+    style_force = tf.ones((b, 1), dtype=tf.float32)            # 1.0 = use ground-truth
+    inputs = {
+    'tch_piezo_input': x,
+    'tch_style_true_input': style_true,
+    'tch_style_force_input': style_force,
+    }
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
@@ -1309,11 +1422,44 @@ def add_sw_teacher_tf(x, y):
 def add_sw_student_tf(x, y):
     y_audio, style_flag = y
     b = tf.shape(x)[0]; T = tf.shape(x)[1]
-    style_true = tf.expand_dims(style_flag, axis=-1)  # (B,1)
-    inputs = {'stu_piezo_input': x, 'stu_style_true_input': style_true}
+    style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
+    style_force = tf.ones((b, 1), dtype=tf.float32)            # 1.0 = use ground-truth
+    inputs = {
+    'stu_piezo_input': x,
+    'stu_style_true_input': style_true,
+    'stu_style_force_input': style_force,
+    }
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
+def add_sw_student_finetune_nf(x, y):
+    # y = (y_audio, style_flag) but finetune uses no true style labels
+    y_audio, _ = y
+    b = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+
+    # Dummy style label for the style head (B,1)
+    style_true  = tf.zeros((b, 1), dtype=tf.float32)
+    # Force the model to use its own classifier during finetune
+    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 = use prediction
+
+    # Provide the full input signature to keep the model interface unchanged
+    inputs = {
+        'stu_piezo_input':        x,
+        'stu_style_true_input':   style_true,
+        'stu_style_force_input':  style_force,
+    }
+
+    # Targets: audio target plus a dummy style target (won't be used)
+    outputs = (y_audio, style_true)
+
+    # Sample weights: train audio only, disable style BCE
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.zeros_like(style_true, dtype=tf.float32)
+
     return inputs, outputs, (sw_audio, sw_style)
 
 def train_shared(
@@ -1354,8 +1500,6 @@ def train_shared(
     steps_per_epoch  = max(approx_steps(durs=train_durs, seg_len=seg_len),1)
     validation_steps = max(approx_steps(durs=val_durs, seg_len=seg_len),1)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
-    
-    style_forcing = bool(build_model_fn_args.get('style_forcing', False))
 
     sig_x = tf.TensorSpec((seg_len,1), tf.float32)
     sig_y = (
@@ -1376,9 +1520,9 @@ def train_shared(
     # Choose the correct mapper based on which model is being built
     
     if kind == 'teacher':
-        sw_map_fn = add_sw_teacher_tf if style_forcing else add_sw_teacher
+        sw_map_fn = add_sw_teacher_tf
     else:
-        sw_map_fn = add_sw_student_tf if style_forcing else add_sw_student
+        sw_map_fn = add_sw_student_tf
     
     train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
@@ -1438,15 +1582,13 @@ def train_shared(
     )
     static_model.summary()
     
-    args_no_style_forcing = {k:v for k,v in build_model_fn_args.items() if k != 'style_forcing'}
-    
     es = EarlyStopping(monitor='val_loss', mode='min', verbose=1, patience=LR_PATIENCE, restore_best_weights=True)
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=LR_FACTOR, patience=LR_PLATEAU_PATIENCE, min_lr=MIN_LR, mode='min', verbose=1)
     cp = ModelCheckpoint(filepath=os.path.join(checkpoint_out_dir, "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
                          monitor='val_loss', mode='min', save_best_only=True, verbose=1)
     demo_cb = DemoCallback(sample_rate=sample_rate,
                            build_model_fn=build_model_fn,
-                           build_model_fn_args=args_no_style_forcing,
+                           build_model_fn_args=build_model_fn_args,
                            logs_out_dir=logs_out_dir,
                            demo_checkpoints_out_dir=demo_checkpoints_out_dir)
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
@@ -1462,7 +1604,7 @@ def train_shared(
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
 
-    dynamic_model = build_model_fn(**args_no_style_forcing, dynamic_time=True)
+    dynamic_model = build_model_fn(**build_model_fn_args, dynamic_time=True)
     dynamic_model.set_weights(static_model.get_weights())
     dynamic_model.save(dynamic_model_filepath)
     print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
@@ -1479,7 +1621,6 @@ def train_teacher(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_teacher_model,
-        build_model_fn_args={'style_forcing': True},
         checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
         logs_out_dir=LOGS_TEACHER_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_TEACHER_OUT_DIR
@@ -1492,8 +1633,9 @@ def train_student(resume=False, resume_ckpt_path=None):
         sys.exit(1)
     teacher = tf.keras.models.load_model(teacher_dynamic_model_filepath, compile=False)
     print("Loaded teacher from", teacher_dynamic_model_filepath)
-    
+
     tmp_dynamic_model = build_student_model(teacher=teacher, dynamic_time=True)
+    
     validate_ir_delay(tmp_dynamic_model)
     
     train_shared(
@@ -1505,7 +1647,7 @@ def train_student(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_student_model,
-        build_model_fn_args={ 'teacher': teacher, 'style_forcing': True },
+        build_model_fn_args={ 'teacher': teacher },
         checkpoint_out_dir=CHECKPOINT_STUDENT_OUT_DIR,
         logs_out_dir=LOGS_STUDENT_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_STUDENT_OUT_DIR
@@ -1625,7 +1767,7 @@ def fine_tune():
             or name.startswith("stu_hf_")
 
     dsS_val = make_mixed_ds(STUDENT_SEG_LEN)
-    dsS_val = dsS_val.map(add_sw_student)
+    dsS_val = dsS_val.map(add_sw_student_finetune_nf)
     dsS_val = dsS_val.take(5)
 
     baseline_S = calibrate_loss_weights(model=finetuned_student_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5)
@@ -1643,14 +1785,16 @@ def fine_tune():
         f"  ENV={RMS_ENV_WEIGHT:.4f}")
     
     _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE)
+    
     finetuned_student_small.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_STUDENT_LR),
         loss=[_combined_loss, "binary_crossentropy"],
-        loss_weights=[1.0, LAMBDA_STYLE_RATIO],
+        loss_weights=[1.0, 0.0],   # disable BCE during finetune - we fully inherit style classification weights from the base models
         metrics=[["mae"], []]
     )
+    
     dsS = make_mixed_ds(STUDENT_SEG_LEN)
-    dsS = dsS.map(add_sw_student)
+    dsS = dsS.map(add_sw_student_finetune_nf)
     ft_chunks_T = build_chunks(pairs_list=[(src,tgt)], seg_len=STUDENT_SEG_LEN, sample_rate=FINETUNE_SAMPLE_RATE)
     stepsS = max(approx_steps( durs=[dur for (_,_,_,dur) in ft_chunks_T], seg_len=STUDENT_SEG_LEN), 1)
     print("Finetune student model summary:")
@@ -1667,61 +1811,6 @@ def fine_tune():
 
 def compute_rms(sig):
     return np.sqrt(np.mean(sig**2))
-
-def _detect_and_print_flips(model, name: str, audio_piezo: np.ndarray, sr: int, seg_len: int, threshold: float = STYLE_FLAG_PROB_THRESHOLD):
-    N = audio_piezo.shape[0]
-    hop = seg_len
-    def get_prob(start):
-        end = start + seg_len
-        if end <= N:
-            chunk = audio_piezo[start:end]
-        else:
-            pad_amt = end - N
-            chunk = np.pad(audio_piezo[start:N], ((0, pad_amt),(0,0)), mode='constant')
-        style_out = model.predict(chunk[None, ...], batch_size=1, verbose=0)[1]
-        return float(style_out[0,0])
-    p0 = get_prob(0)
-    s0 = int(p0 > threshold)
-    last_state = s0
-    flips = []
-    for start in range(hop, N, hop):
-        p = get_prob(start)
-        s = int(p > threshold)
-        if s != last_state:
-            t_sec = start / sr
-            fr = 'pick'   if last_state else 'finger'
-            to = 'pick'   if s          else 'finger'
-            flips.append((t_sec, fr, to, p))
-            last_state = s
-    print(f"\n=== {name} style‐flip report ===")
-    if len(flips) == 0:
-        print("  no flips detected")
-    else:
-        for (t,fr,to,p) in flips:
-            print(f"  at {t:6.3f}s : {fr} → {to}   (P(pick)={p:.3f})")
-    print(f"  TOTAL FLIPS: {len(flips)}")
-
-def profile_base_model_style_flag_flips(teacher_dyn, student_dyn):
-    for model, seg_len, sample_rate, name in [(teacher_dyn, TEACHER_SEG_LEN, TEACHER_SAMPLE_RATE, "TEACHER"), (student_dyn, STUDENT_SEG_LEN, STUDENT_SAMPLE_RATE, "STUDENT")]:
-        if (model is None): continue
-        FRAMES      = LONG_DEMO_SEC * sample_rate
-        START_FRAME = LONG_DEMO_OFFSET_SEC * sample_rate
-        pth_src, _ = all_pairs[LONG_DEMO_PAIR_INDEX]
-        x_long,x_src_sample_rate = sf.read(pth_src, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
-        x_src = x_long[:,0]
-        if x_src_sample_rate != sample_rate:
-            x_mod = resample_to_model_sr(x_src, x_src_sample_rate, sample_rate)
-        else:
-            x_mod = x_src
-        x_demo = x_mod[None, :, None]
-        _detect_and_print_flips(model=model, name=name, audio_piezo=x_demo, sr=sample_rate, seg_len=seg_len, threshold=STYLE_FLAG_PROB_THRESHOLD)
-
-def profile_finetune_model_style_flag_flips(student_dyn):
-    FRAMES      = FINETUNE_DEMO_SEC * FINETUNE_SAMPLE_RATE
-    START_FRAME = FINETUNE_DEMO_OFFSET_SEC * FINETUNE_SAMPLE_RATE
-    x_long,_ = sf.read(os.path.join(FINETUNE_SRC_DIR, "source.wav"), start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
-    x_piezo = x_long[:,0:1]
-    _detect_and_print_flips(model=student_dyn, name="STUDENT", audio_piezo=x_piezo, sr=FINETUNE_SAMPLE_RATE, seg_len=STUDENT_SEG_LEN, threshold=STYLE_FLAG_PROB_THRESHOLD)
 
 def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     for dir_path in [logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
@@ -1797,7 +1886,7 @@ def main ():
                 demo_out_dir=LONG_DEMOS_TEACHER_OUT_DIR,
                 dynamic_model_filepath=os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME),
                 checkpoint_out_dir=CHECKPOINT_TEACHER_OUT_DIR,
-                build_model_fn=build_teacher_model,
+                build_model_fn=build_teacher_model
             )
         if (len(sys.argv) <= 2 or sys.argv[2] !="--teacher-only"):
             prepare_and_generate_demo(
@@ -1819,24 +1908,6 @@ def main ():
             sys.exit(1)
         student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
         generate_fine_tune_demo(model=student_dyn)
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--profile-base-model-style-flag-flips":
-        teacher_dyn_path = os.path.join(MODELS_TEACHER_OUT_DIR, TEACHER_DYNAMIC_MODEL_FILENAME)
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, STUDENT_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(teacher_dyn_path) and not os.path.exists(student_dyn_path):
-            print("Fine-tuned teacher/student dynamic models not found, run --train-teacher and --train-student first")
-            sys.exit(1)
-        teacher_dyn = None if not os.path.exists(teacher_dyn_path) else tf.keras.models.load_model(teacher_dyn_path, compile=False)
-        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
-        profile_base_model_style_flag_flips(teacher_dyn=teacher_dyn, student_dyn=student_dyn)
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--profile-finetune-model-style-flag-flips":
-        student_dyn_path = os.path.join(MODELS_STUDENT_OUT_DIR, FINETUNE_STUDENT_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(student_dyn_path):
-            print("Fine-tuned dynamic model not found, run --fine-tune first")
-            sys.exit(1)
-        student_dyn = None if not os.path.exists(student_dyn_path) else tf.keras.models.load_model(student_dyn_path, compile=False)
-        profile_finetune_model_style_flag_flips(student_dyn=student_dyn)
         sys.exit(0)
     else:
         print("No command given.")
