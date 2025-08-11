@@ -938,14 +938,11 @@ class StuIrAlign(Layer):
         ir = tf.cond(pad_end>0, lambda: tf.pad(ir, [[0,0],[0,pad_end],[0,0]]), lambda: ir)
         return ir[:, self.offset : self.offset + T, :]
     def compute_output_shape(self, input_shape):
-        b, T, _ = input_shape[1]
+        # input_shape = [(b, T_ir, C_ir), (b, T_main, C_main)]
+        b = input_shape[1][0]
+        T = input_shape[1][1]
+        return (b, T, 1)
 
-    def compute_output_shape(self, input_shape):
-        b, T, _ = input_shape
-        if T is None:
-            return (b, None, 1)
-        out_T = T // self.factor
-        return (b, out_T, 1)
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"offset": self.offset})
@@ -998,6 +995,9 @@ class IRLowpass(Layer):
         pad_amt = self.N - 1
         x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"N": self.N})
