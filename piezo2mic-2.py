@@ -75,7 +75,8 @@ TEACHER_DILATIONS              = (1,2,4,8,16,32,64,128)
 TEACHER_PRE_BLOCKS             = 2
 TEACHER_PRE_KERNEL             = 7
 # Bounded look-ahead per layer (in ms):
-TEACHER_LOOKAHEAD_MS           = 1.0
+TEACHER_LOOKAHEAD_MS           = 4.0
+TEACHER_HF_ONSET_SMOOTH_MS     = 3.0
 TEACHER_LOOKAHEAD_SAMPLES      = int(round(TEACHER_SAMPLE_RATE * TEACHER_LOOKAHEAD_MS / 1000.0))
 TEACHER_RECEPTIVE_FIELD        = 1 + (TEACHER_KERNEL_SIZE - 1) * sum(TEACHER_DILATIONS)
 TEACHER_TRAIN_BLOCK_SIZE       = 4096
@@ -121,18 +122,18 @@ TRANSIENT_UPWEIGHT_RATIO  = 0.0   # we now do onset-weighting inside the loss
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
 ONSET_SMOOTH_MS           = 12.0
-HF_ONSET_GAIN             = 3.0
-STFT_HF_ONSET_GAIN        = 2.0
-STFT_HIGH_SPLIT_HZ        = 3500.0
-STFT_HIGH_BOOST           = 3.0
+HF_ONSET_GAIN             = 6.0
+STFT_HF_ONSET_GAIN        = 4.0
+STFT_HIGH_SPLIT_HZ        = 6000.0
+STFT_HIGH_BOOST           = 5.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 1.0
 STFT_WEIGHT               = 1.0
 MEL_WEIGHT                = 1.0
 RMS_ENV_WEIGHT            = 1.0
-COMPLEX_STFT_WEIGHT       = 0.2
-D2_WEIGHT                 = 0.1
+COMPLEX_STFT_WEIGHT       = 0.5
+D2_WEIGHT                 = 0.2
 λ_STYLE_RATIO             = 0.5
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
@@ -1003,6 +1004,11 @@ def film_beta_stable(raw):
     return 0.1 * tf.tanh(raw)
 
 @register_keras_serializable()
+def onset_gate_shape(g, floor=0.15, gain=0.85, eps=1e-6):
+    g = tf.clip_by_value(g, eps, 1.0)
+    return floor + gain * tf.sqrt(g)
+
+@register_keras_serializable()
 class OnsetGate(Layer):
     def __init__(self, sr, alpha=0.98, smooth_ms=ONSET_SMOOTH_MS, **kwargs):
         super().__init__(**kwargs)
@@ -1096,19 +1102,23 @@ def build_teacher_model(dynamic_time=False):
 
     # Style gating
     style_time = TileStyle(name="tch_style_time")([style_prob, inp])
+    
     inv_style  = InvertStyle(name="tch_invert_style")(style_time)
     pick_c   = Multiply(name="tch_pick_contrib")([style_time,   main_pick])
     finger_c = Multiply(name="tch_finger_contrib")([inv_style,   main_finger])
 
     # Onset-gated HF branch with look-ahead in its convs
-    gate = OnsetGate(sr=TEACHER_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS, name="tch_onset_gate")(inp)
+    gate = OnsetGate(sr=TEACHER_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=TEACHER_HF_ONSET_SMOOTH_MS, name="tch_onset_gate")(inp)
+    gate = Lambda(onset_gate_shape, name="tch_onset_gate_shaped")(gate)
+
     hf = Conv1D(TEACHER_FILTERS, 1, padding="same", name="tch_hf_init")(inp)
     hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b0", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
     hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=5, dilation=1, prefix="tch_hf_b1", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
+    hf = gated_sep_block(hf, TEACHER_FILTERS, kernel=3, dilation=1, prefix="tch_hf_b2", lookahead=TEACHER_LOOKAHEAD_SAMPLES)
     hf = Conv1D(1,1,padding="same", name="tch_hf_out")(hf)
     hf = Multiply(name="tch_hf_gate")([hf, gate])
-    hf = IrScale(init=0.1, name="tch_hf_scale")(hf)
-
+    hf = IrScale(init=0.25, name="tch_hf_scale")(hf)
+    
     out = Add(name="tch_mix_main")([pick_c, finger_c, hf])
     return tf.keras.models.Model(inputs=inp, outputs=[out, style_prob], name="piezo2mic_teacher")
 
