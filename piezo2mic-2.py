@@ -151,9 +151,11 @@ OFFLINE_KERNEL_SIZE            = 51
 OFFLINE_DILATIONS              = (1,2,4,8,16,32,64,128)
 OFFLINE_PRE_BLOCKS             = 2
 OFFLINE_PRE_KERNEL             = 7
+
 # Bounded look-ahead per layer (in ms):
 OFFLINE_LOOKAHEAD_MS           = 4.0
-OFFLINE_HF_ONSET_SMOOTH_MS     = 3.0
+OFFLINE_LOSS_ONSET_SMOOTH_MS   = 3.0
+OFFLINE_GATE_ONSET_SMOOTH_MS   = 3.0
 OFFLINE_LOOKAHEAD_SAMPLES      = int(round(OFFLINE_SAMPLE_RATE * OFFLINE_LOOKAHEAD_MS / 1000.0))
 OFFLINE_RECEPTIVE_FIELD        = 1 + (OFFLINE_KERNEL_SIZE - 1) * sum(OFFLINE_DILATIONS)
 OFFLINE_TRAIN_BLOCK_SIZE       = 4096
@@ -168,6 +170,8 @@ REALTIME_KERNEL_SIZE      = 25
 REALTIME_DILATIONS        = (1,2,4,8)
 REALTIME_PRE_BLOCKS       = 1
 REALTIME_PRE_KERNEL       = 5
+REALTIME_LOSS_ONSET_SMOOTH_MS = 6.0
+REALTIME_GATE_ONSET_SMOOTH_MS  = 6.0
 REALTIME_RECEPTIVE_FIELD  = 1 + (REALTIME_KERNEL_SIZE - 1) * sum(REALTIME_DILATIONS)
 REALTIME_TRAIN_BLOCK_SIZE = 4096
 REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
@@ -187,6 +191,7 @@ FINETUNE_REALTIME_EPOCHS      = 10
 FINETUNE_REALTIME_LR          = 1e-4
 FINETUNE_L1_WEIGHT           = 15.0
 FINETUNE_MEL_WEIGHT          = 15.0
+FINETUNE_LOSS_ONSET_SMOOTH_MS = 6.0
 
 FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
@@ -194,11 +199,10 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 # Onset/HF loss shaping
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
-ONSET_SMOOTH_MS           = 12.0
 HF_ONSET_GAIN             = 6.0
 STFT_HF_ONSET_GAIN        = 4.0
-STFT_HIGH_SPLIT_HZ        = 6000.0
-STFT_HIGH_BOOST           = 5.0
+STFT_HIGH_SPLIT_HZ        = 3500.0
+STFT_HIGH_BOOST           = 8.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 1.0
@@ -210,9 +214,6 @@ D2_WEIGHT                 = 0.2
 LAMBDA_STYLE_RATIO        = 0.5
 
 # ──────── TUNING KNOBS ─────────────────────────────────────────────────────────
-ATTACK_SEGMENT_GENERATOR_MIN_DIFF_THRESH = 1e-6
-ATTACK_SEGMENT_GENERATOR_MIN_ENV_THRESH  = 1e-5
-ATTACK_SEGMENT_GENERATOR_MIN_AMP_THRESH  = 1e-6
 SEGMENT_GENERATOR_MIN_AMP_THRESH         = 1e-5
 #───────────────────────────────────────────────────────────────────────────────
 
@@ -644,17 +645,25 @@ class DemoCallback(Callback):
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
+# Allow offline loss to use tighter onset smoothing
 @register_keras_serializable()
 class CombinedLoss(Loss):
-    def __init__(self, sample_rate, extra_small_cplx=False, name="combined_loss", **kwargs):
+    def __init__(self, sample_rate, extra_small_cplx=False, onset_smooth_ms=3.0, name="combined_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate = sample_rate
         self.extra_small_cplx = bool(extra_small_cplx)
+        self.onset_smooth_ms = float(onset_smooth_ms)
     def call(self, y_true, y_pred):
-        return combined_loss(y_true, y_pred, self.sample_rate, extra_small_cplx=self.extra_small_cplx)
+        return combined_loss(y_true, y_pred, self.sample_rate,
+                             extra_small_cplx=self.extra_small_cplx,
+                             onset_smooth_ms=self.onset_smooth_ms)
     def get_config(self):
         config = super().get_config()
-        config.update({"sample_rate": self.sample_rate, "extra_small_cplx": self.extra_small_cplx})
+        config.update({
+            "sample_rate": self.sample_rate,
+            "extra_small_cplx": self.extra_small_cplx,
+            "onset_smooth_ms": self.onset_smooth_ms
+        })
         return config
 
 @register_keras_serializable()
@@ -835,8 +844,11 @@ def rms_env_loss(y_true, y_pred):
     return env_diff[:,None,None]
 
 @register_keras_serializable()
-def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
-    onset_env = onset_envelope(y_true, sample_rate=sample_rate, pre_emph_alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS)
+def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False, onset_smooth_ms=3.0):
+    onset_env = onset_envelope(y_true,
+                               sample_rate=sample_rate,
+                               pre_emph_alpha=HP_PRE_EMPHASIS_HF,
+                               smooth_ms=onset_smooth_ms)
     td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)
     spec = mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
@@ -846,10 +858,7 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
     mel  = log_mel_loss(y_true, y_pred, sample_rate)
     env  = rms_env_loss(y_true, y_pred)
 
-    # Base complex STFT (existing)
     cplx_base = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=onset_env)
-
-    # Extra tiny-window complex STFT to lock the first ms (offline only)
     if extra_small_cplx:
         cplx_64 = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=64, hop=16, win=64, onset_env=onset_env)
         cplx = 0.5 * (cplx_base + cplx_64)
@@ -1019,16 +1028,65 @@ def analyze_loss_scales(model, dataset, sample_rate):
     hf_val   = tf.reduce_mean(hf_loss(y_true_audio, y_pred_audio)).numpy()
     return {'l1':l1_val, 'stft':stft_val, 'mel':mel_val, 'env':env_val, 'hf':hf_val}
 
-def calibrate_loss_weights(model, dataset, sample_rate, n_batches=5):
-    sums = {'l1':0., 'stft':0., 'mel':0., 'env':0., 'hf':0.}
-    for i, (x,y,sw) in enumerate(dataset.take(n_batches)):
-        scales = analyze_loss_scales(model=model, sample_rate=sample_rate, dataset=tf.data.Dataset.from_tensors((x,y,sw)))
-        for k,v in scales.items():
-            sums[k] += v
-    print("Average loss scales over", n_batches, "batches:")
-    for k,v in sums.items():
-        print(f"Initial {k} loss: {v:.4f}")
-    return {k: sums[k]/n_batches for k in sums}
+
+
+def _extract_audio_io(model, batch):
+    if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+        raise ValueError("Unexpected dataset element")
+    x = batch[0]
+    y = batch[1]
+    if isinstance(y, (tuple, list)):
+        y_true_audio = y[0]
+    elif isinstance(y, dict):
+        audio_key = model.output_names[0]
+        y_true_audio = y[audio_key]
+    else:
+        y_true_audio = y
+    y_pred_audio, _ = model(x, training=False)
+    return y_true_audio, y_pred_audio
+
+def analyze_loss_scales_consistent_batch(model, batch, sample_rate, onset_smooth_ms):
+    y_true, y_pred = _extract_audio_io(model, batch)
+    onset_env = onset_envelope(
+        y_true,
+        sample_rate=sample_rate,
+        pre_emph_alpha=HP_PRE_EMPHASIS_HF,
+        smooth_ms=onset_smooth_ms
+    )
+    l1   = tf.reduce_mean(waveform_l1_loss(y_true, y_pred)).numpy()
+    mel  = tf.reduce_mean(log_mel_loss(y_true, y_pred, sample_rate)).numpy()
+    env  = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
+    hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)).numpy()
+    stft_on = tf.reduce_mean(
+        mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
+                                       split_hz=STFT_HIGH_SPLIT_HZ,
+                                       high_boost=STFT_HIGH_BOOST,
+                                       onset_env=onset_env,
+                                       onset_gain=STFT_HF_ONSET_GAIN)
+    ).numpy()
+    return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on}
+
+def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
+                                      onset_smooth_ms=3.0,
+                                      normalize_keys=('l1','stft','mel','env','hf'),
+                                      declared=None):
+    if declared is None:
+        declared = {'l1': L1_WEIGHT, 'stft': STFT_WEIGHT, 'mel': MEL_WEIGHT, 'env': RMS_ENV_WEIGHT, 'hf': HF_WEIGHT}
+    sums = {k:0.0 for k in normalize_keys}
+    count = 0
+    for batch in dataset.take(n_batches):
+        sc = analyze_loss_scales_consistent_batch(model, batch, sample_rate, onset_smooth_ms)
+        for k in normalize_keys:
+            sums[k] += float(sc[k])
+        count += 1
+    avgs = {k: (sums[k] / max(count,1)) for k in normalize_keys}
+    print("Average consistent loss scales:", {k: round(v, 6) for k,v in avgs.items()})
+    ref = float(avgs['l1']) if avgs['l1'] > 0 else 1.0
+    new_w = {}
+    for k in normalize_keys:
+        bs = float(avgs[k])
+        new_w[k] = (declared[k] / bs * ref) if bs > 0 else 0.0
+    return new_w, avgs
 
 def generate_demo (model, out_dir, sample_rate, prediction_name="demo_pred", only_prediction=False):
     assert_has_pairs()
@@ -1388,14 +1446,22 @@ def onset_gate_shape(g, floor=0.15, gain=0.85, eps=1e-6):
     g = tf.clip_by_value(g, eps, 1.0)
     return floor + gain * tf.sqrt(g)
 
+
+# 1) Replace the shaping function with a less compressive version
 @register_keras_serializable()
-def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=ONSET_SMOOTH_MS):
+def onset_gate_shape_linear(g, floor=0.25, gain=0.75, eps=1e-6):
+    g = tf.clip_by_value(g, eps, 1.0)
+    return floor + gain * g  # no sqrt compression
+
+
+@register_keras_serializable()
+def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=3.0):
     # High-pass like pre-emphasis
     pe = y[:, 1:, :] - pre_emph_alpha * y[:, :-1, :]
     pe = tf.pad(pe, [[0, 0], [1, 0], [0, 0]])
     env = tf.abs(pe)
 
-    # Use a Python int for the smoothing window length
+    # Explicit smoothing window (in samples)
     win = max(1, int(round(float(smooth_ms) * float(sample_rate) / 1000.0)))
     ker = tf.ones([win, 1, 1], dtype=tf.float32) / float(win)
 
@@ -1406,23 +1472,18 @@ def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=ONSET_SMOOTH_M
 
 @register_keras_serializable()
 class OnsetGate(Layer):
-    def __init__(self, sr, alpha=0.98, smooth_ms=ONSET_SMOOTH_MS, **kwargs):
+    def __init__(self, sr, alpha=0.98, smooth_ms=3.0, **kwargs):
         super().__init__(**kwargs)
         self.sr = float(sr)
         self.alpha = float(alpha)
         self.smooth_ms = float(smooth_ms)
-        # Precompute Python-int window length once
         self._win = max(1, int(round(self.smooth_ms * self.sr / 1000.0)))
 
     def call(self, x):
-        # High-pass like pre-emphasis
         pe = x[:, 1:, :] - self.alpha * x[:, :-1, :]
         pe = tf.pad(pe, [[0, 0], [1, 0], [0, 0]])
         env = tf.abs(pe)
-
-        # Build the averaging kernel using a valid shape
         ker = tf.ones([self._win, 1, 1], dtype=tf.float32) / float(self._win)
-
         env_sm = tf.nn.conv1d(env, ker, stride=1, padding='SAME')
         m = tf.reduce_max(env_sm, axis=1, keepdims=True) + 1e-6
         env_n = tf.clip_by_value(env_sm / m, 0.0, 1.0)
@@ -1523,9 +1584,10 @@ def build_offline_model(dynamic_time=False):
     pick_c     = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
     finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
 
+
     # Onset-gated HF branch with look-ahead in its convs    
-    gate = OnsetGate(sr=OFFLINE_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=OFFLINE_HF_ONSET_SMOOTH_MS, name="offline_onset_gate")(inp)
-    gate = Lambda(onset_gate_shape, name="offline_onset_gate_shaped")(gate)
+    gate = OnsetGate(sr=OFFLINE_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=OFFLINE_GATE_ONSET_SMOOTH_MS, name="offline_onset_gate")(inp)
+    gate = Lambda(onset_gate_shape_linear, name="offline_onset_gate_shaped")(gate)
     
     g_feat = Conv1D(32, 5, padding="same", activation="relu", name="offline_gate_c1")(x)
     g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="offline_gate_c2")(g_feat)
@@ -1538,7 +1600,7 @@ def build_offline_model(dynamic_time=False):
     hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
     hf = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
     hf = Multiply(name="offline_hf_gate")([hf, gate])
-    hf = IrScale(init=0.25, name="offline_hf_scale")(hf)
+    hf = IrScale(init=1.0, name="offline_hf_scale")(hf)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf])
 
@@ -1631,7 +1693,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
 
     # Onset-gated HF branch (causal)
-    gate = OnsetGate(sr=REALTIME_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
+    gate = OnsetGate(sr=REALTIME_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF, smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
     g_feat = Conv1D(32, 5, padding="same", activation="relu", name="realtime_gate_c1")(x)
     g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="realtime_gate_c2")(g_feat)
     
@@ -1918,27 +1980,30 @@ def train_shared(
     else:
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
         initial_epoch = 0
+  
+    # Choose smoothing per model kind
+    onset_ms_for_loss = OFFLINE_LOSS_ONSET_SMOOTH_MS if kind == 'offline' else REALTIME_LOSS_ONSET_SMOOTH_MS
 
-    baseline = calibrate_loss_weights(model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5)
-    ref_scale = float(baseline['l1'])
-    user_w    = {'l1':L1_WEIGHT, 'stft':STFT_WEIGHT, 'mel':MEL_WEIGHT, 'env':RMS_ENV_WEIGHT, 'hf':HF_WEIGHT}
-    new_w = {}
-    for key, uw in user_w.items():
-        bs = float(baseline[key])
-        new_w[key] = uw / bs * ref_scale if bs > 0.0 else 0.0
-    L1_WEIGHT       = new_w['l1']
-    STFT_WEIGHT     = new_w['stft']
-    MEL_WEIGHT      = new_w['mel']
-    RMS_ENV_WEIGHT  = new_w['env']
-    HF_WEIGHT       = new_w['hf']
-    print(f"→ normalized loss weights:"
-          f"  L1={L1_WEIGHT:.6f}"
-          f"  STFT={STFT_WEIGHT:.6f}"
-          f"  MEL={MEL_WEIGHT:.6f}"
-          f"  ENV={RMS_ENV_WEIGHT:.6f}"
-          f"  HF={HF_WEIGHT:.6f}")
+    # Normalize weights consistently with the actual loss shape
+    new_w, _ = calibrate_loss_weights_consistent(
+        model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5, onset_smooth_ms=onset_ms_for_loss
+    )
+    L1_WEIGHT      = new_w['l1']
+    STFT_WEIGHT    = new_w['stft']
+    MEL_WEIGHT     = new_w['mel']
+    RMS_ENV_WEIGHT = new_w['env']
+    HF_WEIGHT      = new_w['hf']
+    print(f"→ normalized ({kind}) weights:"
+        f" L1={L1_WEIGHT:.6f}"
+        f" STFT={STFT_WEIGHT:.6f}"
+        f" MEL={MEL_WEIGHT:.6f}"
+        f" ENV={RMS_ENV_WEIGHT:.6f}"
+        f" HF={HF_WEIGHT:.6f}")
 
-    _combined_loss = CombinedLoss(sample_rate, extra_small_cplx=(kind == 'offline'))
+    # Instantiate the loss with the per-model smoothing
+    _combined_loss = CombinedLoss(sample_rate,
+                                extra_small_cplx=(kind == 'offline'),
+                                onset_smooth_ms=onset_ms_for_loss)
     _log_mel_loss  = LogMelLoss(sample_rate)
 
     static_model.compile(
@@ -2153,21 +2218,27 @@ def fine_tune():
     dsS_val = dsS_val.map(add_sw_realtime_finetune_nf)
     dsS_val = dsS_val.take(5)
 
-    baseline_S = calibrate_loss_weights(model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5)
-    ref = float(baseline_S['l1'])
-    L1_WEIGHT      = corrected_weights['l1']   / baseline_S['l1']   * ref
-    HF_WEIGHT      = corrected_weights['hf']   / baseline_S['hf']   * ref
-    STFT_WEIGHT    = corrected_weights['stft'] / baseline_S['stft'] * ref
-    MEL_WEIGHT     = corrected_weights['mel']  / baseline_S['mel']  * ref
-    RMS_ENV_WEIGHT = corrected_weights['env']  / baseline_S['env']  * ref
-    print("→ finetune-realtime loss weights recalibrated:"
-          f"  L1={L1_WEIGHT:.4f}"
-          f"  HF={HF_WEIGHT:.4f}"
-          f"  STFT={STFT_WEIGHT:.4f}"
-          f"  MEL={MEL_WEIGHT:.4f}"
-          f"  ENV={RMS_ENV_WEIGHT:.4f}")
+    # Normalize weights consistently with the actual loss shape
+    new_w, _ = calibrate_loss_weights_consistent(
+        model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5, onset_smooth_ms=FINETUNE_LOSS_ONSET_SMOOTH_MS
+    )
+    
+    L1_WEIGHT      = new_w['l1']
+    STFT_WEIGHT    = new_w['stft']
+    MEL_WEIGHT     = new_w['mel']
+    RMS_ENV_WEIGHT = new_w['env']
+    HF_WEIGHT      = new_w['hf']
+    print(f"→ normalized finetune weights:"
+        f" L1={L1_WEIGHT:.6f}"
+        f" STFT={STFT_WEIGHT:.6f}"
+        f" MEL={MEL_WEIGHT:.6f}"
+        f" ENV={RMS_ENV_WEIGHT:.6f}"
+        f" HF={HF_WEIGHT:.6f}")
 
-    _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE)
+    # Instantiate the loss with the per-model smoothing
+    _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE,
+                                extra_small_cplx=False,
+                                onset_smooth_ms=FINETUNE_LOSS_ONSET_SMOOTH_MS)
 
     finetuned_realtime_small.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_REALTIME_LR),
