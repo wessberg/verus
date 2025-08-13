@@ -200,10 +200,10 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 
 # Onset/HF loss shaping
 HP_PRE_EMPHASIS           = 0.8
-HP_PRE_EMPHASIS_HF        = 0.995
+HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
 STFT_HF_ONSET_GAIN        = 5.0
-STFT_HIGH_SPLIT_HZ        = 3500.0
+STFT_HIGH_SPLIT_HZ        = 6000.0
 STFT_HIGH_BOOST           = 12.0
 
 L1_WEIGHT                 = 1.0
@@ -1645,7 +1645,7 @@ def build_offline_model(dynamic_time=False):
     hf_hp_pre = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_hp_pre")(hf)
     
     hf_gated = Multiply(name="offline_hf_gate")([hf_hp_pre, gate])
-    hf_final = IrScale(init=1.2, name="offline_hf_scale")(hf_gated)
+    hf_final = IrScale(init=4, name="offline_hf_scale")(hf_gated)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
