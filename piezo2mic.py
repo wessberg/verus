@@ -136,7 +136,7 @@ ALIGN_WIN_SEC           = 1.0     # seconds used for alignment estimation
 ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 
 # Debugging params
-DEBUG               = False
+DEBUG               = True
 
 # Batch params
 BATCH_SIZE          = 8
@@ -907,6 +907,15 @@ def hp_diff_env(window, α=0.8):
     hp[1:] = window[1:] - α * window[:-1]
     return np.abs(np.diff(hp))
 
+@register_keras_serializable()
+def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
+    """
+    Simple 1st-order high-pass (pre-emphasis): y[n] = x[n] - alpha * x[n-1]
+    x shape: (B, T, C)
+    """
+    x_shift = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
+    return x - alpha * x_shift
+
 def segment_generator(seg_len, chunks, is_pick_chunks, model_sample_rate):
     """
     Yields (x, (y_audio, style_flag)) where x and y_audio are (seg_len, 1) at model_sample_rate.
@@ -1621,6 +1630,10 @@ def build_offline_model(dynamic_time=False):
     gate = GateFloorProduct(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
     
     hf = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(inp)
+    
+    hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
+    hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
+    
     hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
     hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b0")
     hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
@@ -1629,10 +1642,12 @@ def build_offline_model(dynamic_time=False):
     hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     
     hf = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
-    hf = Multiply(name="offline_hf_gate")([hf, gate])
-    hf = IrScale(init=1.2, name="offline_hf_scale")(hf)
+    hf_hp_pre = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_hp_pre")(hf)
+    
+    hf_gated = Multiply(name="offline_hf_gate")([hf_hp_pre, gate])
+    hf_final = IrScale(init=1.2, name="offline_hf_scale")(hf_gated)
 
-    out = Add(name="offline_mix_main")([pick_c, finger_c, hf])
+    out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name="piezo2mic_offline")
 
@@ -1822,16 +1837,23 @@ def build_realtime_model(offline=None, dynamic_time=False):
     )(g_feat)
 
     gate = GateFloorProduct(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
-
-    hf = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(inp)
+    
+    hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
+    hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
+    
     hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
     hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
     hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
-    hf = Multiply(name="realtime_hf_gate")([hf, gate])
-    hf = IrScale(init=0.25, name="realtime_hf_scale")(hf)
+    
+    
+    
+    hf_hp_pre = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_hp_pre")(hf)
+    
+    hf_gated = Multiply(name="realtime_hf_gate")([hf_hp_pre, gate])
+    hf_final = IrScale(init=1.2, name="realtime_hf_scale")(hf_gated)
 
-    y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf])
+    y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
     # Distillation at dual rate
     if offline is not None:
