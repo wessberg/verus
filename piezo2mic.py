@@ -1605,9 +1605,18 @@ def build_offline_model(dynamic_time=False):
     gate_env = OnsetGate(sr=OFFLINE_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
                      smooth_ms=OFFLINE_GATE_ONSET_SMOOTH_MS, name="offline_onset_gate")(inp)
     gate_env = Lambda(onset_gate_shape_linear, name="offline_onset_gate_shaped")(gate_env)
-
-    g_feat = Conv1D(32, 5, padding="same", activation="relu", name="offline_gate_c1")(x)
-    g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="offline_gate_c2")(g_feat)
+    
+    g_feat = Conv1D(
+        32, 5, padding="same", activation="relu",
+        kernel_initializer="he_normal", bias_initializer="zeros",
+        name="offline_gate_c1"
+    )(x)
+    g_feat = Conv1D(
+        1,  3, padding="same", activation="sigmoid",
+        kernel_initializer="glorot_uniform",
+        bias_initializer=tf.keras.initializers.Constant(2.5),  # ≈0.924 after sigmoid
+        name="offline_gate_c2"
+    )(g_feat)
 
     gate = GateFloorProduct(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
     
@@ -1691,8 +1700,12 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
     print(f"HF out scaled RMS={np.sqrt(np.mean(hf**2)+1e-12):.6f}")
 
     # onset vs non-onset comparison using gate as a mask
-    on = gate > 0.7
-    off = gate < 0.3
+    # top 3% as onsets, bottom 50% as off)
+    p_on  = np.percentile(gate, 97.0)
+    p_off = np.percentile(gate, 50.0)
+    on  = gate >= p_on
+    off = gate <= p_off
+
     def rms(a, m): 
         a = a[m]
         return np.sqrt(np.mean(a*a) + 1e-12) if a.size>0 else 0.0
@@ -1795,8 +1808,19 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # Onset-gated HF branch (causal)
     gate_env = OnsetGate(sr=REALTIME_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
                      smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
-    g_feat = Conv1D(32, 5, padding="same", activation="relu", name="realtime_gate_c1")(x)
-    g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="realtime_gate_c2")(g_feat)
+
+    g_feat = Conv1D(
+        32, 5, padding="same", activation="relu",
+        kernel_initializer="he_normal", bias_initializer="zeros",
+        name="realtime_gate_c1"
+    )(x)
+    g_feat = Conv1D(
+        1,  3, padding="same", activation="sigmoid",
+        kernel_initializer="glorot_uniform",
+        bias_initializer=tf.keras.initializers.Constant(2.5),
+        name="realtime_gate_c2"
+    )(g_feat)
+
     gate = GateFloorProduct(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
 
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(inp)
