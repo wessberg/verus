@@ -2518,16 +2518,18 @@ def main ():
             static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
             dynamic_model = build_offline_model(dynamic_time=True)
             dynamic_model.set_weights(static_model.get_weights())
+        else:
+            dynamic_model = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
             
-            demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
+        demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
             
-            summarize_offline_hf_usage(
-                src_path=demo_src,
-                tgt_path=demo_tgt,
-                style_true_flag=1.0,
-                offline_dyn=dynamic_model,
-                sample_rate=OFFLINE_SAMPLE_RATE
-            )
+        summarize_offline_hf_usage(
+            src_path=demo_src,
+            tgt_path=demo_tgt,
+            style_true_flag=1.0,
+            offline_dyn=dynamic_model,
+            sample_rate=OFFLINE_SAMPLE_RATE
+        )
         sys.exit(0)
     else:
         print("No command given.")
