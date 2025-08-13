@@ -110,7 +110,7 @@ if len(sys.argv)>1 and sys.argv[1]=="--demo":
     tf.config.set_visible_devices([], 'GPU')
 
 # Determinism
-SEED = 42
+SEED = 42f
 os.environ['PYTHONHASHSEED'] = str(SEED)
 os.environ['TF_DETERMINISTIC_OPS']  = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
@@ -136,7 +136,7 @@ ALIGN_WIN_SEC           = 1.0     # seconds used for alignment estimation
 ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 
 # Debugging params
-DEBUG               = True
+DEBUG               = False
 
 # Batch params
 BATCH_SIZE          = 8
