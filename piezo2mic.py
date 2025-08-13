@@ -302,8 +302,6 @@ offline_hp_taps_np = firwin(
     pass_zero=False  # high-pass
 ).astype(np.float32)
 
-
-
 offline_hp_min = minimum_phase(offline_hp_taps_np, method='homomorphic').astype(np.float32)
 offline_hp_kernel = offline_hp_min[::-1].reshape(-1,1,1).astype(np.float32)  # reverse for conv1d (corr vs conv)
 offline_hf_hp_taps_tf = tf.constant(offline_hp_kernel, dtype=tf.float32)
