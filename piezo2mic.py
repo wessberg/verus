@@ -203,9 +203,9 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
-STFT_HF_ONSET_GAIN        = 5.0
+STFT_HF_ONSET_GAIN        = 12.0
 STFT_HIGH_SPLIT_HZ        = 4500.0
-STFT_HIGH_BOOST           = 16.0
+STFT_HIGH_BOOST           = 32.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 4.0
@@ -1763,9 +1763,9 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
     print(f"RMS hf_branch onsets={rms(hf,on):.6f} off={rms(hf,off):.6f}")
 
     # high-band energy
-    t_hf_true = float(_band_energy(tf.convert_to_tensor(y), sample_rate, fmin=6000.0).numpy())
-    t_hf_pred = float(_band_energy(tf.convert_to_tensor(yhat[None,:,None]), sample_rate, fmin=6000.0).numpy())
-    print(f"Avg |STFT| >6kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={t_hf_pred/(t_hf_true+1e-12):.3f})")
+    t_hf_true = float(_band_energy(tf.convert_to_tensor(y), sample_rate, fmin=STFT_HIGH_SPLIT_HZ).numpy())
+    t_hf_pred = float(_band_energy(tf.convert_to_tensor(yhat[None,:,None]), sample_rate, fmin=STFT_HIGH_SPLIT_HZ).numpy())
+    print(f"Avg |STFT| >{STFT_HIGH_SPLIT_HZ / 1000}kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={t_hf_pred/(t_hf_true+1e-12):.3f})")
 
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
