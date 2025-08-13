@@ -205,10 +205,10 @@ HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
 STFT_HF_ONSET_GAIN        = 5.0
 STFT_HIGH_SPLIT_HZ        = 6000.0
-STFT_HIGH_BOOST           = 12.0
+STFT_HIGH_BOOST           = 16.0
 
 L1_WEIGHT                 = 1.0
-HF_WEIGHT                 = 2.0
+HF_WEIGHT                 = 3.0
 STFT_WEIGHT               = 3.0
 MEL_WEIGHT                = 3.0
 RMS_ENV_WEIGHT            = 1.0
@@ -301,7 +301,12 @@ offline_hp_taps_np = firwin(
     window="hamming",
     pass_zero=False  # high-pass
 ).astype(np.float32)
-offline_hf_hp_taps_tf = tf.constant(offline_hp_taps_np.reshape(-1,1,1), dtype=tf.float32)
+
+
+
+offline_hp_min = minimum_phase(offline_hp_taps_np, method='homomorphic').astype(np.float32)
+offline_hp_kernel = offline_hp_min[::-1].reshape(-1,1,1).astype(np.float32)  # reverse for conv1d (corr vs conv)
+offline_hf_hp_taps_tf = tf.constant(offline_hp_kernel, dtype=tf.float32)
 
 
 for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR, LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR, DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR]:
@@ -1300,10 +1305,6 @@ class HFHighpass(tf.keras.layers.Layer):
         pad = tf.shape(self.taps)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
-    def compute_output_shape(self, input_shape):
-        return input_shape
-    def get_config(self):
-        return super().get_config()
 
 @register_keras_serializable()
 class RealtimeIrAlign(Layer):
@@ -1677,7 +1678,7 @@ def build_offline_model(dynamic_time=False):
 
     # Gate and scale
     hf_gated = Multiply(name="offline_hf_gate")([hf_hp, gate])
-    hf_final = IrScale(init=4.0, name="offline_hf_scale")(hf_gated)
+    hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_gated)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
