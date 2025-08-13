@@ -110,7 +110,7 @@ if len(sys.argv)>1 and sys.argv[1]=="--demo":
     tf.config.set_visible_devices([], 'GPU')
 
 # Determinism
-SEED = 42f
+SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
 os.environ['TF_DETERMINISTIC_OPS']  = '1'
 os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
