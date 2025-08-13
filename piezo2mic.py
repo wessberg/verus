@@ -202,14 +202,16 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 # Onset/HF loss shaping
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
+HP_PRE_EMPHASIS_GATE      = 0.995
 HF_ONSET_GAIN             = 8.0
 STFT_HF_ONSET_GAIN        = 5.0
-STFT_HIGH_SPLIT_HZ        = 6000.0
+STFT_HIGH_SPLIT_HZ        = 4500.0
 STFT_HIGH_BOOST           = 16.0
+GATE_TOPK_PCT             = 0.02  # 2% top-k mean for normalization
 
 L1_WEIGHT                 = 1.0
-HF_WEIGHT                 = 3.0
-STFT_WEIGHT               = 3.0
+HF_WEIGHT                 = 4.0
+STFT_WEIGHT               = 4.0
 MEL_WEIGHT                = 3.0
 RMS_ENV_WEIGHT            = 1.0
 COMPLEX_STFT_WEIGHT       = 0.5
@@ -1529,26 +1531,52 @@ def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=3.0):
 
 @register_keras_serializable()
 class OnsetGate(Layer):
-    def __init__(self, sr, alpha=0.98, smooth_ms=3.0, **kwargs):
+    def __init__(self, sr, alpha=0.98, smooth_ms=3.0, topk_pct=0.02, **kwargs):
         super().__init__(**kwargs)
         self.sr = float(sr)
         self.alpha = float(alpha)
         self.smooth_ms = float(smooth_ms)
+        self.topk_pct = float(topk_pct)
         self._win = max(1, int(round(self.smooth_ms * self.sr / 1000.0)))
 
     def call(self, x):
         pe = x[:, 1:, :] - self.alpha * x[:, :-1, :]
         pe = tf.pad(pe, [[0, 0], [1, 0], [0, 0]])
         env = tf.abs(pe)
+
         ker = tf.ones([self._win, 1, 1], dtype=tf.float32) / float(self._win)
         env_sm = tf.nn.conv1d(env, ker, stride=1, padding='SAME')
-        m = tf.reduce_max(env_sm, axis=1, keepdims=True) + 1e-6
-        env_n = tf.clip_by_value(env_sm / m, 0.0, 1.0)
+
+        # Top-k mean normalization across time (per batch item)
+        flat = tf.squeeze(env_sm, axis=-1)             # (B, T)
+        T = tf.shape(flat)[1]
+        k = tf.maximum(1, tf.cast(tf.round(self.topk_pct * tf.cast(T, tf.float32)), tf.int32))
+        topk = tf.nn.top_k(flat, k=k, sorted=False).values  # (B, k)
+        denom = tf.reduce_mean(topk, axis=1, keepdims=True) # (B, 1)
+        denom3 = tf.reshape(tf.maximum(denom, 1e-6), (-1, 1, 1))  # (B, 1, 1)
+
+        env_n = tf.clip_by_value(env_sm / denom3, 0.0, 1.0)
         return env_n
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update({"sr": self.sr, "alpha": self.alpha, "smooth_ms": self.smooth_ms})
+        cfg.update({"sr": self.sr, "alpha": self.alpha, "smooth_ms": self.smooth_ms, "topk_pct": self.topk_pct})
+        return cfg
+
+@register_keras_serializable()
+class GateFloorMax(Layer):
+    def __init__(self, floor=0.05, gain=0.95, **kwargs):
+        super().__init__(**kwargs)
+        self.floor = float(floor)
+        self.gain = float(gain)
+
+    def call(self, inputs):
+        gate_env, gate_feat = inputs
+        return self.floor + self.gain * tf.maximum(gate_env, gate_feat)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"floor": self.floor, "gain": self.gain})
         return cfg
 
 def compute_pads(kernel, dilation, lookahead_samples):
@@ -1639,12 +1667,20 @@ def build_offline_model(dynamic_time=False):
  
     inv_style  = InvertStyle(name="offline_invert_style")(style_time_used)
     pick_c     = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
-    finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])  
+    finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
     
-    gate_env = OnsetGate(sr=OFFLINE_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
-                     smooth_ms=OFFLINE_GATE_ONSET_SMOOTH_MS, name="offline_onset_gate")(inp)
+    
+    
+    
+    gate_env = OnsetGate(
+        sr=OFFLINE_SAMPLE_RATE,
+        alpha=HP_PRE_EMPHASIS_GATE,
+        smooth_ms=OFFLINE_GATE_ONSET_SMOOTH_MS,
+        topk_pct=GATE_TOPK_PCT,
+        name="offline_onset_gate"
+    )(inp)
     gate_env = Lambda(onset_gate_shape_linear, name="offline_onset_gate_shaped")(gate_env)
-    
+
     g_feat = Conv1D(
         32, 5, padding="same", activation="relu",
         kernel_initializer="he_normal", bias_initializer="zeros",
@@ -1653,11 +1689,11 @@ def build_offline_model(dynamic_time=False):
     g_feat = Conv1D(
         1,  3, padding="same", activation="sigmoid",
         kernel_initializer="glorot_uniform",
-        bias_initializer=tf.keras.initializers.Constant(2.5),  # ≈0.924 after sigmoid
+        bias_initializer=tf.keras.initializers.Constant(4.0),  # was 2.5 → start closer to 1.0
         name="offline_gate_c2"
     )(g_feat)
 
-    gate = GateFloorProduct(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
+    gate = GateFloorMax(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
     
     hf = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(inp)
     
@@ -1850,10 +1886,19 @@ def build_realtime_model(offline=None, dynamic_time=False):
     total_delay = REALTIME_TOTAL_EXPECTED_IR_DELAY
     ir = RealtimeIrAlign(offset=total_delay + REALTIME_IR_ALIGN_OFFSET_CORRECTION, name='realtime_ir_align')([ir, inp])
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
-
-    # Onset-gated HF branch (causal)
-    gate_env = OnsetGate(sr=REALTIME_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
-                     smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
+    
+    
+    
+    
+    
+    
+    gate_env = OnsetGate(
+        sr=REALTIME_SAMPLE_RATE,
+        alpha=HP_PRE_EMPHASIS_GATE,
+        smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS,
+        topk_pct=GATE_TOPK_PCT,
+        name="realtime_onset_gate"
+    )(inp)
 
     g_feat = Conv1D(
         32, 5, padding="same", activation="relu",
@@ -1863,11 +1908,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
     g_feat = Conv1D(
         1,  3, padding="same", activation="sigmoid",
         kernel_initializer="glorot_uniform",
-        bias_initializer=tf.keras.initializers.Constant(2.5),
+        bias_initializer=tf.keras.initializers.Constant(4.0),  # was 2.5
         name="realtime_gate_c2"
     )(g_feat)
 
-    gate = GateFloorProduct(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
+    gate = GateFloorMax(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
     
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
