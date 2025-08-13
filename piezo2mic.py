@@ -158,6 +158,7 @@ OFFLINE_PRE_KERNEL             = 7
 OFFLINE_LOOKAHEAD_MS           = 8.0
 OFFLINE_LOSS_ONSET_SMOOTH_MS   = 3.0
 OFFLINE_GATE_ONSET_SMOOTH_MS   = 5.0
+OFFLINE_HF_HP_ORDER            = 129
 OFFLINE_LOOKAHEAD_SAMPLES      = int(round(OFFLINE_SAMPLE_RATE * OFFLINE_LOOKAHEAD_MS / 1000.0))
 OFFLINE_RECEPTIVE_FIELD        = 1 + (OFFLINE_KERNEL_SIZE - 1) * sum(OFFLINE_DILATIONS)
 OFFLINE_TRAIN_BLOCK_SIZE       = 4096
@@ -234,12 +235,6 @@ IR_PREDELAY = coarse_steps * REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_LP_ORDER   = 65
 REALTIME_LP_CUTOFF  = 4000
 
-realtime_lp_taps_np = firwin(REALTIME_LP_ORDER,
-                     cutoff=REALTIME_LP_CUTOFF/(REALTIME_SAMPLE_RATE/2),
-                     window="hamming",
-                     pass_zero=True).astype(np.float32)
-realtime_lp_taps_tf = tf.constant(realtime_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
-
 LR          = 1e-4
 LR_FACTOR  = 0.5
 MIN_LR     = 1e-6
@@ -293,6 +288,21 @@ DEMO_CHECKPOINTS_OFFLINE_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "offli
 DEMO_CHECKPOINTS_REALTIME_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "realtime")
 
 SAVE_WEIGHTS           = False
+
+realtime_lp_taps_np = firwin(REALTIME_LP_ORDER,
+                     cutoff=REALTIME_LP_CUTOFF/(REALTIME_SAMPLE_RATE/2),
+                     window="hamming",
+                     pass_zero=True).astype(np.float32)
+realtime_lp_taps_tf = tf.constant(realtime_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
+
+offline_hp_taps_np = firwin(
+    OFFLINE_HF_HP_ORDER,
+    cutoff=STFT_HIGH_SPLIT_HZ/(OFFLINE_SAMPLE_RATE/2.0),
+    window="hamming",
+    pass_zero=False  # high-pass
+).astype(np.float32)
+offline_hf_hp_taps_tf = tf.constant(offline_hp_taps_np.reshape(-1,1,1), dtype=tf.float32)
+
 
 for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR, LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR, DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
@@ -1275,6 +1285,27 @@ class FIRDecimateBy2(Layer):
         return cfg
 
 @register_keras_serializable()
+class HFHighpass(tf.keras.layers.Layer):
+    def __init__(self, taps=None, **kwargs):
+        super().__init__(**kwargs)
+        self._taps_init = offline_hf_hp_taps_tf if taps is None else tf.convert_to_tensor(taps, dtype=tf.float32)
+    def build(self, input_shape):
+        self.taps = self.add_weight(
+            name="hp_taps",
+            shape=self._taps_init.shape,
+            initializer=tf.keras.initializers.Constant(self._taps_init),
+            trainable=False
+        )
+    def call(self, x):
+        pad = tf.shape(self.taps)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
+    def compute_output_shape(self, input_shape):
+        return input_shape
+    def get_config(self):
+        return super().get_config()
+
+@register_keras_serializable()
 class RealtimeIrAlign(Layer):
     def __init__(self, offset, **kwargs):
         super().__init__(**kwargs)
@@ -1642,10 +1673,11 @@ def build_offline_model(dynamic_time=False):
     hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     
     hf = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
-    hf_hp_pre = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_hp_pre")(hf)
-    
-    hf_gated = Multiply(name="offline_hf_gate")([hf_hp_pre, gate])
-    hf_final = IrScale(init=4, name="offline_hf_scale")(hf_gated)
+    hf_hp = HFHighpass(name="offline_hf_highpass")(hf)
+
+    # Gate and scale
+    hf_gated = Multiply(name="offline_hf_gate")([hf_hp, gate])
+    hf_final = IrScale(init=4.0, name="offline_hf_scale")(hf_gated)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
@@ -1846,12 +1878,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
     
-    
-    
-    hf_hp_pre = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_hp_pre")(hf)
-    
-    hf_gated = Multiply(name="realtime_hf_gate")([hf_hp_pre, gate])
-    hf_final = IrScale(init=1.2, name="realtime_hf_scale")(hf_gated)
+    hf_hp = HFHighpass(name="realtime_hf_highpass")(hf)
+
+    # Gate and scale
+    hf_gated = Multiply(name="realtime_hf_gate")([hf_hp, gate])
+    hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_gated)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
