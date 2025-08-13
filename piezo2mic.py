@@ -2593,8 +2593,12 @@ def main ():
             static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
             dynamic_model = build_offline_model(dynamic_time=True)
             dynamic_model.set_weights(static_model.get_weights())
-        else:
+        elif os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
             dynamic_model = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
+        else:
+            static_model = build_offline_model(dynamic_time=False)
+            dynamic_model = build_offline_model(dynamic_time=True)
+            dynamic_model.set_weights(static_model.get_weights())
             
         demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
             
