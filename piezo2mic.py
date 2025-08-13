@@ -660,6 +660,45 @@ class DemoCallback(Callback):
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
+@register_keras_serializable()
+class GateFeatMin(Layer):
+    """
+    Enforces g >= min_val by mapping g in [0,1] to min_val + (1-min_val)*g.
+    """
+    def __init__(self, min_val=0.35, **kwargs):
+        super().__init__(**kwargs)
+        self.min_val = float(min_val)
+
+    def call(self, g):
+        return self.min_val + (1.0 - self.min_val) * g
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"min_val": self.min_val})
+        return cfg
+
+
+@register_keras_serializable()
+class GateOpenReg(Layer):
+    """
+    Optional regularizer to discourage small gate values during onsets.
+    Adds loss: weight * mean(relu(tau - gate_total) * onset_env)
+    """
+    def __init__(self, tau=0.5, weight=0.02, **kwargs):
+        super().__init__(**kwargs)
+        self.tau = float(tau)
+        self.weight = float(weight)
+
+    def call(self, inputs):
+        gate_total, onset_env = inputs
+        penalty = tf.nn.relu(self.tau - gate_total) * onset_env
+        self.add_loss(self.weight * tf.reduce_mean(penalty))
+        return gate_total
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"tau": self.tau, "weight": self.weight})
+        return cfg
 
 @register_keras_serializable()
 class GateFloorProduct(Layer):
@@ -1658,8 +1697,12 @@ def build_offline_model(dynamic_time=False):
         bias_initializer=tf.keras.initializers.Constant(2.5),  # was 2.5 → start closer to 1.0
         name="offline_gate_c2"
     )(g_feat)
-
-    gate = GateFloorProduct(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
+    
+    g_feat = GateFeatMin(min_val=0.35, name="offline_gate_feat_min")(g_feat)
+    
+    gate = GateFloorProduct(floor=0.15, gain=0.85, name="offline_onset_gate_total")([gate_env, g_feat])
+    
+    gate = GateOpenReg(tau=0.5, weight=0.02, name="offline_gate_open_reg")([gate, gate_env])
     
     hf = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(inp)
     
@@ -1867,8 +1910,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
         bias_initializer=tf.keras.initializers.Constant(2.5),  # was 2.5
         name="realtime_gate_c2"
     )(g_feat)
+    
+    g_feat = GateFeatMin(min_val=0.35, name="realtime_gate_feat_min")(g_feat)
 
-    gate = GateFloorProduct(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
+    gate = GateFloorProduct(floor=0.15, gain=0.85, name="realtime_onset_gate_total")([gate_env, g_feat])
+    gate = GateOpenReg(tau=0.5, weight=0.02, name="realtime_gate_open_reg")([gate, gate_env])
     
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
