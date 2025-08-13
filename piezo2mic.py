@@ -200,11 +200,11 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 
 # Onset/HF loss shaping
 HP_PRE_EMPHASIS           = 0.8
-HP_PRE_EMPHASIS_HF        = 0.98
-HF_ONSET_GAIN             = 6.0
-STFT_HF_ONSET_GAIN        = 4.0
+HP_PRE_EMPHASIS_HF        = 0.995
+HF_ONSET_GAIN             = 8.0
+STFT_HF_ONSET_GAIN        = 5.0
 STFT_HIGH_SPLIT_HZ        = 3500.0
-STFT_HIGH_BOOST           = 8.0
+STFT_HIGH_BOOST           = 12.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 2.0
@@ -1467,7 +1467,7 @@ def onset_gate_shape(g, floor=0.15, gain=0.85, eps=1e-6):
 
 # 1) Replace the shaping function with a less compressive version
 @register_keras_serializable()
-def onset_gate_shape_linear(g, floor=0.25, gain=0.75, eps=1e-6):
+def onset_gate_shape_linear(g, floor=0.0, gain=1.0, eps=1e-6):
     g = tf.clip_by_value(g, eps, 1.0)
     return floor + gain * g  # no sqrt compression
 
@@ -1609,7 +1609,7 @@ def build_offline_model(dynamic_time=False):
     g_feat = Conv1D(32, 5, padding="same", activation="relu", name="offline_gate_c1")(x)
     g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="offline_gate_c2")(g_feat)
 
-    gate = GateFloorProduct(floor=0.30, gain=0.70, name="offline_onset_gate_total")([gate_env, g_feat])
+    gate = GateFloorProduct(floor=0.05, gain=0.95, name="offline_onset_gate_total")([gate_env, g_feat])
     
     hf = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(inp)
     hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
@@ -1621,7 +1621,7 @@ def build_offline_model(dynamic_time=False):
     
     hf = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
     hf = Multiply(name="offline_hf_gate")([hf, gate])
-    hf = IrScale(init=1.0, name="offline_hf_scale")(hf)
+    hf = IrScale(init=1.2, name="offline_hf_scale")(hf)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf])
 
@@ -1797,7 +1797,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
                      smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
     g_feat = Conv1D(32, 5, padding="same", activation="relu", name="realtime_gate_c1")(x)
     g_feat = Conv1D(1,  3, padding="same", activation="sigmoid", name="realtime_gate_c2")(g_feat)
-    gate = GateFloorProduct(floor=0.25, gain=0.75, name="realtime_onset_gate_total")([gate_env, g_feat])
+    gate = GateFloorProduct(floor=0.10, gain=0.90, name="realtime_onset_gate_total")([gate_env, g_feat])
 
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(inp)
     hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
