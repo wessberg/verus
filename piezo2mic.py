@@ -26,6 +26,8 @@ Two models are trained in a teacher-student setup:
   The static realtime model distills based on the offline model's layers, while the dynamic realtime model is fully self-contained and explicitly copies over the weights from the offline model's layers to its own (rather than using set_weights, which would cause issues).
   This model is meant for real-time applications, where low latency is critical, such as live performance or real-time monitoring. It is small enough to run on embedded, low-power devices.
   
+It is designed to be optimized for TFLite conversion and run the realtime models on embedded, low-powered devices. All operations must support efficient conversion to that platform.
+  
 ================================
 INPUT DATA
 ================================
@@ -1552,34 +1554,27 @@ def _causal_conv1d(x, kernel):
 
 @register_keras_serializable()
 def gate_gain_signal(
-    x, sample_rate,
-    threshold_db=GATE_THRESHOLD_DB,
-    ratio=GATE_RATIO,
-    attack_ms=GATE_ATTACK_MS,
-    hold_ms=GATE_HOLD_MS,
-    release_ms=GATE_RELEASE_MS,
-    cutoff_hz=GATE_HP_CUTOFF_HZ,
-    hp_order=129
+x, sample_rate,
+threshold_db=GATE_THRESHOLD_DB,
+ratio=GATE_RATIO,
+attack_ms=GATE_ATTACK_MS,
+hold_ms=GATE_HOLD_MS,
+release_ms=GATE_RELEASE_MS,
+cutoff_hz=GATE_HP_CUTOFF_HZ,
+hp_order=129
 ):
-    """
-    Returns the per-sample gate gain in [0,1], without using tf.scan.
-    Sidechain = min-phase causal HPF(x, cutoff_hz),
-    detector = |·| → dB, then a downward expander with attack/hold/release
-    smoothing implemented via tf.while_loop (TFLite-compatible).
-    """
     x = tf.convert_to_tensor(x, dtype=tf.float32)  # (B,T,1)
-
-    # Sidechain: causal min-phase HPF (implemented as causal conv1d)
+    # Sidechain HPF (causal, min-phase)
     kernel = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
-    sc = _causal_conv1d(x, kernel)                    # (B,T,1)
+    sc = _causal_conv1d(x, kernel)  # (B,T,1)
 
-    # Detector: absolute and convert to dB
-    det = tf.abs(sc) + 1e-12                          # (B,T,1)
+    # Detector in dB
+    det = tf.abs(sc) + 1e-12
     LOG10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
-    level_db = 20.0 / LOG10 * tf.math.log(det)        # (B,T,1)
-    lev = tf.squeeze(level_db, axis=-1)               # (B,T)
+    level_db = 20.0 / LOG10 * tf.math.log(det)  # (B,T,1)
+    lev = tf.squeeze(level_db, axis=-1)         # (B,T)
 
-    # Prepare constants (scalar floats)
+    # Times → samples
     atk_s = max(1, int(round((float(attack_ms)  / 1000.0) * float(sample_rate))))
     rel_s = max(1, int(round((float(release_ms) / 1000.0) * float(sample_rate))))
     hld_s = max(0, int(round((float(hold_ms)    / 1000.0) * float(sample_rate))))
@@ -1593,49 +1588,45 @@ def gate_gain_signal(
     B = tf.shape(lev)[0]
     T = tf.shape(lev)[1]
 
-    # Loop over time using tf.while_loop
-    i0 = tf.constant(0, dtype=tf.int32)
-    g0 = tf.zeros((B,), dtype=tf.float32)      # previous gain per batch
-    h0 = tf.zeros((B,), dtype=tf.float32)      # previous hold counter per batch
-    out_ta = tf.TensorArray(tf.float32, size=T, infer_shape=False, element_shape=(None,))
+    @tf.function(experimental_relax_shapes=True)
+    def _loop(lev):
+        i0 = tf.constant(0, tf.int32)
+        g0 = tf.zeros((B,), tf.float32)
+        h0 = tf.zeros((B,), tf.float32)
+        ta = tf.TensorArray(tf.float32, size=0, dynamic_size=True, clear_after_read=False)
 
-    def cond(i, g_prev, hold_prev, ta):
-        return i < T
+        def cond(i, g_prev, h_prev, ta_):
+            return i < T
 
-    def body(i, g_prev, hold_prev, ta):
-        curr_db = lev[:, i]  # (B,)
+        def body(i, g_prev, h_prev, ta_):
+            curr_db = lev[:, i]  # (B,)
 
-        above = curr_db >= thr_db
-        hold_next = tf.where(
-            above,
-            tf.fill(tf.shape(curr_db), hold_samps),
-            tf.maximum(hold_prev - 1.0, 0.0)
-        )
-        open_or_hold = tf.logical_or(above, hold_prev > 0.5)
+            above = (curr_db >= thr_db)
+            h_next = tf.where(above,
+                            tf.fill(tf.shape(curr_db), hold_samps),
+                            tf.maximum(h_prev - 1.0, 0.0))
+            open_or_hold = tf.logical_or(above, h_prev > 0.5)
 
-        # Downward expansion amount in dB for samples below threshold
-        # attn_db = (1 - 1/ratio) * relu(threshold - curr_db)
-        attn_db = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - curr_db)
-        g_close = tf.pow(10.0, -attn_db / 20.0)  # convert dB attenuation to linear
+            attn_db  = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - curr_db)
+            g_close  = tf.pow(tf.constant(10.0, tf.float32), -attn_db / 20.0)
+            g_tgt    = tf.where(open_or_hold, tf.ones_like(g_close), g_close)
 
-        g_target = tf.where(open_or_hold, tf.ones_like(g_close), g_close)
+            inc   = g_tgt > g_prev
+            alpha = tf.where(inc,
+                            tf.fill(tf.shape(g_prev), alpha_open),
+                            tf.fill(tf.shape(g_prev), alpha_close))
 
-        inc = g_target > g_prev
-        alpha = tf.where(
-            inc,
-            tf.fill(tf.shape(g_prev), alpha_open),
-            tf.fill(tf.shape(g_prev), alpha_close)
-        )
-        g_new = alpha * g_prev + (1.0 - alpha) * g_target
+            g_new = alpha * g_prev + (1.0 - alpha) * g_tgt
+            ta_ = ta_.write(i, g_new)
+            return i + 1, g_new, h_next, ta_
 
-        ta = ta.write(i, g_new)
-        return (i + 1, g_new, hold_next, ta)
+        _, _, _, ta_out = tf.while_loop(cond, body, (i0, g0, h0, ta),
+                                        parallel_iterations=1)
+        g_stack = ta_out.stack()        # (T,B)
+        return tf.transpose(g_stack, [1, 0])  # (B,T)
 
-    _, _, _, out_ta = tf.while_loop(cond, body, loop_vars=(i0, g0, h0, out_ta))
-    g_stack = out_ta.stack()         # (T,B)
-    g_bt = tf.transpose(g_stack, [1, 0])  # (B,T)
-    return g_bt[:, :, None]          # (B,T,1)
-
+    g_bt = _loop(lev)
+    return g_bt[:, :, None]
 
 @register_keras_serializable()
 class Gate(tf.keras.layers.Layer):
