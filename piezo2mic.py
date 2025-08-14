@@ -1549,6 +1549,7 @@ def _causal_conv1d(x, kernel):
     x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
     return tf.nn.conv1d(x_pad, filters=kernel, stride=1, padding='VALID')
 
+
 @register_keras_serializable()
 def gate_gain_signal(
     x, sample_rate,
@@ -1561,56 +1562,86 @@ def gate_gain_signal(
     hp_order=129
 ):
     """
-    Returns the per-sample gate gain in [0,1].
-    Sidechain = min-phase causal HPF(x, cutoff_hz), detector=|·| → dB,
-    downward expander with attack/hold/release smoothing on the gain.
+    Returns the per-sample gate gain in [0,1], without using tf.scan.
+    Sidechain = min-phase causal HPF(x, cutoff_hz),
+    detector = |·| → dB, then a downward expander with attack/hold/release
+    smoothing implemented via tf.while_loop (TFLite-compatible).
     """
-    x = tf.convert_to_tensor(x, dtype=tf.float32)
-    B = tf.shape(x)[0]
+    x = tf.convert_to_tensor(x, dtype=tf.float32)  # (B,T,1)
 
+    # Sidechain: causal min-phase HPF (implemented as causal conv1d)
     kernel = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
-    sc = _causal_conv1d(x, kernel)
-    det = tf.abs(sc) + 1e-12
+    sc = _causal_conv1d(x, kernel)                    # (B,T,1)
 
+    # Detector: absolute and convert to dB
+    det = tf.abs(sc) + 1e-12                          # (B,T,1)
     LOG10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
-    level_db = 20.0 / LOG10 * tf.math.log(det)  # (B,T,1)
-    lev = tf.squeeze(level_db, axis=-1)         # (B,T)
-    lev_t = tf.transpose(lev, perm=[1, 0])      # (T,B)
+    level_db = 20.0 / LOG10 * tf.math.log(det)        # (B,T,1)
+    lev = tf.squeeze(level_db, axis=-1)               # (B,T)
 
-    atk_s = max(1, int(round((attack_ms  / 1000.0) * sample_rate)))
-    rel_s = max(1, int(round((release_ms / 1000.0) * sample_rate)))
-    hld_s = max(0, int(round((hold_ms    / 1000.0) * sample_rate)))
+    # Prepare constants (scalar floats)
+    atk_s = max(1, int(round((float(attack_ms)  / 1000.0) * float(sample_rate))))
+    rel_s = max(1, int(round((float(release_ms) / 1000.0) * float(sample_rate))))
+    hld_s = max(0, int(round((float(hold_ms)    / 1000.0) * float(sample_rate))))
 
     alpha_open  = tf.constant(np.exp(-1.0 / atk_s), dtype=tf.float32)
     alpha_close = tf.constant(np.exp(-1.0 / rel_s), dtype=tf.float32)
     hold_samps  = tf.constant(float(hld_s), dtype=tf.float32)
+    thr_db      = tf.constant(float(threshold_db), dtype=tf.float32)
+    ratio_f     = tf.constant(float(ratio), dtype=tf.float32)
 
-    def step_fn(state, curr_db):
-        g_prev, hold_prev = state  # (B,), (B,)
-        above = curr_db >= threshold_db
-        hold_next = tf.where(above, tf.fill(tf.shape(curr_db), hold_samps),
-                             tf.maximum(hold_prev - 1.0, 0.0))
+    B = tf.shape(lev)[0]
+    T = tf.shape(lev)[1]
+
+    # Loop over time using tf.while_loop
+    i0 = tf.constant(0, dtype=tf.int32)
+    g0 = tf.zeros((B,), dtype=tf.float32)      # previous gain per batch
+    h0 = tf.zeros((B,), dtype=tf.float32)      # previous hold counter per batch
+    out_ta = tf.TensorArray(tf.float32, size=T, infer_shape=False, element_shape=(None,))
+
+    def cond(i, g_prev, hold_prev, ta):
+        return i < T
+
+    def body(i, g_prev, hold_prev, ta):
+        curr_db = lev[:, i]  # (B,)
+
+        above = curr_db >= thr_db
+        hold_next = tf.where(
+            above,
+            tf.fill(tf.shape(curr_db), hold_samps),
+            tf.maximum(hold_prev - 1.0, 0.0)
+        )
         open_or_hold = tf.logical_or(above, hold_prev > 0.5)
 
-        attn_db = (1.0 - 1.0/ratio) * tf.nn.relu(threshold_db - curr_db)  # (B,)
-        g_close = tf.pow(10.0, -attn_db / 20.0)
+        # Downward expansion amount in dB for samples below threshold
+        # attn_db = (1 - 1/ratio) * relu(threshold - curr_db)
+        attn_db = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - curr_db)
+        g_close = tf.pow(10.0, -attn_db / 20.0)  # convert dB attenuation to linear
+
         g_target = tf.where(open_or_hold, tf.ones_like(g_close), g_close)
 
         inc = g_target > g_prev
-        alpha = tf.where(inc, alpha_open, alpha_close)
+        alpha = tf.where(
+            inc,
+            tf.fill(tf.shape(g_prev), alpha_open),
+            tf.fill(tf.shape(g_prev), alpha_close)
+        )
         g_new = alpha * g_prev + (1.0 - alpha) * g_target
-        return (g_new, hold_next)
 
-    g0 = tf.zeros((B,), dtype=tf.float32)
-    h0 = tf.zeros((B,), dtype=tf.float32)
-    (g_seq, _) = tf.scan(step_fn, lev_t, initializer=(g0, h0))
-    g_bt = tf.transpose(g_seq, perm=[1, 0])
-    return tf.expand_dims(g_bt, axis=-1)
+        ta = ta.write(i, g_new)
+        return (i + 1, g_new, hold_next, ta)
+
+    _, _, _, out_ta = tf.while_loop(cond, body, loop_vars=(i0, g0, h0, out_ta))
+    g_stack = out_ta.stack()         # (T,B)
+    g_bt = tf.transpose(g_stack, [1, 0])  # (B,T)
+    return g_bt[:, :, None]          # (B,T,1)
+
 
 @register_keras_serializable()
 class Gate(tf.keras.layers.Layer):
     """
     Gate with HPF sidechain and downward expander, returning per-sample gain [0,1].
+    This version is tf.scan-free (uses tf.while_loop internally) and TFLite-friendly.
     """
     def __init__(self, sample_rate,
                  threshold_db=GATE_THRESHOLD_DB,
@@ -1658,7 +1689,9 @@ class Gate(tf.keras.layers.Layer):
         })
         return cfg
 
-# Gate weight for losses (computed from y_true)
+
+# Gate weight for losses (computed from y_true).
+# Reuses the same scan-free implementation.
 @register_keras_serializable()
 def gate_weight(y_true, sample_rate):
     return gate_gain_signal(
@@ -2262,7 +2295,7 @@ def _make_hiss_hp(sr, n, alpha=0.98):
     return 0.5 * y  # conservative level
 
 
-def _render_clicks_from_gate(gate_rel, sr, thresh=0.02, click_len=256, click_decay=0.97):
+def _render_clicks_from_gate(gate_rel, sr, thresh=0.008, click_len=256, click_decay=0.97):
     """
     Create a click track from upward changes in gate_rel. Each time
     the first difference exceeds thresh, emit a short decaying click.
