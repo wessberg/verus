@@ -1257,12 +1257,6 @@ def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target
     
     style_pred_filepath = os.path.join(out_dir, prediction_name + "_style_pred" + ".wav")
     style_true_filepath = os.path.join(out_dir, prediction_name + "_style_true" + ".wav")
-    
-    # TEMP!
-    model = boost_hf_scale_in_model(model, "offline_hf_scale", gain_db=60.0)  
-    y_inf_style_true_gained_hf, _ = model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
-    y_inf_style_true_gained_hf = y_inf_style_true_gained_hf[0, :, 0]
-    sf.write(os.path.join(out_dir, prediction_name + "_style_true_gained" + ".wav"), y_inf_style_true_gained_hf, sample_rate, subtype='FLOAT')
 
     sf.write(style_pred_filepath, y_inf_style_pred, sample_rate, subtype='FLOAT')
     print(f"✅ Demo saved to {style_pred_filepath}. Predicted style: {style_pred_name}")
@@ -1536,16 +1530,19 @@ _gate_hp_kernel_cache = {}
 
 def _get_minphase_hp_kernel(sample_rate, cutoff_hz, order=129):
     key = (int(sample_rate), float(cutoff_hz), int(order))
-    k = _gate_hp_kernel_cache.get(key)
-    if k is None:
-        taps = firwin(order,
-                      cutoff=cutoff_hz/(sample_rate/2.0),
-                      window="hamming",
-                      pass_zero=False).astype(np.float32)
+    k_np = _gate_hp_kernel_cache.get(key)
+    if k_np is None:
+        taps = firwin(
+        order,
+        cutoff=cutoff_hz / (sample_rate / 2.0),
+        window="hamming",
+        pass_zero=False
+        ).astype(np.float32)
         taps_min = minimum_phase(taps, method='homomorphic').astype(np.float32)
-        k = tf.constant(taps_min[::-1].reshape(-1,1,1), dtype=tf.float32)
-        _gate_hp_kernel_cache[key] = k
-    return k
+        k_np = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)
+        _gate_hp_kernel_cache[key] = k_np
+    # Always materialize a new constant in the current graph.
+    return tf.constant(k_np, dtype=tf.float32)
 
 def _causal_conv1d(x, kernel):
     pad = tf.shape(kernel)[0] - 1
