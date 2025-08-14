@@ -125,7 +125,7 @@ OFFLINE_SAMPLE_RATE = 96000
 REALTIME_SAMPLE_RATE = 48000
 FINETUNE_SAMPLE_RATE = 48000
 
-INPUT_AVG_RMS_DBFS_TARGET = -23.0
+#INPUT_AVG_RMS_DBFS_TARGET = -23.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # Alignment (piezo→mic) settings
@@ -134,6 +134,9 @@ ALIGN_MAX_MS            = 5.0     # search range ± this many ms
 ALIGN_PREEMPH_ALPHA     = 0.98    # emphasize HF before GCC-PHAT
 ALIGN_WIN_SEC           = 1.0     # seconds used for alignment estimation
 ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
+
+# NORMALIZED_PREFIX = "_normalized_"
+# WRITE_NORMALIZED_TO_DISK = True
 
 # Debugging params
 DEBUG               = False
@@ -156,8 +159,6 @@ OFFLINE_PRE_KERNEL             = 7
 
 # Bounded look-ahead per layer (in ms):
 OFFLINE_LOOKAHEAD_MS           = 8.0
-OFFLINE_LOSS_ONSET_SMOOTH_MS   = 3.0
-OFFLINE_GATE_ONSET_SMOOTH_MS   = 5.0
 OFFLINE_HF_HP_ORDER            = 129
 OFFLINE_LOOKAHEAD_SAMPLES      = int(round(OFFLINE_SAMPLE_RATE * OFFLINE_LOOKAHEAD_MS / 1000.0))
 OFFLINE_RECEPTIVE_FIELD        = 1 + (OFFLINE_KERNEL_SIZE - 1) * sum(OFFLINE_DILATIONS)
@@ -173,8 +174,6 @@ REALTIME_KERNEL_SIZE      = 25
 REALTIME_DILATIONS        = (1,2,4,8)
 REALTIME_PRE_BLOCKS       = 1
 REALTIME_PRE_KERNEL       = 5
-REALTIME_LOSS_ONSET_SMOOTH_MS = 6.0
-REALTIME_GATE_ONSET_SMOOTH_MS  = 6.0
 REALTIME_RECEPTIVE_FIELD  = 1 + (REALTIME_KERNEL_SIZE - 1) * sum(REALTIME_DILATIONS)
 REALTIME_TRAIN_BLOCK_SIZE = 4096
 REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
@@ -194,18 +193,24 @@ FINETUNE_REALTIME_EPOCHS      = 10
 FINETUNE_REALTIME_LR          = 1e-4
 FINETUNE_L1_WEIGHT           = 15.0
 FINETUNE_MEL_WEIGHT          = 15.0
-FINETUNE_LOSS_ONSET_SMOOTH_MS = 6.0
 
 FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
-# Onset/HF loss shaping
+#HF loss shaping
+GATE_HP_CUTOFF_HZ   = 3000.0
+GATE_THRESHOLD_DB   = -40.0
+GATE_RATIO          = 10.0
+GATE_ATTACK_MS      = 1.0
+GATE_HOLD_MS        = 2.0
+GATE_RELEASE_MS     = 10.0
+GATE_DEBUG_TONE_MULT = 1.0
+
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
-STFT_HF_ONSET_GAIN        = 12.0
-STFT_HIGH_SPLIT_HZ        = 4500.0
 STFT_HIGH_BOOST           = 32.0
+STFT_HF_ONSET_GAIN        = 12.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 4.0
@@ -248,7 +253,7 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 30
+LONG_DEMO_SEC        = 10
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -297,13 +302,13 @@ realtime_lp_taps_tf = tf.constant(realtime_lp_taps_np.reshape(-1,1,1), dtype=tf.
 
 offline_hp_taps_np = firwin(
     OFFLINE_HF_HP_ORDER,
-    cutoff=STFT_HIGH_SPLIT_HZ/(OFFLINE_SAMPLE_RATE/2.0),
+    cutoff=GATE_HP_CUTOFF_HZ/(OFFLINE_SAMPLE_RATE/2.0),
     window="hamming",
     pass_zero=False  # high-pass
 ).astype(np.float32)
 
 offline_hp_min = minimum_phase(offline_hp_taps_np, method='homomorphic').astype(np.float32)
-offline_hp_kernel = offline_hp_min[::-1].reshape(-1,1,1).astype(np.float32)  # reverse for conv1d (corr vs conv)
+offline_hp_kernel = offline_hp_min[::-1].reshape(-1,1,1).astype(np.float32)  # reverse for conv1d
 offline_hf_hp_taps_tf = tf.constant(offline_hp_kernel, dtype=tf.float32)
 
 
@@ -311,6 +316,75 @@ for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHE
     os.makedirs(dir_path, exist_ok=True)
 
 # ────────────────────────────── UTILITIES ───────────────────────────────────
+
+# # Replace your existing write_normalized_pair helper with this more robust version
+
+# def _prefixed_path(path, prefix=NORMALIZED_PREFIX):
+#     folder, name = os.path.split(path)
+#     return os.path.join(folder, f"{prefix}{name}")
+
+# def _try_sf_write(path, data, sr, subtype="FLOAT", fmt="WAV"):
+#     """
+#     Safer wrapper around sf.write with common pitfalls handled.
+#     Returns None on success, or the Exception instance on failure.
+#     """
+#     try:
+#         # Ensure correct shape and dtype for libsndfile
+#         if data.ndim == 1:
+#             data = data[:, None]
+#         data = np.ascontiguousarray(data.astype(np.float32, copy=False))
+#         os.makedirs(os.path.dirname(path), exist_ok=True)
+#         sf.write(path, data, int(sr), subtype=subtype, format=fmt)
+#         return None
+#     except Exception as e:
+#         return e
+
+# def write_normalized_pair(src_path, tgt_path, data_src, data_tgt, samplerate, prefix=NORMALIZED_PREFIX):
+#     """
+#     Write normalized (and optionally aligned) source/target audio to disk
+#     in the same folder as the originals, with a filename prefix.
+#     Falls back to OUT_DIR/normalized/<original_subdirs> if writing into the
+#     input folders fails (e.g., read-only datasets).
+#     """
+#     out_src = _prefixed_path(src_path, prefix)
+#     out_tgt = _prefixed_path(tgt_path, prefix)
+
+#     err_src = _try_sf_write(out_src, data_src, samplerate, subtype="FLOAT", fmt="WAV")
+#     err_tgt = _try_sf_write(out_tgt, data_tgt, samplerate, subtype="FLOAT", fmt="WAV")
+
+#     if err_src is None and err_tgt is None:
+#         if DEBUG:
+#             print(f"[NORMALIZE] Wrote normalized files:\n  {out_src}\n  {out_tgt}")
+#         return
+
+#     # Fallback: mirror under OUT_DIR/normalized/<relative_path_to_input>
+#     # This keeps the directory structure and still produces usable files
+#     fb_base = os.path.join(OUT_DIR, "normalized")
+#     rel_src_dir = os.path.relpath(os.path.dirname(src_path), start=".")
+#     rel_tgt_dir = os.path.relpath(os.path.dirname(tgt_path), start=".")
+#     fb_src_dir = os.path.join(fb_base, rel_src_dir)
+#     fb_tgt_dir = os.path.join(fb_base, rel_tgt_dir)
+#     os.makedirs(fb_src_dir, exist_ok=True)
+#     os.makedirs(fb_tgt_dir, exist_ok=True)
+#     fb_src = os.path.join(fb_src_dir, os.path.basename(out_src))
+#     fb_tgt = os.path.join(fb_tgt_dir, os.path.basename(out_tgt))
+
+#     fb_err_src = None
+#     fb_err_tgt = None
+#     #if err_src is not None:
+#         #fb_err_src = _try_sf_write(fb_src, data_src, samplerate, subtype="FLOAT", fmt="WAV")
+#     if err_tgt is not None:
+#         fb_err_tgt = _try_sf_write(fb_tgt, data_tgt, samplerate, subtype="FLOAT", fmt="WAV")
+
+#     msgs = []
+#     if err_src is not None:
+#         msgs.append(f"src→{out_src} ({err_src}) → fallback {fb_src} "
+#                     f"{'OK' if fb_err_src is None else 'FAIL: '+str(fb_err_src)}")
+#     if err_tgt is not None:
+#         msgs.append(f"tgt→{out_tgt} ({err_tgt}) → fallback {fb_tgt} "
+#                     f"{'OK' if fb_err_tgt is None else 'FAIL: '+str(fb_err_tgt)}")
+
+#     print("[NORMALIZE] Could not write to input folders. " + " | ".join(msgs))
 
 def _extract_epoch_from_ckpt(path):
     fn = os.path.basename(path)
@@ -322,6 +396,19 @@ def pre_emphasis_np(x, α=0.98):
     y[0] = x[0]
     y[1:] = x[1:] - α * x[:-1]
     return y
+
+def gate_debug_tone_freq(sample_rate, cutoff_hz, mult=GATE_DEBUG_TONE_MULT):
+    """
+    Pick an audible, safe tone frequency tied to the gate HP cutoff.
+    Clamps to [50 Hz, 0.45*Nyquist] to avoid aliasing and inaudible extremes.
+    """
+    freq = float(cutoff_hz) * float(mult)
+    nyq_guard = 0.45 * float(sample_rate)
+    if freq < 50.0:
+        freq = 50.0
+    if freq > nyq_guard:
+        freq = nyq_guard
+    return freq
 
 def next_pow2(n):
     return 1<<(int(n-1).bit_length())
@@ -430,7 +517,7 @@ for src in sorted(glob.glob(os.path.join(FINGER_SRC_DIR, "*_source.wav"))):
 all_pairs = picked_pairs + finger_pairs
 
 # normalize files and align target to source
-target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
+#target_rms = 10 ** (INPUT_AVG_RMS_DBFS_TARGET / 20.0)
 
 audio_cache = {}
 for src, tgt in all_pairs:
@@ -444,12 +531,12 @@ for src, tgt in all_pairs:
 
     mono_src = data_src[:,0]
     mono_tgt = data_tgt[:,0]
-    rms_src = np.sqrt(np.mean(mono_src**2) + 1e-12)
-    rms_tgt = np.sqrt(np.mean(mono_tgt**2) + 1e-12)
-    gain_src = target_rms / rms_src
-    gain_tgt = target_rms / rms_tgt
-    data_src = data_src * gain_src
-    data_tgt = data_tgt * gain_tgt
+    # rms_src = np.sqrt(np.mean(mono_src**2) + 1e-12)
+    # rms_tgt = np.sqrt(np.mean(mono_tgt**2) + 1e-12)
+    # gain_src = target_rms / rms_src
+    # gain_tgt = target_rms / rms_tgt
+    # data_src = data_src * gain_src
+    # data_tgt = data_tgt * gain_tgt
 
     if ALIGN_ENABLE:
         L = data_src.shape[0]
@@ -468,6 +555,10 @@ for src, tgt in all_pairs:
                 print(f"[ALIGN] {os.path.basename(src)}: shift target by {delay_samples:.3f} samples ({delay_samples/file_sr*1000:.3f} ms)")
         else:
             print(f"[ALIGN] {os.path.basename(src)}: too short for alignment (L={L}), skipping.")
+
+
+    # if WRITE_NORMALIZED_TO_DISK:
+    #     write_normalized_pair(src, tgt, data_src, data_tgt, file_sr, prefix=NORMALIZED_PREFIX)
 
     audio_cache[src] = data_src
     audio_cache[tgt] = data_tgt
@@ -660,79 +751,21 @@ class DemoCallback(Callback):
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
-@register_keras_serializable()
-class GateFeatMin(Layer):
-    """
-    Enforces g >= min_val by mapping g in [0,1] to min_val + (1-min_val)*g.
-    """
-    def __init__(self, min_val=0.35, **kwargs):
-        super().__init__(**kwargs)
-        self.min_val = float(min_val)
-
-    def call(self, g):
-        return self.min_val + (1.0 - self.min_val) * g
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"min_val": self.min_val})
-        return cfg
-
-
-@register_keras_serializable()
-class GateOpenReg(Layer):
-    """
-    Optional regularizer to discourage small gate values during onsets.
-    Adds loss: weight * mean(relu(tau - gate_total) * onset_env)
-    """
-    def __init__(self, tau=0.5, weight=0.02, **kwargs):
-        super().__init__(**kwargs)
-        self.tau = float(tau)
-        self.weight = float(weight)
-
-    def call(self, inputs):
-        gate_total, onset_env = inputs
-        penalty = tf.nn.relu(self.tau - gate_total) * onset_env
-        self.add_loss(self.weight * tf.reduce_mean(penalty))
-        return gate_total
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"tau": self.tau, "weight": self.weight})
-        return cfg
-
-@register_keras_serializable()
-class GateFloorProduct(Layer):
-    def __init__(self, floor=0.30, gain=0.70, **kwargs):
-        super().__init__(**kwargs)
-        self.floor = float(floor)
-        self.gain  = float(gain)
-
-    def call(self, inputs):
-        gate_env, gate_feat = inputs
-        return self.floor + self.gain * gate_env * gate_feat
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"floor": self.floor, "gain": self.gain})
-        return cfg
 
 @register_keras_serializable()
 class CombinedLoss(Loss):
-    def __init__(self, sample_rate, extra_small_cplx=False, onset_smooth_ms=3.0, name="combined_loss", **kwargs):
+    def __init__(self, sample_rate, extra_small_cplx=False, name="combined_loss", **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate = sample_rate
         self.extra_small_cplx = bool(extra_small_cplx)
-        self.onset_smooth_ms = float(onset_smooth_ms)
     def call(self, y_true, y_pred):
         return combined_loss(y_true, y_pred, self.sample_rate,
-                             extra_small_cplx=self.extra_small_cplx,
-                             onset_smooth_ms=self.onset_smooth_ms)
+                             extra_small_cplx=self.extra_small_cplx)
     def get_config(self):
         config = super().get_config()
         config.update({
             "sample_rate": self.sample_rate,
-            "extra_small_cplx": self.extra_small_cplx,
-            "onset_smooth_ms": self.onset_smooth_ms
+            "extra_small_cplx": self.extra_small_cplx
         })
         return config
 
@@ -799,7 +832,7 @@ def multi_scale_stft_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                   split_hz=STFT_HIGH_SPLIT_HZ,
+                                   split_hz=GATE_HP_CUTOFF_HZ,
                                    high_boost=STFT_HIGH_BOOST,
                                    onset_env=None,
                                    onset_gain=STFT_HF_ONSET_GAIN):
@@ -914,28 +947,26 @@ def rms_env_loss(y_true, y_pred):
     return env_diff[:,None,None]
 
 @register_keras_serializable()
-def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False, onset_smooth_ms=3.0):
-    onset_env = onset_envelope(y_true,
-                               sample_rate=sample_rate,
-                               pre_emph_alpha=HP_PRE_EMPHASIS_HF,
-                               smooth_ms=onset_smooth_ms)
+def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
+    gate_env = gate_weight(y_true, sample_rate)
+
     td   = waveform_l1_loss(y_true, y_pred)
-    hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)
+    hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)
     spec = mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                          split_hz=STFT_HIGH_SPLIT_HZ,
+                                          split_hz=GATE_HP_CUTOFF_HZ,
                                           high_boost=STFT_HIGH_BOOST,
-                                          onset_env=onset_env, onset_gain=STFT_HF_ONSET_GAIN)
+                                          onset_env=gate_env, onset_gain=STFT_HF_ONSET_GAIN)
     mel  = log_mel_loss(y_true, y_pred, sample_rate)
     env  = rms_env_loss(y_true, y_pred)
 
-    cplx_base = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=onset_env)
+    cplx_base = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=256, hop=64, win=256, onset_env=gate_env)
     if extra_small_cplx:
-        cplx_64 = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=64, hop=16, win=64, onset_env=onset_env)
+        cplx_64 = complex_stft_loss_onset(y_true, y_pred, sample_rate, n_fft=64, hop=16, win=64, onset_env=gate_env)
         cplx = 0.5 * (cplx_base + cplx_64)
     else:
         cplx = cplx_base
 
-    d2   = second_diff_l1_onset(y_true, y_pred, onset_env=onset_env)
+    d2   = second_diff_l1_onset(y_true, y_pred, onset_env=gate_env)
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
           + STFT_WEIGHT     * spec
@@ -1124,29 +1155,24 @@ def _extract_audio_io(model, batch):
     y_pred_audio, _ = model(x, training=False)
     return y_true_audio, y_pred_audio
 
-def analyze_loss_scales_consistent_batch(model, batch, sample_rate, onset_smooth_ms):
+def analyze_loss_scales_consistent_batch(model, batch, sample_rate):
     y_true, y_pred = _extract_audio_io(model, batch)
-    onset_env = onset_envelope(
-        y_true,
-        sample_rate=sample_rate,
-        pre_emph_alpha=HP_PRE_EMPHASIS_HF,
-        smooth_ms=onset_smooth_ms
-    )
+    gate_env = gate_weight(y_true, sample_rate)
+
     l1   = tf.reduce_mean(waveform_l1_loss(y_true, y_pred)).numpy()
     mel  = tf.reduce_mean(log_mel_loss(y_true, y_pred, sample_rate)).numpy()
     env  = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
-    hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * onset_env)).numpy()
+    hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)).numpy()
     stft_on = tf.reduce_mean(
         mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                       split_hz=STFT_HIGH_SPLIT_HZ,
+                                       split_hz=GATE_HP_CUTOFF_HZ,
                                        high_boost=STFT_HIGH_BOOST,
-                                       onset_env=onset_env,
+                                       onset_env=gate_env,
                                        onset_gain=STFT_HF_ONSET_GAIN)
     ).numpy()
     return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on}
 
 def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
-                                      onset_smooth_ms=3.0,
                                       normalize_keys=('l1','stft','mel','env','hf'),
                                       declared=None):
     if declared is None:
@@ -1154,7 +1180,7 @@ def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
     sums = {k:0.0 for k in normalize_keys}
     count = 0
     for batch in dataset.take(n_batches):
-        sc = analyze_loss_scales_consistent_batch(model, batch, sample_rate, onset_smooth_ms)
+        sc = analyze_loss_scales_consistent_batch(model, batch, sample_rate)
         for k in normalize_keys:
             sums[k] += float(sc[k])
         count += 1
@@ -1227,10 +1253,16 @@ def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target
         style_true_name = 'pick' if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
     else:
         y_inf_style_true = None
-        style_true_name = None    
+        style_true_name = None  
     
     style_pred_filepath = os.path.join(out_dir, prediction_name + "_style_pred" + ".wav")
     style_true_filepath = os.path.join(out_dir, prediction_name + "_style_true" + ".wav")
+    
+    # TEMP!
+    model = boost_hf_scale_in_model(model, "offline_hf_scale", gain_db=60.0)  
+    y_inf_style_true_gained_hf, _ = model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
+    y_inf_style_true_gained_hf = y_inf_style_true_gained_hf[0, :, 0]
+    sf.write(os.path.join(out_dir, prediction_name + "_style_true_gained" + ".wav"), y_inf_style_true_gained_hf, sample_rate, subtype='FLOAT')
 
     sf.write(style_pred_filepath, y_inf_style_pred, sample_rate, subtype='FLOAT')
     print(f"✅ Demo saved to {style_pred_filepath}. Predicted style: {style_pred_name}")
@@ -1499,6 +1531,150 @@ class InvertStyle(Layer):
     def compute_output_shape(self, input_shape):
         return input_shape
 
+# ─── Gate sidechain HPF (min-phase, causal) cache ────────────────────────────
+_gate_hp_kernel_cache = {}
+
+def _get_minphase_hp_kernel(sample_rate, cutoff_hz, order=129):
+    key = (int(sample_rate), float(cutoff_hz), int(order))
+    k = _gate_hp_kernel_cache.get(key)
+    if k is None:
+        taps = firwin(order,
+                      cutoff=cutoff_hz/(sample_rate/2.0),
+                      window="hamming",
+                      pass_zero=False).astype(np.float32)
+        taps_min = minimum_phase(taps, method='homomorphic').astype(np.float32)
+        k = tf.constant(taps_min[::-1].reshape(-1,1,1), dtype=tf.float32)
+        _gate_hp_kernel_cache[key] = k
+    return k
+
+def _causal_conv1d(x, kernel):
+    pad = tf.shape(kernel)[0] - 1
+    x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+    return tf.nn.conv1d(x_pad, filters=kernel, stride=1, padding='VALID')
+
+@register_keras_serializable()
+def gate_gain_signal(
+    x, sample_rate,
+    threshold_db=GATE_THRESHOLD_DB,
+    ratio=GATE_RATIO,
+    attack_ms=GATE_ATTACK_MS,
+    hold_ms=GATE_HOLD_MS,
+    release_ms=GATE_RELEASE_MS,
+    cutoff_hz=GATE_HP_CUTOFF_HZ,
+    hp_order=129
+):
+    """
+    Returns the per-sample gate gain in [0,1].
+    Sidechain = min-phase causal HPF(x, cutoff_hz), detector=|·| → dB,
+    downward expander with attack/hold/release smoothing on the gain.
+    """
+    x = tf.convert_to_tensor(x, dtype=tf.float32)
+    B = tf.shape(x)[0]
+
+    kernel = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
+    sc = _causal_conv1d(x, kernel)
+    det = tf.abs(sc) + 1e-12
+
+    LOG10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
+    level_db = 20.0 / LOG10 * tf.math.log(det)  # (B,T,1)
+    lev = tf.squeeze(level_db, axis=-1)         # (B,T)
+    lev_t = tf.transpose(lev, perm=[1, 0])      # (T,B)
+
+    atk_s = max(1, int(round((attack_ms  / 1000.0) * sample_rate)))
+    rel_s = max(1, int(round((release_ms / 1000.0) * sample_rate)))
+    hld_s = max(0, int(round((hold_ms    / 1000.0) * sample_rate)))
+
+    alpha_open  = tf.constant(np.exp(-1.0 / atk_s), dtype=tf.float32)
+    alpha_close = tf.constant(np.exp(-1.0 / rel_s), dtype=tf.float32)
+    hold_samps  = tf.constant(float(hld_s), dtype=tf.float32)
+
+    def step_fn(state, curr_db):
+        g_prev, hold_prev = state  # (B,), (B,)
+        above = curr_db >= threshold_db
+        hold_next = tf.where(above, tf.fill(tf.shape(curr_db), hold_samps),
+                             tf.maximum(hold_prev - 1.0, 0.0))
+        open_or_hold = tf.logical_or(above, hold_prev > 0.5)
+
+        attn_db = (1.0 - 1.0/ratio) * tf.nn.relu(threshold_db - curr_db)  # (B,)
+        g_close = tf.pow(10.0, -attn_db / 20.0)
+        g_target = tf.where(open_or_hold, tf.ones_like(g_close), g_close)
+
+        inc = g_target > g_prev
+        alpha = tf.where(inc, alpha_open, alpha_close)
+        g_new = alpha * g_prev + (1.0 - alpha) * g_target
+        return (g_new, hold_next)
+
+    g0 = tf.zeros((B,), dtype=tf.float32)
+    h0 = tf.zeros((B,), dtype=tf.float32)
+    (g_seq, _) = tf.scan(step_fn, lev_t, initializer=(g0, h0))
+    g_bt = tf.transpose(g_seq, perm=[1, 0])
+    return tf.expand_dims(g_bt, axis=-1)
+
+@register_keras_serializable()
+class Gate(tf.keras.layers.Layer):
+    """
+    Gate with HPF sidechain and downward expander, returning per-sample gain [0,1].
+    """
+    def __init__(self, sample_rate,
+                 threshold_db=GATE_THRESHOLD_DB,
+                 ratio=GATE_RATIO,
+                 attack_ms=GATE_ATTACK_MS,
+                 hold_ms=GATE_HOLD_MS,
+                 release_ms=GATE_RELEASE_MS,
+                 cutoff_hz=GATE_HP_CUTOFF_HZ,
+                 hp_order=129,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.sample_rate = int(sample_rate)
+        self.threshold_db = float(threshold_db)
+        self.ratio = float(ratio)
+        self.attack_ms = float(attack_ms)
+        self.hold_ms = float(hold_ms)
+        self.release_ms = float(release_ms)
+        self.cutoff_hz = float(cutoff_hz)
+        self.hp_order = int(hp_order)
+
+    def call(self, x):
+        return gate_gain_signal(
+            x,
+            sample_rate=self.sample_rate,
+            threshold_db=self.threshold_db,
+            ratio=self.ratio,
+            attack_ms=self.attack_ms,
+            hold_ms=self.hold_ms,
+            release_ms=self.release_ms,
+            cutoff_hz=self.cutoff_hz,
+            hp_order=self.hp_order
+        )
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sample_rate": self.sample_rate,
+            "threshold_db": self.threshold_db,
+            "ratio": self.ratio,
+            "attack_ms": self.attack_ms,
+            "hold_ms": self.hold_ms,
+            "release_ms": self.release_ms,
+            "cutoff_hz": self.cutoff_hz,
+            "hp_order": self.hp_order,
+        })
+        return cfg
+
+# Gate weight for losses (computed from y_true)
+@register_keras_serializable()
+def gate_weight(y_true, sample_rate):
+    return gate_gain_signal(
+        y_true,
+        sample_rate=sample_rate,
+        threshold_db=GATE_THRESHOLD_DB,
+        ratio=GATE_RATIO,
+        attack_ms=GATE_ATTACK_MS,
+        hold_ms=GATE_HOLD_MS,
+        release_ms=GATE_RELEASE_MS,
+        cutoff_hz=GATE_HP_CUTOFF_HZ
+    )
+
 # Slice helpers
 @register_keras_serializable()
 def slice_content(x, filters):
@@ -1533,64 +1709,10 @@ def batch_zeros_like_style(x):
 @register_keras_serializable()
 def film_gamma_stable(raw):
     return 1.0 + 0.1 * tf.tanh(raw)
+
 @register_keras_serializable()
 def film_beta_stable(raw):
     return 0.1 * tf.tanh(raw)
-
-@register_keras_serializable()
-def onset_gate_shape(g, floor=0.15, gain=0.85, eps=1e-6):
-    g = tf.clip_by_value(g, eps, 1.0)
-    return floor + gain * tf.sqrt(g)
-
-
-# 1) Replace the shaping function with a less compressive version
-@register_keras_serializable()
-def onset_gate_shape_linear(g, floor=0.0, gain=1.0, eps=1e-6):
-    g = tf.clip_by_value(g, eps, 1.0)
-    return floor + gain * g  # no sqrt compression
-
-
-@register_keras_serializable()
-def onset_envelope(y, sample_rate, pre_emph_alpha=0.98, smooth_ms=3.0):
-    # High-pass like pre-emphasis
-    pe = y[:, 1:, :] - pre_emph_alpha * y[:, :-1, :]
-    pe = tf.pad(pe, [[0, 0], [1, 0], [0, 0]])
-    env = tf.abs(pe)
-
-    # Explicit smoothing window (in samples)
-    win = max(1, int(round(float(smooth_ms) * float(sample_rate) / 1000.0)))
-    ker = tf.ones([win, 1, 1], dtype=tf.float32) / float(win)
-
-    env_sm = tf.nn.conv1d(env, ker, stride=1, padding='SAME')
-    m = tf.reduce_max(env_sm, axis=1, keepdims=True) + 1e-6
-    env_n = tf.clip_by_value(env_sm / m, 0.0, 1.0)
-    return env_n
-
-@register_keras_serializable()
-class OnsetGate(Layer):
-    def __init__(self, sr, alpha=0.98, smooth_ms=3.0, **kwargs):
-        super().__init__(**kwargs)
-        self.sr = float(sr)
-        self.alpha = float(alpha)
-        self.smooth_ms = float(smooth_ms)
-        self._win = max(1, int(round(self.smooth_ms * self.sr / 1000.0)))
-
-    def call(self, x):
-        pe = x[:, 1:, :] - self.alpha * x[:, :-1, :]
-        pe = tf.pad(pe, [[0, 0], [1, 0], [0, 0]])
-        env = tf.abs(pe)
-
-        ker = tf.ones([self._win, 1, 1], dtype=tf.float32) / float(self._win)
-        env_sm = tf.nn.conv1d(env, ker, stride=1, padding='SAME')
-
-        m = tf.reduce_max(env_sm, axis=1, keepdims=True) + 1e-6
-        env_n = tf.clip_by_value(env_sm / m, 0.0, 1.0)
-        return env_n
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"sr": self.sr, "alpha": self.alpha, "smooth_ms": self.smooth_ms})
-        return cfg
 
 def compute_pads(kernel, dilation, lookahead_samples):
     P_tot = (kernel - 1) * dilation
@@ -1682,45 +1804,30 @@ def build_offline_model(dynamic_time=False):
     pick_c     = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
     finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
     
-    gate_env = OnsetGate(sr=OFFLINE_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
-                     smooth_ms=OFFLINE_GATE_ONSET_SMOOTH_MS, name="offline_onset_gate")(inp)
-    gate_env = Lambda(onset_gate_shape_linear, name="offline_onset_gate_shaped")(gate_env)
+        # ─── Gate gain (0..1) computed from the input ────────────────────────────
+    offline_gate = Gate(
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        threshold_db=GATE_THRESHOLD_DB,
+        ratio=GATE_RATIO,
+        attack_ms=GATE_ATTACK_MS,
+        hold_ms=GATE_HOLD_MS,
+        release_ms=GATE_RELEASE_MS,
+        cutoff_hz=GATE_HP_CUTOFF_HZ,
+        name="offline_gate"
+    )(inp)
 
-    g_feat = Conv1D(
-        32, 5, padding="same", activation="relu",
-        kernel_initializer="he_normal", bias_initializer="zeros",
-        name="offline_gate_c1"
-    )(x)
-    g_feat = Conv1D(
-        1,  3, padding="same", activation="sigmoid",
-        kernel_initializer="glorot_uniform",
-        bias_initializer=tf.keras.initializers.Constant(2.5),  # was 2.5 → start closer to 1.0
-        name="offline_gate_c2"
-    )(g_feat)
-    
-    g_feat = GateFeatMin(min_val=0.35, name="offline_gate_feat_min")(g_feat)
-    
-    gate = GateFloorProduct(floor=0.15, gain=0.85, name="offline_onset_gate_total")([gate_env, g_feat])
-    
-    gate = GateOpenReg(tau=0.5, weight=0.02, name="offline_gate_open_reg")([gate, gate_env])
-    
-    hf = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(inp)
-    
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
     hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
-    
-    hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
-    hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b0")
-    hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
-    hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b1")
-    hf = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
-    hf = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
-    
-    hf = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b0")
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b1")
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
+    hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
     hf_hp = HFHighpass(name="offline_hf_highpass")(hf)
 
-    # Gate and scale
-    hf_gated = Multiply(name="offline_hf_gate")([hf_hp, gate])
+    hf_gated = Multiply(name="offline_hf_mult_gate")([hf_hp, offline_gate])
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_gated)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
@@ -1728,28 +1835,48 @@ def build_offline_model(dynamic_time=False):
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name="piezo2mic_offline")
 
 def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, style_true_flag=1.0):
-    
+    """
+    Summarize how the offline model uses its HF branch with the new Gate.
+    - Prints gate stats and HF branch RMS on high/low gate regions
+    - Reports high-band STFT energy above GATE_HP_CUTOFF_HZ for target vs prediction
+
+    Args:
+        offline_dyn: dynamic offline model (built with build_offline_model(dynamic_time=True))
+        src_path: path to source (piezo) file
+        tgt_path: path to target (mic) file
+        sample_rate: model SR (should be OFFLINE_SAMPLE_RATE)
+        style_true_flag: 1.0 for pick / 0.0 for finger (forced)
+
+    Requirements:
+        - Model must expose layers named:
+            "offline_gate" (per-sample gain 0..1),
+            "offline_hf_out" (HF branch pre-HPF),
+            "offline_hf_mult_gate" (HF high-passed and multiplied by gate),
+            "offline_hf_scale" (scaled HF branch that gets mixed),
+            "offline_pick_contrib", "offline_finger_contrib", "offline_mix_main"
+        - Constants available: GATE_HP_CUTOFF_HZ, HP_PRE_EMPHASIS_HF
+        - Utility available: resample_to_model_sr
+    """
+
     def _build_offline_debug_model(offline):
         outs = {
-            "gate_total": offline.get_layer("offline_onset_gate_total").output,
-            "gate_feat":  offline.get_layer("offline_gate_c2").output,
-            "gate_env":   offline.get_layer("offline_onset_gate").output,  # pre-shaped envelope (before shape_linear)
-            "hf_pre":     offline.get_layer("offline_hf_out").output,
-            "hf_gated":   offline.get_layer("offline_hf_gate").output,
-            "hf_scaled":  offline.get_layer("offline_hf_scale").output,
-            "pick_c":     offline.get_layer("offline_pick_contrib").output,
-            "finger_c":   offline.get_layer("offline_finger_contrib").output,
-            "y":          offline.get_layer("offline_mix_main").output,
+            "gate":      offline.get_layer("offline_gate").output,            # gate gain (0..1)
+            "hf_pre":    offline.get_layer("offline_hf_out").output,          # HF branch before HPF
+            "hf_gated":  offline.get_layer("offline_hf_mult_gate").output,    # post-HPF × gate, pre-scale
+            "hf_scaled": offline.get_layer("offline_hf_scale").output,        # final HF branch to mix
+            "pick_c":    offline.get_layer("offline_pick_contrib").output,
+            "finger_c":  offline.get_layer("offline_finger_contrib").output,
+            "y":         offline.get_layer("offline_mix_main").output,        # final mix
         }
         return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
 
-    def _hp(x, alpha=0.98):
-        # pre-emphasis HP like your hf_loss
-        x1 = x[:,1:,:] - alpha * x[:,:-1,:]
-        return tf.pad(x1, [[0,0],[1,0],[0,0]])
+    def _hp(x, alpha=HP_PRE_EMPHASIS_HF):
+        # pre-emphasis HP similar to your hf_loss
+        x1 = x[:, 1:, :] - alpha * x[:, :-1, :]
+        return tf.pad(x1, [[0, 0], [1, 0], [0, 0]])
 
-    def _band_energy(x, sr, fmin=5000.0):
-        # crude HF energy via STFT mask
+    def _band_energy(x, sr, fmin):
+        # crude HF energy via STFT mask above fmin
         t = tf.squeeze(x, -1)  # (B,T)
         n_fft = 1024
         hop   = 256
@@ -1757,58 +1884,68 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
         st = tf.signal.stft(t, frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
         mag = tf.abs(st)  # (B, frames, bins)
         freqs = np.linspace(0.0, sr/2.0, n_fft//2 + 1, dtype=np.float32)
-        mask = tf.cast(freqs[None,None,:] >= fmin, tf.float32)
+        mask = tf.cast(freqs[None, None, :] >= float(fmin), tf.float32)
         hf_mag = mag * mask
         return tf.reduce_mean(hf_mag)  # scalar
-    
+
+    def _read_pair_2s(path_src, path_tgt, model_sr):
+        info = sf.info(path_src)
+        file_sr = info.samplerate
+        frames = int(2.0 * file_sr)  # 2 seconds
+        x_long, _ = sf.read(path_src, start=0, frames=frames, dtype='float32', always_2d=True)
+        y_long, _ = sf.read(path_tgt, start=0, frames=frames, dtype='float32', always_2d=True)
+        x = x_long[:, 0]
+        y = y_long[:, 0]
+        if file_sr != model_sr:
+            x = resample_to_model_sr(x, file_sr, model_sr)
+            y = resample_to_model_sr(y, file_sr, model_sr)
+        return x.astype(np.float32), y.astype(np.float32)
+
+    def _rms(a, mask):
+        a = a[mask]
+        return float(np.sqrt(np.mean(a * a) + 1e-12)) if a.size > 0 else 0.0
+
     dbg = _build_offline_debug_model(offline_dyn)
 
-    info = sf.info(src_path)
-    file_sr = info.samplerate
-    # 2 sec slice
-    frames = int(2.0 * file_sr)
-    x_long,_ = sf.read(src_path, start=0, frames=frames, dtype='float32', always_2d=True)
-    y_long,_ = sf.read(tgt_path, start=0, frames=frames, dtype='float32', always_2d=True)
-    x = x_long[:,0]; y = y_long[:,0]
-    if file_sr != sample_rate:
-        x = resample_to_model_sr(x, file_sr, sample_rate)
-        y = resample_to_model_sr(y, file_sr, sample_rate)
+    # Read a short segment
+    x, y = _read_pair_2s(src_path, tgt_path, sample_rate)
+    x_b = x[None, :, None]
+    y_b = y[None, :, None]
 
-    x = x[None,:,None].astype(np.float32)
-    y = y[None,:,None].astype(np.float32)
-
+    # Force true style for stable comparison
     style_true = np.array([[style_true_flag]], dtype=np.float32)
-    force_one  = np.ones((1,1), dtype=np.float32)
-    outs = dbg.predict([x, style_true, force_one], verbose=0)
-    gate = outs["gate_total"][0,:,0]
-    hf   = outs["hf_scaled"][0,:,0]
-    yhat = outs["y"][0,:,0]
-    hp_true = _hp(tf.convert_to_tensor(y)).numpy()[0,:,0]
-    hp_pred = _hp(tf.convert_to_tensor(yhat[None,:,None])).numpy()[0,:,0]
+    style_force = np.ones((1, 1), dtype=np.float32)
 
-    # simple stats
-    print(f"Gate_total: mean={gate.mean():.3f}, p95={np.percentile(gate,95):.3f}, p99={np.percentile(gate,99):.3f}, max={gate.max():.3f}")
-    print(f"HF out scaled RMS={np.sqrt(np.mean(hf**2)+1e-12):.6f}")
+    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
 
-    # onset vs non-onset comparison using gate as a mask
-    # top 3% as onsets, bottom 50% as off)
-    p_on  = np.percentile(gate, 97.0)
-    p_off = np.percentile(gate, 50.0)
-    on  = gate >= p_on
-    off = gate <= p_off
+    # Fetch arrays
+    gate      = np.asarray(outs["gate"][0, :, 0], dtype=np.float32)        # 0..1
+    hf_scaled = np.asarray(outs["hf_scaled"][0, :, 0], dtype=np.float32)
+    y_pred    = np.asarray(outs["y"][0, :, 0], dtype=np.float32)
 
-    def rms(a, m): 
-        a = a[m]
-        return np.sqrt(np.mean(a*a) + 1e-12) if a.size>0 else 0.0
+    # Pre-emphasis of target and prediction (to inspect high-frequency transient similarity)
+    hp_true = _hp(tf.convert_to_tensor(y_b)).numpy()[0, :, 0]
+    hp_pred = _hp(tf.convert_to_tensor(y_pred[None, :, None])).numpy()[0, :, 0]
 
-    print(f"RMS hp_true onsets={rms(hp_true,on):.6f} off={rms(hp_true,off):.6f}")
-    print(f"RMS hp_pred onsets={rms(hp_pred,on):.6f} off={rms(hp_pred,off):.6f}")
-    print(f"RMS hf_branch onsets={rms(hf,on):.6f} off={rms(hf,off):.6f}")
+    # Gate stats
+    print(f"Gate: mean={gate.mean():.3f}, p95={np.percentile(gate, 95):.3f}, p99={np.percentile(gate, 99):.3f}, max={gate.max():.3f}")
+    print(f"HF out (scaled) RMS={np.sqrt(np.mean(hf_scaled**2) + 1e-12):.6f}")
 
-    # high-band energy
-    t_hf_true = float(_band_energy(tf.convert_to_tensor(y), sample_rate, fmin=STFT_HIGH_SPLIT_HZ).numpy())
-    t_hf_pred = float(_band_energy(tf.convert_to_tensor(yhat[None,:,None]), sample_rate, fmin=STFT_HIGH_SPLIT_HZ).numpy())
-    print(f"Avg |STFT| >{STFT_HIGH_SPLIT_HZ / 1000}kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={t_hf_pred/(t_hf_true+1e-12):.3f})")
+    # Onset vs non-onset comparison using gate as a mask (top 3% as onsets, bottom 50% as off)
+    p_on  = float(np.percentile(gate, 97.0))
+    p_off = float(np.percentile(gate, 50.0))
+    on_mask  = gate >= p_on
+    off_mask = gate <= p_off
+
+    print(f"RMS hp_true onsets={_rms(hp_true, on_mask):.6f} off={_rms(hp_true, off_mask):.6f}")
+    print(f"RMS hp_pred onsets={_rms(hp_pred, on_mask):.6f} off={_rms(hp_pred, off_mask):.6f}")
+    print(f"RMS hf_branch onsets={_rms(hf_scaled, on_mask):.6f} off={_rms(hf_scaled, off_mask):.6f}")
+
+    # High-band STFT energy above the gate HP cutoff
+    t_hf_true = float(_band_energy(tf.convert_to_tensor(y_b), sample_rate, fmin=GATE_HP_CUTOFF_HZ).numpy())
+    t_hf_pred = float(_band_energy(tf.convert_to_tensor(y_pred[None, :, None]), sample_rate, fmin=GATE_HP_CUTOFF_HZ).numpy())
+    ratio = t_hf_pred / (t_hf_true + 1e-12)
+    print(f"Avg |STFT| > {GATE_HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
 
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
@@ -1896,38 +2033,28 @@ def build_realtime_model(offline=None, dynamic_time=False):
     ir = RealtimeIrAlign(offset=total_delay + REALTIME_IR_ALIGN_OFFSET_CORRECTION, name='realtime_ir_align')([ir, inp])
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
     
-    gate_env = OnsetGate(sr=REALTIME_SAMPLE_RATE, alpha=HP_PRE_EMPHASIS_HF,
-                     smooth_ms=REALTIME_GATE_ONSET_SMOOTH_MS, name="realtime_onset_gate")(inp)
+        # ─── Gate gain (0..1) computed from the input ────────────────────────────
+    realtime_gate = Gate(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        threshold_db=GATE_THRESHOLD_DB,
+        ratio=GATE_RATIO,
+        attack_ms=GATE_ATTACK_MS,
+        hold_ms=GATE_HOLD_MS,
+        release_ms=GATE_RELEASE_MS,
+        cutoff_hz=GATE_HP_CUTOFF_HZ,
+        name="realtime_gate"
+    )(inp)
 
-    g_feat = Conv1D(
-        32, 5, padding="same", activation="relu",
-        kernel_initializer="he_normal", bias_initializer="zeros",
-        name="realtime_gate_c1"
-    )(x)
-    g_feat = Conv1D(
-        1,  3, padding="same", activation="sigmoid",
-        kernel_initializer="glorot_uniform",
-        bias_initializer=tf.keras.initializers.Constant(2.5),  # was 2.5
-        name="realtime_gate_c2"
-    )(g_feat)
-    
-    g_feat = GateFeatMin(min_val=0.35, name="realtime_gate_feat_min")(g_feat)
-
-    gate = GateFloorProduct(floor=0.15, gain=0.85, name="realtime_onset_gate_total")([gate_env, g_feat])
-    gate = GateOpenReg(tau=0.5, weight=0.02, name="realtime_gate_open_reg")([gate, gate_env])
-    
+    # HF branch (unchanged topology), gated by 'realtime_gate'
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
-    
-    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
-    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
-    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
-    hf = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
-    
+    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
+    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
+    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
+    hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
     hf_hp = HFHighpass(name="realtime_hf_highpass")(hf)
 
-    # Gate and scale
-    hf_gated = Multiply(name="realtime_hf_gate")([hf_hp, gate])
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf_hp, realtime_gate])
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_gated)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
@@ -2076,7 +2203,203 @@ def add_sw_realtime_finetune_nf(x, y):
     return inputs, outputs, (sw_audio, sw_style)
 
 
+@register_keras_serializable()
+def build_offline_debug_model(offline):
+    outs = {
+        "gate":      offline.get_layer("offline_gate").output,
+        "hf_pre":    offline.get_layer("offline_hf_out").output,
+        "hf_gated":  offline.get_layer("offline_hf_mult_gate").output,
+        "hf_scaled": offline.get_layer("offline_hf_scale").output,
+        "pick_c":    offline.get_layer("offline_pick_contrib").output,
+        "finger_c":  offline.get_layer("offline_finger_contrib").output,
+        "y_pred":    offline.get_layer("offline_mix_main").output,
+    }
+    return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
 
+
+@register_keras_serializable()
+def build_realtime_debug_model(realtime):
+    outs = {
+        "gate":      realtime.get_layer("realtime_gate").output,
+        "hf_pre":    realtime.get_layer("realtime_hf_out").output,
+        "hf_gated":  realtime.get_layer("realtime_hf_mult_gate").output,
+        "hf_scaled": realtime.get_layer("realtime_hf_scale").output,
+        "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
+        "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
+        "y_pred":    realtime.get_layer("realtime_with_ir").output,
+    }
+    return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
+
+def _read_pair_segment(path_src, path_tgt, model_sr, offset_sec, sec):
+    file_sr = sf.info(path_src).samplerate
+    start_frames = int(round(offset_sec * file_sr))
+    frames       = int(round(sec * file_sr))
+    x_long,_ = sf.read(path_src, start=start_frames, frames=frames, dtype='float32', always_2d=True)
+    y_long,_ = sf.read(path_tgt, start=start_frames, frames=frames, dtype='float32', always_2d=True)
+    x_src = x_long[:,0]; y_src = y_long[:,0]
+    if file_sr != model_sr:
+        x_mod = resample_to_model_sr(x_src, file_sr, model_sr)
+        y_mod = resample_to_model_sr(y_src, file_sr, model_sr)
+    else:
+        x_mod, y_mod = x_src, y_src
+    return x_mod.astype(np.float32), y_mod.astype(np.float32)
+
+
+def _normalize_to_peak(sig, peak=0.8):
+    m = float(np.max(np.abs(sig)) + 1e-12)
+    return (sig / m) * peak if m > 0 else sig
+
+def _make_sine(sr, n, freq=5000.0):
+    t = np.arange(n, dtype=np.float32) / float(sr)
+    return np.sin(2.0 * np.pi * freq * t).astype(np.float32)
+
+
+def _make_hiss_hp(sr, n, alpha=0.98):
+    # White noise high-passed by pre-emphasis (similar to your HF losses)
+    w = np.random.randn(n).astype(np.float32)
+    y = np.empty_like(w)
+    y[0] = w[0]
+    y[1:] = w[1:] - alpha * w[:-1]
+    # light normalization
+    y = y / (np.std(y) + 1e-6)
+    return 0.5 * y  # conservative level
+
+
+def _render_clicks_from_gate(gate_rel, sr, thresh=0.02, click_len=256, click_decay=0.97):
+    """
+    Create a click track from upward changes in gate_rel. Each time
+    the first difference exceeds thresh, emit a short decaying click.
+    """
+    n = gate_rel.shape[0]
+    out = np.zeros(n, dtype=np.float32)
+    # first-diff (positive)
+    d = np.diff(gate_rel, prepend=gate_rel[0])
+    events = np.where((d > thresh) & (gate_rel > 0.2))[0]
+    # prebuild click kernel
+    k = np.zeros(click_len, dtype=np.float32)
+    k[0] = 1.0
+    for i in range(1, click_len):
+        k[i] = k[i-1] * click_decay
+    amp = 0.4
+    for e in events:
+        end = min(n, e + click_len)
+        seg_len = end - e
+        out[e:end] += amp * k[:seg_len]
+    return _normalize_to_peak(out, 0.8)
+
+def boost_hf_scale_in_model(model, layer_name, gain_db):
+    """
+    Multiplies the IrScale scalar in the specified layer by 10^(gain_db/20).
+    layer_name: "offline_hf_scale" or "realtime_hf_scale"
+    """
+    layer = model.get_layer(layer_name)
+    w = layer.get_weights()  # [array([scale], dtype=float32)]
+    if not w:
+        raise ValueError(f"No weights in layer {layer_name}")
+    s = float(w[0][0])
+    g = 10.0 ** (gain_db / 20.0)
+    w[0][0] = s * g
+    layer.set_weights(w)
+    print(f"{layer_name}: {s:.4f} → {w[0][0]:.4f} (+{gain_db} dB)")
+    return model
+
+
+def audible_gate_debug_offline(offline_dyn_model, path_src, path_tgt, out_dir,
+                               sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
+    os.makedirs(out_dir, exist_ok=True)
+    sr = OFFLINE_SAMPLE_RATE
+    dbg = build_offline_debug_model(offline_dyn_model)
+
+    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sr, offset_sec=offset_sec, sec=sec)
+    x_b = x[None,:,None]
+
+    if style_mode == "true":
+        style_true = np.array([[style_true_flag]], dtype=np.float32)
+        style_force = np.ones((1,1), dtype=np.float32)
+    else:
+        style_true  = np.zeros((1,1), dtype=np.float32)
+        style_force = np.zeros((1,1), dtype=np.float32)
+
+    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
+
+    def _fetch(key):
+        arr = outs[key][0,:,0]
+        return np.asarray(arr, dtype=np.float32)
+
+    gate      = np.clip(_fetch("gate"), 0.0, 1.0)
+    y_pred    = _fetch("y_pred")
+    pick_c    = _fetch("pick_c")
+    finger_c  = _fetch("finger_c")
+    hf_scaled = _fetch("hf_scaled")
+
+    y_nohf     = pick_c + finger_c
+    gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
+
+    tone_freq = gate_debug_tone_freq(sr, GATE_HP_CUTOFF_HZ)
+    gate_tone = _normalize_to_peak(gate * _make_sine(sr, len(gate), freq=tone_freq), 0.8)
+    
+    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sr, len(gate)), 0.8)
+    gate_clicks = _render_clicks_from_gate(gate, sr)
+
+    sf.write(os.path.join(out_dir, "src.wav"), x, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "tgt.wav"), y, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sr, subtype='FLOAT')
+    print(f"Saved audible gate debug (offline, {style_mode}) to {out_dir}")
+
+
+def audible_gate_debug_realtime(realtime_dyn_model, path_src, path_tgt, out_dir,
+                               sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
+    os.makedirs(out_dir, exist_ok=True)
+    sr = REALTIME_SAMPLE_RATE
+    dbg = build_offline_debug_model(realtime_dyn_model)
+
+    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sr, offset_sec=offset_sec, sec=sec)
+    x_b = x[None,:,None]
+
+    if style_mode == "true":
+        style_true = np.array([[style_true_flag]], dtype=np.float32)
+        style_force = np.ones((1,1), dtype=np.float32)
+    else:
+        style_true  = np.zeros((1,1), dtype=np.float32)
+        style_force = np.zeros((1,1), dtype=np.float32)
+
+    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
+
+    def _fetch(key):
+        arr = outs[key][0,:,0]
+        return np.asarray(arr, dtype=np.float32)
+
+    gate      = np.clip(_fetch("gate"), 0.0, 1.0)
+    y_pred    = _fetch("y_pred")
+    pick_c    = _fetch("pick_c")
+    finger_c  = _fetch("finger_c")
+    hf_scaled = _fetch("hf_scaled")
+
+    y_nohf     = pick_c + finger_c
+    gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
+    
+    tone_freq = gate_debug_tone_freq(sr, GATE_HP_CUTOFF_HZ)
+    gate_tone = _normalize_to_peak(gate * _make_sine(sr, len(gate), freq=tone_freq), 0.8)
+
+    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sr, len(gate)), 0.8)
+    gate_clicks = _render_clicks_from_gate(gate, sr)
+
+    sf.write(os.path.join(out_dir, "src.wav"), x, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "tgt.wav"), y, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sr, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sr, subtype='FLOAT')
+    print(f"Saved audible gate debug (offline, {style_mode}) to {out_dir}")
 
 def train_shared(
     kind,
@@ -2202,12 +2525,8 @@ def train_shared(
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
         initial_epoch = 0
   
-    # Choose smoothing per model kind
-    onset_ms_for_loss = OFFLINE_LOSS_ONSET_SMOOTH_MS if kind == 'offline' else REALTIME_LOSS_ONSET_SMOOTH_MS
-
-    # Normalize weights consistently with the actual loss shape
     new_w, _ = calibrate_loss_weights_consistent(
-        model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5, onset_smooth_ms=onset_ms_for_loss
+        model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5
     )
     L1_WEIGHT      = new_w['l1']
     STFT_WEIGHT    = new_w['stft']
@@ -2222,9 +2541,7 @@ def train_shared(
         f" HF={HF_WEIGHT:.6f}")
 
     # Instantiate the loss with the per-model smoothing
-    _combined_loss = CombinedLoss(sample_rate,
-                                extra_small_cplx=(kind == 'offline'),
-                                onset_smooth_ms=onset_ms_for_loss)
+    _combined_loss = CombinedLoss(sample_rate, extra_small_cplx=(kind == 'offline'))
     _log_mel_loss  = LogMelLoss(sample_rate)
 
     static_model.compile(
@@ -2355,13 +2672,13 @@ def fine_tune():
     rms_y = compute_rms(y_full[:,0])
     print(f"[fine_tune] input RMS: source={rms_x:.6f}, target={rms_y:.6f}")
 
-    target_rms = 10 ** ( INPUT_AVG_RMS_DBFS_TARGET / 20.0 )
-    gain_x     = target_rms / (rms_x + 1e-12)
-    gain_y     = target_rms / (rms_y + 1e-12)
-    print(f"[fine_tune] applying gains: source×{gain_x:.3f}, target×{gain_y:.3f}")
+    #target_rms = 10 ** ( INPUT_AVG_RMS_DBFS_TARGET / 20.0 )
+    #gain_x     = target_rms / (rms_x + 1e-12)
+    #gain_y     = target_rms / (rms_y + 1e-12)
+    #print(f"[fine_tune] applying gains: source×{gain_x:.3f}, target×{gain_y:.3f}")
 
-    x_norm = x_full * gain_x
-    y_norm = y_full * gain_y
+    x_norm = x_full # * gain_x
+    y_norm = y_full # * gain_y
 
     if ALIGN_ENABLE:
         L = x_norm.shape[0]
@@ -2441,7 +2758,7 @@ def fine_tune():
 
     # Normalize weights consistently with the actual loss shape
     new_w, _ = calibrate_loss_weights_consistent(
-        model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5, onset_smooth_ms=FINETUNE_LOSS_ONSET_SMOOTH_MS
+        model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5
     )
     
     L1_WEIGHT      = new_w['l1']
@@ -2457,9 +2774,7 @@ def fine_tune():
         f" HF={HF_WEIGHT:.6f}")
 
     # Instantiate the loss with the per-model smoothing
-    _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE,
-                                extra_small_cplx=False,
-                                onset_smooth_ms=FINETUNE_LOSS_ONSET_SMOOTH_MS)
+    _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE, extra_small_cplx=False)
 
     finetuned_realtime_small.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_REALTIME_LR),
@@ -2611,6 +2926,40 @@ def main ():
             offline_dyn=dynamic_model,
             sample_rate=OFFLINE_SAMPLE_RATE
         )
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-offline":
+        # Load offline dynamic or last checkpoint → dynamic
+        if os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
+            offline_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
+        else:
+            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
+            if not ckpts:
+                print("No offline model found.")
+                sys.exit(1)
+            static = tf.keras.models.load_model(ckpts[-1], compile=False)
+            offline_dyn = build_offline_model(dynamic_time=True)
+            offline_dyn.set_weights(static.get_weights())
+        assert_has_pairs()
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
+        audible_gate_debug_offline(offline_dyn, src, tgt, out_dir, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
+        sys.exit(0)
+
+    elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-realtime":
+        if os.path.exists(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)):
+            realtime_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
+        else:
+            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
+            if not ckpts:
+                print("No realtime model found.")
+                sys.exit(1)
+            static = tf.keras.models.load_model(ckpts[-1], compile=False)
+            realtime_dyn = build_realtime_model(offline=None, dynamic_time=True)
+            copy_weights_by_name(realtime_dyn, static)
+        assert_has_pairs()
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_realtime")
+        audible_gate_debug_realtime(realtime_dyn, src, tgt, out_dir, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
         sys.exit(0)
     else:
         print("No command given.")
