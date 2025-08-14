@@ -1552,81 +1552,117 @@ def _causal_conv1d(x, kernel):
     return tf.nn.conv1d(x_pad, filters=kernel, stride=1, padding='VALID')
 
 
+
+
+
+# ─── Gate smoothing kernels (causal FIR) ─────────────────────────────────────
+_gate_smooth_cache = {}  # (tau_samples, scale, Lmax) -> kernel np.array
+_gate_ones_cache   = {}  # (L,) -> kernel np.array
+
+def _exp_smoothing_kernel(samples, scale=4.0, Lmax=2048):
+    """
+    Causal exponential FIR approximation of an EMA with time-constant 'samples'.
+    Kernel length L ≈ scale * samples, clipped to [8, Lmax].
+    Sum is normalized to 1. Returned reversed (for conv1d cross-correlation).
+    """
+    s = max(1, int(samples))
+    L = int(np.clip(np.ceil(scale * s), 8, Lmax))
+    key = (s, float(scale), int(Lmax))
+    k_np = _gate_smooth_cache.get(key)
+    if k_np is None:
+        a = np.exp(-1.0 / float(s))
+        taps = (1.0 - a) * (a ** np.arange(L, dtype=np.float32))
+        taps = taps / np.sum(taps)  # normalize exactly
+        k_np = taps[::-1].reshape(-1, 1, 1).astype(np.float32)  # reverse for tf.nn.conv1d
+        _gate_smooth_cache[key] = k_np
+    return tf.constant(k_np, dtype=tf.float32)
+
+def _ones_kernel(length):
+    """
+    Causal moving-sum kernel of length 'length' (reversed for conv1d).
+    """
+    L = max(1, int(length))
+    k_np = _gate_ones_cache.get(L)
+    if k_np is None:
+        taps = np.ones((L,), dtype=np.float32)
+        k_np = taps[::-1].reshape(-1, 1, 1).astype(np.float32)
+        _gate_ones_cache[L] = k_np
+    return tf.constant(k_np, dtype=tf.float32)
+
+
 @register_keras_serializable()
 def gate_gain_signal(
-x, sample_rate,
-threshold_db=GATE_THRESHOLD_DB,
-ratio=GATE_RATIO,
-attack_ms=GATE_ATTACK_MS,
-hold_ms=GATE_HOLD_MS,
-release_ms=GATE_RELEASE_MS,
-cutoff_hz=GATE_HP_CUTOFF_HZ,
-hp_order=129
+    x, sample_rate,
+    threshold_db=GATE_THRESHOLD_DB,
+    ratio=GATE_RATIO,
+    attack_ms=GATE_ATTACK_MS,
+    hold_ms=GATE_HOLD_MS,
+    release_ms=GATE_RELEASE_MS,
+    cutoff_hz=GATE_HP_CUTOFF_HZ,
+    hp_order=129
 ):
+    """
+    Fast, causal, loop-free gate gain in [0,1] using only conv1d + elementwise ops.
+    - Sidechain: causal min-phase HPF (as before)
+    - Detector: |·| -> dB
+    - Hold: causal moving "OR" via conv1d with an all-ones kernel over the last hld_s samples
+    - Target gain: 1 when open/hold, else downward-expander g_close (in linear)
+    - Smoothing: separate causal exponential FIRs for attack and release, then per-sample mix
+                 based on whether target is increasing or decreasing.
+    TFLite-friendly (no While/Scan/TensorArray), GPU-friendly, strictly causal.
+    """
     x = tf.convert_to_tensor(x, dtype=tf.float32)  # (B,T,1)
-    # Sidechain HPF (causal, min-phase)
-    kernel = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
-    sc = _causal_conv1d(x, kernel)  # (B,T,1)
+
+    # Causal min-phase HPF sidechain (uses your existing helpers)
+    kernel_hp = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
+    sc = _causal_conv1d(x, kernel_hp)  # (B,T,1)
 
     # Detector in dB
     det = tf.abs(sc) + 1e-12
-    LOG10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
-    level_db = 20.0 / LOG10 * tf.math.log(det)  # (B,T,1)
-    lev = tf.squeeze(level_db, axis=-1)         # (B,T)
+    LN10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
+    level_db = 20.0 / LN10 * tf.math.log(det)        # (B,T,1)
+    lev = tf.squeeze(level_db, axis=-1)              # (B,T)
 
-    # Times → samples
+    # Time constants in samples
     atk_s = max(1, int(round((float(attack_ms)  / 1000.0) * float(sample_rate))))
     rel_s = max(1, int(round((float(release_ms) / 1000.0) * float(sample_rate))))
     hld_s = max(0, int(round((float(hold_ms)    / 1000.0) * float(sample_rate))))
 
-    alpha_open  = tf.constant(np.exp(-1.0 / atk_s), dtype=tf.float32)
-    alpha_close = tf.constant(np.exp(-1.0 / rel_s), dtype=tf.float32)
-    hold_samps  = tf.constant(float(hld_s), dtype=tf.float32)
-    thr_db      = tf.constant(float(threshold_db), dtype=tf.float32)
-    ratio_f     = tf.constant(float(ratio), dtype=tf.float32)
+    thr_db  = tf.constant(float(threshold_db), dtype=tf.float32)
+    ratio_f = tf.constant(float(ratio), dtype=tf.float32)
 
-    B = tf.shape(lev)[0]
-    T = tf.shape(lev)[1]
+    # Above-threshold mask and causal hold via moving sum (conv with ones)
+    above = tf.cast(lev >= thr_db, tf.float32)       # (B,T)
+    above3 = above[:, :, None]                       # (B,T,1)
+    if hld_s > 0:
+        k_hold = _ones_kernel(hld_s)
+        pad = hld_s - 1
+        above_pad = tf.pad(above3, [[0,0],[pad,0],[0,0]])
+        hold_sum = tf.nn.conv1d(above_pad, filters=k_hold, stride=1, padding='VALID')  # (B,T,1)
+        open_or_hold = tf.cast(hold_sum > 0.0, tf.float32)  # 0 or 1
+    else:
+        open_or_hold = above3
 
-    @tf.function(experimental_relax_shapes=True)
-    def _loop(lev):
-        i0 = tf.constant(0, tf.int32)
-        g0 = tf.zeros((B,), tf.float32)
-        h0 = tf.zeros((B,), tf.float32)
-        ta = tf.TensorArray(tf.float32, size=0, dynamic_size=True, clear_after_read=False)
+    # Downward expander: target gain before smoothing
+    # attn_db = (1 - 1/ratio) * relu(threshold - level)
+    attn_db = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - lev)  # (B,T)
+    # Convert dB attenuation to linear using exp: 10^(-attn_db/20) = exp(-ln(10)/20 * attn_db)
+    ALPHA = tf.constant(np.log(10.0)/20.0, dtype=tf.float32)
+    g_close = tf.exp(-ALPHA * attn_db)[:, :, None]              # (B,T,1)
+    g_target = open_or_hold + (1.0 - open_or_hold) * g_close    # (B,T,1)
 
-        def cond(i, g_prev, h_prev, ta_):
-            return i < T
+    # Causal smoothing via exponential FIRs (loop-free, no recursion)
+    k_att = _exp_smoothing_kernel(atk_s,  scale=4.0, Lmax=2048)
+    k_rel = _exp_smoothing_kernel(rel_s,  scale=4.0, Lmax=2048)
+    g_att = _causal_conv1d(g_target, k_att)   # (B,T,1)
+    g_rel = _causal_conv1d(g_target, k_rel)   # (B,T,1)
 
-        def body(i, g_prev, h_prev, ta_):
-            curr_db = lev[:, i]  # (B,)
+    # Select attack vs release by local direction of the target (causal)
+    g_prev = tf.pad(g_target, [[0,0],[1,0],[0,0]])[:, :-1, :]  # previous target
+    inc_mask = tf.cast(g_target > g_prev, tf.float32)          # (B,T,1)
 
-            above = (curr_db >= thr_db)
-            h_next = tf.where(above,
-                            tf.fill(tf.shape(curr_db), hold_samps),
-                            tf.maximum(h_prev - 1.0, 0.0))
-            open_or_hold = tf.logical_or(above, h_prev > 0.5)
-
-            attn_db  = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - curr_db)
-            g_close  = tf.pow(tf.constant(10.0, tf.float32), -attn_db / 20.0)
-            g_tgt    = tf.where(open_or_hold, tf.ones_like(g_close), g_close)
-
-            inc   = g_tgt > g_prev
-            alpha = tf.where(inc,
-                            tf.fill(tf.shape(g_prev), alpha_open),
-                            tf.fill(tf.shape(g_prev), alpha_close))
-
-            g_new = alpha * g_prev + (1.0 - alpha) * g_tgt
-            ta_ = ta_.write(i, g_new)
-            return i + 1, g_new, h_next, ta_
-
-        _, _, _, ta_out = tf.while_loop(cond, body, (i0, g0, h0, ta),
-                                        parallel_iterations=1)
-        g_stack = ta_out.stack()        # (T,B)
-        return tf.transpose(g_stack, [1, 0])  # (B,T)
-
-    g_bt = _loop(lev)
-    return g_bt[:, :, None]
+    g = inc_mask * g_att + (1.0 - inc_mask) * g_rel
+    return tf.clip_by_value(g, 0.0, 1.0)
 
 @register_keras_serializable()
 class Gate(tf.keras.layers.Layer):
