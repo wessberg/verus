@@ -2926,7 +2926,7 @@ def main ():
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
-        audible_gate_debug(offline_dyn, src, tgt, out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
+        audible_gate_debug(offline_dyn, src, tgt, out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
         sys.exit(0)
 
     elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-realtime":
@@ -2946,7 +2946,7 @@ def main ():
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_realtime")
-        audible_gate_debug(realtime_dyn, src, tgt, out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
+        audible_gate_debug(realtime_dyn, src, tgt, out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
         sys.exit(0)
     else:
         print("No command given.")
