@@ -2304,13 +2304,12 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
     return model
 
 
-def audible_gate_debug_offline(offline_dyn_model, path_src, path_tgt, out_dir,
+def audible_gate_debug(dyn_model, path_src, path_tgt, out_dir, sample_rate,
                                sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
     os.makedirs(out_dir, exist_ok=True)
-    sr = OFFLINE_SAMPLE_RATE
-    dbg = build_offline_debug_model(offline_dyn_model)
+    dbg = build_offline_debug_model(dyn_model)
 
-    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sr, offset_sec=offset_sec, sec=sec)
+    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sample_rate, offset_sec=offset_sec, sec=sec)
     x_b = x[None,:,None]
 
     if style_mode == "true":
@@ -2335,71 +2334,22 @@ def audible_gate_debug_offline(offline_dyn_model, path_src, path_tgt, out_dir,
     y_nohf     = pick_c + finger_c
     gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
 
-    tone_freq = gate_debug_tone_freq(sr, GATE_HP_CUTOFF_HZ)
-    gate_tone = _normalize_to_peak(gate * _make_sine(sr, len(gate), freq=tone_freq), 0.8)
+    tone_freq = gate_debug_tone_freq(sample_rate, GATE_HP_CUTOFF_HZ)
+    gate_tone = _normalize_to_peak(gate * _make_sine(sample_rate, len(gate), freq=tone_freq), 0.8)
     
-    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sr, len(gate)), 0.8)
-    gate_clicks = _render_clicks_from_gate(gate, sr)
+    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sample_rate, len(gate)), 0.8)
+    gate_clicks = _render_clicks_from_gate(gate, sample_rate)
 
-    sf.write(os.path.join(out_dir, "src.wav"), x, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "tgt.wav"), y, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sr, subtype='FLOAT')
-    print(f"Saved audible gate debug (offline, {style_mode}) to {out_dir}")
-
-
-def audible_gate_debug_realtime(realtime_dyn_model, path_src, path_tgt, out_dir,
-                               sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
-    os.makedirs(out_dir, exist_ok=True)
-    sr = REALTIME_SAMPLE_RATE
-    dbg = build_offline_debug_model(realtime_dyn_model)
-
-    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sr, offset_sec=offset_sec, sec=sec)
-    x_b = x[None,:,None]
-
-    if style_mode == "true":
-        style_true = np.array([[style_true_flag]], dtype=np.float32)
-        style_force = np.ones((1,1), dtype=np.float32)
-    else:
-        style_true  = np.zeros((1,1), dtype=np.float32)
-        style_force = np.zeros((1,1), dtype=np.float32)
-
-    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
-
-    def _fetch(key):
-        arr = outs[key][0,:,0]
-        return np.asarray(arr, dtype=np.float32)
-
-    gate      = np.clip(_fetch("gate"), 0.0, 1.0)
-    y_pred    = _fetch("y_pred")
-    pick_c    = _fetch("pick_c")
-    finger_c  = _fetch("finger_c")
-    hf_scaled = _fetch("hf_scaled")
-
-    y_nohf     = pick_c + finger_c
-    gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
-    
-    tone_freq = gate_debug_tone_freq(sr, GATE_HP_CUTOFF_HZ)
-    gate_tone = _normalize_to_peak(gate * _make_sine(sr, len(gate), freq=tone_freq), 0.8)
-
-    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sr, len(gate)), 0.8)
-    gate_clicks = _render_clicks_from_gate(gate, sr)
-
-    sf.write(os.path.join(out_dir, "src.wav"), x, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "tgt.wav"), y, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sr, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sr, subtype='FLOAT')
-    print(f"Saved audible gate debug (offline, {style_mode}) to {out_dir}")
+    sf.write(os.path.join(out_dir, "src.wav"), x, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "tgt.wav"), y, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sample_rate, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sample_rate, subtype='FLOAT')
+    print(f"Saved audible gate debug ({style_mode}) to {out_dir}")
 
 def train_shared(
     kind,
@@ -2933,16 +2883,20 @@ def main ():
             offline_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
         else:
             ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
-            if not ckpts:
-                print("No offline model found.")
-                sys.exit(1)
-            static = tf.keras.models.load_model(ckpts[-1], compile=False)
-            offline_dyn = build_offline_model(dynamic_time=True)
-            offline_dyn.set_weights(static.get_weights())
+            
+            if ckpts:
+                static = tf.keras.models.load_model(ckpts[-1], compile=False)
+                offline_dyn = build_offline_model(dynamic_time=True)
+                offline_dyn.set_weights(static.get_weights())
+            else:
+                static = build_offline_model(dynamic_time=False)
+                offline_dyn = build_offline_model(dynamic_time=True)
+                offline_dyn.set_weights(static.get_weights())
+
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
-        audible_gate_debug_offline(offline_dyn, src, tgt, out_dir, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
+        audible_gate_debug(offline_dyn, src, tgt, out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
         sys.exit(0)
 
     elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-realtime":
@@ -2950,16 +2904,19 @@ def main ():
             realtime_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
         else:
             ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
-            if not ckpts:
-                print("No realtime model found.")
-                sys.exit(1)
-            static = tf.keras.models.load_model(ckpts[-1], compile=False)
-            realtime_dyn = build_realtime_model(offline=None, dynamic_time=True)
-            copy_weights_by_name(realtime_dyn, static)
+            if ckpts:
+                static = tf.keras.models.load_model(ckpts[-1], compile=False)
+                realtime_dyn = build_realtime_model(dynamic_time=True)
+                copy_weights_by_name(realtime_dyn, static)
+            else:
+                static = build_realtime_model(dynamic_time=False)
+                realtime_dyn = build_realtime_model(dynamic_time=True)
+                copy_weights_by_name(realtime_dyn, static)
+                
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_realtime")
-        audible_gate_debug_realtime(realtime_dyn, src, tgt, out_dir, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
+        audible_gate_debug(realtime_dyn, src, tgt, out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="predict")
         sys.exit(0)
     else:
         print("No command given.")
