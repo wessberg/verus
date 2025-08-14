@@ -2295,27 +2295,51 @@ def _make_hiss_hp(sr, n, alpha=0.98):
     return 0.5 * y  # conservative level
 
 
-def _render_clicks_from_gate(gate_rel, sr, thresh=0.008, click_len=256, click_decay=0.97):
-    """
-    Create a click track from upward changes in gate_rel. Each time
-    the first difference exceeds thresh, emit a short decaying click.
-    """
-    n = gate_rel.shape[0]
-    out = np.zeros(n, dtype=np.float32)
-    # first-diff (positive)
-    d = np.diff(gate_rel, prepend=gate_rel[0])
-    events = np.where((d > thresh) & (gate_rel > 0.2))[0]
-    # prebuild click kernel
-    k = np.zeros(click_len, dtype=np.float32)
-    k[0] = 1.0
-    for i in range(1, click_len):
-        k[i] = k[i-1] * click_decay
-    amp = 0.4
-    for e in events:
-        end = min(n, e + click_len)
-        seg_len = end - e
-        out[e:end] += amp * k[:seg_len]
-    return _normalize_to_peak(out, 0.8)
+def _render_clicks_from_gate(gate_rel, sr,
+    open_level=0.35,       # gate value at which we consider it "open"
+    low_level=0.20,        # hysteresis: must be below this before counting next open
+    min_separation_ms=8,   # debounce time between clicks
+    click_len_ms=2.5,
+    click_decay=0.97,
+    debug=False):
+        g = np.asarray(gate_rel, dtype=np.float32)
+        g = np.clip(g, 0.0, 1.0)
+        
+        # Rising edges with hysteresis
+        hi = float(open_level)
+        lo = float(low_level)
+        rising = np.where((g[1:] >= hi) & (g[:-1] <= lo))[0] + 1
+
+        # Debounce (minimum separation)
+        min_sep = max(1, int(round(sr * (min_separation_ms / 1000.0))))
+        if rising.size > 1:
+            keep = [rising[0]]
+            for idx in rising[1:]:
+                if idx - keep[-1] >= min_sep:
+                    keep.append(idx)
+            events = np.array(keep, dtype=int)
+        else:
+            events = rising
+
+        # Click kernel
+        click_len = max(8, int(round(sr * (click_len_ms / 1000.0))))
+        k = np.zeros(click_len, dtype=np.float32)
+        k[0] = 1.0
+        for i in range(1, click_len):
+            k[i] = k[i-1] * click_decay
+
+        out = np.zeros_like(g, dtype=np.float32)
+        for e in events:
+            end = min(out.shape[0], e + click_len)
+            out[e:end] += k[:end - e]
+
+        if debug:
+            d = np.diff(g, prepend=g[0])
+            pos_d = d[d > 0]
+            p99 = float(np.percentile(pos_d, 99.0)) if pos_d.size else 0.0
+            print(f"gate_clicks: events={events.size}, gate[min,max,mean]=({g.min():.3f},{g.max():.3f},{g.mean():.3f}), d99={p99:.5f}")
+
+        return _normalize_to_peak(out, 0.8)
 
 def boost_hf_scale_in_model(model, layer_name, gain_db):
     """
