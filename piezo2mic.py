@@ -2296,73 +2296,72 @@ def _make_hiss_hp(sr, n, alpha=0.98):
 
 
 def _render_clicks_from_gate(gate_rel, sr,
-open_level=0.35,     # "open" threshold
-low_level=0.20,      # must fall below this to re-arm
-min_separation_ms=8, # debounce between clicks
+min_separation_ms=12,
+smooth_ms=0.5,          # smooth gate a tiny bit before diff
+hi_percentile=97.0,     # adaptive high threshold from positive slopes
+lo_ratio=0.4,           # hysteresis: low = lo_ratio * high
+restrict_to_when_open=True,  # only click when gate already “somewhat open”
+open_floor=0.20,
 click_len_ms=2.5,
 click_decay=0.97,
-require_drop_below_lo=True,  # hysteresis
-initial_edge_if_high=False,  # click at t=0 if already open
 debug=False):
-    g = np.asarray(gate_rel, dtype=np.float32)
+    g = np.asarray(gate_rel, np.float32)
     g = np.clip(g, 0.0, 1.0)
     n = g.size
-    hi = float(open_level)
-    lo = float(low_level)
-    min_sep = max(1, int(round(sr * (min_separation_ms / 1000.0))))
-    click_len = max(8, int(round(sr * (click_len_ms / 1000.0))))
+    # small smoothing then derivative
+    M = max(1, int(round(sr * (smooth_ms / 1000.0))))
+    if M > 1:
+        kern = np.ones(M, np.float32) / M
+        g_s = np.convolve(g, kern, mode="same")
+    else:
+        g_s = g
+    d = np.diff(g_s, prepend=g_s[0])
 
-    # Build click kernel
-    k = np.zeros(click_len, dtype=np.float32)
+    pos = d[d > 0]
+    if pos.size == 0:
+        return np.zeros_like(g, dtype=np.float32)
+
+    hi = max(1e-5, float(np.percentile(pos, hi_percentile)))
+    lo = float(lo_ratio) * hi
+    min_sep = max(1, int(round(sr * (min_separation_ms / 1000.0))))
+
+    # slope-hysteresis state machine
+    events = []
+    armed = True
+    last = -min_sep
+    for i in range(n):
+        if restrict_to_when_open and g[i] < open_floor:
+            # keep arming but don't fire while very closed
+            if d[i] <= lo:
+                armed = True
+            continue
+        if armed:
+            if d[i] >= hi and (i - last) >= min_sep:
+                events.append(i)
+                last = i
+                armed = False
+        else:
+            if d[i] <= lo:
+                armed = True
+
+    # click kernel
+    click_len = max(8, int(round(sr * (click_len_ms / 1000.0))))
+    k = np.zeros(click_len, np.float32)
     k[0] = 1.0
     for i in range(1, click_len):
         k[i] = k[i-1] * click_decay
 
-    events = []
-    last = -min_sep
-
-    if require_drop_below_lo:
-        # Hysteresis state-machine
-        armed = g[0] <= lo
-        if (not armed) and initial_edge_if_high and g[0] >= hi:
-            events.append(0)
-            last = 0
-            armed = False
-        for i in range(1, n):
-            if armed:
-                if g[i] >= hi and (i - last) >= min_sep:
-                    events.append(i)
-                    last = i
-                    armed = False
-            else:
-                if g[i] <= lo:
-                    armed = True
-    else:
-        # Simple rising-through-hi crossings + debounce
-        cross = np.where((g[1:] >= hi) & (g[:-1] < hi))[0] + 1
-        if cross.size:
-            keep = [cross[0]]
-            for idx in cross[1:]:
-                if idx - keep[-1] >= min_sep:
-                    keep.append(idx)
-            events = keep
-
-        if (not events) and initial_edge_if_high and g[0] >= hi:
-            events = [0]
-
-    out = np.zeros_like(g, dtype=np.float32)
+    out = np.zeros_like(g, np.float32)
     for e in events:
         end = min(n, e + click_len)
         out[e:end] += k[:end - e]
 
     if debug:
-        below_lo = float(np.mean(g <= lo))
-        above_hi = float(np.mean(g >= hi))
-        print(f"gate_clicks: events={len(events)}, "
-            f"gate[min,max,mean]=({g.min():.3f},{g.max():.3f},{g.mean():.3f}), "
-            f"frac<=lo={below_lo:.3f}, frac>=hi={above_hi:.3f}")
+        print(f"gate_clicks: events={len(events)}, hi={hi:.6g}, lo={lo:.6g}, d_max={pos.max():.6g}")
 
-    return _normalize_to_peak(out, 0.8)
+    # normalize to a safe peak for audibility
+    m = float(np.max(np.abs(out)) + 1e-12)
+    return (out / m * 0.8).astype(np.float32)
 
 
 
@@ -2417,11 +2416,6 @@ def audible_gate_debug(dyn_model, path_src, path_tgt, out_dir, sample_rate,
     gate_tone = _normalize_to_peak(gate * _make_sine(sample_rate, len(gate), freq=tone_freq), 0.8)
     
     gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sample_rate, len(gate)), 0.8)
-    
-    
-    print("gate stats:", gate.min(), gate.max(), gate.mean(),
-    "frac_open(>0.35)=", np.mean(gate > 0.35),
-    "frac_closed(<0.20)=", np.mean(gate < 0.20))
     
     gate_clicks = _render_clicks_from_gate(gate, sample_rate)
 
