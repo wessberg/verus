@@ -200,10 +200,11 @@ FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 #HF loss shaping
-GATE_HP_CUTOFF_HZ   = 3000.0
-GATE_THRESHOLD_DB   = -40.0
-GATE_RATIO          = 10.0
-GATE_ATTACK_MS      = 1.0
+HP_CUTOFF_HZ   = 3000.0
+GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
+GATE_THRESHOLD_DB   = -53.0
+GATE_RATIO          = 16.0
+GATE_ATTACK_MS      = 0.5
 GATE_HOLD_MS        = 2.0
 GATE_RELEASE_MS     = 6.0
 GATE_DEBUG_TONE_MULT = 1.0
@@ -304,7 +305,7 @@ realtime_lp_taps_tf = tf.constant(realtime_lp_taps_np.reshape(-1,1,1), dtype=tf.
 
 offline_hp_taps_np = firwin(
     OFFLINE_HF_HP_ORDER,
-    cutoff=GATE_HP_CUTOFF_HZ/(OFFLINE_SAMPLE_RATE/2.0),
+    cutoff=HP_CUTOFF_HZ/(OFFLINE_SAMPLE_RATE/2.0),
     window="hamming",
     pass_zero=False  # high-pass
 ).astype(np.float32)
@@ -834,7 +835,7 @@ def multi_scale_stft_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                   split_hz=GATE_HP_CUTOFF_HZ,
+                                   split_hz=HP_CUTOFF_HZ,
                                    high_boost=STFT_HIGH_BOOST,
                                    onset_env=None,
                                    onset_gain=STFT_HF_ONSET_GAIN):
@@ -955,7 +956,7 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
     td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)
     spec = mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                          split_hz=GATE_HP_CUTOFF_HZ,
+                                          split_hz=HP_CUTOFF_HZ,
                                           high_boost=STFT_HIGH_BOOST,
                                           onset_env=gate_env, onset_gain=STFT_HF_ONSET_GAIN)
     mel  = log_mel_loss(y_true, y_pred, sample_rate)
@@ -1167,7 +1168,7 @@ def analyze_loss_scales_consistent_batch(model, batch, sample_rate):
     hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)).numpy()
     stft_on = tf.reduce_mean(
         mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                       split_hz=GATE_HP_CUTOFF_HZ,
+                                       split_hz=HP_CUTOFF_HZ,
                                        high_boost=STFT_HIGH_BOOST,
                                        onset_env=gate_env,
                                        onset_gain=STFT_HF_ONSET_GAIN)
@@ -1598,7 +1599,7 @@ def gate_gain_signal(
     attack_ms=GATE_ATTACK_MS,
     hold_ms=GATE_HOLD_MS,
     release_ms=GATE_RELEASE_MS,
-    cutoff_hz=GATE_HP_CUTOFF_HZ,
+    cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
     hp_order=129
 ):
     """
@@ -1676,7 +1677,7 @@ class Gate(tf.keras.layers.Layer):
                  attack_ms=GATE_ATTACK_MS,
                  hold_ms=GATE_HOLD_MS,
                  release_ms=GATE_RELEASE_MS,
-                 cutoff_hz=GATE_HP_CUTOFF_HZ,
+                 cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
                  hp_order=129,
                  **kwargs):
         super().__init__(**kwargs)
@@ -1729,7 +1730,7 @@ def gate_weight(y_true, sample_rate):
         attack_ms=GATE_ATTACK_MS,
         hold_ms=GATE_HOLD_MS,
         release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_CUTOFF_HZ
+        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ
     )
 
 # Slice helpers
@@ -1869,7 +1870,7 @@ def build_offline_model(dynamic_time=False):
         attack_ms=GATE_ATTACK_MS,
         hold_ms=GATE_HOLD_MS,
         release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_CUTOFF_HZ,
+        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
         name="offline_gate"
     )(inp)
 
@@ -1999,10 +2000,10 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
     print(f"RMS hf_branch onsets={_rms(hf_scaled, on_mask):.6f} off={_rms(hf_scaled, off_mask):.6f}")
 
     # High-band STFT energy above the gate HP cutoff
-    t_hf_true = float(_band_energy(tf.convert_to_tensor(y_b), sample_rate, fmin=GATE_HP_CUTOFF_HZ).numpy())
-    t_hf_pred = float(_band_energy(tf.convert_to_tensor(y_pred[None, :, None]), sample_rate, fmin=GATE_HP_CUTOFF_HZ).numpy())
+    t_hf_true = float(_band_energy(tf.convert_to_tensor(y_b), sample_rate, fmin=HP_CUTOFF_HZ).numpy())
+    t_hf_pred = float(_band_energy(tf.convert_to_tensor(y_pred[None, :, None]), sample_rate, fmin=HP_CUTOFF_HZ).numpy())
     ratio = t_hf_pred / (t_hf_true + 1e-12)
-    print(f"Avg |STFT| > {GATE_HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
+    print(f"Avg |STFT| > {HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
 
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
@@ -2098,7 +2099,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         attack_ms=GATE_ATTACK_MS,
         hold_ms=GATE_HOLD_MS,
         release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_CUTOFF_HZ,
+        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
         name="realtime_gate"
     )(inp)
 
@@ -2409,10 +2410,11 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
     return model
 
 
-def audible_gate_debug(dyn_model, path_src, path_tgt, out_dir, sample_rate,
+def audible_gate_debug(debug_model, path_src, path_tgt, out_dir, sample_rate,
                                sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
     os.makedirs(out_dir, exist_ok=True)
-    dbg = build_offline_debug_model(dyn_model)
+    
+    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", 24.0)
 
     x, y = _read_pair_segment(path_src, path_tgt, model_sr=sample_rate, offset_sec=offset_sec, sec=sec)
     x_b = x[None,:,None]
@@ -2424,7 +2426,7 @@ def audible_gate_debug(dyn_model, path_src, path_tgt, out_dir, sample_rate,
         style_true  = np.zeros((1,1), dtype=np.float32)
         style_force = np.zeros((1,1), dtype=np.float32)
 
-    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
+    outs = debug_model.predict([x_b, style_true, style_force], verbose=0)
 
     def _fetch(key):
         arr = outs[key][0,:,0]
@@ -2439,7 +2441,7 @@ def audible_gate_debug(dyn_model, path_src, path_tgt, out_dir, sample_rate,
     y_nohf     = pick_c + finger_c
     gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
 
-    tone_freq = gate_debug_tone_freq(sample_rate, GATE_HP_CUTOFF_HZ)
+    tone_freq = gate_debug_tone_freq(sample_rate, HP_CUTOFF_HZ)
     gate_tone = _normalize_to_peak(gate * _make_sine(sample_rate, len(gate), freq=tone_freq), 0.8)
     
     gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sample_rate, len(gate)), 0.8)
@@ -3002,7 +3004,9 @@ def main ():
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
-        audible_gate_debug(offline_dyn, src, tgt, out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
+        
+        debug_model = build_offline_debug_model(offline_dyn)
+        audible_gate_debug(debug_model=debug_model, path_src=src, path_tgt=tgt, out_dir=out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
         sys.exit(0)
 
     elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-realtime":
@@ -3022,7 +3026,8 @@ def main ():
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_realtime")
-        audible_gate_debug(realtime_dyn, src, tgt, out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
+        debug_model = build_realtime_debug_model(realtime_dyn)
+        audible_gate_debug(debug_model=debug_model, path_src=src, path_tgt=tgt, out_dir=out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
         sys.exit(0)
     else:
         print("No command given.")
