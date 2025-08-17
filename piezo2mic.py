@@ -203,10 +203,10 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 HP_CUTOFF_HZ   = 3000.0
 GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
 GATE_THRESHOLD_DB   = -53.0
-GATE_RATIO          = 16.0
-GATE_ATTACK_MS      = 0.5
+GATE_RATIO          = 64.0
+GATE_ATTACK_MS      = 0.1
 GATE_HOLD_MS        = 2.0
-GATE_RELEASE_MS     = 6.0
+GATE_RELEASE_MS     = 4.0
 GATE_DEBUG_TONE_MULT = 1.0
 
 HP_PRE_EMPHASIS           = 0.8
@@ -216,7 +216,7 @@ STFT_HIGH_BOOST           = 32.0
 STFT_HF_ONSET_GAIN        = 12.0
 
 L1_WEIGHT                 = 1.0
-HF_WEIGHT                 = 4.0
+HF_WEIGHT                 = 5.0
 STFT_WEIGHT               = 4.0
 MEL_WEIGHT                = 3.0
 RMS_ENV_WEIGHT            = 1.0
@@ -1590,6 +1590,23 @@ def _ones_kernel(length):
         _gate_ones_cache[L] = k_np
     return tf.constant(k_np, dtype=tf.float32)
 
+@register_keras_serializable()
+class HFLeakRegularizer(Layer):
+    def __init__(self, alpha=1e-3, power=2.0, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = float(alpha)
+        self.power = float(power)
+    def call(self, inputs):
+        hf_scaled, gate_used = inputs
+        # Penalize HF when gate is closed more strongly (power>1)
+        leak_w = tf.pow(1.0 - tf.clip_by_value(gate_used, 0.0, 1.0), self.power)
+        leak = tf.reduce_mean(tf.abs(hf_scaled) * leak_w)
+        self.add_loss(self.alpha * leak)
+        return hf_scaled
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"alpha": self.alpha, "power": self.power})
+        return cfg
 
 @register_keras_serializable()
 def gate_gain_signal(
@@ -1886,6 +1903,9 @@ def build_offline_model(dynamic_time=False):
     hf_hp = HFHighpass(name="offline_hf_highpass")(hf)
 
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf_hp, offline_gate])
+    
+    hf_gated = Multiply(name="offline_hf_mult_gate")([hf_hp, offline_gate])
+    hf_gated = HFLeakRegularizer(alpha=2e-3, power=2.0, name="offline_hf_leak_reg")([hf_gated, offline_gate])
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_gated)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
@@ -2111,8 +2131,9 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
     hf_hp = HFHighpass(name="realtime_hf_highpass")(hf)
-
+    
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf_hp, realtime_gate])
+    hf_gated = HFLeakRegularizer(alpha=2e-3, power=2.0, name="realtime_hf_leak_reg")([hf_gated, realtime_gate])
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_gated)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
@@ -2176,7 +2197,9 @@ def add_sw_offline(x, y):
     y_audio, style_flag = y
     b = tf.shape(x)[0]; T = tf.shape(x)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    style_force = tf.ones((b, 1), dtype=tf.float32)            # 1.0 = use ground-truth
+    # 50% chance to force truth
+    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
+    style_force = force_mask  # 1 or 0
     inputs = {
     'offline_piezo_input': x,
     'offline_style_true_input': style_true,
@@ -2192,7 +2215,11 @@ def add_sw_realtime(x, y):
     y_audio, style_flag = y
     b = tf.shape(x)[0]; T = tf.shape(x)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    style_force = tf.ones((b, 1), dtype=tf.float32)            # 1.0 = use ground-truth
+    
+    # 50% chance to force truth
+    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
+    style_force = force_mask  # 1 or 0
+    
     inputs = {
     'realtime_piezo_input': x,
     'realtime_style_true_input': style_true,
@@ -2414,7 +2441,7 @@ def audible_gate_debug(debug_model, path_src, path_tgt, out_dir, sample_rate,
                                sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
     os.makedirs(out_dir, exist_ok=True)
     
-    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", 24.0)
+    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", 12.0)
 
     x, y = _read_pair_segment(path_src, path_tgt, model_sr=sample_rate, offset_sec=offset_sec, sec=sec)
     x_b = x[None,:,None]
