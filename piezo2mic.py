@@ -153,14 +153,14 @@ FINGER_CHUNK_RATIO = 0.5
 CALIBRATION_CHUNK_COUNT = 32
 
 # Offline params
-OFFLINE_FILTERS                = 128
+OFFLINE_FILTERS                = 160
 OFFLINE_KERNEL_SIZE            = 51
-OFFLINE_DILATIONS              = (1,2,4,8,16,32,64,128)
+OFFLINE_DILATIONS              = (1,2,4,8,16,32,64,128,256)
 OFFLINE_PRE_BLOCKS             = 2
 OFFLINE_PRE_KERNEL             = 7
 
 # Bounded look-ahead per layer (in ms):
-OFFLINE_LOOKAHEAD_MS           = 8.0
+OFFLINE_LOOKAHEAD_MS           = 12.0
 OFFLINE_HF_HP_ORDER            = 129
 OFFLINE_LOOKAHEAD_SAMPLES      = int(round(OFFLINE_SAMPLE_RATE * OFFLINE_LOOKAHEAD_MS / 1000.0))
 OFFLINE_RECEPTIVE_FIELD        = 1 + (OFFLINE_KERNEL_SIZE - 1) * sum(OFFLINE_DILATIONS)
@@ -202,11 +202,11 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 #HF loss shaping
 HP_CUTOFF_HZ   = 3000.0
 GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
-GATE_THRESHOLD_DB   = -53.0
-GATE_RATIO          = 64.0
+GATE_THRESHOLD_DB   = -55.0
+GATE_RATIO          = 999
 GATE_ATTACK_MS      = 0.1
-GATE_HOLD_MS        = 2.0
-GATE_RELEASE_MS     = 4.0
+GATE_HOLD_MS        = 4.0
+GATE_RELEASE_MS     = 20.0
 GATE_DEBUG_TONE_MULT = 1.0
 
 HP_PRE_EMPHASIS           = 0.8
@@ -1617,29 +1617,38 @@ def gate_gain_signal(
     hold_ms=GATE_HOLD_MS,
     release_ms=GATE_RELEASE_MS,
     cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
-    hp_order=129
+    hp_order=129,
+    min_gain_db=-90.0,     # small floor to avoid true zero
+    env_ms=0.35,           # tiny detector smoothing (ms)
+    depth_smooth_ms=0.35   # tiny smoothing of closed-depth (ms)
 ):
     """
-    Fast, causal, loop-free gate gain in [0,1] using only conv1d + elementwise ops.
-    - Sidechain: causal min-phase HPF (as before)
-    - Detector: |·| -> dB
-    - Hold: causal moving "OR" via conv1d with an all-ones kernel over the last hld_s samples
-    - Target gain: 1 when open/hold, else downward-expander g_close (in linear)
-    - Smoothing: separate causal exponential FIRs for attack and release, then per-sample mix
-                 based on whether target is increasing or decreasing.
-    TFLite-friendly (no While/Scan/TensorArray), GPU-friendly, strictly causal.
+    Causal, hard gate with anti-crunch:
+      g = crossfade(open_env  →  close_depth_smoothed)
+
+    - Detector: causal min-phase HPF → |·| → tiny EMA (env_ms) → dB
+    - Open envelope: open_or_hold (0/1 with HOLD) → attack/release smoothing
+    - Close depth: ratio-driven attenuation in dB → linear → tiny EMA (depth_smooth_ms)
+    - Final: g = open_env + (1 - open_env) * close_depth_smoothed
     """
     x = tf.convert_to_tensor(x, dtype=tf.float32)  # (B,T,1)
 
-    # Causal min-phase HPF sidechain (uses your existing helpers)
+    # Sidechain HPF (causal, min-phase)
     kernel_hp = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
     sc = _causal_conv1d(x, kernel_hp)  # (B,T,1)
 
+    # Tiny detector smoothing (band-limit the detector to kill sample-rate jitter)
+    det_raw = tf.abs(sc) + 1e-12
+    if env_ms is not None and env_ms > 0.0:
+        env_smpl = max(1, int(round((float(env_ms) / 1000.0) * float(sample_rate))))
+        k_env = _exp_smoothing_kernel(env_smpl, scale=2.0, Lmax=512)
+        det = _causal_conv1d(det_raw, k_env)
+    else:
+        det = det_raw
+
     # Detector in dB
-    det = tf.abs(sc) + 1e-12
     LN10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
-    level_db = 20.0 / LN10 * tf.math.log(det)        # (B,T,1)
-    lev = tf.squeeze(level_db, axis=-1)              # (B,T)
+    level_db = 20.0 / LN10 * tf.math.log(det)   # (B,T,1) using natural log
 
     # Time constants in samples
     atk_s = max(1, int(round((float(attack_ms)  / 1000.0) * float(sample_rate))))
@@ -1649,44 +1658,57 @@ def gate_gain_signal(
     thr_db  = tf.constant(float(threshold_db), dtype=tf.float32)
     ratio_f = tf.constant(float(ratio), dtype=tf.float32)
 
-    # Above-threshold mask and causal hold via moving sum (conv with ones)
-    above = tf.cast(lev >= thr_db, tf.float32)       # (B,T)
-    above3 = above[:, :, None]                       # (B,T,1)
+    # Above-threshold mask and causal "hold" (0/1)
+    above = tf.cast(level_db >= thr_db, tf.float32)     # (B,T,1)
     if hld_s > 0:
         k_hold = _ones_kernel(hld_s)
         pad = hld_s - 1
-        above_pad = tf.pad(above3, [[0,0],[pad,0],[0,0]])
+        above_pad = tf.pad(above, [[0,0],[pad,0],[0,0]])
         hold_sum = tf.nn.conv1d(above_pad, filters=k_hold, stride=1, padding='VALID')  # (B,T,1)
-        open_or_hold = tf.cast(hold_sum > 0.0, tf.float32)  # 0 or 1
+        open_or_hold = tf.cast(hold_sum > 0.0, tf.float32)  # (B,T,1)
     else:
-        open_or_hold = above3
+        open_or_hold = above
 
-    # Downward expander: target gain before smoothing
-    # attn_db = (1 - 1/ratio) * relu(threshold - level)
-    attn_db = (1.0 - 1.0 / ratio_f) * tf.nn.relu(thr_db - lev)  # (B,T)
-    # Convert dB attenuation to linear using exp: 10^(-attn_db/20) = exp(-ln(10)/20 * attn_db)
+    # Close depth from ratio (in dB → linear), with small floor
+    delta_db = tf.nn.relu(thr_db - level_db[...,0])            # (B,T)
+    attn_db  = ratio_f * delta_db                              # (B,T)
+    attn_db  = tf.minimum(attn_db, tf.constant(120.0, tf.float32))
     ALPHA = tf.constant(np.log(10.0)/20.0, dtype=tf.float32)
-    g_close = tf.exp(-ALPHA * attn_db)[:, :, None]              # (B,T,1)
-    g_target = open_or_hold + (1.0 - open_or_hold) * g_close    # (B,T,1)
+    g_close_raw = tf.exp(-ALPHA * attn_db)[:, :, None]         # (B,T,1)
+    if min_gain_db is not None:
+        floor = tf.constant(10.0 ** (float(min_gain_db)/20.0), dtype=tf.float32)
+        g_close_raw = tf.maximum(g_close_raw, floor)
 
-    # Causal smoothing via exponential FIRs (loop-free, no recursion)
+    # Tiny smoothing of close-depth to avoid residual jitter
+    if depth_smooth_ms is not None and depth_smooth_ms > 0.0:
+        d_smpl = max(1, int(round((float(depth_smooth_ms) / 1000.0) * float(sample_rate))))
+        k_depth = _exp_smoothing_kernel(d_smpl, scale=2.0, Lmax=512)
+        g_close_s = _causal_conv1d(g_close_raw, k_depth)
+    else:
+        g_close_s = g_close_raw
+
+    # Build a clean open envelope (1 when open/hold else 0) with attack/release smoothing
     k_att = _exp_smoothing_kernel(atk_s,  scale=4.0, Lmax=2048)
     k_rel = _exp_smoothing_kernel(rel_s,  scale=4.0, Lmax=2048)
-    g_att = _causal_conv1d(g_target, k_att)   # (B,T,1)
-    g_rel = _causal_conv1d(g_target, k_rel)   # (B,T,1)
+    g_att_open = _causal_conv1d(open_or_hold, k_att)
+    g_rel_open = _causal_conv1d(open_or_hold, k_rel)
 
-    # Select attack vs release by local direction of the target (causal)
-    g_prev = tf.pad(g_target, [[0,0],[1,0],[0,0]])[:, :-1, :]  # previous target
-    inc_mask = tf.cast(g_target > g_prev, tf.float32)          # (B,T,1)
+    g_prev_open = tf.pad(open_or_hold, [[0,0],[1,0],[0,0]])[:, :-1, :]  # previous target
+    inc_open = tf.cast(open_or_hold > g_prev_open, tf.float32)
+    g_env = inc_open * g_att_open + (1.0 - inc_open) * g_rel_open
+    g_env = tf.clip_by_value(g_env, 0.0, 1.0)
 
-    g = inc_mask * g_att + (1.0 - inc_mask) * g_rel
-    return tf.clip_by_value(g, 0.0, 1.0)
+    # Final: crossfade from open envelope (→1) to smoothed close depth (→g_close_s)
+    g = g_env + (1.0 - g_env) * g_close_s
+    g = tf.clip_by_value(g, 0.0, 1.0)
+    return g
+
 
 @register_keras_serializable()
 class Gate(tf.keras.layers.Layer):
     """
     Gate with HPF sidechain and downward expander, returning per-sample gain [0,1].
-    This version is tf.scan-free (uses tf.while_loop internally) and TFLite-friendly.
+    Ratio exclusively controls attenuation depth below threshold.
     """
     def __init__(self, sample_rate,
                  threshold_db=GATE_THRESHOLD_DB,
@@ -1730,7 +1752,7 @@ class Gate(tf.keras.layers.Layer):
             "hold_ms": self.hold_ms,
             "release_ms": self.release_ms,
             "cutoff_hz": self.cutoff_hz,
-            "hp_order": self.hp_order,
+            "hp_order": self.hp_order
         })
         return cfg
 
@@ -1891,6 +1913,7 @@ def build_offline_model(dynamic_time=False):
         name="offline_gate"
     )(inp)
 
+    # HF branch (same topology), but gate BEFORE the high-pass
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
     hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
     hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
@@ -1900,13 +1923,12 @@ def build_offline_model(dynamic_time=False):
     hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
-    hf_hp = HFHighpass(name="offline_hf_highpass")(hf)
 
-    hf_gated = Multiply(name="offline_hf_mult_gate")([hf_hp, offline_gate])
-    
-    hf_gated = Multiply(name="offline_hf_mult_gate")([hf_hp, offline_gate])
-    hf_gated = HFLeakRegularizer(alpha=2e-3, power=2.0, name="offline_hf_leak_reg")([hf_gated, offline_gate])
-    hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_gated)
+    # Move the gate multiply BEFORE the HPF
+    hf_gated = Multiply(name="offline_hf_mult_gate")([hf, offline_gate])
+    hf_hp    = HFHighpass(name="offline_hf_highpass")(hf_gated)
+
+    hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
@@ -2123,18 +2145,18 @@ def build_realtime_model(offline=None, dynamic_time=False):
         name="realtime_gate"
     )(inp)
 
-    # HF branch (unchanged topology), gated by 'realtime_gate'
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
-    hf_hp = HFHighpass(name="realtime_hf_highpass")(hf)
-    
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf_hp, realtime_gate])
-    hf_gated = HFLeakRegularizer(alpha=2e-3, power=2.0, name="realtime_hf_leak_reg")([hf_gated, realtime_gate])
-    hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_gated)
+
+    # Move the gate multiply BEFORE the HPF
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, realtime_gate])
+    hf_hp    = HFHighpass(name="realtime_hf_highpass")(hf_gated)
+
+    hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
