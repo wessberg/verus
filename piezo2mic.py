@@ -144,7 +144,7 @@ ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 DEBUG               = False
 
 # Batch params
-BATCH_SIZE          = 8
+BATCH_SIZE          = 4
 
 # Chunk ratios
 PICK_CHUNK_RATIO = 0.5
