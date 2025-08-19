@@ -99,7 +99,7 @@ import tensorflow as tf
 from scipy.signal import minimum_phase, firwin, resample_poly
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau, TerminateOnNaN
 from tensorflow.keras import regularizers, constraints
 from tensorflow.keras.losses import Loss
 from tensorflow.keras.layers import (
@@ -2666,6 +2666,9 @@ def train_shared(
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=LR_FACTOR, patience=LR_PLATEAU_PATIENCE, min_lr=MIN_LR, mode='min', verbose=1)
     cp = ModelCheckpoint(filepath=os.path.join(checkpoint_out_dir, "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
                          monitor='val_loss', mode='min', save_best_only=True, verbose=1)
+    
+    terminate_on_nan = TerminateOnNaN()
+    
     demo_cb = DemoCallback(sample_rate=sample_rate,
                            build_model_fn=build_model_fn,
                            build_model_fn_args_dynamic=build_model_fn_args_dynamic,
@@ -2680,7 +2683,7 @@ def train_shared(
                      steps_per_epoch=steps_per_epoch,
                      validation_data=val_ds,
                      validation_steps=validation_steps,
-                     callbacks=[es, cp, reduce_lr, tb, demo_cb])
+                     callbacks=[es, cp, reduce_lr, terminate_on_nan, tb, demo_cb])
 
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
