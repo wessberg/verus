@@ -249,6 +249,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
+PICK_BOOST_DB = 14.0
+
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
@@ -1211,6 +1213,9 @@ def generate_demo (model, out_dir, sample_rate, prediction_name="demo_pred", onl
 
 def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target, prediction_name="demo_pred", only_prediction=False, offset_sec=LONG_DEMO_OFFSET_SEC, sec=LONG_DEMO_SEC):
     print("\nGenerating demo…")
+    
+    if (sample_rate == OFFLINE_SAMPLE_RATE):
+        model = boost_hf_scale_in_model(model, "offline_hf_scale", PICK_BOOST_DB)
 
     # Determine frames in FILE sample-rate, not model SR
     file_sr = sf.info(path_src).samplerate
@@ -2463,7 +2468,7 @@ def audible_gate_debug(debug_model, path_src, path_tgt, out_dir, sample_rate,
                                sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
     os.makedirs(out_dir, exist_ok=True)
     
-    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", 12.0)
+    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", PICK_BOOST_DB)
 
     x, y = _read_pair_segment(path_src, path_tgt, model_sr=sample_rate, offset_sec=offset_sec, sec=sec)
     x_b = x[None,:,None]
@@ -2943,7 +2948,7 @@ def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_o
                 dynamic_model.set_weights(static_model.get_weights())
         else:
             dpath = None
-        if not dpath:
+        if dpath is None:
             print("Dynamic model not found. run: python piezo2mic.py --train-offline and/or python piezo2mic.py --train-realtime")
             sys.exit(1)
     else:
