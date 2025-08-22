@@ -177,6 +177,7 @@ REALTIME_TRAIN_BLOCK_SIZE = 4096
 REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
+REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
 
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
 REALTIME_FEAT_DISTILL_ALPHA    = 1.0
@@ -247,7 +248,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-PICK_BOOST_DB = 26
+PICK_BOOST_DB = 28
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -256,8 +257,8 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_SEC        = 30
+LONG_DEMO_OFFSET_SEC = 1200
 LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
@@ -1980,7 +1981,8 @@ def film_apply(x, style_embed, filters, prefix):
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
-def build_offline_causal(offline_src, dynamic_time=True):
+@register_keras_serializable()
+def build_offline_model_causal(offline_src, dynamic_time=True):
     """
     Build a causalized offline model (right-lookahead=0) and copy weights by name
     from the provided non-causal offline model. Returned model is frozen.
@@ -1991,7 +1993,8 @@ def build_offline_causal(offline_src, dynamic_time=True):
         l.trainable = False
     return offline_causal
 
-def build_offline_model(dynamic_time=False):
+@register_keras_serializable()
+def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES, name="piezo2mic_offline"):
     T   = None if dynamic_time else OFFLINE_SEG_LEN
     inp = Input(shape=(T,1), name="offline_piezo_input")
         
@@ -2017,15 +2020,15 @@ def build_offline_model(dynamic_time=False):
 
     x = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_init_pw")(inp)
 
-    # Pre-blocks with look-ahead
+    # Pre-blocks with configurable look-ahead
     for i in range(OFFLINE_PRE_BLOCKS):
-        x = gated_sep_block(x, OFFLINE_FILTERS, OFFLINE_PRE_KERNEL, 1, prefix=f"offline_pre_{i}", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+        x = gated_sep_block(x, OFFLINE_FILTERS, OFFLINE_PRE_KERNEL, 1, prefix=f"offline_pre_{i}", lookahead=lookahead_samples)
         x = film_apply(x, style_embed, OFFLINE_FILTERS, prefix=f"offline_pre_{i}")
 
-    # Dilated stack with bounded look-ahead
+    # Dilated stack with configurable look-ahead
     for idx, d in enumerate(OFFLINE_DILATIONS):
         res = x
-        pad_left, pad_right = compute_pads(OFFLINE_KERNEL_SIZE, d, OFFLINE_LOOKAHEAD_SAMPLES)
+        pad_left, pad_right = compute_pads(OFFLINE_KERNEL_SIZE, d, lookahead_samples)
         x = ZeroPadding1D((pad_left, pad_right), name=f"pad_{idx}")(x)
         g = SeparableConv1D(OFFLINE_FILTERS*2, OFFLINE_KERNEL_SIZE, dilation_rate=d, padding='valid', name=f"sep_{idx}")(x)
         c = Lambda(slice_content, arguments={'filters':OFFLINE_FILTERS}, name=f"slice_content_{idx}")(g)
@@ -2044,7 +2047,7 @@ def build_offline_model(dynamic_time=False):
     pick_c     = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
     finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
     
-        # ─── Gate gain (0..1) computed from the input ────────────────────────────
+    # ─── Gate gain (0..1) computed from the input ────────────────────────────
     offline_gate = Gate(
         sample_rate=OFFLINE_SAMPLE_RATE,
         threshold_db=GATE_THRESHOLD_DB,
@@ -2059,23 +2062,22 @@ def build_offline_model(dynamic_time=False):
     # HF branch (same topology), but gate BEFORE the high-pass
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
     hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=lookahead_samples)
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b0")
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=lookahead_samples)
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b1")
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=OFFLINE_LOOKAHEAD_SAMPLES)
+    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=lookahead_samples)
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
 
     # Move the gate multiply BEFORE the HPF
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, offline_gate])
     hf_hp    = HFHighpass(name="offline_hf_highpass")(hf_gated)
-
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
 
-    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name="piezo2mic_offline")
+    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
 def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, style_true_flag=1.0):
     """
@@ -2195,7 +2197,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
-    # Extra offline input only when distilling
+    # Extra offline input only when distilling (teacher runs at 96 kHz)
     offline_inp = None
     if offline is not None:
         offline_inp = Input(shape=(None,1), name="offline_piezo_input")
@@ -2276,7 +2278,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     ir = RealtimeIrAlign(offset=total_delay + REALTIME_IR_ALIGN_OFFSET_CORRECTION, name='realtime_ir_align')([ir, inp])
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
     
-        # ─── Gate gain (0..1) computed from the input ────────────────────────────
+    # ─── Deterministic Gate for safety cap ─────────────────────────────────────
     realtime_gate = Gate(
         sample_rate=REALTIME_SAMPLE_RATE,
         threshold_db=GATE_THRESHOLD_DB,
@@ -2288,6 +2290,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         name="realtime_gate"
     )(inp)
 
+    # HF branch with learned mask (distilled from teacher gate)
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
@@ -2295,45 +2298,77 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
 
-    # Move the gate multiply BEFORE the HPF
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, realtime_gate])
-    hf_hp    = HFHighpass(name="realtime_hf_highpass")(hf_gated)
+    # Learned HF mask head (causal, tiny)
+    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_hf_mask_c1")(hf_in)
+    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
+    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
+    mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)  # (B,T,1) in [0,1]
 
+    # Safety cap: do not exceed deterministic gate (min)
+    mask_used = Lambda(lambda z: tf.minimum(z[0], z[1]), name="realtime_hf_mask_used")([mask_pred, realtime_gate])
+
+    # Gate BEFORE HPF (consistent with teacher topology)
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
+    hf_hp    = HFHighpass(name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
-    # Distillation at dual rate
+    # ─── Distillation (teacher must be causal here) ────────────────────────────
     if offline is not None:
-        offline.trainable = False
+        teacher = offline
+        teacher.trainable = False
 
-        # Build a feature model from the offline offline (96 kHz) using the offline input
+        # Teacher feature model (96 kHz): selected layers + gate
         if REALTIME_OFFLINE_FEAT_LAYERS:
             offline_feat_model = tf.keras.models.Model(
-                inputs=offline.inputs,
-                outputs=[offline.get_layer(n).output for n in REALTIME_OFFLINE_FEAT_LAYERS],
+                inputs=teacher.inputs,
+                outputs=[teacher.get_layer(n).output for n in REALTIME_OFFLINE_FEAT_LAYERS] + [teacher.get_layer("offline_gate").output],
                 name="offline_feat_model"
             )
-            # offline runs at 96 kHz
-            T_feats = offline_feat_model([offline_inp, style_true_in, style_force_in])
-            if not isinstance(T_feats, list):
-                T_feats = [T_feats]
+            T_outs = offline_feat_model([offline_inp, style_true_in, style_force_in])
+            if not isinstance(T_outs, list):
+                T_outs = [T_outs]
+            # Split: features and gate
+            T_feats = T_outs[:-1]
+            T_gate  = T_outs[-1]
 
-            # Downsample offline features by 2 to match realtime timebase (band-limited)
-            for idx, (T_f, S_f) in enumerate(zip(T_feats, realtime_feats)):
-                T_f_ds = FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(T_f)
-                chan = int(T_f.shape[-1])
+            # Downsample teacher features and gate to 48 kHz
+            T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_feats)]
+            T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
+
+            # KD for features: project student, match lengths, add loss
+            for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
+                chan = int(T_f_ds.shape[-1])
                 proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
-                _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_ds, proj])
+                # match lengths
+                T_f_kd, proj_kd = Lambda(
+                    lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
+                               z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
+                    name=f"feat_kd_match_len_{idx}"
+                )([T_f_ds, proj])
+                _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_kd, proj_kd])
 
-        # Distill from offline audio as well (band-limited decimate-by-2)
-        offline_audio, _ = offline([offline_inp, style_true_in, style_force_in])
+            # KD for HF mask envelope: teacher gate (96k→48k) vs student mask_pred
+            T_gate_kd, mask_kd = Lambda(
+                lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
+                           z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
+                name="hf_mask_kd_match_len"
+            )([T_gate_ds, mask_pred])
+            _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_kd, mask_kd])
+
+        # KD for teacher audio (96k→48k) vs student audio
+        offline_audio, _ = teacher([offline_inp, style_true_in, style_force_in])
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        y_realtime = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="distillation")([offline_audio_ds, y_realtime])
+        teacher_kd, student_kd = Lambda(
+            lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
+                       z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
+            name="audio_kd_match_len"
+        )([offline_audio_ds, y_realtime])
+        _ = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="audio_distill")([teacher_kd, student_kd])
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
-        # Keep offline input as a dedicated input only during distillation training
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
 
     return tf.keras.models.Model(inputs=inputs_list, outputs=[y_realtime, style_prob], name="piezo2mic_realtime")
@@ -3013,13 +3048,18 @@ def train_realtime(resume=False, resume_ckpt_path=None):
     if not os.path.exists(offline_dynamic_model_filepath):
         print("Offline model not found, run --train-offline first")
         sys.exit(1)
-    offline = tf.keras.models.load_model(offline_dynamic_model_filepath, compile=False)
-    print("Loaded offline from", offline_dynamic_model_filepath)
+
+    # Load the original (non-causal) offline model
+    offline_nc = tf.keras.models.load_model(offline_dynamic_model_filepath, compile=False)
+    print("Loaded offline (non-causal) from", offline_dynamic_model_filepath)
+
+    # Build a causalized teacher clone (no right-lookahead) and copy weights
+    offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
+    print("Built causal teacher clone for KD (right-lookahead=0).")
 
     tmp_dynamic_model = build_realtime_model(offline=None, dynamic_time=True)
-    
     validate_ir_delay(tmp_dynamic_model)
-    
+
     train_shared(
         kind='realtime',
         resume=resume,
@@ -3029,12 +3069,12 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_realtime_model,
-        build_model_fn_args_static={ 'offline': offline },
+        build_model_fn_args_static={ 'offline': offline_causal },
         build_model_fn_args_dynamic={ },
         checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
         logs_out_dir=LOGS_REALTIME_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_REALTIME_OUT_DIR,
-        dual_offline=True  # ← enable 96k offline during distillation
+        dual_offline=True  # keep dual-rate dataset (48k student + 96k teacher input)
     )
 
 def generate_fine_tune_demo(model):
