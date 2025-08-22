@@ -107,10 +107,6 @@ from tensorflow.keras.layers import (
     Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D, Reshape
 )
 
-# Turn off GPU acceleration for inference in demo mode (more reliable on many systems)
-if len(sys.argv)>1 and sys.argv[1]=="--demo":
-    tf.config.set_visible_devices([], 'GPU')
-
 # Determinism
 SEED = 42
 os.environ['PYTHONHASHSEED'] = str(SEED)
@@ -199,15 +195,17 @@ FINETUNE_MEL_WEIGHT          = 15.0
 FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
-#HF loss shaping
-HP_CUTOFF_HZ   = 1200.0
+# HF loss shaping
+HP_CUTOFF_HZ   = 2000.0
 GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
-GATE_THRESHOLD_DB   = -55.0
-GATE_RATIO          = 999
+GATE_THRESHOLD_DB   = -52.0
+GATE_RATIO          = 50
 GATE_ATTACK_MS      = 0.1
 GATE_HOLD_MS        = 4.0
-GATE_RELEASE_MS     = 20.0
+GATE_RELEASE_MS     = 4.0
 GATE_DEBUG_TONE_MULT = 1.0
+GATE_ENV_MS          = 0.50
+GATE_DEPTH_SMOOTH_MS = 20.0
 
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -249,7 +247,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-PICK_BOOST_DB = 20.0
+PICK_BOOST_DB = 26
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -258,7 +256,7 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 60
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -1211,73 +1209,202 @@ def generate_demo (model, out_dir, sample_rate, prediction_name="demo_pred", onl
         only_prediction=only_prediction
     )
 
-def generate_demo_from_files (model, out_dir, sample_rate, path_src, path_target, prediction_name="demo_pred", only_prediction=False, offset_sec=LONG_DEMO_OFFSET_SEC, sec=LONG_DEMO_SEC):
-    print("\nGenerating demo…")
-    
-    if (sample_rate == OFFLINE_SAMPLE_RATE):
+def _get_model_context_for_streaming(model_sample_rate: int):
+    """
+    Returns (left_ctx_model, right_ctx_model) in samples at the model's sample-rate.
+    """
+    if model_sample_rate == OFFLINE_SAMPLE_RATE:
+        # Left = receptive field - 1 (causal extent), Right = bounded look-ahead per layer
+        return int(OFFLINE_RECEPTIVE_FIELD - 1), int(OFFLINE_LOOKAHEAD_SAMPLES)
+    elif model_sample_rate == REALTIME_SAMPLE_RATE:
+        return int(REALTIME_RECEPTIVE_FIELD - 1), 0
+    else:
+        # Fallback: treat as causal with tiny RF (safe default)
+        return 1024, 0  # adjust if you add other sample-rates
+        
+
+def generate_demo_from_files(model,
+                             out_dir,
+                             sample_rate,
+                             path_src,
+                             path_target,
+                             prediction_name="demo_pred",
+                             only_prediction=False,
+                             offset_sec=LONG_DEMO_OFFSET_SEC,
+                             sec=LONG_DEMO_SEC,
+                             block_sec=12.0,
+                             resample_margin_ms=50.0):
+    """
+    Streaming/chunked version: keeps memory flat by processing blocks with
+    sufficient left/right context and a small resampling margin, and writes out
+    results incrementally.
+
+    - Handles sample-rate mismatch via resample_poly per block.
+    - Uses overlap-and-trim so only the "valid" interior (free of edge effects) is written.
+    - For offline (96 kHz), also applies HF boost as in your original function.
+
+    Args:
+        block_sec: length (in seconds at model SR) of the core region written per iteration.
+        resample_margin_ms: extra margin (ms at file SR) around each block to absorb resampler transients.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Keep original offline boost behavior
+    if sample_rate == OFFLINE_SAMPLE_RATE:
         model = boost_hf_scale_in_model(model, "offline_hf_scale", PICK_BOOST_DB)
 
-    # Determine frames in FILE sample-rate, not model SR
-    file_sr = sf.info(path_src).samplerate
+    # Determine FILE sample-rate and region to render in file-frame domain
+    info = sf.info(path_src)
+    file_sr = info.samplerate
     START_FRAME = int(round(offset_sec * file_sr))
-    FRAMES      = int(round(sec * file_sr))
-    
-    # if demo_src includes "pick", use the 1.0 as style_flag, otherwise use 0.0
+    TOTAL_FRAMES = int(round(sec * file_sr))
+    END_FRAME = START_FRAME + TOTAL_FRAMES
+
+    # Style flag from filename (same logic as your original function)
     if "pick" in path_src:
         style_true_flag = 1.0
     elif "finger" in path_src:
         style_true_flag = 0.0
     else:
-        # It might be a blended chunk where the styles may be intermixed
         style_true_flag = None
-    
-    x_long,x_src_sample_rate = sf.read(path_src, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
-    y_long,_  = sf.read(path_target, start=START_FRAME, frames=FRAMES, dtype='float32', always_2d=True)
-    x_src = x_long[:,0]
-    y_src = y_long[:,0]
-    if x_src_sample_rate != sample_rate:
-        x_mod = resample_to_model_sr(x_src, x_src_sample_rate, sample_rate)
-        y_mod = resample_to_model_sr(y_src, x_src_sample_rate, sample_rate)
-    else:
-        x_mod = x_src
-        y_mod = y_src
-    x_demo = x_mod[None, :, None]
-    
-    # First predict the style using the dynamic model, not based on the true style flag, but on the classifier itself.
-    dummy_style = np.zeros((1, 1), dtype=np.float32)
-    force_zero  = np.zeros((1, 1), dtype=np.float32)
-    y_inf_style_pred, style_pred_out = model.predict([x_demo, dummy_style, force_zero], batch_size=1, verbose=0)
-    y_inf_style_pred = y_inf_style_pred[0, :, 0]
-    style_pred = float(style_pred_out[0, 0])
-    style_pred_name = 'pick' if style_pred > STYLE_FLAG_PROB_THRESHOLD else 'finger'
 
-    # Now, if the true style is known (such as is the case for the base models),
-    # also infer the audio, but guided by the true style flag
+    # Model contexts and conversions
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
+    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
+    block_core_model = max(1, int(round(block_sec * sample_rate)))
+    want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
+
+    # Outputs
+    style_pred_path = os.path.join(out_dir, prediction_name + "_style_pred.wav")
+    style_true_path = os.path.join(out_dir, prediction_name + "_style_true.wav")
+
+    w_pred = sf.SoundFile(style_pred_path, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_true = None
     if style_true_flag is not None:
-        style_true = np.array([[style_true_flag]], dtype=np.float32)
-        force_one  = np.ones((1, 1), dtype=np.float32)
-        y_inf_style_true, _ = model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
-        y_inf_style_true = y_inf_style_true[0, :, 0]
-        style_true_name = 'pick' if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        w_true = sf.SoundFile(style_true_path, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    w_src = None
+    w_tgt = None
+    if not only_prediction:
+        w_src = sf.SoundFile(os.path.join(out_dir, "demo_source.wav"), mode='w',
+                             samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w_tgt = sf.SoundFile(os.path.join(out_dir, "demo_target.wav"), mode='w',
+                             samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    # Streaming loop
+    produced_model = 0
+    prob_sum = 0.0
+    prob_count = 0
+
+    while produced_model < want_total_model:
+        core_model = min(block_core_model, want_total_model - produced_model)
+
+        # contexts for this block
+        left_this = left_ctx_model if produced_model > 0 else 0
+        right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
+
+        # Map model offsets → file frames
+        core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
+        core_start_file = START_FRAME + core_start_file_off
+
+        left_ctx_file = int(math.ceil(left_this * (file_sr / float(sample_rate))))
+        right_ctx_file = int(math.ceil(right_this * (file_sr / float(sample_rate))))
+        core_file_len = int(math.ceil(core_model * (file_sr / float(sample_rate))))
+
+        read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
+        read_b_desired = core_start_file + core_file_len + right_ctx_file + resample_margin_file
+        read_b = min(END_FRAME, read_b_desired)
+        n_read = max(0, read_b - read_a)
+        if n_read <= 0:
+            break
+
+        # Read source (and target if needed) in FILE SR
+        x_block_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+        x_file = x_block_2d[:, 0]
+        if not only_prediction:
+            y_block_2d, _ = sf.read(path_target, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+            y_file = y_block_2d[:, 0]
+
+        # Resample block to MODEL SR
+        if file_sr != sample_rate:
+            x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
+            if not only_prediction:
+                y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
+        else:
+            x_resamp = x_file
+            if not only_prediction:
+                y_resamp = y_file
+
+        # Compute where left-context starts inside resampled array
+        left_off_file = (core_start_file - left_ctx_file) - read_a
+        left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
+        # Build the exact inference window: [left_ctx + core + right_ctx] in model samples
+        inp_start = max(0, min(left_off_model, len(x_resamp)))
+        inp_end = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
+        x_inp = x_resamp[inp_start:inp_end]
+        if x_inp.size == 0:
+            break
+
+        # Indices of "core" region inside x_inp
+        core_start_in_inp = min(left_this, len(x_inp))
+        core_end_in_inp = min(core_start_in_inp + core_model, len(x_inp))
+        core_len = max(0, core_end_in_inp - core_start_in_inp)
+        if core_len <= 0:
+            break
+
+        x_demo = x_inp[None, :, None].astype(np.float32)
+
+        # Predicted-style pass
+        dummy_style = np.zeros((1, 1), dtype=np.float32)
+        force_zero  = np.zeros((1, 1), dtype=np.float32)
+        y_inf_pred, style_pred_out = model.predict([x_demo, dummy_style, force_zero], batch_size=1, verbose=0)
+        y_inf_pred = y_inf_pred[0, :, 0]
+        y_core_pred = y_inf_pred[core_start_in_inp:core_end_in_inp]
+        w_pred.write(y_core_pred)
+
+        # Accumulate style prob weighted by samples in this block's core
+        prob_sum += float(style_pred_out[0, 0]) * float(core_len)
+        prob_count += core_len
+
+        # True-style pass (if known)
+        if w_true is not None:
+            style_true = np.array([[style_true_flag]], dtype=np.float32)
+            force_one  = np.ones((1, 1), dtype=np.float32)
+            y_inf_true, _ = model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
+            y_inf_true = y_inf_true[0, :, 0]
+            y_core_true = y_inf_true[core_start_in_inp:core_end_in_inp]
+            w_true.write(y_core_true)
+
+        # Write source/target if requested (use the same cropping)
+        if not only_prediction:
+            core_start_global = inp_start + core_start_in_inp
+            core_end_global = inp_start + core_end_in_inp
+            x_core = x_resamp[core_start_global:core_end_global]
+            y_core = y_resamp[core_start_global:core_end_global]
+            w_src.write(x_core)
+            w_tgt.write(y_core)
+
+        produced_model += core_len
+
+    # Close writers
+    w_pred.close()
+    if w_true is not None:
+        w_true.close()
+    if w_src is not None:
+        w_src.close()
+    if w_tgt is not None:
+        w_tgt.close()
+
+    # Final style report
+    if prob_count > 0:
+        p = prob_sum / float(prob_count)
+        style_pred_name = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        print(f"✅ Demo saved to {style_pred_path}. Predicted style (avg): {style_pred_name} ({p:.4f})")
+        if w_true is not None:
+            style_true_name = 'pick' if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
+            print(f"✅ Demo saved to {style_true_path}. True style: {style_true_name}")
     else:
-        y_inf_style_true = None
-        style_true_name = None  
-    
-    style_pred_filepath = os.path.join(out_dir, prediction_name + "_style_pred" + ".wav")
-    style_true_filepath = os.path.join(out_dir, prediction_name + "_style_true" + ".wav")
-
-    sf.write(style_pred_filepath, y_inf_style_pred, sample_rate, subtype='FLOAT')
-    print(f"✅ Demo saved to {style_pred_filepath}. Predicted style: {style_pred_name}")
-
-    if y_inf_style_true is not None:
-        sf.write(style_true_filepath, y_inf_style_true, sample_rate, subtype='FLOAT')
-        print(f"✅ Demo saved to {style_true_filepath}. True style: {style_true_name}")
-
-    if (not only_prediction):
-        source_filepath = os.path.join(out_dir, "demo_source" +".wav")
-        target_filepath = os.path.join(out_dir, "demo_target" + ".wav")
-        sf.write(source_filepath, x_mod, sample_rate, subtype='FLOAT')
-        sf.write(target_filepath, y_mod, sample_rate, subtype='FLOAT')
+        print(f"✅ Demo saved to {style_pred_path}.")
 
 def make_sinc_filter():
     t = np.arange(REALTIME_IR_FIR_SIZE) - (REALTIME_IR_FIR_SIZE - 1)/2.0
@@ -1623,9 +1750,9 @@ def gate_gain_signal(
     release_ms=GATE_RELEASE_MS,
     cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
     hp_order=129,
-    min_gain_db=-90.0,     # small floor to avoid true zero
-    env_ms=0.35,           # tiny detector smoothing (ms)
-    depth_smooth_ms=0.35   # tiny smoothing of closed-depth (ms)
+    min_gain_db=-60.0,     # small floor to avoid true zero
+    env_ms=GATE_ENV_MS,           # tiny detector smoothing (ms)
+    depth_smooth_ms=GATE_DEPTH_SMOOTH_MS   # tiny smoothing of closed-depth (ms)
 ):
     """
     Causal, hard gate with anti-crunch:
@@ -1852,6 +1979,17 @@ def film_apply(x, style_embed, filters, prefix):
     ])
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
+
+def build_offline_causal(offline_src, dynamic_time=True):
+    """
+    Build a causalized offline model (right-lookahead=0) and copy weights by name
+    from the provided non-causal offline model. Returned model is frozen.
+    """
+    offline_causal = build_offline_model(dynamic_time=dynamic_time, lookahead_samples=0, name="piezo2mic_offline_causal")
+    copy_weights_by_name(offline_causal, offline_src, verbose=True)
+    for l in offline_causal.layers:
+        l.trainable = False
+    return offline_causal
 
 def build_offline_model(dynamic_time=False):
     T   = None if dynamic_time else OFFLINE_SEG_LEN
@@ -2463,55 +2601,205 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
     print(f"{layer_name}: {s:.4f} → {w[0][0]:.4f} (+{gain_db} dB)")
     return model
 
+# Retune the offline Gate inside an already-trained offline model and save it.
 
-def audible_gate_debug(debug_model, path_src, path_tgt, out_dir, sample_rate,
-                               sec=10.0, offset_sec=0.0, style_mode="predict", style_true_flag=1.0):
+import os
+import tensorflow as tf
+
+def retune_offline_gate_inplace(
+    model,
+    threshold_db=None,
+    ratio=None,
+    attack_ms=None,
+    hold_ms=None,
+    release_ms=None,
+    cutoff_hz=None,
+    hp_order=None
+):
+    """
+    Loads the saved offline model, updates the 'offline_gate' layer parameters
+    (threshold/ratio/attack/hold/release/cutoff/hp_order), and saves the result.
+
+    Only the Gate layer's attributes are changed; no weights are touched.
+    """
+    m = model
+    g = m.get_layer("offline_gate")
+
+    def _maybe_set(attr, val, cast=float):
+        if val is not None:
+            setattr(g, attr, cast(val))
+
+    _maybe_set("threshold_db", threshold_db, float)
+    _maybe_set("ratio",        ratio,        float)
+    _maybe_set("attack_ms",    attack_ms,    float)
+    _maybe_set("hold_ms",      hold_ms,      float)
+    _maybe_set("release_ms",   release_ms,   float)
+    _maybe_set("cutoff_hz",    cutoff_hz,    float)
+    _maybe_set("hp_order",     hp_order,     int)
+
+    print("New gate params:",
+          dict(threshold_db=g.threshold_db, ratio=g.ratio, attack_ms=g.attack_ms,
+               hold_ms=g.hold_ms, release_ms=g.release_ms,
+               cutoff_hz=g.cutoff_hz, hp_order=g.hp_order))
+    return m
+
+def audible_gate_debug(debug_model,
+                                 path_src,
+                                 path_tgt,
+                                 out_dir,
+                                 sample_rate,
+                                 sec=10.0,
+                                 offset_sec=0.0,
+                                 style_mode="true",
+                                 style_true_flag=1.0,
+                                 block_sec=10.0,
+                                 resample_margin_ms=50.0):
+    """
+    Streaming version of audible_gate_debug. Processes the file in blocks with context
+    and writes all debug WAVs incrementally to avoid large allocations.
+
+    For simplicity and robustness, gate_clicks is omitted in this streaming variant.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    
-    debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", PICK_BOOST_DB)
 
-    x, y = _read_pair_segment(path_src, path_tgt, model_sr=sample_rate, offset_sec=offset_sec, sec=sec)
-    x_b = x[None,:,None]
+    # Boost HF scale like your original offline debug does
+    if sample_rate == OFFLINE_SAMPLE_RATE:
+        debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", PICK_BOOST_DB)
 
+    # Input region in file-sample domain
+    info = sf.info(path_src)
+    file_sr = info.samplerate
+    START_FRAME = int(round(offset_sec * file_sr))
+    TOTAL_FRAMES = int(round(sec * file_sr))
+    END_FRAME = START_FRAME + TOTAL_FRAMES
+    want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
+
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
+    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
+    block_core_model = max(1, int(round(block_sec * sample_rate)))
+
+    # Style inputs
     if style_mode == "true":
-        style_true = np.array([[style_true_flag]], dtype=np.float32)
-        style_force = np.ones((1,1), dtype=np.float32)
+        style_in  = np.array([[style_true_flag]], dtype=np.float32)
+        force_in  = np.ones((1, 1), dtype=np.float32)
     else:
-        style_true  = np.zeros((1,1), dtype=np.float32)
-        style_force = np.zeros((1,1), dtype=np.float32)
+        style_in  = np.zeros((1, 1), dtype=np.float32)
+        force_in  = np.zeros((1, 1), dtype=np.float32)
 
-    outs = debug_model.predict([x_b, style_true, style_force], verbose=0)
+    # Output writers
+    w_src  = sf.SoundFile(os.path.join(out_dir, "src.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_tgt  = sf.SoundFile(os.path.join(out_dir, "tgt.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_full = sf.SoundFile(os.path.join(out_dir, "pred_full.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_nohf = sf.SoundFile(os.path.join(out_dir, "pred_nohf.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_hf   = sf.SoundFile(os.path.join(out_dir, "hf_only.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_gr   = sf.SoundFile(os.path.join(out_dir, "gate_raw.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_gt   = sf.SoundFile(os.path.join(out_dir, "gate_tone.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_gh   = sf.SoundFile(os.path.join(out_dir, "gate_hiss.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-    def _fetch(key):
-        arr = outs[key][0,:,0]
-        return np.asarray(arr, dtype=np.float32)
-
-    gate      = np.clip(_fetch("gate"), 0.0, 1.0)
-    y_pred    = _fetch("y_pred")
-    pick_c    = _fetch("pick_c")
-    finger_c  = _fetch("finger_c")
-    hf_scaled = _fetch("hf_scaled")
-
-    y_nohf     = pick_c + finger_c
-    gate_raw   = _normalize_to_peak(2.0 * (gate - 0.5), 0.8)
-
+    # Tone state (continuous phase across blocks)
     tone_freq = gate_debug_tone_freq(sample_rate, HP_CUTOFF_HZ)
-    gate_tone = _normalize_to_peak(gate * _make_sine(sample_rate, len(gate), freq=tone_freq), 0.8)
-    
-    gate_hiss  = _normalize_to_peak(gate * _make_hiss_hp(sample_rate, len(gate)), 0.8)
-    
-    gate_clicks = _render_clicks_from_gate(gate, sample_rate)
+    omega = 2.0 * np.pi * (tone_freq / float(sample_rate))
+    phase = 0.0
 
-    sf.write(os.path.join(out_dir, "src.wav"), x, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "tgt.wav"), y, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_full.wav"), y_pred, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "pred_nohf.wav"), y_nohf, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "hf_only.wav"), hf_scaled, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_raw.wav"), gate_raw, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_tone.wav"), gate_tone, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_hiss.wav"), gate_hiss, sample_rate, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "gate_clicks.wav"), gate_clicks, sample_rate, subtype='FLOAT')
-    print(f"Saved audible gate debug ({style_mode}) to {out_dir}")
+    produced_model = 0
+
+    while produced_model < want_total_model:
+        core_model = min(block_core_model, want_total_model - produced_model)
+        left_this = left_ctx_model if produced_model > 0 else 0
+        right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
+
+        core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
+        core_start_file = START_FRAME + core_start_file_off
+
+        left_ctx_file = int(math.ceil(left_this * (file_sr / float(sample_rate))))
+        right_ctx_file = int(math.ceil(right_this * (file_sr / float(sample_rate))))
+        core_file_len = int(math.ceil(core_model * (file_sr / float(sample_rate))))
+
+        read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
+        read_b_desired = core_start_file + core_file_len + right_ctx_file + resample_margin_file
+        read_b = min(END_FRAME, read_b_desired)
+        n_read = max(0, read_b - read_a)
+        if n_read <= 0:
+            break
+
+        x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+        y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+        x_file = x_blk_2d[:, 0]
+        y_file = y_blk_2d[:, 0]
+
+        if file_sr != sample_rate:
+            x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
+            y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
+        else:
+            x_resamp = x_file
+            y_resamp = y_file
+
+        left_off_file = (core_start_file - left_ctx_file) - read_a
+        left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
+        inp_start = max(0, min(left_off_model, len(x_resamp)))
+        inp_end = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
+        x_inp = x_resamp[inp_start:inp_end]
+        if x_inp.size == 0:
+            break
+
+        core_start_in_inp = min(left_this, len(x_inp))
+        core_end_in_inp = min(core_start_in_inp + core_model, len(x_inp))
+        core_len = max(0, core_end_in_inp - core_start_in_inp)
+        if core_len <= 0:
+            break
+
+        x_b = x_inp[None, :, None].astype(np.float32)
+        outs = debug_model.predict([x_b, style_in, force_in], verbose=0)
+        # outs is a dict with keys: "gate", "hf_scaled", "pick_c", "finger_c", "y_pred"
+        def _core_of(key):
+            arr = np.asarray(outs[key][0, :, 0], dtype=np.float32)
+            return arr[core_start_in_inp:core_end_in_inp]
+
+        gate_core   = np.clip(_core_of("gate"), 0.0, 1.0)
+        y_pred_core = _core_of("y_pred")
+        pick_c_core = _core_of("pick_c")
+        fins_c_core = _core_of("finger_c")
+        hf_s_core   = _core_of("hf_scaled")
+        y_nohf_core = pick_c_core + fins_c_core
+
+        # Write model-derived signals
+        w_full.write(y_pred_core)
+        w_nohf.write(y_nohf_core)
+        w_hf.write(hf_s_core)
+
+        # Write src/tgt (same cropping)
+        core_start_global = inp_start + core_start_in_inp
+        core_end_global   = inp_start + core_end_in_inp
+        w_src.write(x_resamp[core_start_global:core_end_global])
+        w_tgt.write(y_resamp[core_start_global:core_end_global])
+
+        # gate_raw [-0.8..+0.8]
+        gate_raw = 0.8 * (2.0 * (gate_core - 0.5))
+        w_gr.write(gate_raw)
+
+        # gate_tone and gate_hiss (streaming-safe)
+        t = np.arange(core_len, dtype=np.float32)
+        tone = np.sin(phase + omega * t).astype(np.float32)
+        phase = (phase + omega * float(core_len)) % (2.0 * np.pi)
+        w_gt.write(0.8 * gate_core * tone)
+
+        # simple HP hiss, scaled
+        # quick HP via 1st-order pre-emphasis (consistent with your other code)
+        hiss = np.random.randn(core_len).astype(np.float32)
+        if core_len > 1:
+            hiss[1:] = hiss[1:] - HP_PRE_EMPHASIS_HF * hiss[:-1]
+        w_gh.write(0.8 * gate_core * hiss)
+
+        produced_model += core_len
+
+    # Close all writers
+    for w in [w_src, w_tgt, w_full, w_nohf, w_hf, w_gr, w_gt, w_gh]:
+        try:
+            w.close()
+        except:
+            pass
+
+    print(f"Saved streaming audible gate debug ({style_mode}) to {out_dir}")
 
 def train_shared(
     kind,
@@ -3053,6 +3341,7 @@ def main ():
                 static = tf.keras.models.load_model(ckpts[-1], compile=False)
                 offline_dyn = build_offline_model(dynamic_time=True)
                 offline_dyn.set_weights(static.get_weights())
+                offline_dyn.save(ckpts[-1] + "_foo.keras")
             else:
                 static = build_offline_model(dynamic_time=False)
                 offline_dyn = build_offline_model(dynamic_time=True)
@@ -3063,6 +3352,18 @@ def main ():
         out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
         
         debug_model = build_offline_debug_model(offline_dyn)
+
+        # debug_model = retune_offline_gate_inplace(
+        #     model=debug_model,
+        #     attack_ms=GATE_ATTACK_MS,
+        #     cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
+        #     hold_ms=GATE_HOLD_MS,
+        #     release_ms=GATE_RELEASE_MS,
+        #     hp_order=OFFLINE_HF_HP_ORDER,
+        #     ratio=GATE_RATIO,
+        #     threshold_db=GATE_THRESHOLD_DB
+        # )
+        
         audible_gate_debug(debug_model=debug_model, path_src=src, path_tgt=tgt, out_dir=out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
         sys.exit(0)
 
