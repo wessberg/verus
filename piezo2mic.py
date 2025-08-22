@@ -257,8 +257,8 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 30
-LONG_DEMO_OFFSET_SEC = 1200
+LONG_DEMO_SEC        = 60
+LONG_DEMO_OFFSET_SEC = 1320
 LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
@@ -1952,7 +1952,7 @@ def compute_pads(kernel, dilation, lookahead_samples):
 
 def gated_sep_block(x, filters, kernel, dilation, prefix, lookahead=0):
     res = x
-    pad_left, pad_right = compute_pads(kernel, dilation, lookahead)
+    pad_left, pad_right = compute_pads(kernel=kernel, dilation=dilation, lookahead_samples=lookahead)
     x   = ZeroPadding1D((pad_left, pad_right), name=f"{prefix}_pad")(x)
     g   = SeparableConv1D(2*filters, kernel, dilation_rate=dilation, padding="valid", name=f"{prefix}_sep")(x)
     c   = Lambda(slice_content, arguments={"filters": filters}, name=f"{prefix}_slice_c")(g)
@@ -2028,7 +2028,7 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     # Dilated stack with configurable look-ahead
     for idx, d in enumerate(OFFLINE_DILATIONS):
         res = x
-        pad_left, pad_right = compute_pads(OFFLINE_KERNEL_SIZE, d, lookahead_samples)
+        pad_left, pad_right = compute_pads(kernel=OFFLINE_KERNEL_SIZE, dilation=d, lookahead_samples=lookahead_samples)
         x = ZeroPadding1D((pad_left, pad_right), name=f"pad_{idx}")(x)
         g = SeparableConv1D(OFFLINE_FILTERS*2, OFFLINE_KERNEL_SIZE, dilation_rate=d, padding='valid', name=f"sep_{idx}")(x)
         c = Lambda(slice_content, arguments={'filters':OFFLINE_FILTERS}, name=f"slice_content_{idx}")(g)
@@ -2231,7 +2231,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     realtime_feats = []
     for i, d in enumerate(REALTIME_DILATIONS):
         res = x
-        pad_left, pad_right = compute_pads(REALTIME_KERNEL_SIZE, d, lookahead=0)
+        pad_left, pad_right = compute_pads(kernel=REALTIME_KERNEL_SIZE, dilation=d, lookahead_samples=0)
         x   = ZeroPadding1D((pad_left, pad_right), name=f"realtime_pad_{i}")(x)
         g   = SeparableConv1D(2*REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid", name=f"realtime_sep_{i}")(x)
         c   = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
