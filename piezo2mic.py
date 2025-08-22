@@ -140,7 +140,9 @@ ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 DEBUG               = False
 
 # Batch params
-BATCH_SIZE          = 4
+OFFLINE_BATCH_SIZE          = 4
+REALTIME_BATCH_SIZE         = 32
+FINETUNE_BATCH_SIZE         = 32
 
 # Chunk ratios
 PICK_CHUNK_RATIO = 0.5
@@ -2373,10 +2375,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
 
     return tf.keras.models.Model(inputs=inputs_list, outputs=[y_realtime, style_prob], name="piezo2mic_realtime")
 
-def approx_steps(durs, seg_len):
-    return 10 if DEBUG else sum(max((d-seg_len)//(seg_len//2)+1,0) for d in durs)//BATCH_SIZE
-
-def approx_steps_from_chunks(chunks, seg_len, model_sample_rate):
+def approx_steps_from_chunks(chunks, seg_len, model_sample_rate, batch_size):
     """
     Estimate steps/epoch given chunks defined in file-rate samples while model uses model_sample_rate.
     Uses 50% overlap.
@@ -2388,7 +2387,7 @@ def approx_steps_from_chunks(chunks, seg_len, model_sample_rate):
         hop_src = max(1, need_src_len // 2)
         num = max((cdur - need_src_len) // hop_src + 1, 0)
         total_windows += num
-    return 10 if DEBUG else max(total_windows // BATCH_SIZE, 1)
+    return 10 if DEBUG else max(total_windows // batch_size, 1)
 
 # ────────────────────────────── TRAINING ─────────────────────────────────────
 
@@ -2840,6 +2839,7 @@ def train_shared(
     kind,
     seg_len,
     sample_rate,
+    batch_size,
     build_model_fn,
     checkpoint_out_dir,
     logs_out_dir,
@@ -2872,8 +2872,8 @@ def train_shared(
     val_pick_chunks     = [c for c in val_chunks   if c in pick_chunks]
     val_finger_chunks   = [c for c in val_chunks   if c in finger_chunks]
 
-    steps_per_epoch  = approx_steps_from_chunks(train_chunks, seg_len, sample_rate)
-    validation_steps = approx_steps_from_chunks(val_chunks,   seg_len, sample_rate)
+    steps_per_epoch  = approx_steps_from_chunks(chunks=train_chunks, seg_len=seg_len, model_sample_rate=sample_rate, batch_size=batch_size)
+    validation_steps = approx_steps_from_chunks(chunks=val_chunks,   seg_len=seg_len, model_sample_rate=sample_rate, batch_size=batch_size)
     print(f"≈ {steps_per_epoch} train steps/epoch, {validation_steps} val steps")
 
     sig_y = (
@@ -2941,7 +2941,7 @@ def train_shared(
     train_ds = tf.data.Dataset.sample_from_datasets(
         [pick_ds, finger_ds],
         weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO]
-    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(BATCH_SIZE)
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True).batch(batch_size)
 
     train_ds = train_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
@@ -2949,7 +2949,7 @@ def train_shared(
         [val_pick_ds, val_finger_ds],
         weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
         seed=SEED
-    ).batch(BATCH_SIZE)
+    ).batch(batch_size=batch_size)
     val_ds = val_ds.map(sw_map_fn).repeat().prefetch(tf.data.AUTOTUNE)
 
     if resume and resume_ckpt_path:
@@ -3035,6 +3035,7 @@ def train_offline(resume=False, resume_ckpt_path=None):
         resume_ckpt_path=resume_ckpt_path,
         seg_len=OFFLINE_SEG_LEN,
         sample_rate=OFFLINE_SAMPLE_RATE,
+        batch_size=OFFLINE_BATCH_SIZE,
         static_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_offline_model,
@@ -3066,6 +3067,7 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         resume_ckpt_path=resume_ckpt_path,
         seg_len=REALTIME_SEG_LEN,
         sample_rate=REALTIME_SAMPLE_RATE,
+        batch_size=REALTIME_BATCH_SIZE,
         static_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_realtime_model,
@@ -3170,7 +3172,7 @@ def fine_tune():
         ds_pu = tf.data.Dataset.from_generator(pu_gen, output_signature=(spec_x, spec_y))
         ds_fu = tf.data.Dataset.from_generator(fu_gen, output_signature=(spec_x, spec_y))
         mixed = tf.data.Dataset.sample_from_datasets([ds_pu, ds_fu], weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO], seed=SEED)
-        return mixed.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        return mixed.batch(FINETUNE_BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
     print("\n🔧 Fine-tuning REALTIME on new pair…")
     base_realtime_full = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME), compile=False)
