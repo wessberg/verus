@@ -180,6 +180,7 @@ REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
+REALTIME_HF_HP_ORDER            = 129
 
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
 REALTIME_FEAT_DISTILL_ALPHA    = 1.0
@@ -1492,20 +1493,51 @@ class FIRDecimateBy2(Layer):
 
 @register_keras_serializable()
 class HFHighpass(tf.keras.layers.Layer):
-    def __init__(self, taps=None, **kwargs):
+    def __init__(self, taps=None, sample_rate=None, cutoff_hz=HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, **kwargs):
+        """
+        Causal min-phase FIR high-pass, implemented as conv1d with left padding.
+        - If 'taps' is provided, it is used as-is (Tensor/ndarray of shape [L,1,1], already time-reversed for conv1d).
+        - Otherwise, taps are generated from (sample_rate, cutoff_hz, order) via _get_minphase_hp_kernel.
+        Taps are saved as non-trainable weights for TFLite export.
+        """
         super().__init__(**kwargs)
-        self._taps_init = offline_hf_hp_taps_tf if taps is None else tf.convert_to_tensor(taps, dtype=tf.float32)
+        self.sample_rate = None if sample_rate is None else int(sample_rate)
+        self.cutoff_hz   = float(cutoff_hz)
+        self.order       = int(order)
+        self._taps_init  = None if taps is None else tf.convert_to_tensor(taps, dtype=tf.float32)
+
     def build(self, input_shape):
+        if self._taps_init is None:
+            # Fallback to a known SR if none provided (should not happen if you pass sample_rate explicitly)
+            sr = self.sample_rate if self.sample_rate is not None else OFFLINE_SAMPLE_RATE
+            init_taps = _get_minphase_hp_kernel(sr, self.cutoff_hz, self.order)
+        else:
+            init_taps = self._taps_init
+
         self.taps = self.add_weight(
             name="hp_taps",
-            shape=self._taps_init.shape,
-            initializer=tf.keras.initializers.Constant(self._taps_init),
+            shape=init_taps.shape,
+            initializer=tf.keras.initializers.Constant(init_taps),
             trainable=False
         )
+
     def call(self, x):
         pad = tf.shape(self.taps)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sample_rate": self.sample_rate,
+            "cutoff_hz":   self.cutoff_hz,
+            "order":       self.order
+        })
+        # taps are stored as weights; no need to serialize them in config
+        return cfg
 
 @register_keras_serializable()
 class RealtimeIrAlign(Layer):
@@ -2074,7 +2106,12 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
 
     # Move the gate multiply BEFORE the HPF
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, offline_gate])
-    hf_hp    = HFHighpass(name="offline_hf_highpass")(hf_gated)
+    
+    hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE,
+                      cutoff_hz=HP_CUTOFF_HZ,
+                      order=OFFLINE_HF_HP_ORDER,
+                      name="offline_hf_highpass")(hf_gated)
+    
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
 
     out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
@@ -2311,7 +2348,12 @@ def build_realtime_model(offline=None, dynamic_time=False):
 
     # Gate BEFORE HPF (consistent with teacher topology)
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
-    hf_hp    = HFHighpass(name="realtime_hf_highpass")(hf_gated)
+    
+    hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
+                      cutoff_hz=HP_CUTOFF_HZ,
+                      order=REALTIME_HF_HP_ORDER,  # or define a separate HF order if you prefer
+                      name="realtime_hf_highpass")(hf_gated)
+    
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
