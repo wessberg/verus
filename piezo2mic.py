@@ -224,7 +224,7 @@ FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 # HF loss shaping
-HP_CUTOFF_HZ   = 2000.0
+HP_CUTOFF_HZ   = 3000.0
 GATE_DEBUG_TONE_MULT = 1.0
 
 HP_PRE_EMPHASIS           = 0.8
@@ -267,7 +267,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-PICK_BOOST_DB = 28
+OFFLINE_PICK_BOOST_DB = 28
+REALTIME_PICK_BOOST_DB = 8
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -1270,7 +1271,8 @@ def generate_demo_from_files(model,
     os.makedirs(out_dir, exist_ok=True)
         
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
-    model = boost_hf_scale_in_model(model, hf_scale_layer_name, PICK_BOOST_DB)
+    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
+    model = boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
 
     # Determine FILE sample-rate and region to render in file-frame domain
     info = sf.info(path_src)
@@ -2749,7 +2751,8 @@ def audible_gate_debug(debug_model,
     os.makedirs(out_dir, exist_ok=True)
 
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
-    debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, PICK_BOOST_DB)
+    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
+    debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, pick_boost_db)
 
     # Input region in file-sample domain
     info = sf.info(path_src)
