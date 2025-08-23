@@ -98,13 +98,13 @@ import soundfile as sf
 import tensorflow as tf
 from scipy.signal import minimum_phase, firwin, resample_poly
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau, TerminateOnNaN
-from tensorflow.keras import regularizers, constraints
-from tensorflow.keras.losses import Loss
-from tensorflow.keras.layers import (
-    Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D, AveragePooling1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D, Reshape
+from tensorflow.keras.utils import register_keras_serializable # pyright: ignore[reportMissingImports]
+from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau, TerminateOnNaN # pyright: ignore[reportMissingImports]
+from tensorflow.keras import regularizers, constraints # pyright: ignore[reportMissingImports]
+from tensorflow.keras.losses import Loss # pyright: ignore[reportMissingImports]
+from tensorflow.keras.layers import (  # pyright: ignore[reportMissingImports]
+    Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
+    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D, Reshape, Minimum
 )
 
 # Determinism
@@ -260,8 +260,8 @@ DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 1320
+LONG_DEMO_SEC        = 10
+LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
@@ -1661,13 +1661,19 @@ class IrScale(Layer):
 class DistillLoss(Layer):
     def __init__(self, alpha, **kwargs):
         super().__init__(**kwargs)
-        self.alpha = alpha
+        self.alpha = float(alpha)
+
     def call(self, inputs):
         y_t, y_s = inputs
-        sq = tf.math.squared_difference(y_t, y_s)
-        loss = tf.reduce_mean(sq)
+        # Align time dimension to the minimum length to avoid shape mismatches
+        t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
+        y_t_trim = y_t[:, :t, :]
+        y_s_trim = y_s[:, :t, :]
+        loss = tf.reduce_mean(tf.math.squared_difference(y_t_trim, y_s_trim))
         self.add_loss(self.alpha * loss)
+        # Return the student unchanged so we don't alter the forward graph
         return y_s
+
     def get_config(self):
         cfg = super().get_config()
         cfg.update({'alpha': self.alpha})
@@ -2231,6 +2237,7 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
     ratio = t_hf_pred / (t_hf_true + 1e-12)
     print(f"Avg |STFT| > {HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
 
+# Replace your entire build_realtime_model() with this version (no anonymous Lambdas)
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
     T   = None if dynamic_time else REALTIME_SEG_LEN
@@ -2343,15 +2350,15 @@ def build_realtime_model(offline=None, dynamic_time=False):
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)  # (B,T,1) in [0,1]
 
-    # Safety cap: do not exceed deterministic gate (min)
-    mask_used = Lambda(lambda z: tf.minimum(z[0], z[1]), name="realtime_hf_mask_used")([mask_pred, realtime_gate])
+    # Safety cap: do not exceed deterministic gate (use built-in Minimum; no anonymous Lambda)
+    mask_used = Minimum(name="realtime_hf_mask_used")([mask_pred, realtime_gate])
 
     # Gate BEFORE HPF (consistent with teacher topology)
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
     
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
                       cutoff_hz=HP_CUTOFF_HZ,
-                      order=REALTIME_HF_HP_ORDER,  # or define a separate HF order if you prefer
+                      order=REALTIME_HF_HP_ORDER,
                       name="realtime_hf_highpass")(hf_gated)
     
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
@@ -2381,35 +2388,19 @@ def build_realtime_model(offline=None, dynamic_time=False):
             T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_feats)]
             T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
 
-            # KD for features: project student, match lengths, add loss
+            # KD for features: project student, add loss (DistillLoss does its own length match)
             for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
                 chan = int(T_f_ds.shape[-1])
                 proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
-                # match lengths
-                T_f_kd, proj_kd = Lambda(
-                    lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
-                               z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
-                    name=f"feat_kd_match_len_{idx}"
-                )([T_f_ds, proj])
-                _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_kd, proj_kd])
+                _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_ds, proj])
 
             # KD for HF mask envelope: teacher gate (96k→48k) vs student mask_pred
-            T_gate_kd, mask_kd = Lambda(
-                lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
-                           z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
-                name="hf_mask_kd_match_len"
-            )([T_gate_ds, mask_pred])
-            _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_kd, mask_kd])
+            _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_ds, mask_pred])
 
         # KD for teacher audio (96k→48k) vs student audio
         offline_audio, _ = teacher([offline_inp, style_true_in, style_force_in])
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        teacher_kd, student_kd = Lambda(
-            lambda z: (z[0][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :],
-                       z[1][:, :tf.minimum(tf.shape(z[0])[1], tf.shape(z[1])[1]), :]),
-            name="audio_kd_match_len"
-        )([offline_audio_ds, y_realtime])
-        _ = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="audio_distill")([teacher_kd, student_kd])
+        _ = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="audio_distill")([offline_audio_ds, y_realtime])
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
@@ -2738,9 +2729,8 @@ def audible_gate_debug(debug_model,
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    # Boost HF scale like your original offline debug does
-    if sample_rate == OFFLINE_SAMPLE_RATE:
-        debug_model = boost_hf_scale_in_model(debug_model, "offline_hf_scale", PICK_BOOST_DB)
+    hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
+    debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, PICK_BOOST_DB)
 
     # Input region in file-sample domain
     info = sf.info(path_src)
