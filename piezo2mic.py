@@ -165,6 +165,16 @@ OFFLINE_RECEPTIVE_FIELD        = 1 + (OFFLINE_KERNEL_SIZE - 1) * sum(OFFLINE_DIL
 OFFLINE_TRAIN_BLOCK_SIZE       = 4096
 OFFLINE_SEG_LEN                = OFFLINE_RECEPTIVE_FIELD + OFFLINE_TRAIN_BLOCK_SIZE
 OFFLINE_EMBED_DIM              = 32
+
+OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
+OFFLINE_GATE_THRESHOLD_DB   = -52.0
+OFFLINE_GATE_RATIO          = 50
+OFFLINE_GATE_ATTACK_MS      = 0.1
+OFFLINE_GATE_HOLD_MS        = 4.0
+OFFLINE_GATE_RELEASE_MS     = 4.0
+OFFLINE_GATE_ENV_MS          = 0.50
+OFFLINE_GATE_DEPTH_SMOOTH_MS = 20.0
+
 OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline.keras"
 OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
@@ -181,6 +191,20 @@ REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
 REALTIME_HF_HP_ORDER            = 129
+REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
+REALTIME_STYLE_BLEND_INIT    = 0.5   # initial blend weight for teacher style in the predicted path
+REALTIME_STYLE_BLEND_TRAINABLE = False  # set True if you want the blend to be learned
+
+REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ   = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
+REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
+REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
+REALTIME_GATE_ATTACK_MS                  = 0.5
+REALTIME_GATE_HOLD_MS                    = 4.0
+REALTIME_GATE_RELEASE_MS                 = 10.0
+REALTIME_GATE_ENV_MS                     = 0.35
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 6.0
+REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
+REALTIME_GATE_DEPTH_LMAX                = 256
 
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
 REALTIME_FEAT_DISTILL_ALPHA    = 1.0
@@ -201,15 +225,7 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 
 # HF loss shaping
 HP_CUTOFF_HZ   = 2000.0
-GATE_HP_SIDECHAIN_LOW_CUT_HZ   = 14000.0
-GATE_THRESHOLD_DB   = -52.0
-GATE_RATIO          = 50
-GATE_ATTACK_MS      = 0.1
-GATE_HOLD_MS        = 4.0
-GATE_RELEASE_MS     = 4.0
 GATE_DEBUG_TONE_MULT = 1.0
-GATE_ENV_MS          = 0.50
-GATE_DEPTH_SMOOTH_MS = 20.0
 
 HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -1656,6 +1672,76 @@ class IrScale(Layer):
         cfg = super().get_config()
         cfg.update({"init": self.init})
         return cfg
+    
+@register_keras_serializable()
+class BlendScalar(Layer):
+    """
+    Blend two scalar tensors y = (1 - alpha) * student + alpha * teacher.
+    alpha in [0,1]. If trainable=False, it's a fixed convex combination.
+    Inputs must be broadcast-compatible (typically shape (B,1)).
+    """
+    def __init__(self, init_alpha=0.5, trainable=False, **kwargs):
+        super().__init__(**kwargs)
+        self.init_alpha = float(init_alpha)
+        self._trainable_alpha = bool(trainable)
+
+    def build(self, input_shape):
+        self.alpha = self.add_weight(
+            name="alpha",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.init_alpha),
+            trainable=self._trainable_alpha
+        )
+
+    def call(self, inputs):
+        student, teacher = inputs
+        a = tf.clip_by_value(self.alpha, 0.0, 1.0)
+        return (1.0 - a) * student + a * teacher
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "init_alpha": self.init_alpha,
+            "trainable": self._trainable_alpha
+        })
+        return cfg
+
+@register_keras_serializable()
+class CausalMovingAverage(Layer):
+    """
+    Causal moving average over time with left padding of (taps-1).
+    Applies a diagonal kernel → no cross-channel mixing.
+    """
+    def __init__(self, taps=24, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.taps = int(taps)
+
+    def build(self, input_shape):
+        c = int(input_shape[-1])
+        w = np.zeros((self.taps, c, c), dtype=np.float32)
+        w[:] = 0.0
+        for ch in range(c):
+            w[:, ch, ch] = 1.0 / float(self.taps)
+        self.kernel = self.add_weight(
+            name="ma_diag",
+            shape=w.shape,
+            initializer=tf.keras.initializers.Constant(w),
+            trainable=False
+        )
+
+    def call(self, x):
+        pad = self.taps - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        y = tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+        return y
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"taps": self.taps})
+        return cfg
 
 @register_keras_serializable()
 class DistillLoss(Layer):
@@ -1784,94 +1870,78 @@ class HFLeakRegularizer(Layer):
 @register_keras_serializable()
 def gate_gain_signal(
     x, sample_rate,
-    threshold_db=GATE_THRESHOLD_DB,
-    ratio=GATE_RATIO,
-    attack_ms=GATE_ATTACK_MS,
-    hold_ms=GATE_HOLD_MS,
-    release_ms=GATE_RELEASE_MS,
-    cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
+    threshold_db,
+    ratio,
+    attack_ms,
+    hold_ms,
+    release_ms,
+    cutoff_hz,
     hp_order=129,
-    min_gain_db=-60.0,     # small floor to avoid true zero
-    env_ms=GATE_ENV_MS,           # tiny detector smoothing (ms)
-    depth_smooth_ms=GATE_DEPTH_SMOOTH_MS   # tiny smoothing of closed-depth (ms)
+    min_gain_db=-60.0,
+    env_ms=None,
+    depth_smooth_ms=None,
+    # NEW: allow per-call Lmax
+    env_lmax=None,
+    depth_lmax=None
 ):
-    """
-    Causal, hard gate with anti-crunch:
-      g = crossfade(open_env  →  close_depth_smoothed)
+    x = tf.convert_to_tensor(x, dtype=tf.float32)
 
-    - Detector: causal min-phase HPF → |·| → tiny EMA (env_ms) → dB
-    - Open envelope: open_or_hold (0/1 with HOLD) → attack/release smoothing
-    - Close depth: ratio-driven attenuation in dB → linear → tiny EMA (depth_smooth_ms)
-    - Final: g = open_env + (1 - open_env) * close_depth_smoothed
-    """
-    x = tf.convert_to_tensor(x, dtype=tf.float32)  # (B,T,1)
-
-    # Sidechain HPF (causal, min-phase)
     kernel_hp = _get_minphase_hp_kernel(sample_rate, cutoff_hz, hp_order)
-    sc = _causal_conv1d(x, kernel_hp)  # (B,T,1)
+    sc = _causal_conv1d(x, kernel_hp)
 
-    # Tiny detector smoothing (band-limit the detector to kill sample-rate jitter)
     det_raw = tf.abs(sc) + 1e-12
     if env_ms is not None and env_ms > 0.0:
         env_smpl = max(1, int(round((float(env_ms) / 1000.0) * float(sample_rate))))
-        k_env = _exp_smoothing_kernel(env_smpl, scale=2.0, Lmax=512)
+        k_env = _exp_smoothing_kernel(env_smpl, scale=2.0, Lmax=(env_lmax or 512))
         det = _causal_conv1d(det_raw, k_env)
     else:
         det = det_raw
 
-    # Detector in dB
     LN10 = tf.math.log(tf.constant(10.0, dtype=tf.float32))
-    level_db = 20.0 / LN10 * tf.math.log(det)   # (B,T,1) using natural log
+    level_db = 20.0 / LN10 * tf.math.log(det)
 
-    # Time constants in samples
     atk_s = max(1, int(round((float(attack_ms)  / 1000.0) * float(sample_rate))))
     rel_s = max(1, int(round((float(release_ms) / 1000.0) * float(sample_rate))))
     hld_s = max(0, int(round((float(hold_ms)    / 1000.0) * float(sample_rate))))
 
     thr_db  = tf.constant(float(threshold_db), dtype=tf.float32)
-    ratio_f = tf.constant(float(ratio), dtype=tf.float32)
+    ratio_f = tf.constant(float(ratio),        dtype=tf.float32)
 
-    # Above-threshold mask and causal "hold" (0/1)
-    above = tf.cast(level_db >= thr_db, tf.float32)     # (B,T,1)
+    above = tf.cast(level_db >= thr_db, tf.float32)
     if hld_s > 0:
         k_hold = _ones_kernel(hld_s)
         pad = hld_s - 1
         above_pad = tf.pad(above, [[0,0],[pad,0],[0,0]])
-        hold_sum = tf.nn.conv1d(above_pad, filters=k_hold, stride=1, padding='VALID')  # (B,T,1)
-        open_or_hold = tf.cast(hold_sum > 0.0, tf.float32)  # (B,T,1)
+        hold_sum = tf.nn.conv1d(above_pad, filters=k_hold, stride=1, padding='VALID')
+        open_or_hold = tf.cast(hold_sum > 0.0, tf.float32)
     else:
         open_or_hold = above
 
-    # Close depth from ratio (in dB → linear), with small floor
-    delta_db = tf.nn.relu(thr_db - level_db[...,0])            # (B,T)
-    attn_db  = ratio_f * delta_db                              # (B,T)
-    attn_db  = tf.minimum(attn_db, tf.constant(120.0, tf.float32))
+    delta_db = tf.nn.relu(thr_db - level_db[...,0])
+    attn_db  = tf.minimum(ratio_f * delta_db, tf.constant(120.0, tf.float32))
     ALPHA = tf.constant(np.log(10.0)/20.0, dtype=tf.float32)
-    g_close_raw = tf.exp(-ALPHA * attn_db)[:, :, None]         # (B,T,1)
+    g_close_raw = tf.exp(-ALPHA * attn_db)[:, :, None]
     if min_gain_db is not None:
         floor = tf.constant(10.0 ** (float(min_gain_db)/20.0), dtype=tf.float32)
         g_close_raw = tf.maximum(g_close_raw, floor)
 
-    # Tiny smoothing of close-depth to avoid residual jitter
     if depth_smooth_ms is not None and depth_smooth_ms > 0.0:
         d_smpl = max(1, int(round((float(depth_smooth_ms) / 1000.0) * float(sample_rate))))
-        k_depth = _exp_smoothing_kernel(d_smpl, scale=2.0, Lmax=512)
+        k_depth = _exp_smoothing_kernel(d_smpl, scale=2.0, Lmax=(depth_lmax or 512))
         g_close_s = _causal_conv1d(g_close_raw, k_depth)
     else:
         g_close_s = g_close_raw
 
-    # Build a clean open envelope (1 when open/hold else 0) with attack/release smoothing
-    k_att = _exp_smoothing_kernel(atk_s,  scale=4.0, Lmax=2048)
-    k_rel = _exp_smoothing_kernel(rel_s,  scale=4.0, Lmax=2048)
+    k_att = _exp_smoothing_kernel(atk_s, scale=4.0, Lmax=2048)
+    k_rel = _exp_smoothing_kernel(rel_s, scale=4.0, Lmax=2048)
     g_att_open = _causal_conv1d(open_or_hold, k_att)
     g_rel_open = _causal_conv1d(open_or_hold, k_rel)
 
-    g_prev_open = tf.pad(open_or_hold, [[0,0],[1,0],[0,0]])[:, :-1, :]  # previous target
+    g_prev_open = tf.pad(open_or_hold, [[0,0],[1,0],[0,0]])[:, :-1, :]
     inc_open = tf.cast(open_or_hold > g_prev_open, tf.float32)
     g_env = inc_open * g_att_open + (1.0 - inc_open) * g_rel_open
     g_env = tf.clip_by_value(g_env, 0.0, 1.0)
 
-    # Final: crossfade from open envelope (→1) to smoothed close depth (→g_close_s)
     g = g_env + (1.0 - g_env) * g_close_s
     g = tf.clip_by_value(g, 0.0, 1.0)
     return g
@@ -1881,16 +1951,20 @@ def gate_gain_signal(
 class Gate(tf.keras.layers.Layer):
     """
     Gate with HPF sidechain and downward expander, returning per-sample gain [0,1].
-    Ratio exclusively controls attenuation depth below threshold.
+    Now supports per-instance env_ms/depth_smooth_ms and per-instance Lmax caps.
     """
     def __init__(self, sample_rate,
-                 threshold_db=GATE_THRESHOLD_DB,
-                 ratio=GATE_RATIO,
-                 attack_ms=GATE_ATTACK_MS,
-                 hold_ms=GATE_HOLD_MS,
-                 release_ms=GATE_RELEASE_MS,
-                 cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
-                 hp_order=129,
+                 threshold_db,
+                 ratio,
+                 attack_ms,
+                 hold_ms,
+                 release_ms,
+                 cutoff_hz,
+                 hp_order,
+                 env_ms=OFFLINE_GATE_ENV_MS,
+                 depth_smooth_ms=OFFLINE_GATE_DEPTH_SMOOTH_MS,
+                 env_lmax=None,
+                 depth_lmax=None,
                  **kwargs):
         super().__init__(**kwargs)
         self.sample_rate = int(sample_rate)
@@ -1901,6 +1975,10 @@ class Gate(tf.keras.layers.Layer):
         self.release_ms = float(release_ms)
         self.cutoff_hz = float(cutoff_hz)
         self.hp_order = int(hp_order)
+        self.env_ms = None if env_ms is None else float(env_ms)
+        self.depth_smooth_ms = None if depth_smooth_ms is None else float(depth_smooth_ms)
+        self.env_lmax = None if env_lmax is None else int(env_lmax)
+        self.depth_lmax = None if depth_lmax is None else int(depth_lmax)
 
     def call(self, x):
         return gate_gain_signal(
@@ -1912,7 +1990,11 @@ class Gate(tf.keras.layers.Layer):
             hold_ms=self.hold_ms,
             release_ms=self.release_ms,
             cutoff_hz=self.cutoff_hz,
-            hp_order=self.hp_order
+            hp_order=self.hp_order,
+            env_ms=self.env_ms,
+            depth_smooth_ms=self.depth_smooth_ms,
+            env_lmax=self.env_lmax,
+            depth_lmax=self.depth_lmax
         )
 
     def get_config(self):
@@ -1925,7 +2007,11 @@ class Gate(tf.keras.layers.Layer):
             "hold_ms": self.hold_ms,
             "release_ms": self.release_ms,
             "cutoff_hz": self.cutoff_hz,
-            "hp_order": self.hp_order
+            "hp_order": self.hp_order,
+            "env_ms": self.env_ms,
+            "depth_smooth_ms": self.depth_smooth_ms,
+            "env_lmax": self.env_lmax,
+            "depth_lmax": self.depth_lmax
         })
         return cfg
 
@@ -1937,12 +2023,12 @@ def gate_weight(y_true, sample_rate):
     return gate_gain_signal(
         y_true,
         sample_rate=sample_rate,
-        threshold_db=GATE_THRESHOLD_DB,
-        ratio=GATE_RATIO,
-        attack_ms=GATE_ATTACK_MS,
-        hold_ms=GATE_HOLD_MS,
-        release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ
+        threshold_db=OFFLINE_GATE_THRESHOLD_DB,
+        ratio=OFFLINE_GATE_RATIO,
+        attack_ms=OFFLINE_GATE_ATTACK_MS,
+        hold_ms=OFFLINE_GATE_HOLD_MS,
+        release_ms=OFFLINE_GATE_RELEASE_MS,
+        cutoff_hz=OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
     )
 
 # Slice helpers
@@ -2090,12 +2176,17 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     # ─── Gate gain (0..1) computed from the input ────────────────────────────
     offline_gate = Gate(
         sample_rate=OFFLINE_SAMPLE_RATE,
-        threshold_db=GATE_THRESHOLD_DB,
-        ratio=GATE_RATIO,
-        attack_ms=GATE_ATTACK_MS,
-        hold_ms=GATE_HOLD_MS,
-        release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
+        threshold_db=OFFLINE_GATE_THRESHOLD_DB,
+        ratio=OFFLINE_GATE_RATIO,
+        attack_ms=OFFLINE_GATE_ATTACK_MS,
+        hold_ms=OFFLINE_GATE_HOLD_MS,
+        release_ms=OFFLINE_GATE_RELEASE_MS,
+        cutoff_hz=OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ,
+        depth_smooth_ms=OFFLINE_GATE_DEPTH_SMOOTH_MS,
+        env_ms=OFFLINE_GATE_ENV_MS,
+        hp_order=OFFLINE_HF_HP_ORDER,
+        env_lmax=None,
+        depth_lmax=None,
         name="offline_gate"
     )(inp)
 
@@ -2258,9 +2349,32 @@ def build_realtime_model(offline=None, dynamic_time=False):
     style_logit = Dense(1, name="realtime_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
 
+    # If a teacher is provided, get the teacher style prob and distill it to the student.
+    # Also use a convex blend (teacher vs student) for the predicted path.
+    style_pred_source = style_prob  # default = student
+    if offline is not None:
+        teacher = offline
+        teacher.trainable = False
+
+        # Get teacher style prob (and audio) in one pass
+        offline_audio, offline_style_prob = teacher([offline_inp, style_true_in, style_force_in])
+
+        # Distill the style probability (reshape to 3D so DistillLoss can slice [:,:,:])
+        style_prob_3d          = Reshape((1,1), name="realtime_style_prob_3d")(style_prob)
+        offline_style_prob_3d  = Reshape((1,1), name="offline_style_prob_3d")(offline_style_prob)
+        _ = DistillLoss(alpha=REALTIME_STYLE_DISTILL_ALPHA, name="style_prob_distill")([offline_style_prob_3d, style_prob_3d])
+
+        # Use a fixed (or trainable) blend for the predicted path during training
+        style_pred_source = BlendScalar(
+            init_alpha=REALTIME_STYLE_BLEND_INIT,
+            trainable=REALTIME_STYLE_BLEND_TRAINABLE,
+            name="realtime_style_blend"
+        )([style_prob, offline_style_prob])
+
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
+    # Use blended style prediction in the predicted path if teacher available
     style_used_scalar = Add(name="realtime_style_used_scalar")([
-        Multiply(name="realtime_style_pred_part")([one_minus_force, style_prob]),
+        Multiply(name="realtime_style_pred_part")([one_minus_force, style_pred_source]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
     style_time_used = TileStyle(name="realtime_style_time_used")([style_used_scalar, inp])
@@ -2323,20 +2437,25 @@ def build_realtime_model(offline=None, dynamic_time=False):
     total_delay = REALTIME_TOTAL_EXPECTED_IR_DELAY
     ir = RealtimeIrAlign(offset=total_delay + REALTIME_IR_ALIGN_OFFSET_CORRECTION, name='realtime_ir_align')([ir, inp])
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
-    
-    # ─── Deterministic Gate for safety cap ─────────────────────────────────────
+
+    # Gate for HF mask safety cap
     realtime_gate = Gate(
         sample_rate=REALTIME_SAMPLE_RATE,
-        threshold_db=GATE_THRESHOLD_DB,
-        ratio=GATE_RATIO,
-        attack_ms=GATE_ATTACK_MS,
-        hold_ms=GATE_HOLD_MS,
-        release_ms=GATE_RELEASE_MS,
-        cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
+        threshold_db=REALTIME_GATE_THRESHOLD_DB,
+        ratio=REALTIME_GATE_RATIO,
+        attack_ms=REALTIME_GATE_ATTACK_MS,
+        hold_ms=REALTIME_GATE_HOLD_MS,
+        release_ms=REALTIME_GATE_RELEASE_MS,
+        cutoff_hz=HP_CUTOFF_HZ,
+        hp_order=REALTIME_HF_HP_ORDER,
+        env_ms=REALTIME_GATE_ENV_MS,
+        depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS,
+        env_lmax=REALTIME_GATE_ENV_LMAX,
+        depth_lmax=REALTIME_GATE_DEPTH_LMAX,
         name="realtime_gate"
     )(inp)
 
-    # HF branch with learned mask (distilled from teacher gate)
+    # HF branch with learned mask
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
@@ -2344,32 +2463,28 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
     hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
 
-    # Learned HF mask head (causal, tiny)
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
-    mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)  # (B,T,1) in [0,1]
-
-    # Safety cap: do not exceed deterministic gate (use built-in Minimum; no anonymous Lambda)
-    mask_used = Minimum(name="realtime_hf_mask_used")([mask_pred, realtime_gate])
-
-    # Gate BEFORE HPF (consistent with teacher topology)
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
     
+    
+    mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
+    # Tiny causal smoothing to kill zipper/clicks (0.5 ms @ 48k → ~24 taps)
+    mask_smoothed = CausalMovingAverage(taps=24, name="realtime_hf_mask_smooth")(mask_pred)
+    # Safety cap
+    mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
+
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
                       cutoff_hz=HP_CUTOFF_HZ,
                       order=REALTIME_HF_HP_ORDER,
                       name="realtime_hf_highpass")(hf_gated)
-    
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
     # ─── Distillation (teacher must be causal here) ────────────────────────────
     if offline is not None:
-        teacher = offline
-        teacher.trainable = False
-
         # Teacher feature model (96 kHz): selected layers + gate
         if REALTIME_OFFLINE_FEAT_LAYERS:
             offline_feat_model = tf.keras.models.Model(
@@ -2380,7 +2495,6 @@ def build_realtime_model(offline=None, dynamic_time=False):
             T_outs = offline_feat_model([offline_inp, style_true_in, style_force_in])
             if not isinstance(T_outs, list):
                 T_outs = [T_outs]
-            # Split: features and gate
             T_feats = T_outs[:-1]
             T_gate  = T_outs[-1]
 
@@ -2388,7 +2502,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
             T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_feats)]
             T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
 
-            # KD for features: project student, add loss (DistillLoss does its own length match)
+            # KD for features
             for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
                 chan = int(T_f_ds.shape[-1])
                 proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
@@ -2398,7 +2512,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
             _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_ds, mask_pred])
 
         # KD for teacher audio (96k→48k) vs student audio
-        offline_audio, _ = teacher([offline_inp, style_true_in, style_force_in])
+        # offline_audio already computed above
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
         _ = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="audio_distill")([offline_audio_ds, y_realtime])
 
@@ -2469,12 +2583,18 @@ def add_sw_realtime_dual(x, y):
     y = (y_audio_realtime, style_flag)
     Produces a dict of model inputs with both realtime and offline inputs for distillation.
     Returns sample_weights as a tuple matching the model's output order for maximum compatibility.
+
+    Note: style_force is randomized (50%) so the network sometimes uses the predicted path
+    (where the teacher-student blended style is applied) during training.
     """
     x_realtime, x_offline = x
     y_audio, style_flag = y
     b = tf.shape(x_realtime)[0]; T_realtime = tf.shape(x_realtime)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    style_force = tf.ones((b, 1), dtype=tf.float32)            # 1.0 = use ground-truth
+
+    # 50% chance to force ground-truth style vs. predicted (blended) style
+    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
+    style_force = force_mask  # 1 or 0
 
     inputs = {
         'realtime_piezo_input':        x_realtime,
@@ -2487,7 +2607,6 @@ def add_sw_realtime_dual(x, y):
     sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
 
-    # Return sample weights as a tuple to match outputs order [audio, style]
     sample_weights = (sw_audio, sw_style)
     return inputs, outputs, sample_weights
 
@@ -2541,116 +2660,22 @@ def build_realtime_debug_model(realtime):
         "hf_pre":    realtime.get_layer("realtime_hf_out").output,
         "hf_gated":  realtime.get_layer("realtime_hf_mult_gate").output,
         "hf_scaled": realtime.get_layer("realtime_hf_scale").output,
+        "mask_pred": realtime.get_layer("realtime_hf_mask").output,
+        "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
         "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
         "y_pred":    realtime.get_layer("realtime_with_ir").output,
     }
+    # Optional bypass exports if you added them
+    try:
+        outs["hf_scaled_gate_only"] = realtime.get_layer("realtime_hf_scale_gate_only").output
+    except:
+        pass
+    try:
+        outs["hf_mask_smooth"] = realtime.get_layer("realtime_hf_mask_smooth").output
+    except:
+        pass
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
-
-def _read_pair_segment(path_src, path_tgt, model_sr, offset_sec, sec):
-    file_sr = sf.info(path_src).samplerate
-    start_frames = int(round(offset_sec * file_sr))
-    frames       = int(round(sec * file_sr))
-    x_long,_ = sf.read(path_src, start=start_frames, frames=frames, dtype='float32', always_2d=True)
-    y_long,_ = sf.read(path_tgt, start=start_frames, frames=frames, dtype='float32', always_2d=True)
-    x_src = x_long[:,0]; y_src = y_long[:,0]
-    if file_sr != model_sr:
-        x_mod = resample_to_model_sr(x_src, file_sr, model_sr)
-        y_mod = resample_to_model_sr(y_src, file_sr, model_sr)
-    else:
-        x_mod, y_mod = x_src, y_src
-    return x_mod.astype(np.float32), y_mod.astype(np.float32)
-
-
-def _normalize_to_peak(sig, peak=0.8):
-    m = float(np.max(np.abs(sig)) + 1e-12)
-    return (sig / m) * peak if m > 0 else sig
-
-def _make_sine(sr, n, freq=5000.0):
-    t = np.arange(n, dtype=np.float32) / float(sr)
-    return np.sin(2.0 * np.pi * freq * t).astype(np.float32)
-
-
-def _make_hiss_hp(sr, n, alpha=0.98):
-    # White noise high-passed by pre-emphasis (similar to your HF losses)
-    w = np.random.randn(n).astype(np.float32)
-    y = np.empty_like(w)
-    y[0] = w[0]
-    y[1:] = w[1:] - alpha * w[:-1]
-    # light normalization
-    y = y / (np.std(y) + 1e-6)
-    return 0.5 * y  # conservative level
-
-
-def _render_clicks_from_gate(gate_rel, sr,
-min_separation_ms=12,
-smooth_ms=0.5,          # smooth gate a tiny bit before diff
-hi_percentile=97.0,     # adaptive high threshold from positive slopes
-lo_ratio=0.4,           # hysteresis: low = lo_ratio * high
-restrict_to_when_open=True,  # only click when gate already “somewhat open”
-open_floor=0.20,
-click_len_ms=2.5,
-click_decay=0.97,
-debug=False):
-    g = np.asarray(gate_rel, np.float32)
-    g = np.clip(g, 0.0, 1.0)
-    n = g.size
-    # small smoothing then derivative
-    M = max(1, int(round(sr * (smooth_ms / 1000.0))))
-    if M > 1:
-        kern = np.ones(M, np.float32) / M
-        g_s = np.convolve(g, kern, mode="same")
-    else:
-        g_s = g
-    d = np.diff(g_s, prepend=g_s[0])
-
-    pos = d[d > 0]
-    if pos.size == 0:
-        return np.zeros_like(g, dtype=np.float32)
-
-    hi = max(1e-5, float(np.percentile(pos, hi_percentile)))
-    lo = float(lo_ratio) * hi
-    min_sep = max(1, int(round(sr * (min_separation_ms / 1000.0))))
-
-    # slope-hysteresis state machine
-    events = []
-    armed = True
-    last = -min_sep
-    for i in range(n):
-        if restrict_to_when_open and g[i] < open_floor:
-            # keep arming but don't fire while very closed
-            if d[i] <= lo:
-                armed = True
-            continue
-        if armed:
-            if d[i] >= hi and (i - last) >= min_sep:
-                events.append(i)
-                last = i
-                armed = False
-        else:
-            if d[i] <= lo:
-                armed = True
-
-    # click kernel
-    click_len = max(8, int(round(sr * (click_len_ms / 1000.0))))
-    k = np.zeros(click_len, np.float32)
-    k[0] = 1.0
-    for i in range(1, click_len):
-        k[i] = k[i-1] * click_decay
-
-    out = np.zeros_like(g, np.float32)
-    for e in events:
-        end = min(n, e + click_len)
-        out[e:end] += k[:end - e]
-
-    if debug:
-        print(f"gate_clicks: events={len(events)}, hi={hi:.6g}, lo={lo:.6g}, d_max={pos.max():.6g}")
-
-    # normalize to a safe peak for audibility
-    m = float(np.max(np.abs(out)) + 1e-12)
-    return (out / m * 0.8).astype(np.float32)
-
-
 
 def boost_hf_scale_in_model(model, layer_name, gain_db):
     """
