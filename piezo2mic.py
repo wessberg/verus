@@ -141,7 +141,7 @@ DEBUG               = False
 
 # Batch params
 OFFLINE_BATCH_SIZE          = 4
-REALTIME_BATCH_SIZE         = 32
+REALTIME_BATCH_SIZE         = 12
 FINETUNE_BATCH_SIZE         = 32
 
 # Chunk ratios
@@ -196,7 +196,7 @@ REALTIME_STYLE_BLEND_INIT    = 0.5   # initial blend weight for teacher style in
 REALTIME_STYLE_BLEND_TRAINABLE = False  # set True if you want the blend to be learned
 
 REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ   = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
-REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
+REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_THRESHOLD_DB
 REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
 REALTIME_GATE_ATTACK_MS                  = 0.5
 REALTIME_GATE_HOLD_MS                    = 4.0
@@ -1268,10 +1268,9 @@ def generate_demo_from_files(model,
         resample_margin_ms: extra margin (ms at file SR) around each block to absorb resampler transients.
     """
     os.makedirs(out_dir, exist_ok=True)
-
-    # Keep original offline boost behavior
-    if sample_rate == OFFLINE_SAMPLE_RATE:
-        model = boost_hf_scale_in_model(model, "offline_hf_scale", PICK_BOOST_DB)
+        
+    hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
+    model = boost_hf_scale_in_model(model, hf_scale_layer_name, PICK_BOOST_DB)
 
     # Determine FILE sample-rate and region to render in file-frame domain
     info = sf.info(path_src)
@@ -2446,7 +2445,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         attack_ms=REALTIME_GATE_ATTACK_MS,
         hold_ms=REALTIME_GATE_HOLD_MS,
         release_ms=REALTIME_GATE_RELEASE_MS,
-        cutoff_hz=HP_CUTOFF_HZ,
+        cutoff_hz=REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ,
         hp_order=REALTIME_HF_HP_ORDER,
         env_ms=REALTIME_GATE_ENV_MS,
         depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS,
