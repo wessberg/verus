@@ -2721,12 +2721,7 @@ def audible_gate_debug(debug_model,
                                  style_true_flag=1.0,
                                  block_sec=10.0,
                                  resample_margin_ms=50.0):
-    """
-    Streaming version of audible_gate_debug. Processes the file in blocks with context
-    and writes all debug WAVs incrementally to avoid large allocations.
 
-    For simplicity and robustness, gate_clicks is omitted in this streaming variant.
-    """
     os.makedirs(out_dir, exist_ok=True)
 
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
