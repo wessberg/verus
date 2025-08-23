@@ -254,6 +254,7 @@ REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 REALTIME_IR_ALIGN_OFFSET_CORRECTION = -64
 REALTIME_TOTAL_EXPECTED_IR_DELAY = (REALTIME_IR_FIR_SIZE - 1) + ((REALTIME_IR_FIR_SIZE - 1)//2)
+REALTIME_IR_BOOST_DB = 0.5
 
 coarse_steps = math.ceil((REALTIME_IR_FIR_SIZE - 1) / REALTIME_IR_DOWNSAMPLE_FACTOR)
 IR_PREDELAY = coarse_steps * REALTIME_IR_DOWNSAMPLE_FACTOR
@@ -1273,6 +1274,9 @@ def generate_demo_from_files(model,
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
     pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
     model = boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
+
+    if (sample_rate == REALTIME_SAMPLE_RATE):
+        model = boost_hf_scale_in_model(model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
 
     # Determine FILE sample-rate and region to render in file-frame domain
     info = sf.info(path_src)
@@ -2753,6 +2757,8 @@ def audible_gate_debug(debug_model,
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
     pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
     debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, pick_boost_db)
+    if (sample_rate == REALTIME_SAMPLE_RATE):
+        debug_model = boost_hf_scale_in_model(debug_model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
 
     # Input region in file-sample domain
     info = sf.info(path_src)
