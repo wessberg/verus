@@ -190,7 +190,7 @@ REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
-REALTIME_HF_HP_ORDER            = 129
+REALTIME_HF_HP_ORDER            = 257
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
 REALTIME_STYLE_BLEND_INIT    = 0.5   # initial blend weight for teacher style in the predicted path
 REALTIME_STYLE_BLEND_TRAINABLE = False  # set True if you want the blend to be learned
@@ -2474,8 +2474,8 @@ def build_realtime_model(offline=None, dynamic_time=False):
     
     
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
-    # Tiny causal smoothing to kill zipper/clicks (0.5 ms @ 48k → ~24 taps)
-    mask_smoothed = CausalMovingAverage(taps=24, name="realtime_hf_mask_smooth")(mask_pred)
+    mask_smoothed = CausalMovingAverage(taps=96, name="realtime_hf_mask_smooth")(mask_pred)
+    
     # Safety cap
     mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
 
