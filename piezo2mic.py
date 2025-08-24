@@ -190,10 +190,20 @@ REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
-REALTIME_HF_HP_ORDER          = 813
+REALTIME_HF_HP_ORDER          = OFFLINE_HF_HP_ORDER
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
-REALTIME_STYLE_BLEND_INIT    = 0.5   # initial blend weight for teacher style in the predicted path
-REALTIME_STYLE_BLEND_TRAINABLE = False  # set True if you want the blend to be learned
+
+REALTIME_AUDIO_STFT_DISTILL_ALPHA   = 0.4   # KD weight for STFT KD (teacher audio_ds vs student audio)
+REALTIME_STEM_PICK_DISTILL_ALPHA    = 0.5   # KD weight for pick stem
+REALTIME_STEM_FINGER_DISTILL_ALPHA  = 0.5   # KD weight for finger stem
+REALTIME_STEM_HF_DISTILL_ALPHA      = 0.5   # KD weight for HF stem
+REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (small; avoids cap conflict)
+REALTIME_FEAT_DISTILL_ALPHA         = 1.0
+# Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
+REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 0.3   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
+REALTIME_STYLE_BLEND_INIT           = 0.7
+REALTIME_STYLE_BLEND_TRAINABLE      = True
+REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
 
 REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ   = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
 REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_THRESHOLD_DB
@@ -206,8 +216,7 @@ REALTIME_GATE_DEPTH_SMOOTH_MS            = 6.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
-REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
-REALTIME_FEAT_DISTILL_ALPHA    = 1.0
+
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 
@@ -971,9 +980,11 @@ def rms_env_loss(y_true, y_pred):
     env_diff = tf.reduce_mean(tf.abs(rms_t - rms_p), axis=1)
     return env_diff[:,None,None]
 
+
 @register_keras_serializable()
 def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
-    gate_env = gate_weight(y_true, sample_rate)
+    # Use model-appropriate gate
+    gate_env = gate_weight_dynamic(y_true, sample_rate)
 
     td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)
@@ -1181,20 +1192,28 @@ def _extract_audio_io(model, batch):
     return y_true_audio, y_pred_audio
 
 def analyze_loss_scales_consistent_batch(model, batch, sample_rate):
+    # Extract audio tensors from (x, y, [sw]) batch
     y_true, y_pred = _extract_audio_io(model, batch)
-    gate_env = gate_weight(y_true, sample_rate)
+
+    # Use the model-appropriate gate (offline vs realtime) based on sample_rate
+    gate_env = gate_weight_dynamic(y_true, sample_rate)
 
     l1   = tf.reduce_mean(waveform_l1_loss(y_true, y_pred)).numpy()
     mel  = tf.reduce_mean(log_mel_loss(y_true, y_pred, sample_rate)).numpy()
     env  = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
+
+    # Match CombinedLoss behavior: gate-weighted HF and STFT terms
     hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)).numpy()
     stft_on = tf.reduce_mean(
-        mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                       split_hz=HP_CUTOFF_HZ,
-                                       high_boost=STFT_HIGH_BOOST,
-                                       onset_env=gate_env,
-                                       onset_gain=STFT_HF_ONSET_GAIN)
+        mrstft_mag_loss_weighted_onset(
+            y_true, y_pred, sample_rate,
+            split_hz=HP_CUTOFF_HZ,
+            high_boost=STFT_HIGH_BOOST,
+            onset_env=gate_env,
+            onset_gain=STFT_HF_ONSET_GAIN
+        )
     ).numpy()
+
     return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on}
 
 def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
@@ -1453,15 +1472,52 @@ _ir_fir_up  = tf.constant(_ir_fir_kernel, dtype=tf.float32)  # post-LP (synthesi
 
 # ────────────────────────────── CUSTOM LAYERS ────────────────────────────────
 
+class KDAlphaScheduler(tf.keras.callbacks.Callback):
+    """
+    Linearly anneal alpha variables of KD layers and style blend over epochs.
+    targets: dict of layer_name -> (start_alpha, end_alpha, start_epoch, end_epoch)
+    """
+    def __init__(self, targets):
+        super().__init__()
+        self.targets = targets
+
+    def on_epoch_begin(self, epoch, logs=None):
+        for lname, (a0, a1, e0, e1) in self.targets.items():
+            layer = None
+            try:
+                layer = self.model.get_layer(lname)
+            except:
+                continue
+            if layer is None:
+                continue
+            # progress
+            if epoch <= e0:
+                a = a0
+            elif epoch >= e1:
+                a = a1
+            else:
+                p = (epoch - e0) / max(1, (e1 - e0))
+                a = a0 + (a1 - a0) * p
+            # Set alpha if supported
+            if hasattr(layer, "set_alpha"):
+                layer.set_alpha(a)
+            else:
+                # Style blend: its "alpha" is a trainable weight[0]
+                if lname == "realtime_style_blend":
+                    w = layer.get_weights()
+                    if w and len(w[0].shape) == 1 and w[0].shape[0] == 1:
+                        w[0][0] = float(a)
+                        layer.set_weights(w)
+
 # Proper band-limited decimate-by-2 layer for 1-D sequences (applies same FIR per channel)
 @register_keras_serializable()
 class FIRDecimateBy2(Layer):
-    def __init__(self, num_taps=63, cutoff=0.47, window="hamming", name=None, **kwargs):
+    def __init__(self, num_taps=127, cutoff=0.45, window="blackman", name=None, **kwargs):
         """
-        num_taps: length of the FIR. 63 is a good compromise for decimation-by-2
-        cutoff: normalized (0..1) relative to Nyquist of the input signal.
-                For decimate-by-2, use something like ~0.47 to leave a margin.
-        window: window for firwin.
+        Band-limited decimator-by-2. Tighter LP and more taps reduce aliasing and ripple.
+        - num_taps: 127 (was 63)
+        - cutoff:   0.45 (was 0.47)
+        - window:   blackman (was hamming)
         """
         super().__init__(name=name, **kwargs)
         self.num_taps = int(num_taps)
@@ -1469,29 +1525,22 @@ class FIRDecimateBy2(Layer):
         self.window = str(window)
 
     def build(self, input_shape):
-        # Channels must be known to build a fixed diagonal kernel for tf.nn.conv1d
         c = int(input_shape[-1])
         taps_np = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
-
-        # Build (kernel, in_channels, out_channels) so each channel gets identical FIR, no cross-channel mixing
         W = np.zeros((self.num_taps, c, c), dtype=np.float32)
         for ch in range(c):
             W[:, ch, ch] = taps_np
-
         self.kernel = self.add_weight(
             name="fir_kernel_diag",
             shape=W.shape,
             initializer=tf.keras.initializers.Constant(W),
             trainable=False
         )
-
         super().build(input_shape)
 
     def call(self, x):
-        # Time-pad on the left by (num_taps - 1) to keep output aligned with input's start
         pad = self.num_taps - 1
         x_pad = tf.pad(x, [[0, 0], [pad, 0], [0, 0]])
-        # Stride-by-2 valid convolution = decimation
         y = tf.nn.conv1d(x_pad, filters=self.kernel, stride=2, padding='VALID')
         return y
     
@@ -1499,7 +1548,6 @@ class FIRDecimateBy2(Layer):
         b, t, c = input_shape
         if t is None:
             return (b, None, c)
-        # With left pad of (num_taps - 1) and VALID conv, output length is floor(t/2)
         out_t = t // 2
         return (b, out_t, c)
 
@@ -1749,25 +1797,204 @@ class CausalMovingAverage(Layer):
         return cfg
 
 @register_keras_serializable()
-class DistillLoss(Layer):
+class AdjustableAlphaMixin:
+    def build_alpha(self, init_alpha, name="alpha"):
+        self.alpha_var = self.add_weight(
+            name=name,
+            shape=(),
+            initializer=tf.keras.initializers.Constant(float(init_alpha)),
+            trainable=False
+        )
+    def set_alpha(self, new_alpha):
+        self.alpha_var.assign(float(new_alpha))
+    def get_config(self):
+        return {}
+
+@register_keras_serializable()
+class DistillLoss(Layer, AdjustableAlphaMixin):
     def __init__(self, alpha, **kwargs):
         super().__init__(**kwargs)
-        self.alpha = float(alpha)
+        self.init_alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
 
     def call(self, inputs):
         y_t, y_s = inputs
-        # Align time dimension to the minimum length to avoid shape mismatches
         t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
         y_t_trim = y_t[:, :t, :]
         y_s_trim = y_s[:, :t, :]
         loss = tf.reduce_mean(tf.math.squared_difference(y_t_trim, y_s_trim))
-        self.add_loss(self.alpha * loss)
-        # Return the student unchanged so we don't alter the forward graph
+        self.add_loss(self.alpha_var * loss)
         return y_s
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update({'alpha': self.alpha})
+        cfg.update({'alpha': float(self.init_alpha)})
+        return cfg
+
+@register_keras_serializable()
+class DistillLossBestShift(Layer, AdjustableAlphaMixin):
+    """
+    Shift-aware MSE KD: finds best integer shift for teacher within ±max_shift samples.
+    Training-only loss; returns the student unchanged.
+    """
+    def __init__(self, alpha, max_shift=8, **kwargs):
+        super().__init__(**kwargs)
+        self.init_alpha = float(alpha)
+        self.max_shift = int(max_shift)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def _shift(self, x, s):
+        # x: (B,T,C), s: scalar int32 Tensor
+        T = tf.shape(x)[1]
+        def shift_right():
+            pad = tf.zeros_like(x[:, :s, :])
+            return tf.concat([x[:, s:, :], pad], axis=1)
+        def shift_left():
+            s_abs = -s
+            pad = tf.zeros_like(x[:, :s_abs, :])
+            return tf.concat([pad, x[:, :T - s_abs, :]], axis=1)
+        def no_shift():
+            return x
+        return tf.case(
+            [(tf.greater(s, 0), shift_right),
+             (tf.less(s, 0), shift_left)],
+            default=no_shift
+        )
+
+    def call(self, inputs):
+        y_t, y_s = inputs
+        t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
+        y_t = y_t[:, :t, :]
+        y_s = y_s[:, :t, :]
+
+        shifts = tf.range(-self.max_shift, self.max_shift + 1, dtype=tf.int32)
+
+        def loss_for_shift(s):
+            y_t_s = self._shift(y_t, s)
+            return tf.reduce_mean(tf.math.squared_difference(y_t_s, y_s))
+
+        # Use fn_output_signature instead of deprecated dtype=
+        losses = tf.map_fn(loss_for_shift, shifts, fn_output_signature=tf.float32)
+        best = tf.reduce_min(losses)
+        self.add_loss(self.alpha_var * best)
+        return y_s
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'alpha': float(self.init_alpha), 'max_shift': self.max_shift})
+        return cfg
+
+@register_keras_serializable()
+class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
+    """
+    Multi-scale STFT magnitude L1 KD (training-only).
+    """
+    def __init__(self, alpha, **kwargs):
+        super().__init__(**kwargs)
+        self.init_alpha = float(alpha)
+        self.scales = [
+            (128,   32,  128),
+            (256,   64,  256),
+            (512,  128,  512),
+            (1024, 256, 1024),
+            (2048, 512, 2048),
+        ]
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs):
+        y_t, y_s = inputs  # (B,T,1)
+        t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
+        t_true = tf.squeeze(y_t[:, :t, :], -1)
+        t_pred = tf.squeeze(y_s[:, :t, :], -1)
+
+        per_scale = []
+        for n_fft, hop, win in self.scales:
+            st_t = tf.signal.stft(
+                t_true,
+                frame_length=win,
+                frame_step=hop,
+                fft_length=n_fft,
+                window_fn=tf.signal.hann_window,  # accepts dtype kwarg
+                pad_end=True
+            )
+            st_p = tf.signal.stft(
+                t_pred,
+                frame_length=win,
+                frame_step=hop,
+                fft_length=n_fft,
+                window_fn=tf.signal.hann_window,
+                pad_end=True
+            )
+            mag_t = tf.abs(st_t)
+            mag_p = tf.abs(st_p)
+            per_scale.append(tf.reduce_mean(tf.abs(mag_t - mag_p)))
+
+        loss = tf.add_n(per_scale) / float(len(self.scales))
+        self.add_loss(self.alpha_var * loss)
+        return y_s
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({'alpha': float(self.init_alpha)})
+        return cfg
+    
+def _make_lpf_kernel(sample_rate, cutoff_hz=2800.0, order=129, window="hamming"):
+    taps = firwin(order, cutoff_hz / (sample_rate / 2.0), window=window, pass_zero=True).astype(np.float32)
+    taps = taps / np.sum(taps + 1e-12)
+    # reverse for tf.nn.conv1d cross-correlation
+    return tf.constant(taps[::-1].reshape(-1, 1, 1), dtype=tf.float32)
+
+@register_keras_serializable()
+class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
+    """
+    Penalize low-band energy in the student's HF branch: L1(LPF(hf_final)).
+    Returns input unchanged; training-only constraint.
+    """
+    def __init__(self, alpha, cutoff_hz=2800.0, order=129, sample_rate=REALTIME_SAMPLE_RATE, window="hamming", **kwargs):
+        super().__init__(**kwargs)
+        self.init_alpha = float(alpha)
+        self.cutoff_hz = float(cutoff_hz)
+        self.order = int(order)
+        self.sample_rate = int(sample_rate)
+        self.window = str(window)
+
+    def build(self, input_shape):
+        k = _make_lpf_kernel(self.sample_rate, self.cutoff_hz, self.order, self.window)
+        self.kernel = self.add_weight(
+            name="lp_taps_for_penalty",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, x):
+        pad = tf.shape(self.kernel)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        lp = tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+        loss = tf.reduce_mean(tf.abs(lp))
+        self.add_loss(self.alpha_var * loss)
+        return x
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            'alpha': float(self.init_alpha),
+            'cutoff_hz': self.cutoff_hz,
+            'order': self.order,
+            'sample_rate': self.sample_rate,
+            'window': self.window
+        })
         return cfg
 
 @register_keras_serializable()
@@ -2021,13 +2248,11 @@ class Gate(tf.keras.layers.Layer):
         return cfg
 
 
-# Gate weight for losses (computed from y_true).
-# Reuses the same scan-free implementation.
 @register_keras_serializable()
-def gate_weight(y_true, sample_rate):
+def gate_weight_offline(y_true):
     return gate_gain_signal(
         y_true,
-        sample_rate=sample_rate,
+        sample_rate=OFFLINE_SAMPLE_RATE,
         threshold_db=OFFLINE_GATE_THRESHOLD_DB,
         ratio=OFFLINE_GATE_RATIO,
         attack_ms=OFFLINE_GATE_ATTACK_MS,
@@ -2035,6 +2260,30 @@ def gate_weight(y_true, sample_rate):
         release_ms=OFFLINE_GATE_RELEASE_MS,
         cutoff_hz=OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
     )
+
+@register_keras_serializable()
+def gate_weight_realtime(y_true):
+    return gate_gain_signal(
+        y_true,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        threshold_db=REALTIME_GATE_THRESHOLD_DB,
+        ratio=REALTIME_GATE_RATIO,
+        attack_ms=REALTIME_GATE_ATTACK_MS,
+        hold_ms=REALTIME_GATE_HOLD_MS,
+        release_ms=REALTIME_GATE_RELEASE_MS,
+        cutoff_hz=REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ
+    )
+
+@register_keras_serializable()
+def gate_weight_dynamic(y_true, sample_rate):
+    sr = int(sample_rate)
+    if sr == OFFLINE_SAMPLE_RATE:
+        return gate_weight_offline(y_true)
+    elif sr == REALTIME_SAMPLE_RATE:
+        return gate_weight_realtime(y_true)
+    else:
+        # default to realtime params if an unknown SR is used
+        return gate_weight_realtime(y_true)
 
 # Slice helpers
 @register_keras_serializable()
@@ -2333,43 +2582,34 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
     ratio = t_hf_pred / (t_hf_true + 1e-12)
     print(f"Avg |STFT| > {HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
 
-# Replace your entire build_realtime_model() with this version (no anonymous Lambdas)
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
-    # Extra offline input only when distilling (teacher runs at 96 kHz)
     offline_inp = None
     if offline is not None:
         offline_inp = Input(shape=(None,1), name="offline_piezo_input")
 
-    # The known, true style of the input (may or may not be known)
     style_true_in  = Input(shape=(1,), name="realtime_style_true_input")
-    style_force_in = Input(shape=(1,), name="realtime_style_force_input")  # 0=predict, 1=ground-truth
+    style_force_in = Input(shape=(1,), name="realtime_style_force_input")
 
-    # Style head (realtime side)
+    # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
     style_logit = Dense(1, name="realtime_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
 
-    # If a teacher is provided, get the teacher style prob and distill it to the student.
-    # Also use a convex blend (teacher vs student) for the predicted path.
-    style_pred_source = style_prob  # default = student
+    style_pred_source = style_prob
     if offline is not None:
         teacher = offline
         teacher.trainable = False
-
-        # Get teacher style prob (and audio) in one pass
         offline_audio, offline_style_prob = teacher([offline_inp, style_true_in, style_force_in])
 
-        # Distill the style probability (reshape to 3D so DistillLoss can slice [:,:,:])
         style_prob_3d          = Reshape((1,1), name="realtime_style_prob_3d")(style_prob)
         offline_style_prob_3d  = Reshape((1,1), name="offline_style_prob_3d")(offline_style_prob)
         _ = DistillLoss(alpha=REALTIME_STYLE_DISTILL_ALPHA, name="style_prob_distill")([offline_style_prob_3d, style_prob_3d])
 
-        # Use a fixed (or trainable) blend for the predicted path during training
         style_pred_source = BlendScalar(
             init_alpha=REALTIME_STYLE_BLEND_INIT,
             trainable=REALTIME_STYLE_BLEND_TRAINABLE,
@@ -2377,7 +2617,6 @@ def build_realtime_model(offline=None, dynamic_time=False):
         )([style_prob, offline_style_prob])
 
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
-    # Use blended style prediction in the predicted path if teacher available
     style_used_scalar = Add(name="realtime_style_used_scalar")([
         Multiply(name="realtime_style_pred_part")([one_minus_force, style_pred_source]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
@@ -2407,12 +2646,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
         x   = Add(name=f"realtime_res_add_{i}")([x, res])
         x   = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}")
 
-        # Keep track of realtime features that correspond to offline layers
         offline_feat_name = f"offline_dil_{i}_film_apply"
         if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
             realtime_feats.append(x)
 
-    # Style-gated pick/finger blend
+    # Style-gated pick/finger blend (raw stems then style gating)
     out_pick   = Conv1D(1,1,padding="same", name="realtime_final_pick")(x)
     out_finger = Conv1D(1,1,padding="same", name="realtime_final_finger")(x)
     inv_style  = InvertStyle(name="realtime_invert_style")(style_time_used)
@@ -2471,12 +2709,8 @@ def build_realtime_model(offline=None, dynamic_time=False):
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
-    
-    
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
     mask_smoothed = CausalMovingAverage(taps=96, name="realtime_hf_mask_smooth")(mask_pred)
-    
-    # Safety cap
     mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
 
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
@@ -2486,11 +2720,22 @@ def build_realtime_model(offline=None, dynamic_time=False):
                       name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
+    # Training-only constraint (no runtime cost): penalize LF content in hf_final
+    hf_final = HFLowbandPenalty(
+        alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
+        cutoff_hz=2800.0,
+        order=129,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_hf_lowband_penalty"
+    )(hf_final)
+
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
     # ─── Distillation (teacher must be causal here) ────────────────────────────
     if offline is not None:
-        # Teacher feature model (96 kHz): selected layers + gate
+        # Teacher feature model
+        T_outs = []
+        T_gate = None
         if REALTIME_OFFLINE_FEAT_LAYERS:
             offline_feat_model = tf.keras.models.Model(
                 inputs=teacher.inputs,
@@ -2502,24 +2747,44 @@ def build_realtime_model(offline=None, dynamic_time=False):
                 T_outs = [T_outs]
             T_feats = T_outs[:-1]
             T_gate  = T_outs[-1]
+        else:
+            T_gate = teacher.get_layer("offline_gate").output
 
-            # Downsample teacher features and gate to 48 kHz
-            T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_feats)]
-            T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
+        # Downsample teacher features/gate
+        T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_outs[:-1])] if T_outs else []
+        T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
 
-            # KD for features
-            for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
-                chan = int(T_f_ds.shape[-1])
-                proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
-                _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_ds, proj])
+        # KD for features
+        for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
+            chan = int(T_f_ds.shape[-1])
+            proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
+            _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_ds, proj])
 
-            # KD for HF mask envelope: teacher gate (96k→48k) vs student mask_pred
-            _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_ds, mask_pred])
+        # KD for HF mask: teacher gate (96k→48k) vs student mask_pred
+        _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_ds, mask_pred])
+        # Optional: also KD on mask_used to avoid fighting the cap
+        _ = DistillLoss(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, name="mask_used_distill")([T_gate_ds, mask_used])
 
-        # KD for teacher audio (96k→48k) vs student audio
-        # offline_audio already computed above
+        # KD for teacher audio (96k→48k) vs student audio: shift-aware + STFT
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        _ = DistillLoss(alpha=REALTIME_DISTILL_ALPHA, name="audio_distill")([offline_audio_ds, y_realtime])
+        _ = DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime])
+        _ = MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime])
+
+        # KD for stems: pick/finger/HF
+        offline_pick   = teacher.get_layer("offline_final_pick").output
+        offline_finger = teacher.get_layer("offline_final_finger").output
+        offline_hf_scaled = teacher.get_layer("offline_hf_scale").output  # post-HPF + scale at 96k
+
+        offline_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(offline_pick)
+        offline_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(offline_finger)
+        offline_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(offline_hf_scaled)
+
+        # KD with shift-aware MSE for pick/finger stems
+        _ = DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA, max_shift=8, name="stem_pick_distill")([offline_pick_ds, out_pick])
+        _ = DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([offline_finger_ds, out_finger])
+
+        # KD for HF stem (simple MSE; already high-passed on both sides)
+        _ = DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([offline_hf_ds, hf_final])
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
@@ -2700,9 +2965,6 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
 
 # Retune the offline Gate inside an already-trained offline model and save it.
 
-import os
-import tensorflow as tf
-
 def retune_offline_gate_inplace(
     model,
     threshold_db=None,
@@ -2713,12 +2975,6 @@ def retune_offline_gate_inplace(
     cutoff_hz=None,
     hp_order=None
 ):
-    """
-    Loads the saved offline model, updates the 'offline_gate' layer parameters
-    (threshold/ratio/attack/hold/release/cutoff/hp_order), and saves the result.
-
-    Only the Gate layer's attributes are changed; no weights are touched.
-    """
     m = model
     g = m.get_layer("offline_gate")
 
@@ -3065,13 +3321,34 @@ def train_shared(
     )
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
 
+    cbs = [es, cp, reduce_lr, terminate_on_nan, tb, demo_cb]
+
+    if kind == 'realtime':
+        kd_targets = {
+            # audio KD
+            "audio_distill":       (REALTIME_DISTILL_ALPHA,        2.0,  0,  80),   # 8→2 example if you set REALTIME_DISTILL_ALPHA=8; adjust as needed
+            "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA, 0.2,  0,  80),
+            # feature/stem KD
+            "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
+            "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
+            "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,   0.2,  0,  80),
+            "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA, 0.2,  0,  80),
+            "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,     0.2,  0,  80),
+            # mask/gate KD
+            "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,     1.0,  0,  80),
+            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,   0.1,  0,  80),
+            # style blend schedule (not a KD layer, but exposes a scalar weight)
+            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,       0.3,  0, 100),
+        }
+        cbs.append(KDAlphaScheduler(kd_targets))
+
     static_model.fit(train_ds,
                      initial_epoch=initial_epoch,
                      epochs=1 if DEBUG else EPOCHS,
                      steps_per_epoch=steps_per_epoch,
                      validation_data=val_ds,
                      validation_steps=validation_steps,
-                     callbacks=[es, cp, reduce_lr, terminate_on_nan, tb, demo_cb])
+                     callbacks=cbs)
 
     static_model.save(static_model_filepath)
     print("✅ Saved FP32 static model:", static_model_filepath)
@@ -3291,7 +3568,8 @@ def fine_tune():
     dsS = make_mixed_ds(REALTIME_SEG_LEN)
     dsS = dsS.map(add_sw_realtime_finetune_nf)
     ft_chunks_T = build_chunks(pairs_list=[(src, tgt)], seg_len=REALTIME_SEG_LEN, sample_rate=FINETUNE_SAMPLE_RATE)
-    stepsS = max(approx_steps_from_chunks(ft_chunks_T, REALTIME_SEG_LEN, FINETUNE_SAMPLE_RATE), 1)
+
+    stepsS = max(approx_steps_from_chunks(ft_chunks_T, REALTIME_SEG_LEN, FINETUNE_SAMPLE_RATE, FINETUNE_BATCH_SIZE), 1)
     print("Finetune realtime model summary:")
     finetuned_realtime_small.summary()
     finetuned_realtime_small.fit(dsS, epochs=FINETUNE_REALTIME_EPOCHS, steps_per_epoch=stepsS, verbose=1)
