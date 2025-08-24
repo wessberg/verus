@@ -190,7 +190,7 @@ REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
-REALTIME_HF_HP_ORDER            = 257
+REALTIME_HF_HP_ORDER          = 513
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
 REALTIME_STYLE_BLEND_INIT    = 0.5   # initial blend weight for teacher style in the predicted path
 REALTIME_STYLE_BLEND_TRAINABLE = False  # set True if you want the blend to be learned
@@ -3440,6 +3440,7 @@ def main ():
             ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
             
             if ckpts:
+                print("Loading latest checkpoint:", ckpts[-1])
                 static = tf.keras.models.load_model(ckpts[-1], compile=False)
                 offline_dyn = build_offline_model(dynamic_time=True)
                 offline_dyn.set_weights(static.get_weights())
@@ -3475,6 +3476,7 @@ def main ():
         else:
             ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
             if ckpts:
+                print("Loading latest checkpoint:", ckpts[-1])
                 static = tf.keras.models.load_model(ckpts[-1], compile=False)
                 realtime_dyn = build_realtime_model(dynamic_time=True)
                 copy_weights_by_name(realtime_dyn, static)
