@@ -2814,13 +2814,21 @@ def build_realtime_model(offline=None, dynamic_time=False):
         offline_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(offline_pick)
         offline_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(offline_finger)
         offline_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(offline_hf_scaled)
+        
+        # Band-match the teacher HF KD target to the student's band by re-HPF at 48 kHz, 3 kHz
+        offline_hf_ds_hp48 = HFHighpass(
+            sample_rate=REALTIME_SAMPLE_RATE,
+            cutoff_hz=HP_CUTOFF_HZ,
+            order=REALTIME_HF_HP_ORDER,
+            name="offline_hf_ds_hp48"
+        )(offline_hf_ds)
 
         # KD with shift-aware MSE for pick/finger stems
-        _ = DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA, max_shift=8, name="stem_pick_distill")([offline_pick_ds, out_pick])
+        _ = DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([offline_pick_ds,   out_pick])
         _ = DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([offline_finger_ds, out_finger])
 
-        # KD for HF stem (simple MSE; already high-passed on both sides)
-        _ = DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([offline_hf_ds, hf_final])
+        # HF stem KD: use the 48 kHz, 3 kHz high-pass matched target
+        _ = DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([offline_hf_ds_hp48, hf_final])
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
