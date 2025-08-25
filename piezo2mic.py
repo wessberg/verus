@@ -1416,17 +1416,26 @@ class ResizeNearest1D(tf.keras.layers.Layer):
     def __init__(self, factor, **kwargs):
         super().__init__(**kwargs)
         self.factor = int(factor)
+
     def call(self, x):
-        # x: (B,T,C) -> (B,T*factor,C)
+        # x: (B,T,C) -> (B, T*factor, C)
+        # Deterministic nearest upsample via reshape + tile (no tf.image.resize)
+        b = tf.shape(x)[0]
         t = tf.shape(x)[1]
-        x4 = tf.expand_dims(x, axis=2)  # (B,T,1,C)
-        y4 = tf.image.resize(x4, size=[t * self.factor, 1], method='nearest', antialias=False)
-        return tf.squeeze(y4, axis=2)
+        c = tf.shape(x)[2]
+
+        # Insert a singleton axis then tile along it
+        x4 = tf.reshape(x, [b, t, 1, c])
+        y4 = tf.tile(x4, [1, 1, self.factor, 1])
+        y  = tf.reshape(y4, [b, t * self.factor, c])
+        return y
+
     def compute_output_shape(self, s):
         b, t, c = s
         return (b, None if t is None else t * self.factor, c)
+
     def get_config(self):
-        return {'factor': self.factor}
+        return {'factor': self.factor, **super().get_config()}
 
 @register_keras_serializable()
 class MatchTimeToRef(Layer):
