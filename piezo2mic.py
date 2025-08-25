@@ -26,7 +26,7 @@ Two models are trained in a teacher-student setup:
   The static realtime model distills based on the offline model's layers, while the dynamic realtime model is fully self-contained and explicitly copies over the weights from the offline model's layers to its own (rather than using set_weights, which would cause issues).
   This model is meant for real-time applications, where low latency is critical, such as live performance or real-time monitoring. It is small enough to run on embedded, low-power devices.
   
-It is designed to be optimized for TFLite conversion and run the realtime models on embedded, low-powered devices. All operations must support efficient conversion to that platform.
+It is designed to be optimized for TFLite conversion and run the realtime models on embedded, low-powered ARM microcontrollers. All operations must support efficient conversion to that platform, including full support for INT8 quantization and pruning.
   
 ================================
 INPUT DATA
@@ -99,12 +99,14 @@ import tensorflow as tf
 from scipy.signal import minimum_phase, firwin, resample_poly
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable # pyright: ignore[reportMissingImports]
-from tensorflow.keras.callbacks import TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau, TerminateOnNaN # pyright: ignore[reportMissingImports]
-from tensorflow.keras import regularizers, constraints # pyright: ignore[reportMissingImports]
-from tensorflow.keras.losses import Loss # pyright: ignore[reportMissingImports]
+from tensorflow.keras.callbacks import ( # pyright: ignore[reportMissingImports]
+    TensorBoard, EarlyStopping, ModelCheckpoint, Callback, ReduceLROnPlateau, TerminateOnNaN
+)
+from tensorflow.keras import regularizers, constraints  # pyright: ignore[reportMissingImports]
+from tensorflow.keras.losses import Loss  # pyright: ignore[reportMissingImports]
 from tensorflow.keras.layers import (  # pyright: ignore[reportMissingImports]
     Input, Conv1D, SeparableConv1D, ZeroPadding1D, GlobalAveragePooling1D,
-    Activation, Multiply, Add, Lambda, Dense, Layer, UpSampling1D, Reshape, Minimum
+    Activation, Multiply, Add, Lambda, Dense, Layer, Reshape, Minimum
 )
 
 # Determinism
@@ -125,13 +127,6 @@ FINETUNE_SAMPLE_RATE = 48000
 
 #INPUT_AVG_RMS_DBFS_TARGET = -23.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
-
-# Alignment (piezo→mic) settings
-ALIGN_ENABLE            = False
-ALIGN_MAX_MS            = 5.0     # search range ± this many ms
-ALIGN_PREEMPH_ALPHA     = 0.98    # emphasize HF before GCC-PHAT
-ALIGN_WIN_SEC           = 1.0     # seconds used for alignment estimation
-ALIGN_USE_FRACTIONAL    = True    # apply sub-sample shift via FFT phase ramp
 
 # NORMALIZED_PREFIX = "_normalized_"
 # WRITE_NORMALIZED_TO_DISK = True
@@ -213,8 +208,8 @@ REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
 REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 6.0
-REALTIME_GATE_ENV_MS                     = OFFLINE_GATE_ENV_MS
-REALTIME_GATE_DEPTH_SMOOTH_MS            = 4.0
+REALTIME_GATE_ENV_MS                     = 0.05
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 20.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
@@ -226,7 +221,7 @@ OFFLINE_RESO_LENGTH           = 257     # causal FIR length per mode
 OFFLINE_RESO_CENTERS_HZ       = [240, 320, 420, 540, 700, 900, 1150, 1450, 1800, 2250, 2800, 3400, 4100, 4900, 5800, 6800]
 OFFLINE_RESO_DECAYS_MS        = [70, 65, 60, 55, 50, 45, 40, 38, 35, 32, 30, 28, 26, 24, 22, 20]
 OFFLINE_RESO_STRIKE_GAIN      = 3.0
-OFFLINE_RESO_BOOST_DB  = 0.0
+OFFLINE_RESO_BOOST_DB         = 0.0
 
 REALTIME_RESO_ENABLE          = True
 REALTIME_RESO_MODES           = 12
@@ -234,9 +229,7 @@ REALTIME_RESO_LENGTH          = 97
 REALTIME_RESO_CENTERS_HZ      = [280, 360, 460, 600, 780, 1000, 1300, 1700, 2200, 2900, 3600, 4300]
 REALTIME_RESO_DECAYS_MS       = [60, 55, 50, 45, 40, 35, 32, 28, 25, 22, 20, 18]
 REALTIME_RESO_STRIKE_GAIN     = 2.5
-REALTIME_RESO_BOOST_DB = 0.0
-
-
+REALTIME_RESO_BOOST_DB        = 0.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
@@ -257,7 +250,6 @@ FINETUNE_DEMO_OFFSET_SEC = 0
 HP_CUTOFF_HZ   = 3000.0
 GATE_DEBUG_TONE_MULT = 1.0
 
-HP_PRE_EMPHASIS           = 0.8
 HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
 STFT_HIGH_BOOST           = 32.0
@@ -282,12 +274,7 @@ REALTIME_IR_FIR_SIZE          = 129
 REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
-REALTIME_IR_ALIGN_OFFSET_CORRECTION = -64
-REALTIME_TOTAL_EXPECTED_IR_DELAY = (REALTIME_IR_FIR_SIZE - 1) + ((REALTIME_IR_FIR_SIZE - 1)//2)
-REALTIME_IR_BOOST_DB = 0.5
-
-coarse_steps = math.ceil((REALTIME_IR_FIR_SIZE - 1) / REALTIME_IR_DOWNSAMPLE_FACTOR)
-IR_PREDELAY = coarse_steps * REALTIME_IR_DOWNSAMPLE_FACTOR
+REALTIME_IR_BOOST_DB = 0.0
 
 REALTIME_LP_ORDER   = 65
 REALTIME_LP_CUTOFF  = 4000
@@ -298,7 +285,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_BOOST_DB = 24
+OFFLINE_PICK_BOOST_DB = 22
 REALTIME_PICK_BOOST_DB = 8
 
 SHUFFLE_BUF         = 1000
@@ -349,108 +336,34 @@ DEMO_CHECKPOINTS_REALTIME_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "real
 
 SAVE_WEIGHTS           = False
 
-realtime_lp_taps_np = firwin(REALTIME_LP_ORDER,
-                     cutoff=REALTIME_LP_CUTOFF/(REALTIME_SAMPLE_RATE/2),
-                     window="hamming",
-                     pass_zero=True).astype(np.float32)
-realtime_lp_taps_tf = tf.constant(realtime_lp_taps_np.reshape(-1,1,1), dtype=tf.float32)
+# ─── Minimum‑phase IR low‑pass taps for the realtime IR branch ──────────────
 
-offline_hp_taps_np = firwin(
-    OFFLINE_HF_HP_ORDER,
-    cutoff=HP_CUTOFF_HZ/(OFFLINE_SAMPLE_RATE/2.0),
-    window="hamming",
-    pass_zero=False  # high-pass
-).astype(np.float32)
+def make_minphase_lp_kernel(order=REALTIME_LP_ORDER,
+                            cutoff_hz=REALTIME_LP_CUTOFF,
+                            sr=REALTIME_SAMPLE_RATE,
+                            window="hamming"):
+    # Linear-phase prototype
+    taps_lin = firwin(order,
+                      cutoff=cutoff_hz/(sr/2.0),
+                      window=window,
+                      pass_zero=True).astype(np.float32)
+    # Convert to minimum-phase
+    taps_min = minimum_phase(taps_lin, method="homomorphic").astype(np.float32)
+    # Preserve DC gain
+    taps_min /= (np.sum(taps_min) + 1e-12)
+    # Reverse for tf.nn.conv1d (cross-correlation) to implement causal convolution
+    return tf.constant(taps_min[::-1].reshape(-1, 1, 1), dtype=tf.float32)
 
-offline_hp_min = minimum_phase(offline_hp_taps_np, method='homomorphic').astype(np.float32)
-offline_hp_kernel = offline_hp_min[::-1].reshape(-1,1,1).astype(np.float32)  # reverse for conv1d
-offline_hf_hp_taps_tf = tf.constant(offline_hp_kernel, dtype=tf.float32)
-
+# Use this kernel as the default for IRLowpass
+realtime_lp_taps_tf = make_minphase_lp_kernel()
 
 for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR, LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR, DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR]:
     os.makedirs(dir_path, exist_ok=True)
-
-# ────────────────────────────── UTILITIES ───────────────────────────────────
-
-# # Replace your existing write_normalized_pair helper with this more robust version
-
-# def _prefixed_path(path, prefix=NORMALIZED_PREFIX):
-#     folder, name = os.path.split(path)
-#     return os.path.join(folder, f"{prefix}{name}")
-
-# def _try_sf_write(path, data, sr, subtype="FLOAT", fmt="WAV"):
-#     """
-#     Safer wrapper around sf.write with common pitfalls handled.
-#     Returns None on success, or the Exception instance on failure.
-#     """
-#     try:
-#         # Ensure correct shape and dtype for libsndfile
-#         if data.ndim == 1:
-#             data = data[:, None]
-#         data = np.ascontiguousarray(data.astype(np.float32, copy=False))
-#         os.makedirs(os.path.dirname(path), exist_ok=True)
-#         sf.write(path, data, int(sr), subtype=subtype, format=fmt)
-#         return None
-#     except Exception as e:
-#         return e
-
-# def write_normalized_pair(src_path, tgt_path, data_src, data_tgt, samplerate, prefix=NORMALIZED_PREFIX):
-#     """
-#     Write normalized (and optionally aligned) source/target audio to disk
-#     in the same folder as the originals, with a filename prefix.
-#     Falls back to OUT_DIR/normalized/<original_subdirs> if writing into the
-#     input folders fails (e.g., read-only datasets).
-#     """
-#     out_src = _prefixed_path(src_path, prefix)
-#     out_tgt = _prefixed_path(tgt_path, prefix)
-
-#     err_src = _try_sf_write(out_src, data_src, samplerate, subtype="FLOAT", fmt="WAV")
-#     err_tgt = _try_sf_write(out_tgt, data_tgt, samplerate, subtype="FLOAT", fmt="WAV")
-
-#     if err_src is None and err_tgt is None:
-#         if DEBUG:
-#             print(f"[NORMALIZE] Wrote normalized files:\n  {out_src}\n  {out_tgt}")
-#         return
-
-#     # Fallback: mirror under OUT_DIR/normalized/<relative_path_to_input>
-#     # This keeps the directory structure and still produces usable files
-#     fb_base = os.path.join(OUT_DIR, "normalized")
-#     rel_src_dir = os.path.relpath(os.path.dirname(src_path), start=".")
-#     rel_tgt_dir = os.path.relpath(os.path.dirname(tgt_path), start=".")
-#     fb_src_dir = os.path.join(fb_base, rel_src_dir)
-#     fb_tgt_dir = os.path.join(fb_base, rel_tgt_dir)
-#     os.makedirs(fb_src_dir, exist_ok=True)
-#     os.makedirs(fb_tgt_dir, exist_ok=True)
-#     fb_src = os.path.join(fb_src_dir, os.path.basename(out_src))
-#     fb_tgt = os.path.join(fb_tgt_dir, os.path.basename(out_tgt))
-
-#     fb_err_src = None
-#     fb_err_tgt = None
-#     #if err_src is not None:
-#         #fb_err_src = _try_sf_write(fb_src, data_src, samplerate, subtype="FLOAT", fmt="WAV")
-#     if err_tgt is not None:
-#         fb_err_tgt = _try_sf_write(fb_tgt, data_tgt, samplerate, subtype="FLOAT", fmt="WAV")
-
-#     msgs = []
-#     if err_src is not None:
-#         msgs.append(f"src→{out_src} ({err_src}) → fallback {fb_src} "
-#                     f"{'OK' if fb_err_src is None else 'FAIL: '+str(fb_err_src)}")
-#     if err_tgt is not None:
-#         msgs.append(f"tgt→{out_tgt} ({err_tgt}) → fallback {fb_tgt} "
-#                     f"{'OK' if fb_err_tgt is None else 'FAIL: '+str(fb_err_tgt)}")
-
-#     print("[NORMALIZE] Could not write to input folders. " + " | ".join(msgs))
 
 def _extract_epoch_from_ckpt(path):
     fn = os.path.basename(path)
     m = re.search(r'epoch_(\d+)', fn)
     return int(m.group(1)) if m else 0
-
-def pre_emphasis_np(x, α=0.98):
-    y = np.empty_like(x)
-    y[0] = x[0]
-    y[1:] = x[1:] - α * x[:-1]
-    return y
 
 def gate_debug_tone_freq(sample_rate, cutoff_hz, mult=GATE_DEBUG_TONE_MULT):
     """
@@ -464,86 +377,6 @@ def gate_debug_tone_freq(sample_rate, cutoff_hz, mult=GATE_DEBUG_TONE_MULT):
     if freq > nyq_guard:
         freq = nyq_guard
     return freq
-
-def next_pow2(n):
-    return 1<<(int(n-1).bit_length())
-
-def gcc_phat_delay(sig, ref, sr, max_ms=5.0):
-    """
-    Estimate delay (in samples) where 'ref' lags 'sig' by GCC-PHAT.
-    Positive return means ref occurs later (so ref should be advanced).
-    """
-    n = len(sig)
-    m = len(ref)
-    L = min(n, m)
-    sig = sig[:L]
-    ref = ref[:L]
-
-    sig = pre_emphasis_np(sig, ALIGN_PREEMPH_ALPHA)
-    ref = pre_emphasis_np(ref, ALIGN_PREEMPH_ALPHA)
-
-    nfft = int(2 ** np.ceil(np.log2(2*L - 1)))
-    SIG = np.fft.rfft(sig, nfft)
-    REF = np.fft.rfft(ref, nfft)
-    R = SIG * np.conj(REF)
-    denom = np.abs(R) + 1e-12
-    R /= denom
-
-    cc = np.fft.irfft(R, nfft)
-    cc = np.concatenate((cc[-(nfft//2):], cc[:(nfft//2)]))
-    lags = np.arange(-nfft//2, nfft//2)
-
-    max_lag = int(sr * max_ms / 1000.0)
-    mask = (lags >= -max_lag) & (lags <= max_lag)
-    cc_sel = cc[mask]
-    lags_sel = lags[mask]
-    k = np.argmax(np.abs(cc_sel))
-    delay = lags_sel[k]
-
-    if 1 <= k < len(cc_sel)-1:
-        y0, y1, y2 = cc_sel[k-1], cc_sel[k], cc_sel[k+1]
-        denom2 = (y0 - 2*y1 + y2)
-        if np.abs(denom2) > 1e-12:
-            peak_adj = 0.5*(y0 - y2)/denom2
-            delay = delay + peak_adj
-
-    return float(delay)
-
-def shift_signal_int(sig, shift):
-    """
-    Shift 1-D signal by integer samples. Positive shift advances (moves earlier).
-    """
-    L = sig.shape[0]
-    s = int(np.round(shift))
-    if s > 0:
-        out = np.empty_like(sig)
-        out[:-s] = sig[s:]
-        out[-s:] = 0.0
-        return out
-    elif s < 0:
-        s = -s
-        out = np.empty_like(sig)
-        out[s:] = sig[:-s]
-        out[:s] = 0.0
-        return out
-    else:
-        return sig
-
-def shift_signal_frac(sig, delay):
-    """
-    Fractional shift using FFT phase ramp.
-    Positive delay advances the signal (earlier) by 'delay' samples.
-    """
-    if abs(delay) < 1e-8:
-        return sig.copy()
-    L = len(sig)
-    N = next_pow2(L + 2048)
-    X = np.fft.rfft(sig, N)
-    k = np.arange(0, len(X), dtype=np.float64)
-    phase = np.exp(+1j * 2.0 * np.pi * k * delay / N)
-    Y = X * phase
-    y = np.fft.irfft(Y, N)
-    return y[:L].astype(sig.dtype)
 
 def resample_to_model_sr(audio, audio_sample_rate: int, model_sample_rate: int):
     g = math.gcd(audio_sample_rate, model_sample_rate)
@@ -586,34 +419,6 @@ for src, tgt in all_pairs:
 
     mono_src = data_src[:,0]
     mono_tgt = data_tgt[:,0]
-    # rms_src = np.sqrt(np.mean(mono_src**2) + 1e-12)
-    # rms_tgt = np.sqrt(np.mean(mono_tgt**2) + 1e-12)
-    # gain_src = target_rms / rms_src
-    # gain_tgt = target_rms / rms_tgt
-    # data_src = data_src * gain_src
-    # data_tgt = data_tgt * gain_tgt
-
-    if ALIGN_ENABLE:
-        L = data_src.shape[0]
-        M = min(L, int(ALIGN_WIN_SEC * file_sr))
-        if M > 2048:
-            delay_samples = gcc_phat_delay(data_src[:M,0], data_tgt[:M,0], file_sr, max_ms=ALIGN_MAX_MS)
-            data_tgt_shifted = data_tgt.copy()
-            if ALIGN_USE_FRACTIONAL:
-                for c in range(data_tgt.shape[1]):
-                    data_tgt_shifted[:,c] = shift_signal_frac(data_tgt[:,c], delay_samples)
-            else:
-                for c in range(data_tgt.shape[1]):
-                    data_tgt_shifted[:,c] = shift_signal_int(data_tgt[:,c], delay_samples)
-            data_tgt = data_tgt_shifted
-            if not DEBUG:
-                print(f"[ALIGN] {os.path.basename(src)}: shift target by {delay_samples:.3f} samples ({delay_samples/file_sr*1000:.3f} ms)")
-        else:
-            print(f"[ALIGN] {os.path.basename(src)}: too short for alignment (L={L}), skipping.")
-
-
-    # if WRITE_NORMALIZED_TO_DISK:
-    #     write_normalized_pair(src, tgt, data_src, data_tgt, file_sr, prefix=NORMALIZED_PREFIX)
 
     audio_cache[src] = data_src
     audio_cache[tgt] = data_tgt
@@ -641,29 +446,6 @@ def build_chunks(pairs_list, seg_len, sample_rate):
         if rem >= need_src_len:
             chunks.append((src, tgt, n_full * chunk_len, rem))
     return chunks
-
-def validate_ir_delay(dynamic_realtime_model):
-    fir_down = dynamic_realtime_model.get_layer("realtime_ir_downsample")
-    fir_post = dynamic_realtime_model.get_layer("realtime_ir_post_lp")
-    align   = dynamic_realtime_model.get_layer("realtime_ir_align")
-    expected = int(align.offset)
-    factor = REALTIME_IR_DOWNSAMPLE_FACTOR
-    N = expected + factor
-    N = int(math.ceil(N / factor) * factor)
-    x = np.zeros((1, N, 1), dtype=np.float32)
-    x[0, 0, 0] = 1.0
-    y_down = fir_down(x)
-    y_up   = UpSampling1D(size=factor)(y_down)
-    y_fir  = fir_post(y_up)
-    ir     = y_fir.numpy()[0, :, 0]
-    thresh = 1e-6
-    nz     = np.where(np.abs(ir) > thresh)[0]
-    measured = int(nz[0]) if len(nz) else None
-    print(f"FIR-only → expected delay {expected}, measured {measured}")
-    if measured != expected:
-        print("⚠️  MISMATCH!  adjust RealtimeIrAlign.offset to", measured)
-    else:
-        print("✅ FIR-delay lines up.")
         
 def assert_has_pairs ():
     if not all_pairs:
@@ -1041,12 +823,6 @@ def mean_hf_metric(y_true, y_pred):
 
 # ────────────────────────────── DATA PIPELINE HELPERS ───────────────────────
 
-def hp_diff_env(window, α=0.8):
-    hp = np.empty_like(window)
-    hp[0] = window[0]
-    hp[1:] = window[1:] - α * window[:-1]
-    return np.abs(np.diff(hp))
-
 @register_keras_serializable()
 def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
     """
@@ -1166,37 +942,6 @@ def segment_generator_dual(seg_len_realtime,
 
         yield (x_realtime, x_offline), (y_audio_realtime, style_flag)
 
-def analyze_loss_scales(model, dataset, sample_rate):
-    # Take one batch from your validation dataset
-    batch = next(iter(dataset))
-    # Unpack batch: supports (x, y) or (x, y, sw)
-    if isinstance(batch, (tuple, list)):
-        if len(batch) == 2:
-            x, y = batch
-        elif len(batch) >= 3:
-            x, y = batch[0], batch[1]
-        else:
-            raise ValueError("Unsupported dataset element structure for analyze_loss_scales.")
-    else:
-        raise ValueError("Unsupported dataset element type for analyze_loss_scales.")
-
-    # Extract the audio target
-    if isinstance(y, dict):
-        audio_key = model.output_names[0]
-        y_true_audio = y[audio_key]
-    else:
-        y_true_audio = y[0]
-
-    y_pred_audio, _ = model(x, training=False)
-    l1_val   = tf.reduce_mean(waveform_l1_loss(y_true_audio, y_pred_audio)).numpy()
-    stft_val = tf.reduce_mean(multi_scale_stft_loss(y_true_audio, y_pred_audio)).numpy()
-    mel_val  = tf.reduce_mean(log_mel_loss(y_true_audio, y_pred_audio, sample_rate)).numpy()
-    env_val  = tf.reduce_mean(rms_env_loss(y_true_audio, y_pred_audio)).numpy()
-    hf_val   = tf.reduce_mean(hf_loss(y_true_audio, y_pred_audio)).numpy()
-    return {'l1':l1_val, 'stft':stft_val, 'mel':mel_val, 'env':env_val, 'hf':hf_val}
-
-
-
 def _extract_audio_io(model, batch):
     if not isinstance(batch, (tuple, list)) or len(batch) < 2:
         raise ValueError("Unexpected dataset element")
@@ -1212,7 +957,7 @@ def _extract_audio_io(model, batch):
     y_pred_audio, _ = model(x, training=False)
     return y_true_audio, y_pred_audio
 
-def analyze_loss_scales_consistent_batch(model, batch, sample_rate):
+def analyze_loss_scales(model, batch, sample_rate):
     # Extract audio tensors from (x, y, [sw]) batch
     y_true, y_pred = _extract_audio_io(model, batch)
 
@@ -1245,7 +990,7 @@ def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
     sums = {k:0.0 for k in normalize_keys}
     count = 0
     for batch in dataset.take(n_batches):
-        sc = analyze_loss_scales_consistent_batch(model, batch, sample_rate)
+        sc = analyze_loss_scales(model, batch, sample_rate)
         for k in normalize_keys:
             sums[k] += float(sc[k])
         count += 1
@@ -1641,37 +1386,12 @@ class HFHighpass(tf.keras.layers.Layer):
         return cfg
 
 @register_keras_serializable()
-class RealtimeIrAlign(Layer):
-    def __init__(self, offset, **kwargs):
-        super().__init__(**kwargs)
-        self.offset = int(offset)
-    def call(self, inputs):
-        ir, main = inputs
-        T = tf.shape(main)[1]
-        T_ir = tf.shape(ir)[1]
-        needed = self.offset + T
-        pad_end = needed - T_ir
-        ir = tf.cond(
-            pad_end > 0,
-            lambda: tf.pad(ir, [[0, 0], [0, pad_end], [0, 0]]),
-            lambda: ir
-        )
-        return ir[:, self.offset: self.offset + T, :]
-    def compute_output_shape(self, input_shape):
-        # (batch, time, channels), match main input time dimension
-        T = input_shape[1][1]
-        return (None, T, 1)
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"offset": self.offset})
-        return cfg
-
-@register_keras_serializable()
 class RealtimeIrDownsampleFIR(Layer):
     def __init__(self, factor=REALTIME_IR_DOWNSAMPLE_FACTOR, **kwargs):
         super().__init__(**kwargs)
-        self.factor = factor
+        self.factor = int(factor)
         self.kernel_size = REALTIME_IR_FIR_SIZE
+
     def call(self, x):
         p = x[..., 0:1]
         pad = self.kernel_size - 1
@@ -1682,34 +1402,55 @@ class RealtimeIrDownsampleFIR(Layer):
         b, T, _ = input_shape
         if T is None:
             return (b, None, 1)
-        # With left pad of (kernel_size - 1) and stride=self.factor, result is floor(T/factor)
-        out_T = T // self.factor
+        # With left pad (L-1) and VALID conv: out_T = floor((T-1)/factor) + 1 = ceil(T/factor)
+        out_T = (T + self.factor - 1) // self.factor
         return (b, out_T, 1)
 
     def get_config(self):
         cfg = super().get_config()
         cfg.update({'factor': self.factor})
         return cfg
+    
+@register_keras_serializable()
+class ResizeNearest1D(tf.keras.layers.Layer):
+    def __init__(self, factor, **kwargs):
+        super().__init__(**kwargs)
+        self.factor = int(factor)
+    def call(self, x):
+        # x: (B,T,C) -> (B,T*factor,C)
+        t = tf.shape(x)[1]
+        x4 = tf.expand_dims(x, axis=2)  # (B,T,1,C)
+        y4 = tf.image.resize(x4, size=[t * self.factor, 1], method='nearest', antialias=False)
+        return tf.squeeze(y4, axis=2)
+    def compute_output_shape(self, s):
+        b, t, c = s
+        return (b, None if t is None else t * self.factor, c)
+    def get_config(self):
+        return {'factor': self.factor}
 
 @register_keras_serializable()
-class RealtimeIrPostLP(Layer):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.kernel_size = REALTIME_IR_FIR_SIZE
-    def call(self, x):
-        pad = self.kernel_size - 1
-        x_pad = tf.pad(x, [[0,0], [pad,0], [0,0]])
-        return tf.nn.conv1d(x_pad, filters=_ir_fir_up, stride=1, padding='VALID')
-    def compute_output_shape(self, input_shape):
-        return input_shape
-    def get_config(self):
-        return super().get_config()
+class MatchTimeToRef(Layer):
+    """
+    Crops or pads the time axis of x to match the time length of ref.
+    Always returns exactly T_ref samples (no control flow/cond needed).
+    """
+    def call(self, inputs):
+        x, ref = inputs
+        T_ref = tf.shape(ref)[1]
+        pad_amt = tf.maximum(0, T_ref - tf.shape(x)[1])
+        x_pad = tf.pad(x, [[0,0],[0,pad_amt],[0,0]])
+        return x_pad[:, :T_ref, :]
 
+    def compute_output_shape(self, input_shapes):
+        x_shape, ref_shape = input_shapes
+        return (x_shape[0], ref_shape[1], x_shape[2])
+    
+# ─── IRLowpass layer (unchanged API; now defaults to min‑phase taps) ────────
 @register_keras_serializable()
 class IRLowpass(Layer):
     def __init__(self, taps=None, **kwargs):
         super().__init__(**kwargs)
-        # If taps not provided on deserialization, use module-level constant.
+        # taps must be [L,1,1] and already reversed for conv1d (as above).
         if taps is None:
             taps = realtime_lp_taps_tf
         self._taps_init = tf.convert_to_tensor(taps, dtype=tf.float32)
@@ -1723,10 +1464,8 @@ class IRLowpass(Layer):
         )
 
     def call(self, x):
-        pad_amt = tf.shape(self.taps)[0] - 1  # int32
-        paddings = tf.stack([[0, 0], [pad_amt, 0], [0, 0]])
-        paddings = tf.cast(paddings, tf.int32)  # ensure correct dtype
-        x_pad = tf.pad(x, paddings)
+        pad_amt = tf.shape(self.taps)[0] - 1
+        x_pad = tf.pad(x, [[0, 0], [pad_amt, 0], [0, 0]])
         return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
 
     def compute_output_shape(self, input_shape):
@@ -1734,10 +1473,6 @@ class IRLowpass(Layer):
 
     def get_config(self):
         return super().get_config()
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
 
 @register_keras_serializable()
 class IrScale(Layer):
@@ -2020,7 +1755,8 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
         super().build(input_shape)
 
     def call(self, x, training=None):
-        if training is False:
+        # Only active when training is explicitly True.
+        if training is not True:
             return x
         pad = tf.shape(self.kernel)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
@@ -2038,31 +1774,6 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
             'sample_rate': self.sample_rate,
             'window': self.window
         })
-        return cfg
-
-
-@register_keras_serializable()
-class HFLeakRegularizer(Layer):
-    """
-    Training-only: penalize HF energy when the gate is closed.
-    """
-    def __init__(self, alpha=1e-3, power=2.0, **kwargs):
-        super().__init__(**kwargs)
-        self.alpha = float(alpha)
-        self.power = float(power)
-
-    def call(self, inputs, training=None):
-        hf_scaled, gate_used = inputs
-        if training is False:
-            return hf_scaled
-        leak_w = tf.pow(1.0 - tf.clip_by_value(gate_used, 0.0, 1.0), self.power)
-        leak = tf.reduce_mean(tf.abs(hf_scaled) * leak_w)
-        self.add_loss(self.alpha * leak)
-        return hf_scaled
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"alpha": self.alpha, "power": self.power})
         return cfg
 
 @register_keras_serializable()
@@ -2219,24 +1930,6 @@ def _ones_kernel(length):
     return tf.constant(k_np, dtype=tf.float32)
 
 @register_keras_serializable()
-class HFLeakRegularizer(Layer):
-    def __init__(self, alpha=1e-3, power=2.0, **kwargs):
-        super().__init__(**kwargs)
-        self.alpha = float(alpha)
-        self.power = float(power)
-    def call(self, inputs):
-        hf_scaled, gate_used = inputs
-        # Penalize HF when gate is closed more strongly (power>1)
-        leak_w = tf.pow(1.0 - tf.clip_by_value(gate_used, 0.0, 1.0), self.power)
-        leak = tf.reduce_mean(tf.abs(hf_scaled) * leak_w)
-        self.add_loss(self.alpha * leak)
-        return hf_scaled
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"alpha": self.alpha, "power": self.power})
-        return cfg
-
-@register_keras_serializable()
 def gate_gain_signal(
     x, sample_rate,
     threshold_db,
@@ -2384,6 +2077,218 @@ class Gate(tf.keras.layers.Layer):
         })
         return cfg
 
+@register_keras_serializable()
+class GateInt8Linear(tf.keras.layers.Layer):
+    """
+    INT8/TFLM-friendly gate with the same semantics as the original dB-domain Gate:
+
+      - Sidechain: HPF (causal min-phase) → rectifier → optional env smoothing
+      - above = (env >= thr_lin) with thr_lin = 10^(threshold_db/20)
+      - Hold: if hold_ms>0, keep 'open' for a causal window using ones FIR (like original)
+      - Attack/Release smoothing on open_or_hold (identical mixer logic)
+      - Close depth: g_close_raw = min(1, (env/thr_lin)^ratio) with integer-power via repeated squaring
+      - Floor: max(min_gain_db, 10^(-120/20)) ≈ max(min_gain, 1e-6)
+      - Depth smoothing (optional)
+      - Final: g = g_env + (1 - g_env) * g_close_s, clipped to [0,1]
+
+    All ops are add/mul/abs/conv/compare/cast/clip — no log/exp.
+    """
+    def __init__(self, sample_rate,
+                 threshold_db,
+                 ratio,
+                 attack_ms,
+                 hold_ms,
+                 release_ms,
+                 cutoff_hz,
+                 hp_order,
+                 env_ms=None,
+                 depth_smooth_ms=None,
+                 env_lmax=None,
+                 depth_lmax=None,
+                 min_gain_db=-60.0,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.sample_rate = int(sample_rate)
+        self.threshold_db = float(threshold_db)
+        self.ratio = float(ratio)
+        self.attack_ms = float(attack_ms)
+        self.hold_ms = float(hold_ms)
+        self.release_ms = float(release_ms)
+        self.cutoff_hz = float(cutoff_hz)
+        self.hp_order = int(hp_order)
+        self.env_ms = None if env_ms is None else float(env_ms)
+        self.depth_smooth_ms = None if depth_smooth_ms is None else float(depth_smooth_ms)
+        self.env_lmax = None if env_lmax is None else int(env_lmax)
+        self.depth_lmax = None if depth_lmax is None else int(depth_lmax)
+
+        # Precompute linear threshold/floors
+        self.thr_lin = float(10.0 ** (self.threshold_db / 20.0))
+        self.min_gain = float(10.0 ** (float(min_gain_db) / 20.0))
+        self.min_gain_120db = float(10.0 ** (-120.0 / 20.0))  # -120 dB floor from original clamp
+
+        # Integer power exponent (approx the ratio, as in dB domain)
+        self.ratio_int = int(max(1, round(self.ratio)))
+
+        # Kernels (set in build)
+        self.hp_kernel = None
+        self.k_env = None
+        self.k_att = None
+        self.k_rel = None
+        self.k_depth = None
+        self.k_hold = None
+        self.pad_hold = 0
+
+    def build(self, input_shape):
+        # HPF sidechain
+        hp_k = _get_minphase_hp_kernel(self.sample_rate, self.cutoff_hz, self.hp_order)
+        self.hp_kernel = self.add_weight(
+            name="hp_taps_linear",
+            shape=hp_k.shape,
+            initializer=tf.keras.initializers.Constant(hp_k),
+            trainable=False
+        )
+
+        # Optional envelope smoothing
+        if self.env_ms is not None and self.env_ms > 0.0:
+            env_smpl = max(1, int(round((self.env_ms / 1000.0) * self.sample_rate)))
+            k_env = _exp_smoothing_kernel(env_smpl, scale=2.0, Lmax=(self.env_lmax or 512))
+            self.k_env = self.add_weight(
+                name="env_smooth_taps",
+                shape=k_env.shape,
+                initializer=tf.keras.initializers.Constant(k_env),
+                trainable=False
+            )
+
+        # Attack/Release smoothing
+        atk_s = max(1, int(round((self.attack_ms  / 1000.0) * self.sample_rate)))
+        rel_s = max(1, int(round((self.release_ms / 1000.0) * self.sample_rate)))
+        k_att = _exp_smoothing_kernel(atk_s, scale=4.0, Lmax=2048)
+        k_rel = _exp_smoothing_kernel(rel_s, scale=4.0, Lmax=2048)
+        self.k_att = self.add_weight(
+            name="open_attack_taps",
+            shape=k_att.shape,
+            initializer=tf.keras.initializers.Constant(k_att),
+            trainable=False
+        )
+        self.k_rel = self.add_weight(
+            name="open_release_taps",
+            shape=k_rel.shape,
+            initializer=tf.keras.initializers.Constant(k_rel),
+            trainable=False
+        )
+
+        # Optional depth smoothing of close gain
+        if self.depth_smooth_ms is not None and self.depth_smooth_ms > 0.0:
+            d_smpl = max(1, int(round((self.depth_smooth_ms / 1000.0) * self.sample_rate)))
+            k_depth = _exp_smoothing_kernel(d_smpl, scale=2.0, Lmax=(self.depth_lmax or 512))
+            self.k_depth = self.add_weight(
+                name="depth_smooth_taps",
+                shape=k_depth.shape,
+                initializer=tf.keras.initializers.Constant(k_depth),
+                trainable=False
+            )
+
+        # Hold kernel (like original)
+        if self.hold_ms > 0.0:
+            hld_s = max(1, int(round((self.hold_ms / 1000.0) * self.sample_rate)))
+            k_hold = _ones_kernel(hld_s)
+            self.k_hold = self.add_weight(
+                name="hold_ones_taps",
+                shape=k_hold.shape,
+                initializer=tf.keras.initializers.Constant(k_hold),
+                trainable=False
+            )
+            self.pad_hold = int(hld_s - 1)
+        else:
+            self.k_hold = None
+            self.pad_hold = 0
+
+        super().build(input_shape)
+
+    def _powi_ratio(self, x):
+        """
+        Compute x^ratio_int by repeated squaring (ratio_int is a small positive int).
+        Uses only muls; no log/exp/pow ops.
+        """
+        n = int(self.ratio_int)
+        # Early outs
+        if n <= 1:
+            return x
+
+        result = tf.ones_like(x)
+        base = x
+        m = n
+        while m > 0:
+            if (m & 1) == 1:
+                result = result * base
+            base = base * base
+            m >>= 1
+        return result
+
+    def call(self, x):
+        thr = tf.constant(self.thr_lin, tf.float32)
+
+        # Sidechain env
+        sc = _causal_conv1d(x, self.hp_kernel)
+        env = tf.abs(sc) + 1e-12
+        if self.k_env is not None:
+            env = _causal_conv1d(env, self.k_env)
+
+        # above and optional hold
+        above = tf.cast(tf.greater_equal(env, thr), tf.float32)  # 0/1 float
+        if self.k_hold is not None:
+            above_pad = tf.pad(above, [[0, 0], [self.pad_hold, 0], [0, 0]])
+            hold_sum = tf.nn.conv1d(above_pad, filters=self.k_hold, stride=1, padding='VALID')
+            open_or_hold = tf.cast(tf.greater(hold_sum, 0.0), tf.float32)  # 0/1 exactly like original
+        else:
+            open_or_hold = above
+
+        # Attack/Release smoothing on open_or_hold
+        g_prev_open = tf.pad(open_or_hold, [[0, 0], [1, 0], [0, 0]])[:, :-1, :]
+        inc_open = tf.cast(tf.greater(open_or_hold, g_prev_open), tf.float32)
+        g_att_open = _causal_conv1d(open_or_hold, self.k_att)
+        g_rel_open = _causal_conv1d(open_or_hold, self.k_rel)
+        g_env = inc_open * g_att_open + (1.0 - inc_open) * g_rel_open
+        g_env = tf.clip_by_value(g_env, 0.0, 1.0)
+
+        # Close gain in linear domain: (env/thr)^ratio, clamped to [floor, 1]
+        env_over_thr = env / thr
+        g_close_raw = self._powi_ratio(env_over_thr)
+        g_close_raw = tf.minimum(g_close_raw, 1.0)
+
+        floor = tf.constant(max(self.min_gain, self.min_gain_120db), tf.float32)
+        g_close_raw = tf.maximum(g_close_raw, floor)
+
+        # Optional depth smoothing
+        if self.k_depth is not None:
+            g_close_s = _causal_conv1d(g_close_raw, self.k_depth)
+            g_close_s = tf.clip_by_value(g_close_s, floor, 1.0)
+        else:
+            g_close_s = g_close_raw
+
+        # Final gain (0..1)
+        g = g_env + (1.0 - g_env) * g_close_s
+        return tf.clip_by_value(g, 0.0, 1.0)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sample_rate": self.sample_rate,
+            "threshold_db": self.threshold_db,
+            "ratio": self.ratio,
+            "attack_ms": self.attack_ms,
+            "hold_ms": self.hold_ms,
+            "release_ms": self.release_ms,
+            "cutoff_hz": self.cutoff_hz,
+            "hp_order": self.hp_order,
+            "env_ms": self.env_ms,
+            "depth_smooth_ms": self.depth_smooth_ms,
+            "env_lmax": self.env_lmax,
+            "depth_lmax": self.depth_lmax,
+            "min_gain_db": 20.0 * np.log10(max(self.min_gain, 1e-12)),
+            "ratio_int": self.ratio_int
+        })
+        return cfg
 
 @register_keras_serializable()
 def gate_weight_offline(y_true):
@@ -2428,10 +2333,6 @@ def slice_content(x, filters):
     return x[:, :, :filters]
 
 @register_keras_serializable()
-def extract_style_scalar(x):
-    return x[:, 0:1, 0:1]
-
-@register_keras_serializable()
 def slice_gate(x, filters):
     return x[:, :, filters:]
 
@@ -2446,11 +2347,6 @@ def slice_film_beta(x, filters):
 @register_keras_serializable()
 def invert(x):
     return 1.0 - x
-
-@register_keras_serializable()
-def batch_zeros_like_style(x):
-    # Return a (B,1) zeros tensor using batch size from a reference tensor x
-    return tf.zeros((tf.shape(x)[0], 1), dtype=tf.float32)
 
 # Stabilized FiLM
 @register_keras_serializable()
@@ -2550,7 +2446,7 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
     )(exc)
 
     # 4) per-mode gains (style) × (strike boost)
-    gains = Dense(REALTIME_RESO_MODES, activation="softplus", name="realtime_reso_gains")(style_embed)
+    gains = Dense(REALTIME_RESO_MODES, activation="relu", name="realtime_reso_gains")(style_embed)
     gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
     sboost= Lambda(strike_boost, arguments={'gain': REALTIME_RESO_STRIKE_GAIN}, name="realtime_strike_boost")(strike)
     gains_t = Multiply(name="realtime_reso_gains_time")([gains, sboost])
@@ -2828,7 +2724,8 @@ def build_realtime_model(offline=None, dynamic_time=False):
         Multiply(name="realtime_style_pred_part")([one_minus_force, style_pred_source]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
-    style_time_used = TileStyle(name="realtime_style_time_used")([style_used_scalar, inp])
+    
+    style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
     style_embed = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
     x = Conv1D(REALTIME_FILTERS, kernel_size=1, padding="same", name="realtime_init_pw")(inp)
@@ -2860,12 +2757,14 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # Style-gated pick/finger blend (raw stems then style gating)
     out_pick   = Conv1D(1,1,padding="same", name="realtime_final_pick")(x)
     out_finger = Conv1D(1,1,padding="same", name="realtime_final_finger")(x)
-    inv_style  = InvertStyle(name="realtime_invert_style")(style_time_used)
-    pick_c     = Multiply(name="realtime_pick_contrib")([style_time_used, out_pick])
+    # Style-gated pick/finger stems via broadcasting
+    inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
+    pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_realtime = Add(name="realtime_main")([pick_c, finger_c])
 
     # Low-rate IR Branch (causal)
+        # Low-rate IR Branch (causal, intrinsically aligned; no Align needed)
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -2881,15 +2780,16 @@ def build_realtime_model(offline=None, dynamic_time=False):
             pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             name=f"realtime_ir_sep_{i}"
         )(ir)
+
     ir = IrScale(init=0.6, name="realtime_ir_scale")(ir)
-    ir = UpSampling1D(size=REALTIME_IR_DOWNSAMPLE_FACTOR, name="realtime_ir_upsample")(ir)
-    ir = RealtimeIrPostLP(name="realtime_ir_post_lp")(ir)
-    total_delay = REALTIME_TOTAL_EXPECTED_IR_DELAY
-    ir = RealtimeIrAlign(offset=total_delay + REALTIME_IR_ALIGN_OFFSET_CORRECTION, name='realtime_ir_align')([ir, inp])
+
+    # Upsample by repeat (ZOH) → single causal min-phase LPF → match length to input
+    ir = ResizeNearest1D(factor=REALTIME_IR_DOWNSAMPLE_FACTOR, name="realtime_ir_upsample")(ir)
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
+    ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
     # Gate for HF mask safety cap
-    realtime_gate = Gate(
+    realtime_gate = GateInt8Linear(
         sample_rate=REALTIME_SAMPLE_RATE,
         threshold_db=REALTIME_GATE_THRESHOLD_DB,
         ratio=REALTIME_GATE_RATIO,
@@ -2902,6 +2802,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS,
         env_lmax=REALTIME_GATE_ENV_LMAX,
         depth_lmax=REALTIME_GATE_DEPTH_LMAX,
+        min_gain_db=-60.0,  # keep your original default/floor
         name="realtime_gate"
     )(inp)
 
@@ -2925,7 +2826,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
                       cutoff_hz=HP_CUTOFF_HZ,
                       order=REALTIME_HF_HP_ORDER,
                       name="realtime_hf_highpass")(hf_gated)
-    hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
+    hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
     # Training-only constraint (no runtime cost): penalize LF content in hf_final
     hf_final = HFLowbandPenalty(
@@ -2941,8 +2842,8 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # ─── Resonance branch (realtime) ──────────────────────────────────────
     realtime_reso = _add_resonance_branch_realtime(inp=inp, style_embed=style_embed, gate=realtime_gate)
 
-    if realtime_reso is not None:
-        y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
+    y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
+        
 
     # ─── Distillation for resonance stem from teacher ─────────────────────
     if offline is not None and realtime_reso is not None:
@@ -3161,6 +3062,7 @@ def build_offline_debug_model(offline):
 
 @register_keras_serializable()
 def build_realtime_debug_model(realtime):
+    
     outs = {
         "gate":      realtime.get_layer("realtime_gate").output,
         "hf_pre":    realtime.get_layer("realtime_hf_out").output,
@@ -3170,12 +3072,10 @@ def build_realtime_debug_model(realtime):
         "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
         "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
-        "y_pred":    realtime.get_layer("realtime_with_ir").output,
+        "y_pred":    realtime.get_layer("realtime_with_ir_reso").output,
+        "reso":     realtime.get_layer("realtime_reso_scale").output,
+        "ir_only":  realtime.get_layer("realtime_ir_lowpass").output
     }
-    
-    outs.update({
-        "reso":     realtime.get_layer("realtime_reso_scale").output if "realtime_reso_scale" in [l.name for l in realtime.layers] else None
-    })
     
     # Optional bypass exports if you added them
     try:
@@ -3204,39 +3104,6 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
     print(f"{layer_name}: {s:.4f} → {w[0][0]:.4f} (+{gain_db} dB)")
     return model
 
-# Retune the offline Gate inside an already-trained offline model and save it.
-
-def retune_offline_gate_inplace(
-    model,
-    threshold_db=None,
-    ratio=None,
-    attack_ms=None,
-    hold_ms=None,
-    release_ms=None,
-    cutoff_hz=None,
-    hp_order=None
-):
-    m = model
-    g = m.get_layer("offline_gate")
-
-    def _maybe_set(attr, val, cast=float):
-        if val is not None:
-            setattr(g, attr, cast(val))
-
-    _maybe_set("threshold_db", threshold_db, float)
-    _maybe_set("ratio",        ratio,        float)
-    _maybe_set("attack_ms",    attack_ms,    float)
-    _maybe_set("hold_ms",      hold_ms,      float)
-    _maybe_set("release_ms",   release_ms,   float)
-    _maybe_set("cutoff_hz",    cutoff_hz,    float)
-    _maybe_set("hp_order",     hp_order,     int)
-
-    print("New gate params:",
-          dict(threshold_db=g.threshold_db, ratio=g.ratio, attack_ms=g.attack_ms,
-               hold_ms=g.hold_ms, release_ms=g.release_ms,
-               cutoff_hz=g.cutoff_hz, hp_order=g.hp_order))
-    return m
-
 def audible_gate_debug(debug_model,
                                  path_src,
                                  path_tgt,
@@ -3263,9 +3130,9 @@ def audible_gate_debug(debug_model,
     # Optional: resonance stem boost for quick A/B during demo generation
     try:
         if OFFLINE_RESO_BOOST_DB != 0.0 and sample_rate == OFFLINE_SAMPLE_RATE:
-            model = boost_hf_scale_in_model(model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
+            debug_model = boost_hf_scale_in_model(debug_model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
         elif REALTIME_RESO_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
-            model = boost_hf_scale_in_model(model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
+            debug_model = boost_hf_scale_in_model(debug_model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
     except Exception:
         pass  # layer may not exist (e.g., older models)
 
@@ -3298,6 +3165,8 @@ def audible_gate_debug(debug_model,
     w_gr   = sf.SoundFile(os.path.join(out_dir, "gate_raw.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
     w_gt   = sf.SoundFile(os.path.join(out_dir, "gate_tone.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
     w_gh   = sf.SoundFile(os.path.join(out_dir, "gate_hiss.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_reso = sf.SoundFile(os.path.join(out_dir, "reso_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_ir_only = sf.SoundFile(os.path.join(out_dir, "ir_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
     # Tone state (continuous phase across blocks)
     tone_freq = gate_debug_tone_freq(sample_rate, HP_CUTOFF_HZ)
@@ -3369,6 +3238,8 @@ def audible_gate_debug(debug_model,
         w_full.write(y_pred_core)
         w_nohf.write(y_nohf_core)
         w_hf.write(hf_s_core)
+        w_reso.write(_core_of("reso"))
+        w_ir_only.write(_core_of("ir_only"))
 
         # Write src/tgt (same cropping)
         core_start_global = inp_start + core_start_in_inp
@@ -3396,7 +3267,7 @@ def audible_gate_debug(debug_model,
         produced_model += core_len
 
     # Close all writers
-    for w in [w_src, w_tgt, w_full, w_nohf, w_hf, w_gr, w_gt, w_gh]:
+    for w in [w_src, w_tgt, w_full, w_nohf, w_hf, w_gr, w_gt, w_gh, w_reso, w_ir_only]:
         try:
             w.close()
         except:
@@ -3649,9 +3520,6 @@ def train_realtime(resume=False, resume_ckpt_path=None):
     offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
     print("Built causal teacher clone for KD (right-lookahead=0).")
 
-    tmp_dynamic_model = build_realtime_model(offline=None, dynamic_time=True)
-    validate_ir_delay(tmp_dynamic_model)
-
     train_shared(
         kind='realtime',
         resume=resume,
@@ -3715,21 +3583,6 @@ def fine_tune():
 
     x_norm = x_full # * gain_x
     y_norm = y_full # * gain_y
-
-    if ALIGN_ENABLE:
-        L = x_norm.shape[0]
-        M = min(L, int(ALIGN_WIN_SEC * FINETUNE_SAMPLE_RATE))
-        if M > 2048:
-            delay_samples = gcc_phat_delay(x_norm[:M,0], y_norm[:M,0], FINETUNE_SAMPLE_RATE, max_ms=ALIGN_MAX_MS)
-            y_norm_shifted = y_norm.copy()
-            if ALIGN_USE_FRACTIONAL:
-                for c in range(y_norm.shape[1]):
-                    y_norm_shifted[:,c] = shift_signal_frac(y_norm[:,c], delay_samples)
-            else:
-                for c in range(y_norm.shape[1]):
-                    y_norm_shifted[:,c] = shift_signal_int(y_norm[:,c], delay_samples)
-            y_norm = y_norm_shifted
-            print(f"[fine_tune ALIGN] shift target by {delay_samples:.3f} samples ({delay_samples/FINETUNE_SAMPLE_RATE*1000:.3f} ms)")
 
     rms_x2 = compute_rms(x_norm[:,0])
     rms_y2 = compute_rms(y_norm[:,0])
