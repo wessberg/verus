@@ -1811,9 +1811,6 @@ class AdjustableAlphaMixin:
         return {}
 
 # ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
-from tensorflow.keras.utils import register_keras_serializable
-from tensorflow.keras.layers import Layer
-import tensorflow as tf
 
 @register_keras_serializable()
 class DistillLoss(Layer, AdjustableAlphaMixin):
