@@ -947,13 +947,29 @@ def _extract_audio_io(model, batch):
         raise ValueError("Unexpected dataset element")
     x = batch[0]
     y = batch[1]
+    # Audio target
     if isinstance(y, (tuple, list)):
         y_true_audio = y[0]
     elif isinstance(y, dict):
-        audio_key = model.output_names[0]
-        y_true_audio = y[audio_key]
+        out_names = [t.name.split(':')[0].split('/')[-1] for t in model.outputs]
+        y_true_audio = y[out_names[0]]
     else:
         y_true_audio = y
+
+    # Feed inputs as a list in the model’s input order to avoid the KeyError
+    if isinstance(x, dict):
+        in_names = [t.name.split(':')[0].split('/')[-1] for t in model.inputs]
+        try:
+            x = [x[k] for k in in_names]
+        except KeyError:
+            # Be tolerant to any prefixes (e.g., serving_default_) that might appear
+            x_norm = {k.split(':')[0].split('/')[-1]: v for k, v in x.items()}
+            missing = [k for k in in_names if k not in x_norm]
+            if missing:
+                raise KeyError(f"Batch is missing inputs required by the model: {missing}. "
+                            f"Batch keys={list(x.keys())}, expected={in_names}")
+            x = [x_norm[k] for k in in_names]
+
     y_pred_audio, _ = model(x, training=False)
     return y_true_audio, y_pred_audio
 
@@ -1536,6 +1552,21 @@ class BlendScalar(Layer):
         })
         return cfg
 
+# Add near your other custom layers
+@register_keras_serializable()
+class LossTether(tf.keras.layers.Layer):
+    """
+    Connects auxiliary tensors (e.g., outputs of KD layers that only add losses)
+    to the model graph without altering the primary tensor.
+    Inputs: [primary, aux1, aux2, ...]
+    Output: primary (unchanged)
+    This ensures all aux tensors are 'reachable' so their add_loss is kept.
+    """
+    def call(self, inputs):
+        if isinstance(inputs, (list, tuple)):
+            return inputs[0]
+        return inputs
+
 @register_keras_serializable()
 class CausalMovingAverage(Layer):
     """
@@ -1831,10 +1862,6 @@ def _causal_conv1d(x, kernel):
     pad = tf.shape(kernel)[0] - 1
     x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
     return tf.nn.conv1d(x_pad, filters=kernel, stride=1, padding='VALID')
-
-
-
-
 
 # ─── Gate smoothing kernels (causal FIR) ─────────────────────────────────────
 _gate_smooth_cache = {}  # (tau_samples, scale, Lmax) -> kernel np.array
@@ -2698,82 +2725,143 @@ def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, sty
 def build_realtime_model(offline=None, dynamic_time=False):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
-
+        
     offline_inp = None
     if offline is not None:
-        offline_inp = Input(shape=(None,1), name="offline_piezo_input")
+        # Use dynamic time for teacher input to keep compatibility with any seg_len
+        offline_inp = Input(shape=(None, 1), name="realtime_offline_piezo_input")
 
+    # Style IO
     style_true_in  = Input(shape=(1,), name="realtime_style_true_input")
     style_force_in = Input(shape=(1,), name="realtime_style_force_input")
 
-    # Style head
+    # Style head (student)
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
     style_logit = Dense(1, name="realtime_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
 
+    kd_tensors = []
     style_pred_source = style_prob
+
+    # If teacher provided, build a single combo to fetch everything in one call
+    T_feats = []
+    T_gate = None
+    offline_audio = None
+    offline_style_prob = None
+    off_pick = None
+    off_finger = None
+    off_hf_scaled = None
+    off_reso_scaled = None
+    has_reso = False
+
     if offline is not None:
         teacher = offline
         teacher.trainable = False
-        offline_audio, offline_style_prob = teacher([offline_inp, style_true_in, style_force_in])
 
-        style_prob_3d          = Reshape((1,1), name="realtime_style_prob_3d")(style_prob)
-        offline_style_prob_3d  = Reshape((1,1), name="offline_style_prob_3d")(offline_style_prob)
-        _ = DistillLoss(alpha=REALTIME_STYLE_DISTILL_ALPHA, name="style_prob_distill")([offline_style_prob_3d, style_prob_3d])
+        feat_names = REALTIME_OFFLINE_FEAT_LAYERS or []
+        feat_outs = [teacher.get_layer(n).output for n in feat_names]
 
+        # Always available in the teacher
+        gate_out = teacher.get_layer("offline_gate").output
+        audio_out, style_prob_out = teacher.outputs
+
+        # Stems
+        pick_out   = teacher.get_layer("offline_final_pick").output
+        finger_out = teacher.get_layer("offline_final_finger").output
+        hf_scaled  = teacher.get_layer("offline_hf_scale").output
+
+        # Optional resonance stem
+        try:
+            reso_scaled = teacher.get_layer("offline_reso_scale").output
+            has_reso = True
+        except Exception:
+            reso_scaled = None
+            has_reso = False
+
+        teacher_combo = tf.keras.Model(
+            inputs=teacher.inputs,
+            outputs=feat_outs + [gate_out, audio_out, style_prob_out, pick_out, finger_out, hf_scaled] + ([reso_scaled] if has_reso else []),
+            name="offline_teacher_combo"
+        )
+
+        combo = teacher_combo([offline_inp, style_true_in, style_force_in])
+
+        idx = 0
+        if feat_names:
+            T_feats = combo[idx: idx + len(feat_names)]
+            idx += len(feat_names)
+
+        T_gate             = combo[idx]; idx += 1
+        offline_audio      = combo[idx]; idx += 1
+        offline_style_prob = combo[idx]; idx += 1
+        off_pick           = combo[idx]; idx += 1
+        off_finger         = combo[idx]; idx += 1
+        off_hf_scaled      = combo[idx]; idx += 1
+        off_reso_scaled    = combo[idx] if has_reso else None
+
+        # Style KD and blend
+        style_prob_3d         = Reshape((1, 1), name="realtime_style_prob_3d")(style_prob)
+        offline_style_prob_3d = Reshape((1, 1), name="offline_style_prob_3d")(offline_style_prob)
+        kd_tensors.append(
+            DistillLoss(alpha=REALTIME_STYLE_DISTILL_ALPHA, name="style_prob_distill")(
+                [offline_style_prob_3d, style_prob_3d]
+            )
+        )
         style_pred_source = BlendScalar(
             init_alpha=REALTIME_STYLE_BLEND_INIT,
             trainable=REALTIME_STYLE_BLEND_TRAINABLE,
             name="realtime_style_blend"
         )([style_prob, offline_style_prob])
 
+    # Use either the blended teacher/student style or the true one based on style_force
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
     style_used_scalar = Add(name="realtime_style_used_scalar")([
         Multiply(name="realtime_style_pred_part")([one_minus_force, style_pred_source]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
-    
+
     style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
     style_embed = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
-    x = Conv1D(REALTIME_FILTERS, kernel_size=1, padding="same", name="realtime_init_pw")(inp)
+    # Main causal stack
+    x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw")(inp)
 
-    # Pre-blocks (causal)
+    # Pre-blocks
     for i in range(REALTIME_PRE_BLOCKS):
         x = gated_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1, prefix=f"realtime_pre_{i}", lookahead=0)
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}")
 
-    # Dilated stack (causal)
+    # Dilated stack
     realtime_feats = []
     for i, d in enumerate(REALTIME_DILATIONS):
         res = x
         pad_left, pad_right = compute_pads(kernel=REALTIME_KERNEL_SIZE, dilation=d, lookahead_samples=0)
-        x   = ZeroPadding1D((pad_left, pad_right), name=f"realtime_pad_{i}")(x)
-        g   = SeparableConv1D(2*REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid", name=f"realtime_sep_{i}")(x)
-        c   = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
-        g2  = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
-        x   = Multiply(name=f"realtime_gate_mul_{i}")([Activation("tanh", name=f"realtime_tanh_{i}")(c),
-                                                       Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
-        x   = Conv1D(REALTIME_FILTERS, kernel_size=1, padding="same", name=f"realtime_pw_{i}")(x)
-        x   = Add(name=f"realtime_res_add_{i}")([x, res])
-        x   = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}")
+        x = ZeroPadding1D((pad_left, pad_right), name=f"realtime_pad_{i}")(x)
+        g = SeparableConv1D(2 * REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid", name=f"realtime_sep_{i}")(x)
+        c = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
+        g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
+        x = Multiply(name=f"realtime_gate_mul_{i}")([
+            Activation("tanh",    name=f"realtime_tanh_{i}")(c),
+            Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)
+        ])
+        x = Conv1D(REALTIME_FILTERS, 1, padding="same", name=f"realtime_pw_{i}")(x)
+        x = Add(name=f"realtime_res_add_{i}")([x, res])
+        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}")
 
         offline_feat_name = f"offline_dil_{i}_film_apply"
         if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
             realtime_feats.append(x)
 
-    # Style-gated pick/finger blend (raw stems then style gating)
-    out_pick   = Conv1D(1,1,padding="same", name="realtime_final_pick")(x)
-    out_finger = Conv1D(1,1,padding="same", name="realtime_final_finger")(x)
-    # Style-gated pick/finger stems via broadcasting
+    # Pick/finger heads and style mix
+    out_pick   = Conv1D(1, 1, padding="same", name="realtime_final_pick")(x)
+    out_finger = Conv1D(1, 1, padding="same", name="realtime_final_finger")(x)
     inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
     pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_realtime = Add(name="realtime_main")([pick_c, finger_c])
 
-    # Low-rate IR Branch (causal)
-        # Low-rate IR Branch (causal, intrinsically aligned; no Align needed)
+    # Low-rate IR branch (causal)
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -2791,13 +2879,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
         )(ir)
 
     ir = IrScale(init=0.6, name="realtime_ir_scale")(ir)
-
-    # Upsample by repeat (ZOH) → single causal min-phase LPF → match length to input
     ir = ResizeNearest1D(factor=REALTIME_IR_DOWNSAMPLE_FACTOR, name="realtime_ir_upsample")(ir)
     ir = IRLowpass(name="realtime_ir_lowpass")(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
-    # Gate for HF mask safety cap
+    # Gate for HF mask safety cap (INT8-friendly)
     realtime_gate = GateInt8Linear(
         sample_rate=REALTIME_SAMPLE_RATE,
         threshold_db=REALTIME_GATE_THRESHOLD_DB,
@@ -2811,7 +2897,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS,
         env_lmax=REALTIME_GATE_ENV_LMAX,
         depth_lmax=REALTIME_GATE_DEPTH_LMAX,
-        min_gain_db=-60.0,  # keep your original default/floor
+        min_gain_db=-60.0,
         name="realtime_gate"
     )(inp)
 
@@ -2821,7 +2907,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
     hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
-    hf    = Conv1D(1,1,padding="same", name="realtime_hf_out")(hf)
+    hf    = Conv1D(1, 1, padding="same", name="realtime_hf_out")(hf)
 
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
@@ -2831,13 +2917,15 @@ def build_realtime_model(offline=None, dynamic_time=False):
     mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
 
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
-    hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
-                      cutoff_hz=HP_CUTOFF_HZ,
-                      order=REALTIME_HF_HP_ORDER,
-                      name="realtime_hf_highpass")(hf_gated)
+    hf_hp    = HFHighpass(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        cutoff_hz=HP_CUTOFF_HZ,
+        order=REALTIME_HF_HP_ORDER,
+        name="realtime_hf_highpass"
+    )(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
-    # Training-only constraint (no runtime cost): penalize LF content in hf_final
+    # Training-only penalty
     hf_final = HFLowbandPenalty(
         alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
         cutoff_hz=2800.0,
@@ -2846,87 +2934,61 @@ def build_realtime_model(offline=None, dynamic_time=False):
         name="realtime_hf_lowband_penalty"
     )(hf_final)
 
+    # Mix IR and HF into main
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
-    
-    # ─── Resonance branch (realtime) ──────────────────────────────────────
+
+    # Resonance branch (student)
     realtime_reso = _add_resonance_branch_realtime(inp=inp, style_embed=style_embed, gate=realtime_gate)
-
     y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
-        
 
-    # ─── Distillation for resonance stem from teacher ─────────────────────
-    if offline is not None and realtime_reso is not None:
-        try:
-            offline_reso_scaled = teacher.get_layer("offline_reso_scale").output  # (B, T96k, 1)
-            offline_reso_ds     = FIRDecimateBy2(name="offline_reso_ds2")(offline_reso_scaled)
-            _ = DistillLoss(alpha=REALTIME_STEM_RESO_DISTILL_ALPHA, name="stem_reso_distill")([offline_reso_ds, realtime_reso])
-        except:
-            # If training with a teacher that has no resonance branch yet
-            pass
-
-    # ─── Distillation (teacher must be causal here) ────────────────────────────
+    # KD wiring (student vs teacher) — all based on the single teacher_combo call
     if offline is not None:
-        # Teacher feature model
-        T_outs = []
-        T_gate = None
-        if REALTIME_OFFLINE_FEAT_LAYERS:
-            offline_feat_model = tf.keras.models.Model(
-                inputs=teacher.inputs,
-                outputs=[teacher.get_layer(n).output for n in REALTIME_OFFLINE_FEAT_LAYERS] + [teacher.get_layer("offline_gate").output],
-                name="offline_feat_model"
-            )
-            T_outs = offline_feat_model([offline_inp, style_true_in, style_force_in])
-            if not isinstance(T_outs, list):
-                T_outs = [T_outs]
-            T_feats = T_outs[:-1]
-            T_gate  = T_outs[-1]
-        else:
-            T_gate = teacher.get_layer("offline_gate").output
-
-        # Downsample teacher features/gate
-        T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{idx}")(t) for idx, t in enumerate(T_outs[:-1])] if T_outs else []
+        # Downsample teacher features/gate (96k → 48k)
+        T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{i}")(t) for i, t in enumerate(T_feats)]
         T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
 
-        # KD for features
-        for idx, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
+        # Feature KD
+        for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
             chan = int(T_f_ds.shape[-1])
-            proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{idx}")(S_f)
-            _ = DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{idx}")([T_f_ds, proj])
+            proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{i}")(S_f)
+            kd_tensors.append(
+                DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
+            )
 
-        # KD for HF mask: teacher gate (96k→48k) vs student mask_pred
-        _ = DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_distill")([T_gate_ds, mask_pred])
-        # Optional: also KD on mask_used to avoid fighting the cap
-        _ = DistillLoss(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, name="mask_used_distill")([T_gate_ds, mask_used])
+        # Mask/gate KD
+        kd_tensors.append(DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA,   name="hf_mask_distill")([T_gate_ds, mask_pred]))
+        kd_tensors.append(DistillLoss(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, name="mask_used_distill")([T_gate_ds, mask_used]))
 
-        # KD for teacher audio (96k→48k) vs student audio: shift-aware + STFT
+        # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        _ = DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime])
-        _ = MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime])
+        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime]))
+        kd_tensors.append(MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime]))
 
-        # KD for stems: pick/finger/HF
-        offline_pick   = teacher.get_layer("offline_final_pick").output
-        offline_finger = teacher.get_layer("offline_final_finger").output
-        offline_hf_scaled = teacher.get_layer("offline_hf_scale").output  # post-HPF + scale at 96k
-
-        offline_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(offline_pick)
-        offline_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(offline_finger)
-        offline_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(offline_hf_scaled)
-        
-        # Band-match the teacher HF KD target to the student's band by re-HPF at 48 kHz, 3 kHz
-        offline_hf_ds_hp48 = HFHighpass(
+        # Stem KD
+        off_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(off_pick)
+        off_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(off_finger)
+        off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
+        off_hf_ds_hp48 = HFHighpass(
             sample_rate=REALTIME_SAMPLE_RATE,
             cutoff_hz=HP_CUTOFF_HZ,
             order=REALTIME_HF_HP_ORDER,
             name="offline_hf_ds_hp48"
-        )(offline_hf_ds)
+        )(off_hf_ds)
 
-        # KD with shift-aware MSE for pick/finger stems
-        _ = DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([offline_pick_ds,   out_pick])
-        _ = DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([offline_finger_ds, out_finger])
+        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
+        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
+        kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48, hf_final]))
 
-        # HF stem KD: use the 48 kHz, 3 kHz high-pass matched target
-        _ = DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([offline_hf_ds_hp48, hf_final])
+        # Resonance KD (optional)
+        if realtime_reso is not None and off_reso_scaled is not None:
+            off_reso_ds = FIRDecimateBy2(name="offline_reso_ds2")(off_reso_scaled)
+            kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_RESO_DISTILL_ALPHA, name="stem_reso_distill")([off_reso_ds, realtime_reso]))
 
+    # Ensure KD tensors are graph-reachable
+    if kd_tensors:
+        y_realtime = LossTether(name="realtime_kd_tether")([y_realtime] + kd_tensors)
+
+    # Assemble inputs/outputs
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
@@ -3008,10 +3070,10 @@ def add_sw_realtime_dual(x, y):
     style_force = force_mask  # 1 or 0
 
     inputs = {
-        'realtime_piezo_input':        x_realtime,
-        'offline_piezo_input':         x_offline,
-        'realtime_style_true_input':   style_true,
-        'realtime_style_force_input':  style_force,
+        'realtime_piezo_input':         x_realtime,
+        'realtime_offline_piezo_input': x_offline,
+        'realtime_style_true_input':    style_true,
+        'realtime_style_force_input':   style_force,
     }
     outputs = (y_audio, style_true)
 
