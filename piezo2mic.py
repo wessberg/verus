@@ -1959,7 +1959,13 @@ class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
         return cfg
 
 
-@register_keras_serializable())
+def _make_lpf_kernel(sample_rate, cutoff_hz=2800.0, order=129, window="hamming"):
+    taps = firwin(order, cutoff_hz / (sample_rate / 2.0), window=window, pass_zero=True).astype(np.float32)
+    taps = taps / np.sum(taps + 1e-12)
+    # reverse for tf.nn.conv1d cross-correlation
+    return tf.constant(taps[::-1].reshape(-1, 1, 1), dtype=tf.float32)
+
+@register_keras_serializable()
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
     """
     Penalize low-band energy in the student's HF branch: L1(LPF(hf_final)).
