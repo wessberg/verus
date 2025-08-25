@@ -1325,7 +1325,8 @@ class FIRDecimateBy2(Layer):
         b, t, c = input_shape
         if t is None:
             return (b, None, c)
-        out_t = t // 2
+        # With causal left pad (L-1), VALID conv with stride=2 ⇒ out_T = ceil(T/2)
+        out_t = (t + 1) // 2
         return (b, out_t, c)
 
     def get_config(self):
