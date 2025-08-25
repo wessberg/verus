@@ -190,8 +190,7 @@ REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
-REALTIME_HF_HP_ORDER          = 259
-REALTIME_HF_MASK_SMOOTH_TAPS = 64 
+REALTIME_HF_HP_ORDER          = OFFLINE_HF_HP_ORDER
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
 
 REALTIME_AUDIO_STFT_DISTILL_ALPHA   = 0.4   # KD weight for STFT KD (teacher audio_ds vs student audio)
@@ -202,7 +201,6 @@ REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (s
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 0.8   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
-REALTIME_HF_LEAK_ALPHA              = 8e-4
 REALTIME_STYLE_BLEND_INIT           = 0.7
 REALTIME_STYLE_BLEND_TRAINABLE      = True
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
@@ -265,7 +263,7 @@ REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 REALTIME_IR_ALIGN_OFFSET_CORRECTION = -64
 REALTIME_TOTAL_EXPECTED_IR_DELAY = (REALTIME_IR_FIR_SIZE - 1) + ((REALTIME_IR_FIR_SIZE - 1)//2)
-REALTIME_IR_BOOST_DB = 0.0
+REALTIME_IR_BOOST_DB = 0.5
 
 coarse_steps = math.ceil((REALTIME_IR_FIR_SIZE - 1) / REALTIME_IR_DOWNSAMPLE_FACTOR)
 IR_PREDELAY = coarse_steps * REALTIME_IR_DOWNSAMPLE_FACTOR
@@ -2084,31 +2082,21 @@ def _ones_kernel(length):
     return tf.constant(k_np, dtype=tf.float32)
 
 @register_keras_serializable()
-class HFLeakRegularizer(Layer, AdjustableAlphaMixin):
-    """
-    Penalize HF when the gate/mask is closed: add_loss(alpha * mean(|hf| * (1 - gate)^power)).
-    Returns input unchanged (training-only).
-    """
+class HFLeakRegularizer(Layer):
     def __init__(self, alpha=1e-3, power=2.0, **kwargs):
         super().__init__(**kwargs)
-        self.init_alpha = float(alpha)
+        self.alpha = float(alpha)
         self.power = float(power)
-
-    def build(self, input_shape):
-        # alpha is trainable via KDAlphaScheduler using set_alpha()
-        self.build_alpha(self.init_alpha, name="alpha")
-        super().build(input_shape)
-
     def call(self, inputs):
         hf_scaled, gate_used = inputs
+        # Penalize HF when gate is closed more strongly (power>1)
         leak_w = tf.pow(1.0 - tf.clip_by_value(gate_used, 0.0, 1.0), self.power)
         leak = tf.reduce_mean(tf.abs(hf_scaled) * leak_w)
-        self.add_loss(self.alpha_var * leak)
+        self.add_loss(self.alpha * leak)
         return hf_scaled
-
     def get_config(self):
         cfg = super().get_config()
-        cfg.update({"alpha": float(self.init_alpha), "power": self.power})
+        cfg.update({"alpha": self.alpha, "power": self.power})
         return cfg
 
 @register_keras_serializable()
@@ -2732,12 +2720,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
                       name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=4.0, name="realtime_hf_scale")(hf_hp)
 
-    # NEW: training-only leak penalty when the gate/mask is low (no runtime cost)
-    hf_final = HFLeakRegularizer(
-        alpha=REALTIME_HF_LEAK_ALPHA, power=2.0, name="realtime_hf_leak_reg"
-    )([hf_final, mask_used])
-
-    # Existing training-only lowband penalty (keep, but with stronger alpha)
+    # Training-only constraint (no runtime cost): penalize LF content in hf_final
     hf_final = HFLowbandPenalty(
         alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
         cutoff_hz=2800.0,
@@ -3343,23 +3326,19 @@ def train_shared(
     if kind == 'realtime':
         kd_targets = {
             # audio KD
-            "audio_distill":       (REALTIME_DISTILL_ALPHA,              2.0,  0,  80),
-            "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA,   0.2,  0,  80),
+            "audio_distill":       (REALTIME_DISTILL_ALPHA,        2.0,  0,  80),   # 8→2 example if you set REALTIME_DISTILL_ALPHA=8; adjust as needed
+            "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA, 0.2,  0,  80),
             # feature/stem KD
-            "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
-            "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
-            "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,    0.2,  0,  80),
-            "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA,  0.2,  0,  80),
-            "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,      0.2,  0,  80),
+            "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
+            "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
+            "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,   0.2,  0,  80),
+            "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA, 0.2,  0,  80),
+            "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,     0.2,  0,  80),
             # mask/gate KD
-            "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,      1.0,  0,  80),
-            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,    0.1,  0,  80),
-            # style blend schedule
-            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,           0.3,  0, 100),
-
-            # NEW: schedule training-only HF constraints (no runtime cost)
-            "realtime_hf_lowband_penalty": (REALTIME_HF_LOWBAND_PENALTY_ALPHA, 0.2, 0, 80),
-            "realtime_hf_leak_reg":        (REALTIME_HF_LEAK_ALPHA,            0.0, 0, 80),
+            "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,     1.0,  0,  80),
+            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,   0.1,  0,  80),
+            # style blend schedule (not a KD layer, but exposes a scalar weight)
+            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,       0.3,  0, 100),
         }
         cbs.append(KDAlphaScheduler(kd_targets))
 
