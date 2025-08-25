@@ -1810,6 +1810,11 @@ class AdjustableAlphaMixin:
     def get_config(self):
         return {}
 
+# ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
+from tensorflow.keras.utils import register_keras_serializable
+from tensorflow.keras.layers import Layer
+import tensorflow as tf
+
 @register_keras_serializable()
 class DistillLoss(Layer, AdjustableAlphaMixin):
     def __init__(self, alpha, **kwargs):
@@ -1820,8 +1825,10 @@ class DistillLoss(Layer, AdjustableAlphaMixin):
         self.build_alpha(self.init_alpha, name="alpha")
         super().build(input_shape)
 
-    def call(self, inputs):
+    def call(self, inputs, training=None):
         y_t, y_s = inputs
+        if training is False:
+            return y_s
         t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
         y_t_trim = y_t[:, :t, :]
         y_s_trim = y_s[:, :t, :]
@@ -1833,6 +1840,7 @@ class DistillLoss(Layer, AdjustableAlphaMixin):
         cfg = super().get_config()
         cfg.update({'alpha': float(self.init_alpha)})
         return cfg
+
 
 @register_keras_serializable()
 class DistillLossBestShift(Layer, AdjustableAlphaMixin):
@@ -1850,25 +1858,31 @@ class DistillLossBestShift(Layer, AdjustableAlphaMixin):
         super().build(input_shape)
 
     def _shift(self, x, s):
-        # x: (B,T,C), s: scalar int32 Tensor
         T = tf.shape(x)[1]
+
         def shift_right():
             pad = tf.zeros_like(x[:, :s, :])
             return tf.concat([x[:, s:, :], pad], axis=1)
+
         def shift_left():
             s_abs = -s
             pad = tf.zeros_like(x[:, :s_abs, :])
             return tf.concat([pad, x[:, :T - s_abs, :]], axis=1)
+
         def no_shift():
             return x
+
         return tf.case(
             [(tf.greater(s, 0), shift_right),
              (tf.less(s, 0), shift_left)],
             default=no_shift
         )
 
-    def call(self, inputs):
+    def call(self, inputs, training=None):
         y_t, y_s = inputs
+        if training is False:
+            return y_s
+
         t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
         y_t = y_t[:, :t, :]
         y_s = y_s[:, :t, :]
@@ -1879,7 +1893,6 @@ class DistillLossBestShift(Layer, AdjustableAlphaMixin):
             y_t_s = self._shift(y_t, s)
             return tf.reduce_mean(tf.math.squared_difference(y_t_s, y_s))
 
-        # Use fn_output_signature instead of deprecated dtype=
         losses = tf.map_fn(loss_for_shift, shifts, fn_output_signature=tf.float32)
         best = tf.reduce_min(losses)
         self.add_loss(self.alpha_var * best)
@@ -1889,6 +1902,7 @@ class DistillLossBestShift(Layer, AdjustableAlphaMixin):
         cfg = super().get_config()
         cfg.update({'alpha': float(self.init_alpha), 'max_shift': self.max_shift})
         return cfg
+
 
 @register_keras_serializable()
 class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
@@ -1910,8 +1924,11 @@ class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
         self.build_alpha(self.init_alpha, name="alpha")
         super().build(input_shape)
 
-    def call(self, inputs):
-        y_t, y_s = inputs  # (B,T,1)
+    def call(self, inputs, training=None):
+        y_t, y_s = inputs
+        if training is False:
+            return y_s
+
         t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
         t_true = tf.squeeze(y_t[:, :t, :], -1)
         t_pred = tf.squeeze(y_s[:, :t, :], -1)
@@ -1920,19 +1937,13 @@ class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
         for n_fft, hop, win in self.scales:
             st_t = tf.signal.stft(
                 t_true,
-                frame_length=win,
-                frame_step=hop,
-                fft_length=n_fft,
-                window_fn=tf.signal.hann_window,  # accepts dtype kwarg
-                pad_end=True
+                frame_length=win, frame_step=hop, fft_length=n_fft,
+                window_fn=tf.signal.hann_window, pad_end=True
             )
             st_p = tf.signal.stft(
                 t_pred,
-                frame_length=win,
-                frame_step=hop,
-                fft_length=n_fft,
-                window_fn=tf.signal.hann_window,
-                pad_end=True
+                frame_length=win, frame_step=hop, fft_length=n_fft,
+                window_fn=tf.signal.hann_window, pad_end=True
             )
             mag_t = tf.abs(st_t)
             mag_p = tf.abs(st_p)
@@ -1946,14 +1957,9 @@ class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
         cfg = super().get_config()
         cfg.update({'alpha': float(self.init_alpha)})
         return cfg
-    
-def _make_lpf_kernel(sample_rate, cutoff_hz=2800.0, order=129, window="hamming"):
-    taps = firwin(order, cutoff_hz / (sample_rate / 2.0), window=window, pass_zero=True).astype(np.float32)
-    taps = taps / np.sum(taps + 1e-12)
-    # reverse for tf.nn.conv1d cross-correlation
-    return tf.constant(taps[::-1].reshape(-1, 1, 1), dtype=tf.float32)
 
-@register_keras_serializable()
+
+@register_keras_serializable())
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
     """
     Penalize low-band energy in the student's HF branch: L1(LPF(hf_final)).
@@ -1978,7 +1984,9 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
         self.build_alpha(self.init_alpha, name="alpha")
         super().build(input_shape)
 
-    def call(self, x):
+    def call(self, x, training=None):
+        if training is False:
+            return x
         pad = tf.shape(self.kernel)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
         lp = tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
@@ -1995,6 +2003,31 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
             'sample_rate': self.sample_rate,
             'window': self.window
         })
+        return cfg
+
+
+@register_keras_serializable()
+class HFLeakRegularizer(Layer):
+    """
+    Training-only: penalize HF energy when the gate is closed.
+    """
+    def __init__(self, alpha=1e-3, power=2.0, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = float(alpha)
+        self.power = float(power)
+
+    def call(self, inputs, training=None):
+        hf_scaled, gate_used = inputs
+        if training is False:
+            return hf_scaled
+        leak_w = tf.pow(1.0 - tf.clip_by_value(gate_used, 0.0, 1.0), self.power)
+        leak = tf.reduce_mean(tf.abs(hf_scaled) * leak_w)
+        self.add_loss(self.alpha * leak)
+        return hf_scaled
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"alpha": self.alpha, "power": self.power})
         return cfg
 
 @register_keras_serializable()
