@@ -193,12 +193,14 @@ REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (tea
 REALTIME_HF_HP_ORDER          = OFFLINE_HF_HP_ORDER
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
 
-REALTIME_AUDIO_STFT_DISTILL_ALPHA   = 0.4   # KD weight for STFT KD (teacher audio_ds vs student audio)
+REALTIME_AUDIO_STFT_DISTILL_ALPHA   = 0.6   # KD weight for STFT KD (teacher audio_ds vs student audio)
 REALTIME_STEM_PICK_DISTILL_ALPHA    = 0.5   # KD weight for pick stem
 REALTIME_STEM_FINGER_DISTILL_ALPHA  = 0.5   # KD weight for finger stem
-REALTIME_STEM_HF_DISTILL_ALPHA      = 0.5   # KD weight for HF stem
+REALTIME_STEM_HF_DISTILL_ALPHA      = 0.8   # KD weight for HF stem
 REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (small; avoids cap conflict)
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
+REALTIME_STEM_RESO_DISTILL_ALPHA    = 0.4
+
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 0.8   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
 REALTIME_STYLE_BLEND_INIT           = 0.7
@@ -211,10 +213,29 @@ REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
 REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 6.0
-REALTIME_GATE_ENV_MS                     = 0.05
+REALTIME_GATE_ENV_MS                     = OFFLINE_GATE_ENV_MS
 REALTIME_GATE_DEPTH_SMOOTH_MS            = 4.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
+
+# ─── Resonance branch params ─────────────────────────────────────────────
+# OFFLINE (96k): more modes and longer IRs
+OFFLINE_RESO_ENABLE           = True
+OFFLINE_RESO_MODES            = 16
+OFFLINE_RESO_LENGTH           = 257     # causal FIR length per mode
+OFFLINE_RESO_CENTERS_HZ       = [240, 320, 420, 540, 700, 900, 1150, 1450, 1800, 2250, 2800, 3400, 4100, 4900, 5800, 6800]
+OFFLINE_RESO_DECAYS_MS        = [70, 65, 60, 55, 50, 45, 40, 38, 35, 32, 30, 28, 26, 24, 22, 20]
+OFFLINE_RESO_STRIKE_GAIN      = 3.0
+OFFLINE_RESO_BOOST_DB  = 0.0
+
+REALTIME_RESO_ENABLE          = True
+REALTIME_RESO_MODES           = 12
+REALTIME_RESO_LENGTH          = 97
+REALTIME_RESO_CENTERS_HZ      = [280, 360, 460, 600, 780, 1000, 1300, 1700, 2200, 2900, 3600, 4300]
+REALTIME_RESO_DECAYS_MS       = [60, 55, 50, 45, 40, 35, 32, 28, 25, 22, 20, 18]
+REALTIME_RESO_STRIKE_GAIN     = 2.5
+REALTIME_RESO_BOOST_DB = 0.0
+
 
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
@@ -1292,10 +1313,21 @@ def generate_demo_from_files(model,
         
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
     pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
-    model = boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
+    
+    if pick_boost_db != 0.0:
+        model = boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
 
-    if (sample_rate == REALTIME_SAMPLE_RATE):
+    if sample_rate == REALTIME_SAMPLE_RATE and REALTIME_IR_BOOST_DB != 0.0:
         model = boost_hf_scale_in_model(model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
+        
+    # Optional: resonance stem boost for quick A/B during demo generation
+    try:
+        if OFFLINE_RESO_BOOST_DB != 0.0 and sample_rate == OFFLINE_SAMPLE_RATE:
+            model = boost_hf_scale_in_model(model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
+        elif REALTIME_RESO_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
+            model = boost_hf_scale_in_model(model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
+    except Exception:
+        pass  # layer may not exist (e.g., older models)
 
     # Determine FILE sample-rate and region to render in file-frame domain
     info = sf.info(path_src)
@@ -2087,6 +2119,75 @@ def _causal_conv1d(x, kernel):
 _gate_smooth_cache = {}  # (tau_samples, scale, Lmax) -> kernel np.array
 _gate_ones_cache   = {}  # (L,) -> kernel np.array
 
+@register_keras_serializable()
+def gate_onset(g):
+    # g: (B,T,1) ∈ [0,1]; return rising edges as positive envelope
+    g_prev = tf.pad(g, [[0,0],[1,0],[0,0]])[:, :-1, :]
+    return tf.nn.relu(g - g_prev)
+
+def _make_modal_kernels(centers_hz, decays_ms, length, sample_rate):
+    L = int(length)
+    t = np.arange(L, dtype=np.float32)
+    kernels = []
+    for f, d_ms in zip(centers_hz, decays_ms):
+        tau_s = max(1.0, (float(d_ms) / 1000.0) * float(sample_rate))
+        env = np.exp(-t / tau_s).astype(np.float32)
+        s   = np.sin(2.0 * np.pi * float(f) * t / float(sample_rate)).astype(np.float32)
+        h = env * s
+        h /= np.maximum(np.sqrt(np.sum(h*h, dtype=np.float32)), 1e-6)
+        kernels.append(h)
+    K = np.stack(kernels, axis=1)      # (L, M)
+    K = K[::-1, :]                     # reverse for conv1d (cross-correlation → convolution)
+    return K.reshape(L, 1, -1).astype(np.float32)
+
+@register_keras_serializable()
+class ModalBank(tf.keras.layers.Layer):
+    """
+    Fixed bank of causal decaying-sine FIRs (one output channel per mode).
+    - Inputs: (B,T,1), outputs: (B,T,M)
+    - Implementation: left-pad by (L-1), tf.nn.conv1d with fixed kernels.
+    """
+    def __init__(self, centers_hz, decays_ms, length, sample_rate, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.centers_hz = [float(x) for x in centers_hz]
+        self.decays_ms  = [float(x) for x in decays_ms]
+        self.length     = int(length)
+        self.sample_rate= int(sample_rate)
+
+    def build(self, input_shape):
+        K = _make_modal_kernels(self.centers_hz, self.decays_ms, self.length, self.sample_rate)
+        self.kernel = self.add_weight(
+            name="modal_kernels",
+            shape=K.shape,
+            initializer=tf.keras.initializers.Constant(K),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        pad = self.length - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        b, t, _ = input_shape
+        return (b, t, len(self.centers_hz))
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "centers_hz": self.centers_hz,
+            "decays_ms":  self.decays_ms,
+            "length":     self.length,
+            "sample_rate":self.sample_rate
+        })
+        return cfg
+
+@register_keras_serializable()
+def strike_boost(x, gain=2.5):
+    # x: (B,T,1), returns (B,T,1) = 1 + gain*x
+    return 1.0 + tf.constant(float(gain), tf.float32) * x
+
 def _exp_smoothing_kernel(samples, scale=4.0, Lmax=2048):
     """
     Causal exponential FIR approximation of an EMA with time-constant 'samples'.
@@ -2395,6 +2496,70 @@ def film_apply(x, style_embed, filters, prefix):
         beta3
     ])
 
+def _add_resonance_branch_offline(inp, style_embed, gate):
+    if not OFFLINE_RESO_ENABLE:
+        return None
+    # 1) strike (onset) envelope
+    strike = Lambda(gate_onset, name="offline_strike_onrise")(gate)
+    strike = CausalMovingAverage(taps=96, name="offline_strike_smooth")(strike)  # ~1 ms at 96k
+
+    # 2) excitation (HP + gate + mild nonlinearity)
+    exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="offline_reso_pre_emph")(inp)
+    exc = Multiply(name="offline_reso_exc_gate")([exc, gate])
+    exc = Activation('tanh', name="offline_reso_drive")(exc)
+
+    # 3) modal bank
+    modes = ModalBank(
+        centers_hz=OFFLINE_RESO_CENTERS_HZ,
+        decays_ms=OFFLINE_RESO_DECAYS_MS,
+        length=OFFLINE_RESO_LENGTH,
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        name="offline_reso_modal"
+    )(exc)  # (B,T,M)
+
+    # 4) per-mode gains (style) × (strike boost)
+    gains = Dense(OFFLINE_RESO_MODES, activation="softplus", name="offline_reso_gains")(style_embed)   # (B,M)
+    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)                  # (B,1,M)
+    sboost= Lambda(strike_boost, arguments={'gain': OFFLINE_RESO_STRIKE_GAIN}, name="offline_strike_boost")(strike)  # (B,T,1)
+    gains_t = Multiply(name="offline_reso_gains_time")([gains, sboost])                                # broadcast to (B,T,M)
+
+    m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains_t])
+    reso = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)
+    reso = IrScale(init=1.0, name="offline_reso_scale")(reso)
+    return reso
+
+def _add_resonance_branch_realtime(inp, style_embed, gate):
+    if not REALTIME_RESO_ENABLE:
+        return None
+    # 1) strike env
+    strike = Lambda(gate_onset, name="realtime_strike_onrise")(gate)
+    strike = CausalMovingAverage(taps=48, name="realtime_strike_smooth")(strike)  # ~1 ms at 48k
+
+    # 2) excitation
+    exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="realtime_reso_pre_emph")(inp)
+    exc = Multiply(name="realtime_reso_exc_gate")([exc, gate])
+    exc = Activation('tanh', name="realtime_reso_drive")(exc)
+
+    # 3) modal bank
+    modes = ModalBank(
+        centers_hz=REALTIME_RESO_CENTERS_HZ,
+        decays_ms=REALTIME_RESO_DECAYS_MS,
+        length=REALTIME_RESO_LENGTH,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_reso_modal"
+    )(exc)
+
+    # 4) per-mode gains (style) × (strike boost)
+    gains = Dense(REALTIME_RESO_MODES, activation="softplus", name="realtime_reso_gains")(style_embed)
+    gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
+    sboost= Lambda(strike_boost, arguments={'gain': REALTIME_RESO_STRIKE_GAIN}, name="realtime_strike_boost")(strike)
+    gains_t = Multiply(name="realtime_reso_gains_time")([gains, sboost])
+
+    m_scaled = Multiply(name="realtime_reso_modes_scaled")([modes, gains_t])
+    reso = Conv1D(1, 1, padding="same", name="realtime_reso_mix")(m_scaled)
+    reso = IrScale(init=1.0, name="realtime_reso_scale")(reso)
+    return reso
+
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
 @register_keras_serializable()
@@ -2500,8 +2665,14 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
                       name="offline_hf_highpass")(hf_gated)
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
+    
+    offline_reso = _add_resonance_branch_offline(inp=inp, style_embed=style_embed, gate=offline_gate)
 
-    out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
+    # Final sum
+    if offline_reso is None:
+        out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
+    else:
+        out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final, offline_reso])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
@@ -2766,6 +2937,22 @@ def build_realtime_model(offline=None, dynamic_time=False):
     )(hf_final)
 
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
+    
+    # ─── Resonance branch (realtime) ──────────────────────────────────────
+    realtime_reso = _add_resonance_branch_realtime(inp=inp, style_embed=style_embed, gate=realtime_gate)
+
+    if realtime_reso is not None:
+        y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
+
+    # ─── Distillation for resonance stem from teacher ─────────────────────
+    if offline is not None and realtime_reso is not None:
+        try:
+            offline_reso_scaled = teacher.get_layer("offline_reso_scale").output  # (B, T96k, 1)
+            offline_reso_ds     = FIRDecimateBy2(name="offline_reso_ds2")(offline_reso_scaled)
+            _ = DistillLoss(alpha=REALTIME_STEM_RESO_DISTILL_ALPHA, name="stem_reso_distill")([offline_reso_ds, realtime_reso])
+        except:
+            # If training with a teacher that has no resonance branch yet
+            pass
 
     # ─── Distillation (teacher must be causal here) ────────────────────────────
     if offline is not None:
@@ -2964,6 +3151,11 @@ def build_offline_debug_model(offline):
         "finger_c":  offline.get_layer("offline_finger_contrib").output,
         "y_pred":    offline.get_layer("offline_mix_main").output,
     }
+    
+    outs.update({
+        "reso":     offline.get_layer("offline_reso_scale").output if "offline_reso_scale" in [l.name for l in offline.layers] else None
+    })
+    
     return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
 
 
@@ -2980,6 +3172,11 @@ def build_realtime_debug_model(realtime):
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
         "y_pred":    realtime.get_layer("realtime_with_ir").output,
     }
+    
+    outs.update({
+        "reso":     realtime.get_layer("realtime_reso_scale").output if "realtime_reso_scale" in [l.name for l in realtime.layers] else None
+    })
+    
     # Optional bypass exports if you added them
     try:
         outs["hf_scaled_gate_only"] = realtime.get_layer("realtime_hf_scale_gate_only").output
@@ -3056,9 +3253,21 @@ def audible_gate_debug(debug_model,
 
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
     pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
-    debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, pick_boost_db)
-    if (sample_rate == REALTIME_SAMPLE_RATE):
+    
+    if pick_boost_db != 0.0:
+        debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, pick_boost_db)
+
+    if REALTIME_IR_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
         debug_model = boost_hf_scale_in_model(debug_model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
+        
+    # Optional: resonance stem boost for quick A/B during demo generation
+    try:
+        if OFFLINE_RESO_BOOST_DB != 0.0 and sample_rate == OFFLINE_SAMPLE_RATE:
+            model = boost_hf_scale_in_model(model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
+        elif REALTIME_RESO_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
+            model = boost_hf_scale_in_model(model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
+    except Exception:
+        pass  # layer may not exist (e.g., older models)
 
     # Input region in file-sample domain
     info = sf.info(path_src)
@@ -3383,6 +3592,7 @@ def train_shared(
             "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,   0.1,  0,  80),
             # style blend schedule (not a KD layer, but exposes a scalar weight)
             "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,       0.3,  0, 100),
+            "stem_reso_distill":   (REALTIME_STEM_RESO_DISTILL_ALPHA, 0.2, 0, 80)
         }
         cbs.append(KDAlphaScheduler(kd_targets))
 
