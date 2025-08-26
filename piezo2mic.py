@@ -175,7 +175,7 @@ OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
 # HF loss shaping
 OFFLINE_HP_CUTOFF_HZ   = 3000.0
-REALTIME_HP_CUTOFF_HZ  = 3000.0
+REALTIME_HP_CUTOFF_HZ  = 5200.0
 
 # Realtime params
 REALTIME_FILTERS          = 48
@@ -2990,8 +2990,8 @@ def build_realtime_model(offline=None, dynamic_time=False):
     realtime_reso = _add_resonance_branch_realtime(
         inp=inp,
         style_embed=style_embed,
-        trigger=mask_used,          # align to HF gate open
-        style_mask=style_scalar_b3  # pick-only
+        trigger=realtime_gate,      # fast-attack → clear rising edge
+        style_mask=style_scalar_b3
     )
     
     y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
