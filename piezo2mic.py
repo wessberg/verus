@@ -341,6 +341,11 @@ DEMO_CHECKPOINTS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "checkpoints")
 DEMO_CHECKPOINTS_OFFLINE_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "offline")
 DEMO_CHECKPOINTS_REALTIME_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "realtime")
 
+# Stems demos
+STEMS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "stems")
+STEMS_OFFLINE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "offline")
+STEMS_REALTIME_OUT_DIR = os.path.join(STEMS_OUT_DIR, "realtime")
+
 SAVE_WEIGHTS           = False
 
 # ─── Minimum‑phase IR low‑pass taps for the realtime IR branch ──────────────
@@ -364,7 +369,13 @@ def make_minphase_lp_kernel(order=REALTIME_LP_ORDER,
 # Use this kernel as the default for IRLowpass
 realtime_lp_taps_tf = make_minphase_lp_kernel()
 
-for dir_path in [DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR, LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR, DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR, FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR]:
+for dir_path in [
+    DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR,
+    LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR,
+    DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR,
+    FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR,
+    STEMS_OFFLINE_OUT_DIR, STEMS_REALTIME_OUT_DIR
+]:
     os.makedirs(dir_path, exist_ok=True)
 
 def _extract_epoch_from_ckpt(path):
@@ -3278,6 +3289,293 @@ def boost_hf_scale_in_model(model, layer_name, gain_db):
     print(f"{layer_name}: {s:.4f} → {w[0][0]:.4f} (+{gain_db} dB)")
     return model
 
+def _boost_scales_for_stems(model, sample_rate):
+    """
+    Apply optional demo boosts to the debug model's IrScale layers.
+    Only applies when the *_BOOST_DB values exceed 0.0.
+    """
+    # HF scale boost
+    hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
+    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
+    if pick_boost_db > 0.0:
+        try:
+            boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
+        except Exception as e:
+            print(f"[stems] HF scale boost failed ({hf_scale_layer_name}): {e}")
+
+    # IR scale boost (realtime only)
+    if sample_rate == REALTIME_SAMPLE_RATE and REALTIME_IR_BOOST_DB > 0.0:
+        try:
+            boost_hf_scale_in_model(model, "realtime_ir_scale", REALTIME_IR_BOOST_DB)
+        except Exception as e:
+            print(f"[stems] IR scale boost failed: {e}")
+
+    # Resonance scale boost
+    try:
+        if sample_rate == OFFLINE_SAMPLE_RATE and OFFLINE_RESO_BOOST_DB > 0.0:
+            boost_hf_scale_in_model(model, "offline_reso_scale", OFFLINE_RESO_BOOST_DB)
+        elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESO_BOOST_DB > 0.0:
+            boost_hf_scale_in_model(model, "realtime_reso_scale", REALTIME_RESO_BOOST_DB)
+    except Exception as e:
+        # Some models may not have resonance branch
+        print(f"[stems] Resonance scale boost skipped or failed: {e}")
+
+
+def render_isolated_stems(
+    debug_model,
+    path_src,
+    path_tgt,
+    out_dir,
+    sample_rate,
+    sec=LONG_DEMO_SEC,
+    offset_sec=LONG_DEMO_OFFSET_SEC,
+    block_sec=12.0,
+    resample_margin_ms=50.0
+):
+    """
+    Render model stems to disk, streaming in blocks:
+      - piezo source
+      - mic target
+      - pred_full_predicted
+      - pred_full_forced (if style is known)
+      - stem_hf_only
+      - stem_ir_lowpass (realtime only)
+      - stem_reso_only (if exists)
+      - stem_pick_only
+      - stem_finger_only
+    Uses the model's debug_model, which must expose outputs:
+      realtime: gate, hf_scaled, pick_c, finger_c, y_pred, reso, ir_only, (optionally others)
+      offline:  gate, hf_scaled, pick_c, finger_c, y_pred, (reso optional)
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Apply any requested demo boosts
+    _boost_scales_for_stems(debug_model, sample_rate)
+
+    # Decide forced style from filename
+    if "pick" in path_src:
+        style_true_flag = 1.0
+    elif "finger" in path_src:
+        style_true_flag = 0.0
+    else:
+        style_true_flag = None  # unknown/mixed
+
+    # Resolve file SR and desired region
+    info = sf.info(path_src)
+    file_sr = info.samplerate
+    START_FRAME = int(round(offset_sec * file_sr))
+    TOTAL_FRAMES = int(round(sec * file_sr))
+    END_FRAME = START_FRAME + TOTAL_FRAMES
+    want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
+
+    # Streaming contexts
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
+    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
+    block_core_model = max(1, int(round(block_sec * sample_rate)))
+
+    # Style input tensors for predicted vs forced
+    style_pred_in  = np.zeros((1, 1), dtype=np.float32)  # dummy
+    force_pred_in  = np.zeros((1, 1), dtype=np.float32)  # 0 = use predicted style
+
+    style_true_in  = None
+    force_true_in  = None
+    if style_true_flag is not None:
+        style_true_in = np.array([[style_true_flag]], dtype=np.float32)
+        force_true_in = np.ones((1, 1), dtype=np.float32)  # 1 = force true style
+
+    # Open writers
+    w_src   = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_tgt   = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_predp = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_predt = None
+    if style_true_in is not None:
+        forced_name = "pick" if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else "finger"
+        w_predt = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced_{forced_name}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    w_hf    = sf.SoundFile(os.path.join(out_dir, "stem_hf_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    # Optional stems
+    w_ir    = None
+    w_reso  = None
+    w_pick  = sf.SoundFile(os.path.join(out_dir, "stem_pick_only.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_fing  = sf.SoundFile(os.path.join(out_dir, "stem_finger_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    # Check which optional outputs exist in this debug model
+    debug_out_layer_names = set([k.name if hasattr(k, "name") else str(k) for k in debug_model.outputs])
+    # If outputs was dict, Keras preserves keys in predict() dict; we still probe keys in returned dict below.
+
+    produced_model = 0
+
+    def _core_crop(arr, a, b):
+        return arr[a:b]
+
+    while produced_model < want_total_model:
+        # Determine core region for this iteration
+        core_model = min(block_core_model, want_total_model - produced_model)
+        left_this = left_ctx_model if produced_model > 0 else 0
+        right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
+
+        # Map to file frames
+        core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
+        core_start_file = START_FRAME + core_start_file_off
+
+        left_ctx_file = int(math.ceil(left_this * (file_sr / float(sample_rate))))
+        right_ctx_file = int(math.ceil(right_this * (file_sr / float(sample_rate))))
+        core_file_len = int(math.ceil(core_model * (file_sr / float(sample_rate))))
+
+        read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
+        read_b_desired = core_start_file + core_file_len + right_ctx_file + resample_margin_file
+        read_b = min(END_FRAME, read_b_desired)
+        n_read = max(0, read_b - read_a)
+        if n_read <= 0:
+            break
+
+        # Read file-rate audio
+        x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+        y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
+        x_file = x_blk_2d[:, 0]
+        y_file = y_blk_2d[:, 0]
+
+        # Resample to model SR
+        if file_sr != sample_rate:
+            x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
+            y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
+        else:
+            x_resamp = x_file
+            y_resamp = y_file
+
+        # Build input window with left/right context at model SR
+        left_off_file = (core_start_file - left_ctx_file) - read_a
+        left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
+        inp_start = max(0, min(left_off_model, len(x_resamp)))
+        inp_end = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
+        x_inp = x_resamp[inp_start:inp_end]
+        if x_inp.size <= 0:
+            break
+
+        core_start_in_inp = min(left_this, len(x_inp))
+        core_end_in_inp = min(core_start_in_inp + core_model, len(x_inp))
+        core_len = max(0, core_end_in_inp - core_start_in_inp)
+        if core_len <= 0:
+            break
+
+        x_b = x_inp[None, :, None].astype(np.float32)
+
+        # 1) Predicted style pass
+        outs_pred = debug_model.predict([x_b, style_pred_in, force_pred_in], verbose=0)
+        # Keras returns a dict when you pass dict outputs in the Model; ensure we can index by keys
+        if isinstance(outs_pred, (list, tuple)):
+            raise RuntimeError("Expected dict outputs from debug_model; got list/tuple. Please update build_*_debug_model to return a dict of named outputs.")
+        def core_of(out_dict, key):
+            arr = np.asarray(out_dict[key][0, :, 0], dtype=np.float32)
+            return _core_crop(arr, core_start_in_inp, core_end_in_inp)
+
+        # Write full prediction (predicted style) and stems
+        y_pred_core = core_of(outs_pred, "y_pred")
+        w_predp.write(y_pred_core)
+
+        hf_core = core_of(outs_pred, "hf_scaled")
+        w_hf.write(hf_core)
+
+        # Optional stems
+        if "ir_only" in outs_pred:
+            ir_core = core_of(outs_pred, "ir_only")
+            if w_ir is None:
+                w_ir = sf.SoundFile(os.path.join(out_dir, "stem_ir_lowpass.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            w_ir.write(ir_core)
+        if "reso" in outs_pred:
+            res_core = core_of(outs_pred, "reso")
+            if w_reso is None:
+                w_reso = sf.SoundFile(os.path.join(out_dir, "stem_reso_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            w_reso.write(res_core)
+
+        # Pick/finger contributions (always present in both offline/realtime debug models)
+        w_pick.write(core_of(outs_pred, "pick_c"))
+        w_fing.write(core_of(outs_pred, "finger_c"))
+
+        # 2) Forced style pass (if known)
+        if w_predt is not None:
+            outs_true = debug_model.predict([x_b, style_true_in, force_true_in], verbose=0)
+            y_true_core = core_of(outs_true, "y_pred")
+            w_predt.write(y_true_core)
+
+        # Write source/target (same cropping)
+        core_start_global = inp_start + core_start_in_inp
+        core_end_global = inp_start + core_end_in_inp
+        w_src.write(x_resamp[core_start_global:core_end_global])
+        w_tgt.write(y_resamp[core_start_global:core_end_global])
+
+        produced_model += core_len
+
+    # Close files
+    for w in [w_src, w_tgt, w_predp, w_predt, w_hf, w_ir, w_reso, w_pick, w_fing]:
+        try:
+            if w is not None:
+                w.close()
+        except:
+            pass
+
+    print(f"✅ Stems saved to {out_dir}")
+
+
+def run_render_stems_offline():
+    # Load offline dynamic or build from checkpoint
+    if os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
+        offline_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
+    else:
+        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
+        if ckpts:
+            print("Loading latest checkpoint:", ckpts[-1])
+            static = tf.keras.models.load_model(ckpts[-1], compile=False)
+            offline_dyn = build_offline_model(dynamic_time=True)
+            offline_dyn.set_weights(static.get_weights())
+        else:
+            static = build_offline_model(dynamic_time=False)
+            offline_dyn = build_offline_model(dynamic_time=True)
+            offline_dyn.set_weights(static.get_weights())
+
+    assert_has_pairs()
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    dbg = build_offline_debug_model(offline_dyn)
+    render_isolated_stems(
+        debug_model=dbg,
+        path_src=src,
+        path_tgt=tgt,
+        out_dir=STEMS_OFFLINE_OUT_DIR,
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        sec=LONG_DEMO_SEC,
+        offset_sec=LONG_DEMO_OFFSET_SEC
+    )
+
+
+def run_render_stems_realtime():
+    # Load realtime dynamic or build from checkpoint
+    if os.path.exists(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)):
+        realtime_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
+    else:
+        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
+        if ckpts:
+            print("Loading latest checkpoint:", ckpts[-1])
+            static = tf.keras.models.load_model(ckpts[-1], compile=False)
+            realtime_dyn = build_realtime_model(dynamic_time=True)
+            copy_weights_by_name(realtime_dyn, static)
+        else:
+            static = build_realtime_model(dynamic_time=False)
+            realtime_dyn = build_realtime_model(dynamic_time=True)
+            copy_weights_by_name(realtime_dyn, static)
+
+    assert_has_pairs()
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    dbg = build_realtime_debug_model(realtime_dyn)
+    render_isolated_stems(
+        debug_model=dbg,
+        path_src=src,
+        path_tgt=tgt,
+        out_dir=STEMS_REALTIME_OUT_DIR,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        sec=LONG_DEMO_SEC,
+        offset_sec=LONG_DEMO_OFFSET_SEC
+    )
+
 def audible_gate_debug(debug_model,
                                  path_src,
                                  path_tgt,
@@ -3991,64 +4289,11 @@ def main ():
             sample_rate=OFFLINE_SAMPLE_RATE
         )
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-offline":
-        # Load offline dynamic or last checkpoint → dynamic
-        if os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
-            offline_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
-        else:
-            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
-            
-            if ckpts:
-                print("Loading latest checkpoint:", ckpts[-1])
-                static = tf.keras.models.load_model(ckpts[-1], compile=False)
-                offline_dyn = build_offline_model(dynamic_time=True)
-                offline_dyn.set_weights(static.get_weights())
-                offline_dyn.save(ckpts[-1] + "_foo.keras")
-            else:
-                static = build_offline_model(dynamic_time=False)
-                offline_dyn = build_offline_model(dynamic_time=True)
-                offline_dyn.set_weights(static.get_weights())
-
-        assert_has_pairs()
-        src, tgt = all_pairs[DEMO_PAIR_INDEX]
-        out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_offline")
-        
-        debug_model = build_offline_debug_model(offline_dyn)
-
-        # debug_model = retune_offline_gate_inplace(
-        #     model=debug_model,
-        #     attack_ms=GATE_ATTACK_MS,
-        #     cutoff_hz=GATE_HP_SIDECHAIN_LOW_CUT_HZ,
-        #     hold_ms=GATE_HOLD_MS,
-        #     release_ms=GATE_RELEASE_MS,
-        #     hp_order=OFFLINE_HF_HP_ORDER,
-        #     ratio=GATE_RATIO,
-        #     threshold_db=GATE_THRESHOLD_DB
-        # )
-        
-        audible_gate_debug(debug_model=debug_model, path_src=src, path_tgt=tgt, out_dir=out_dir, sample_rate=OFFLINE_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
-        sys.exit(0)
-
-    elif len(sys.argv)>1 and sys.argv[1]=="--audible-gate-realtime":
-        if os.path.exists(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)):
-            realtime_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
-        else:
-            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
-            if ckpts:
-                print("Loading latest checkpoint:", ckpts[-1])
-                static = tf.keras.models.load_model(ckpts[-1], compile=False)
-                realtime_dyn = build_realtime_model(dynamic_time=True)
-                copy_weights_by_name(realtime_dyn, static)
-            else:
-                static = build_realtime_model(dynamic_time=False)
-                realtime_dyn = build_realtime_model(dynamic_time=True)
-                copy_weights_by_name(realtime_dyn, static)
-                
-        assert_has_pairs()
-        src, tgt = all_pairs[DEMO_PAIR_INDEX]
-        out_dir = os.path.join(DEMOS_OUT_DIR, "audible_gate_realtime")
-        debug_model = build_realtime_debug_model(realtime_dyn)
-        audible_gate_debug(debug_model=debug_model, path_src=src, path_tgt=tgt, out_dir=out_dir, sample_rate=REALTIME_SAMPLE_RATE, sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC, style_mode="true")
+    elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only"):
+            run_render_stems_offline()
+        if (len(sys.argv) <= 2 or sys.argv[2] !="--offline-only"):
+            run_render_stems_realtime()
         sys.exit(0)
     else:
         print("No command given.")
