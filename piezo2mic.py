@@ -214,7 +214,7 @@ REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 20.0
 REALTIME_GATE_ENV_MS                     = 0.02
-REALTIME_GATE_DEPTH_SMOOTH_MS            = 20.0
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 10.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
@@ -230,7 +230,7 @@ OFFLINE_RESO_DS_FACTOR    = 16     # 96k → 6 kHz
 OFFLINE_RESO_LENGTH_DS    = 384    # 384 @ 6 kHz ≈ 64 ms
 OFFLINE_RESO_CENTERS_HZ   = log_spaced(1400.0, 2000.0, OFFLINE_RESO_MODES)
 OFFLINE_RESO_DECAYS_MS    = list(np.linspace(55.0, 22.0, OFFLINE_RESO_MODES))
-OFFLINE_RESO_STRIKE_DECAY_MS = 35.0
+OFFLINE_RESO_STRIKE_DECAY_MS = 120.0
 OFFLINE_RESO_ONSET_THR  = 0.02
 OFFLINE_RESO_BOOST_DB     = 0.0
 
@@ -241,7 +241,7 @@ REALTIME_RESO_DS_FACTOR   = 8      # 48k → 6 kHz
 REALTIME_RESO_LENGTH_DS   = 384    # 384 @ 6 kHz ≈ 64 ms
 REALTIME_RESO_CENTERS_HZ  = log_spaced(700.0, 2000.0, REALTIME_RESO_MODES)
 REALTIME_RESO_DECAYS_MS   = list(np.linspace(45.0, 18.0, REALTIME_RESO_MODES))
-REALTIME_RESO_STRIKE_DECAY_MS = 35.0
+REALTIME_RESO_STRIKE_DECAY_MS = 120.0
 REALTIME_RESO_ONSET_THR = 0.02
 REALTIME_RESO_BOOST_DB    = 0.0
 
@@ -2502,24 +2502,27 @@ def film_apply(x, style_embed, filters, prefix):
         beta3
     ])
 
-def _add_resonance_branch_offline(inp, style_embed, gate):
+def _add_resonance_branch_offline(inp, style_embed, gate, style_mask=None):
     """
-    Triggered resonance: only active on pick attacks (no baseline).
-    Causal, streaming-safe, and TFLite-friendly.
+    Offline resonance triggered by HF gate opening:
+      - gate: offline HF gate (same detector as HF)
+      - style_mask: offline style mask over time (pick-only)
+      - Longer decay envelope; single post‑mix gating
     """
     if not OFFLINE_RESO_ENABLE:
         return None
 
-    # Onset pulses → decaying strike envelope that returns to zero
-    strike_on   = Lambda(gate_onset, name="offline_strike_onrise")(gate)
-    strike_pulse = Lambda(onset_binarize, arguments={'thr': OFFLINE_RESO_ONSET_THR}, name="offline_strike_bin")(strike_on)
-    strike_env  = CausalExpSmoother(
+    trig_on    = Lambda(gate_onset, name="offline_reso_onrise")(gate)
+    trig_pulse = Lambda(onset_binarize, arguments={'thr': OFFLINE_RESO_ONSET_THR}, name="offline_reso_on_bin")(trig_on)
+    if style_mask is not None:
+        trig_pulse = Multiply(name="offline_reso_pick_only")([trig_pulse, style_mask])
+
+    strike_env = CausalExpSmoother(
         time_const_ms=OFFLINE_RESO_STRIKE_DECAY_MS,
         sample_rate=OFFLINE_SAMPLE_RATE,
-        name="offline_strike_env"
-    )(strike_pulse)  # (B,T,1) decays to 0 between attacks
+        name="offline_reso_strike_env"
+    )(trig_pulse)  # (B,T,1)
 
-    # Excitation (drive) — gated by strike_env so no energy is injected between attacks
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="offline_reso_pre_emph")(inp)
     exc = Activation('tanh', name="offline_reso_drive")(exc)
 
@@ -2528,16 +2531,11 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     if (1 << stages) != fac:
         raise ValueError(f"OFFLINE_RESO_DS_FACTOR must be power-of-two, got {OFFLINE_RESO_DS_FACTOR}")
 
-    # Decimate both the excitation and the strike envelope to modal rate
     x_ds, env_ds = exc, strike_env
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"offline_reso_ds2_{i}")(x_ds)
         env_ds = FIRDecimateBy2(name=f"offline_reso_env_ds2_{i}")(env_ds)
 
-    # Gate the excitation at the decimated rate (pre-convolution), so modes are only driven on attacks
-    x_ds = Multiply(name="offline_reso_exc_gated_ds")([x_ds, env_ds])
-
-    # Modal bank (long kernels at DS rate)
     ds_sr = OFFLINE_SAMPLE_RATE // fac
     modes = ModalBank(
         centers_hz=OFFLINE_RESO_CENTERS_HZ,
@@ -2547,7 +2545,6 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
         name="offline_reso_modal_ds"
     )(x_ds)  # (B,Tds,M)
 
-    # Per-mode gains — softplus keeps them positive; bias helps avoid dead gains
     gains = Dense(
         OFFLINE_RESO_MODES,
         activation="softplus",
@@ -2555,16 +2552,13 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
         kernel_regularizer=regularizers.l2(1e-5),
         name="offline_reso_gains"
     )(style_embed)  # (B,M)
-
-    # Gate the gains over time too (after decimation), reinforcing "no resonance when no strike"
     gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)
-    gains_t = Multiply(name="offline_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M)
 
-    # Mix modes and return to model rate
-    m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains_t])
+    m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains])
     reso_ds  = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)
 
-    # Upsample and smooth to 96k
+    reso_ds = Multiply(name="offline_reso_apply_env_ds")([reso_ds, env_ds])
+
     offline_lp_taps = make_minphase_lp_kernel(
         order=REALTIME_LP_ORDER,
         cutoff_hz=0.9 * (OFFLINE_SAMPLE_RATE / (2.0 * OFFLINE_RESO_DS_FACTOR)),
@@ -2574,46 +2568,52 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     reso_us  = IRLowpass(taps=offline_lp_taps, name="offline_reso_lowpass")(reso_us)
     reso     = MatchTimeToRef(name="offline_reso_matchlen")([reso_us, inp])
 
-    # Final scalar
     reso = IrScale(init=1.0, name="offline_reso_scale")(reso)
     return reso
 
-
-def _add_resonance_branch_realtime(inp, style_embed, gate):
+def _add_resonance_branch_realtime(inp, style_embed, trigger, style_mask=None):
     """
-    Triggered resonance: only active on pick attacks (no baseline).
-    Causal, streaming-safe, TFLite/INT8 friendly.
+    Resonance triggered by the HF gate opening:
+      - trigger: (B,T,1) gate you want to align to (use HF mask_used for realtime)
+      - style_mask: (B,1,1) or (B,T,1); multiply to enforce pick-only
+      - Longer decay envelope so it rings out after opening
+      - Single gating after mode mixing (stronger output)
     """
     if not REALTIME_RESO_ENABLE:
         return None
 
-    # Onset pulses → decaying strike envelope that returns to zero
-    strike_on   = Lambda(gate_onset, name="realtime_strike_onrise")(gate)
-    strike_pulse = Lambda(onset_binarize, arguments={'thr': REALTIME_RESO_ONSET_THR}, name="realtime_strike_bin")(strike_on)
-    strike_env  = CausalExpSmoother(
-        time_const_ms=REALTIME_RESO_STRIKE_DECAY_MS,
-        sample_rate=REALTIME_SAMPLE_RATE,
-        name="realtime_strike_env"
-    )(strike_pulse)  # (B,T,1)
+    # 1) Build a trigger envelope from the HF gate opening
+    # Rising edges -> binarized pulses
+    trig_on    = Lambda(gate_onset, name="realtime_reso_onrise")(trigger)
+    trig_pulse = Lambda(onset_binarize, arguments={'thr': REALTIME_RESO_ONSET_THR}, name="realtime_reso_on_bin")(trig_on)
 
-    # Excitation (drive) — gated by strike_env so no energy between attacks
+    # Enforce pick-only (soft gating by style mask; set hard gate if you prefer)
+    if style_mask is not None:
+        trig_pulse = Multiply(name="realtime_reso_pick_only")([trig_pulse, style_mask])
+
+    # Decay envelope that lasts longer than the HF gate
+    strike_env = CausalExpSmoother(
+        time_const_ms=REALTIME_RESO_STRIKE_DECAY_MS,  # make this larger if you want longer ring
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_reso_strike_env"
+    )(trig_pulse)  # (B,T,1)
+
+    # 2) Excitation (no pre-gating; we gate once later, post‑mix)
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="realtime_reso_pre_emph")(inp)
     exc = Activation('tanh', name="realtime_reso_drive")(exc)
 
+    # 3) Decimate excitation and envelope to modal rate
     fac = int(REALTIME_RESO_DS_FACTOR)
     stages = int(round(math.log2(max(1, fac))))
     if (1 << stages) != fac:
         raise ValueError(f"REALTIME_RESO_DS_FACTOR must be power-of-two, got {REALTIME_RESO_DS_FACTOR}")
 
-    # Decimate both excitation and envelope
     x_ds, env_ds = exc, strike_env
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"realtime_reso_ds2_{i}")(x_ds)
         env_ds = FIRDecimateBy2(name=f"realtime_reso_env_ds2_{i}")(env_ds)
 
-    # Gate the excitation at DS rate (pre-convolution)
-    x_ds = Multiply(name="realtime_reso_exc_gated_ds")([x_ds, env_ds])
-
+    # 4) Modal bank (no time-gating inside; we’ll apply env_ds once after mixing)
     ds_sr = REALTIME_SAMPLE_RATE // fac
     modes = ModalBank(
         centers_hz=REALTIME_RESO_CENTERS_HZ,
@@ -2623,24 +2623,29 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
         name="realtime_reso_modal_ds"
     )(x_ds)  # (B,Tds,M)
 
-    # Per-mode gains — softplus keeps them positive; bias avoids dead gains
+    # Per-mode gains (positive)
     gains = Dense(
         REALTIME_RESO_MODES,
-        activation="softplus",  # ReLU can die at 0; softplus stays >0 and is TFLite friendly
+        activation="softplus",
         bias_initializer=tf.keras.initializers.Constant(0.3),
         kernel_regularizer=regularizers.l2(1e-5),
         name="realtime_reso_gains"
     )(style_embed)  # (B,M)
     gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
-    gains_t = Multiply(name="realtime_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M)
 
-    m_scaled = Multiply(name="realtime_reso_modes_scaled")([modes, gains_t])
+    # Mix modes
+    m_scaled = Multiply(name="realtime_reso_modes_scaled")([modes, gains])
     reso_ds  = Conv1D(1, 1, padding="same", name="realtime_reso_mix")(m_scaled)
 
+    # 5) Apply the long strike envelope just once, after the mix (stronger)
+    reso_ds = Multiply(name="realtime_reso_apply_env_ds")([reso_ds, env_ds])
+
+    # 6) Upsample and low-pass back to 48 kHz
     reso_us  = ResizeNearest1D(factor=REALTIME_RESO_DS_FACTOR, name="realtime_reso_upsample")(reso_ds)
     reso_us  = IRLowpass(name="realtime_reso_lowpass")(reso_us)
     reso     = MatchTimeToRef(name="realtime_reso_matchlen")([reso_us, inp])
 
+    # Final scalar
     reso = IrScale(init=1.0, name="realtime_reso_scale")(reso)
     return reso
 
@@ -2750,7 +2755,12 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
     
-    offline_reso = _add_resonance_branch_offline(inp=inp, style_embed=style_embed, gate=offline_gate)
+    offline_reso = _add_resonance_branch_offline(
+        inp=inp,
+        style_embed=style_embed,
+        gate=offline_gate,           # same detector as HF branch
+        style_mask=style_time_used   # pick-only
+    )
 
     # Final sum
     if offline_reso is None:
@@ -2977,7 +2987,13 @@ def build_realtime_model(offline=None, dynamic_time=False):
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
     # Resonance branch (student)
-    realtime_reso = _add_resonance_branch_realtime(inp=inp, style_embed=style_embed, gate=realtime_gate)
+    realtime_reso = _add_resonance_branch_realtime(
+        inp=inp,
+        style_embed=style_embed,
+        trigger=mask_used,          # align to HF gate open
+        style_mask=style_scalar_b3  # pick-only
+    )
+    
     y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
 
     # KD wiring (student vs teacher) — all based on the single teacher_combo call
