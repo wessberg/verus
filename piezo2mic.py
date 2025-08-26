@@ -173,6 +173,10 @@ OFFLINE_GATE_DEPTH_SMOOTH_MS = 20.0
 OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline.keras"
 OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
+# HF loss shaping
+OFFLINE_HP_CUTOFF_HZ   = 3000.0
+REALTIME_HP_CUTOFF_HZ  = 3000.0
+
 # Realtime params
 REALTIME_FILTERS          = 48
 REALTIME_KERNEL_SIZE      = 25
@@ -198,6 +202,7 @@ REALTIME_STEM_RESO_DISTILL_ALPHA    = 0.0
 
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 1.0   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
+REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ = max(2900.0, 0.75 * REALTIME_HP_CUTOFF_HZ)
 REALTIME_STYLE_BLEND_INIT           = 0.7
 REALTIME_STYLE_BLEND_TRAINABLE      = True
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
@@ -207,8 +212,8 @@ REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_THRESHOLD_DB
 REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
 REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
-REALTIME_GATE_RELEASE_MS                 = 6.0
-REALTIME_GATE_ENV_MS                     = 0.05
+REALTIME_GATE_RELEASE_MS                 = 20.0
+REALTIME_GATE_ENV_MS                     = 0.02
 REALTIME_GATE_DEPTH_SMOOTH_MS            = 20.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
@@ -226,6 +231,7 @@ OFFLINE_RESO_LENGTH_DS    = 384    # 384 @ 6 kHz ≈ 64 ms
 OFFLINE_RESO_CENTERS_HZ   = log_spaced(1400.0, 2000.0, OFFLINE_RESO_MODES)
 OFFLINE_RESO_DECAYS_MS    = list(np.linspace(55.0, 22.0, OFFLINE_RESO_MODES))
 OFFLINE_RESO_STRIKE_DECAY_MS = 35.0
+OFFLINE_RESO_ONSET_THR  = 0.02
 OFFLINE_RESO_BOOST_DB     = 0.0
 
 # Realtime (48 kHz)
@@ -236,6 +242,7 @@ REALTIME_RESO_LENGTH_DS   = 384    # 384 @ 6 kHz ≈ 64 ms
 REALTIME_RESO_CENTERS_HZ  = log_spaced(700.0, 2000.0, REALTIME_RESO_MODES)
 REALTIME_RESO_DECAYS_MS   = list(np.linspace(45.0, 18.0, REALTIME_RESO_MODES))
 REALTIME_RESO_STRIKE_DECAY_MS = 35.0
+REALTIME_RESO_ONSET_THR = 0.02
 REALTIME_RESO_BOOST_DB    = 0.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
@@ -252,10 +259,6 @@ FINETUNE_MEL_WEIGHT          = 15.0
 
 FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
-
-# HF loss shaping
-HP_CUTOFF_HZ   = 3000.0
-GATE_DEBUG_TONE_MULT = 1.0
 
 HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
@@ -369,6 +372,15 @@ def make_minphase_lp_kernel(order=REALTIME_LP_ORDER,
 # Use this kernel as the default for IRLowpass
 realtime_lp_taps_tf = make_minphase_lp_kernel()
 
+def hp_cutoff_for_sr(sr):
+    sr = int(sr)
+    if sr == OFFLINE_SAMPLE_RATE:
+        return OFFLINE_HP_CUTOFF_HZ
+    elif sr == REALTIME_SAMPLE_RATE:
+        return REALTIME_HP_CUTOFF_HZ
+
+    raise ValueError(f"Unsupported sample rate: {sr}")
+
 for dir_path in [
     DEMO_GENERATOR_OUTPUTS_OUT_DIR, CHECKPOINT_OFFLINE_OUT_DIR, CHECKPOINT_REALTIME_OUT_DIR,
     LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR,
@@ -382,19 +394,6 @@ def _extract_epoch_from_ckpt(path):
     fn = os.path.basename(path)
     m = re.search(r'epoch_(\d+)', fn)
     return int(m.group(1)) if m else 0
-
-def gate_debug_tone_freq(sample_rate, cutoff_hz, mult=GATE_DEBUG_TONE_MULT):
-    """
-    Pick an audible, safe tone frequency tied to the gate HP cutoff.
-    Clamps to [50 Hz, 0.45*Nyquist] to avoid aliasing and inaudible extremes.
-    """
-    freq = float(cutoff_hz) * float(mult)
-    nyq_guard = 0.45 * float(sample_rate)
-    if freq < 50.0:
-        freq = 50.0
-    if freq > nyq_guard:
-        freq = nyq_guard
-    return freq
 
 def resample_to_model_sr(audio, audio_sample_rate: int, model_sample_rate: int):
     g = math.gcd(audio_sample_rate, model_sample_rate)
@@ -687,7 +686,7 @@ def multi_scale_stft_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                   split_hz=HP_CUTOFF_HZ,
+                                   split_hz=OFFLINE_HP_CUTOFF_HZ,
                                    high_boost=STFT_HIGH_BOOST,
                                    onset_env=None,
                                    onset_gain=STFT_HF_ONSET_GAIN):
@@ -810,7 +809,7 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
     td   = waveform_l1_loss(y_true, y_pred)
     hf   = hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)
     spec = mrstft_mag_loss_weighted_onset(y_true, y_pred, sample_rate,
-                                          split_hz=HP_CUTOFF_HZ,
+                                          split_hz=hp_cutoff_for_sr(sample_rate),
                                           high_boost=STFT_HIGH_BOOST,
                                           onset_env=gate_env, onset_gain=STFT_HF_ONSET_GAIN)
     mel  = log_mel_loss(y_true, y_pred, sample_rate)
@@ -1007,7 +1006,7 @@ def analyze_loss_scales(model, batch, sample_rate):
     stft_on = tf.reduce_mean(
         mrstft_mag_loss_weighted_onset(
             y_true, y_pred, sample_rate,
-            split_hz=HP_CUTOFF_HZ,
+            split_hz=hp_cutoff_for_sr(sample_rate),
             high_boost=STFT_HIGH_BOOST,
             onset_env=gate_env,
             onset_gain=STFT_HF_ONSET_GAIN
@@ -1279,9 +1278,16 @@ h_min = h_min.astype(np.float32)
 _ir_fir_kernel = h_min[::-1].reshape(-1, 1, 1).astype(np.float32)
 
 _ir_fir_tf  = tf.constant(_ir_fir_kernel, dtype=tf.float32)  # downsampling (analysis) FIR
-_ir_fir_up  = tf.constant(_ir_fir_kernel, dtype=tf.float32)  # post-LP (synthesis) FIR
 
 # ────────────────────────────── CUSTOM LAYERS ────────────────────────────────
+
+@register_keras_serializable()
+def onset_binarize(x, thr=0.02):
+    """
+    Binarize onset spikes: returns 1.0 where x > thr else 0.0.
+    thr is a small positive constant; tune per model/sample_rate if needed.
+    """
+    return tf.cast(tf.greater(x, tf.constant(float(thr), dtype=tf.float32)), tf.float32)
 
 class KDAlphaScheduler(tf.keras.callbacks.Callback):
     """
@@ -1382,7 +1388,7 @@ class FIRDecimateBy2(tf.keras.layers.Layer):
 
 @register_keras_serializable()
 class HFHighpass(tf.keras.layers.Layer):
-    def __init__(self, taps=None, sample_rate=None, cutoff_hz=HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, **kwargs):
+    def __init__(self, taps=None, sample_rate=None, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, **kwargs):
         """
         Causal min-phase FIR high-pass, implemented as conv1d with left padding.
         - If 'taps' is provided, it is used as-is (Tensor/ndarray of shape [L,1,1], already time-reversed for conv1d).
@@ -2497,34 +2503,41 @@ def film_apply(x, style_embed, filters, prefix):
     ])
 
 def _add_resonance_branch_offline(inp, style_embed, gate):
+    """
+    Triggered resonance: only active on pick attacks (no baseline).
+    Causal, streaming-safe, and TFLite-friendly.
+    """
     if not OFFLINE_RESO_ENABLE:
         return None
 
-    # Onset → long strike envelope → boost with baseline 1.0
+    # Onset pulses → decaying strike envelope that returns to zero
     strike_on   = Lambda(gate_onset, name="offline_strike_onrise")(gate)
-    strike_long = CausalExpSmoother(
+    strike_pulse = Lambda(onset_binarize, arguments={'thr': OFFLINE_RESO_ONSET_THR}, name="offline_strike_bin")(strike_on)
+    strike_env  = CausalExpSmoother(
         time_const_ms=OFFLINE_RESO_STRIKE_DECAY_MS,
         sample_rate=OFFLINE_SAMPLE_RATE,
-        name="offline_strike_long"
-    )(strike_on)  # (B,T,1)
-    # Boosted envelope: 1 + g * env
-    strike_boosted = Lambda(strike_boost, arguments={'gain': 2.5}, name="offline_strike_boost")(strike_long)
+        name="offline_strike_env"
+    )(strike_pulse)  # (B,T,1) decays to 0 between attacks
 
-    # Excitation
+    # Excitation (drive) — gated by strike_env so no energy is injected between attacks
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="offline_reso_pre_emph")(inp)
     exc = Activation('tanh', name="offline_reso_drive")(exc)
 
-    # Decimate both excitation and boosted envelope
     fac = int(OFFLINE_RESO_DS_FACTOR)
     stages = int(round(math.log2(max(1, fac))))
     if (1 << stages) != fac:
-        raise ValueError(f"OFFLINE_RESO_DS_FACTOR must be power-of-two, got {OFFLINE_RESO_DS_FACTOR}")  
+        raise ValueError(f"OFFLINE_RESO_DS_FACTOR must be power-of-two, got {OFFLINE_RESO_DS_FACTOR}")
 
-    x_ds, env_ds = exc, strike_boosted
+    # Decimate both the excitation and the strike envelope to modal rate
+    x_ds, env_ds = exc, strike_env
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"offline_reso_ds2_{i}")(x_ds)
         env_ds = FIRDecimateBy2(name=f"offline_reso_env_ds2_{i}")(env_ds)
 
+    # Gate the excitation at the decimated rate (pre-convolution), so modes are only driven on attacks
+    x_ds = Multiply(name="offline_reso_exc_gated_ds")([x_ds, env_ds])
+
+    # Modal bank (long kernels at DS rate)
     ds_sr = OFFLINE_SAMPLE_RATE // fac
     modes = ModalBank(
         centers_hz=OFFLINE_RESO_CENTERS_HZ,
@@ -2532,24 +2545,26 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
         length=OFFLINE_RESO_LENGTH_DS,
         sample_rate=ds_sr,
         name="offline_reso_modal_ds"
-    )(x_ds)  # (B, Tds, M)
+    )(x_ds)  # (B,Tds,M)
 
-    # Softplus + positive bias keeps modes alive
+    # Per-mode gains — softplus keeps them positive; bias helps avoid dead gains
     gains = Dense(
         OFFLINE_RESO_MODES,
         activation="softplus",
         bias_initializer=tf.keras.initializers.Constant(0.3),
-        kernel_regularizer=regularizers.l2(1e-5),         # lighter regularization than activity L1
+        kernel_regularizer=regularizers.l2(1e-5),
         name="offline_reso_gains"
     )(style_embed)  # (B,M)
 
-    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)  # (B,1,M)
-    gains_t = Multiply(name="offline_reso_gains_time_ds")([gains, env_ds])             # (B,Tds,M)
+    # Gate the gains over time too (after decimation), reinforcing "no resonance when no strike"
+    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)
+    gains_t = Multiply(name="offline_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M)
 
+    # Mix modes and return to model rate
     m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains_t])
     reso_ds  = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)
 
-    # Upsample + lowpass to model SR
+    # Upsample and smooth to 96k
     offline_lp_taps = make_minphase_lp_kernel(
         order=REALTIME_LP_ORDER,
         cutoff_hz=0.9 * (OFFLINE_SAMPLE_RATE / (2.0 * OFFLINE_RESO_DS_FACTOR)),
@@ -2559,24 +2574,29 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     reso_us  = IRLowpass(taps=offline_lp_taps, name="offline_reso_lowpass")(reso_us)
     reso     = MatchTimeToRef(name="offline_reso_matchlen")([reso_us, inp])
 
-    reso = IrScale(init=1.2, name="offline_reso_scale")(reso)  # slightly >1 init helps
+    # Final scalar
+    reso = IrScale(init=1.0, name="offline_reso_scale")(reso)
     return reso
 
 
 def _add_resonance_branch_realtime(inp, style_embed, gate):
+    """
+    Triggered resonance: only active on pick attacks (no baseline).
+    Causal, streaming-safe, TFLite/INT8 friendly.
+    """
     if not REALTIME_RESO_ENABLE:
         return None
 
-    # Onset → long strike envelope → boost with baseline 1.0
+    # Onset pulses → decaying strike envelope that returns to zero
     strike_on   = Lambda(gate_onset, name="realtime_strike_onrise")(gate)
-    strike_long = CausalExpSmoother(
+    strike_pulse = Lambda(onset_binarize, arguments={'thr': REALTIME_RESO_ONSET_THR}, name="realtime_strike_bin")(strike_on)
+    strike_env  = CausalExpSmoother(
         time_const_ms=REALTIME_RESO_STRIKE_DECAY_MS,
         sample_rate=REALTIME_SAMPLE_RATE,
-        name="realtime_strike_long"
-    )(strike_on)
-    strike_boosted = Lambda(strike_boost, arguments={'gain': 2.5}, name="realtime_strike_boost")(strike_long)
+        name="realtime_strike_env"
+    )(strike_pulse)  # (B,T,1)
 
-    # Excitation and decimation
+    # Excitation (drive) — gated by strike_env so no energy between attacks
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="realtime_reso_pre_emph")(inp)
     exc = Activation('tanh', name="realtime_reso_drive")(exc)
 
@@ -2585,10 +2605,14 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
     if (1 << stages) != fac:
         raise ValueError(f"REALTIME_RESO_DS_FACTOR must be power-of-two, got {REALTIME_RESO_DS_FACTOR}")
 
-    x_ds, env_ds = exc, strike_boosted
+    # Decimate both excitation and envelope
+    x_ds, env_ds = exc, strike_env
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"realtime_reso_ds2_{i}")(x_ds)
         env_ds = FIRDecimateBy2(name=f"realtime_reso_env_ds2_{i}")(env_ds)
+
+    # Gate the excitation at DS rate (pre-convolution)
+    x_ds = Multiply(name="realtime_reso_exc_gated_ds")([x_ds, env_ds])
 
     ds_sr = REALTIME_SAMPLE_RATE // fac
     modes = ModalBank(
@@ -2597,12 +2621,12 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
         length=REALTIME_RESO_LENGTH_DS,
         sample_rate=ds_sr,
         name="realtime_reso_modal_ds"
-    )(x_ds)  # (B, Tds, M)
+    )(x_ds)  # (B,Tds,M)
 
-    # Softplus + positive bias avoids dead ReLUs at 0
+    # Per-mode gains — softplus keeps them positive; bias avoids dead gains
     gains = Dense(
         REALTIME_RESO_MODES,
-        activation="softplus",
+        activation="softplus",  # ReLU can die at 0; softplus stays >0 and is TFLite friendly
         bias_initializer=tf.keras.initializers.Constant(0.3),
         kernel_regularizer=regularizers.l2(1e-5),
         name="realtime_reso_gains"
@@ -2617,7 +2641,7 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
     reso_us  = IRLowpass(name="realtime_reso_lowpass")(reso_us)
     reso     = MatchTimeToRef(name="realtime_reso_matchlen")([reso_us, inp])
 
-    reso = IrScale(init=1.2, name="realtime_reso_scale")(reso)
+    reso = IrScale(init=1.0, name="realtime_reso_scale")(reso)
     return reso
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
@@ -2720,7 +2744,7 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, offline_gate])
     
     hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE,
-                      cutoff_hz=HP_CUTOFF_HZ,
+                      cutoff_hz=OFFLINE_HP_CUTOFF_HZ,
                       order=OFFLINE_HF_HP_ORDER,
                       name="offline_hf_highpass")(hf_gated)
     
@@ -2735,119 +2759,6 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
         out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final, offline_reso])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
-
-def summarize_offline_hf_usage(offline_dyn, src_path, tgt_path, sample_rate, style_true_flag=1.0):
-    """
-    Summarize how the offline model uses its HF branch with the new Gate.
-    - Prints gate stats and HF branch RMS on high/low gate regions
-    - Reports high-band STFT energy above GATE_HP_CUTOFF_HZ for target vs prediction
-
-    Args:
-        offline_dyn: dynamic offline model (built with build_offline_model(dynamic_time=True))
-        src_path: path to source (piezo) file
-        tgt_path: path to target (mic) file
-        sample_rate: model SR (should be OFFLINE_SAMPLE_RATE)
-        style_true_flag: 1.0 for pick / 0.0 for finger (forced)
-
-    Requirements:
-        - Model must expose layers named:
-            "offline_gate" (per-sample gain 0..1),
-            "offline_hf_out" (HF branch pre-HPF),
-            "offline_hf_mult_gate" (HF high-passed and multiplied by gate),
-            "offline_hf_scale" (scaled HF branch that gets mixed),
-            "offline_pick_contrib", "offline_finger_contrib", "offline_mix_main"
-        - Constants available: GATE_HP_CUTOFF_HZ, HP_PRE_EMPHASIS_HF
-        - Utility available: resample_to_model_sr
-    """
-
-    def _build_offline_debug_model(offline):
-        outs = {
-            "gate":      offline.get_layer("offline_gate").output,            # gate gain (0..1)
-            "hf_pre":    offline.get_layer("offline_hf_out").output,          # HF branch before HPF
-            "hf_gated":  offline.get_layer("offline_hf_mult_gate").output,    # post-HPF × gate, pre-scale
-            "hf_scaled": offline.get_layer("offline_hf_scale").output,        # final HF branch to mix
-            "pick_c":    offline.get_layer("offline_pick_contrib").output,
-            "finger_c":  offline.get_layer("offline_finger_contrib").output,
-            "y":         offline.get_layer("offline_mix_main").output,        # final mix
-        }
-        return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
-
-    def _hp(x, alpha=HP_PRE_EMPHASIS_HF):
-        # pre-emphasis HP similar to your hf_loss
-        x1 = x[:, 1:, :] - alpha * x[:, :-1, :]
-        return tf.pad(x1, [[0, 0], [1, 0], [0, 0]])
-
-    def _band_energy(x, sr, fmin):
-        # crude HF energy via STFT mask above fmin
-        t = tf.squeeze(x, -1)  # (B,T)
-        n_fft = 1024
-        hop   = 256
-        win   = 1024
-        st = tf.signal.stft(t, frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
-        mag = tf.abs(st)  # (B, frames, bins)
-        freqs = np.linspace(0.0, sr/2.0, n_fft//2 + 1, dtype=np.float32)
-        mask = tf.cast(freqs[None, None, :] >= float(fmin), tf.float32)
-        hf_mag = mag * mask
-        return tf.reduce_mean(hf_mag)  # scalar
-
-    def _read_pair_2s(path_src, path_tgt, model_sr):
-        info = sf.info(path_src)
-        file_sr = info.samplerate
-        frames = int(2.0 * file_sr)  # 2 seconds
-        x_long, _ = sf.read(path_src, start=0, frames=frames, dtype='float32', always_2d=True)
-        y_long, _ = sf.read(path_tgt, start=0, frames=frames, dtype='float32', always_2d=True)
-        x = x_long[:, 0]
-        y = y_long[:, 0]
-        if file_sr != model_sr:
-            x = resample_to_model_sr(x, file_sr, model_sr)
-            y = resample_to_model_sr(y, file_sr, model_sr)
-        return x.astype(np.float32), y.astype(np.float32)
-
-    def _rms(a, mask):
-        a = a[mask]
-        return float(np.sqrt(np.mean(a * a) + 1e-12)) if a.size > 0 else 0.0
-
-    dbg = _build_offline_debug_model(offline_dyn)
-
-    # Read a short segment
-    x, y = _read_pair_2s(src_path, tgt_path, sample_rate)
-    x_b = x[None, :, None]
-    y_b = y[None, :, None]
-
-    # Force true style for stable comparison
-    style_true = np.array([[style_true_flag]], dtype=np.float32)
-    style_force = np.ones((1, 1), dtype=np.float32)
-
-    outs = dbg.predict([x_b, style_true, style_force], verbose=0)
-
-    # Fetch arrays
-    gate      = np.asarray(outs["gate"][0, :, 0], dtype=np.float32)        # 0..1
-    hf_scaled = np.asarray(outs["hf_scaled"][0, :, 0], dtype=np.float32)
-    y_pred    = np.asarray(outs["y"][0, :, 0], dtype=np.float32)
-
-    # Pre-emphasis of target and prediction (to inspect high-frequency transient similarity)
-    hp_true = _hp(tf.convert_to_tensor(y_b)).numpy()[0, :, 0]
-    hp_pred = _hp(tf.convert_to_tensor(y_pred[None, :, None])).numpy()[0, :, 0]
-
-    # Gate stats
-    print(f"Gate: mean={gate.mean():.3f}, p95={np.percentile(gate, 95):.3f}, p99={np.percentile(gate, 99):.3f}, max={gate.max():.3f}")
-    print(f"HF out (scaled) RMS={np.sqrt(np.mean(hf_scaled**2) + 1e-12):.6f}")
-
-    # Onset vs non-onset comparison using gate as a mask (top 3% as onsets, bottom 50% as off)
-    p_on  = float(np.percentile(gate, 97.0))
-    p_off = float(np.percentile(gate, 50.0))
-    on_mask  = gate >= p_on
-    off_mask = gate <= p_off
-
-    print(f"RMS hp_true onsets={_rms(hp_true, on_mask):.6f} off={_rms(hp_true, off_mask):.6f}")
-    print(f"RMS hp_pred onsets={_rms(hp_pred, on_mask):.6f} off={_rms(hp_pred, off_mask):.6f}")
-    print(f"RMS hf_branch onsets={_rms(hf_scaled, on_mask):.6f} off={_rms(hf_scaled, off_mask):.6f}")
-
-    # High-band STFT energy above the gate HP cutoff
-    t_hf_true = float(_band_energy(tf.convert_to_tensor(y_b), sample_rate, fmin=HP_CUTOFF_HZ).numpy())
-    t_hf_pred = float(_band_energy(tf.convert_to_tensor(y_pred[None, :, None]), sample_rate, fmin=HP_CUTOFF_HZ).numpy())
-    ratio = t_hf_pred / (t_hf_true + 1e-12)
-    print(f"Avg |STFT| > {HP_CUTOFF_HZ/1000:.1f} kHz: target={t_hf_true:.6f} pred={t_hf_pred:.6f} (ratio={ratio:.3f})")
 
 @register_keras_serializable()
 def build_realtime_model(offline=None, dynamic_time=False):
@@ -3047,7 +2958,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
     hf_hp    = HFHighpass(
         sample_rate=REALTIME_SAMPLE_RATE,
-        cutoff_hz=HP_CUTOFF_HZ,
+        cutoff_hz=REALTIME_HP_CUTOFF_HZ,
         order=REALTIME_HF_HP_ORDER,
         name="realtime_hf_highpass"
     )(hf_gated)
@@ -3056,7 +2967,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # Training-only penalty
     hf_final = HFLowbandPenalty(
         alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
-        cutoff_hz=2900.0,
+        cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
         order=129,
         sample_rate=REALTIME_SAMPLE_RATE,
         name="realtime_hf_lowband_penalty"
@@ -3098,7 +3009,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
         off_hf_ds_hp48 = HFHighpass(
             sample_rate=REALTIME_SAMPLE_RATE,
-            cutoff_hz=HP_CUTOFF_HZ,
+            cutoff_hz=REALTIME_HP_CUTOFF_HZ,
             order=REALTIME_HF_HP_ORDER,
             name="offline_hf_ds_hp48"
         )(off_hf_ds)
@@ -3589,177 +3500,6 @@ def run_render_stems_realtime():
         sec=LONG_DEMO_SEC,
         offset_sec=LONG_DEMO_OFFSET_SEC
     )
-
-def audible_gate_debug(debug_model,
-                                 path_src,
-                                 path_tgt,
-                                 out_dir,
-                                 sample_rate,
-                                 sec=10.0,
-                                 offset_sec=0.0,
-                                 style_mode="true",
-                                 style_true_flag=1.0,
-                                 block_sec=10.0,
-                                 resample_margin_ms=50.0):
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
-    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
-    
-    if pick_boost_db != 0.0:
-        debug_model = boost_hf_scale_in_model(debug_model, hf_scale_layer_name, pick_boost_db)
-
-    if REALTIME_IR_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
-        debug_model = boost_hf_scale_in_model(debug_model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
-        
-    # Optional: resonance stem boost for quick A/B during demo generation
-    try:
-        if OFFLINE_RESO_BOOST_DB != 0.0 and sample_rate == OFFLINE_SAMPLE_RATE:
-            debug_model = boost_hf_scale_in_model(debug_model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
-        elif REALTIME_RESO_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
-            debug_model = boost_hf_scale_in_model(debug_model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
-    except Exception:
-        pass  # layer may not exist (e.g., older models)
-
-    # Input region in file-sample domain
-    info = sf.info(path_src)
-    file_sr = info.samplerate
-    START_FRAME = int(round(offset_sec * file_sr))
-    TOTAL_FRAMES = int(round(sec * file_sr))
-    END_FRAME = START_FRAME + TOTAL_FRAMES
-    want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
-
-    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
-    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
-    block_core_model = max(1, int(round(block_sec * sample_rate)))
-
-    # Style inputs
-    if style_mode == "true":
-        style_in  = np.array([[style_true_flag]], dtype=np.float32)
-        force_in  = np.ones((1, 1), dtype=np.float32)
-    else:
-        style_in  = np.zeros((1, 1), dtype=np.float32)
-        force_in  = np.zeros((1, 1), dtype=np.float32)
-
-    # Output writers
-    w_src  = sf.SoundFile(os.path.join(out_dir, "src.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_tgt  = sf.SoundFile(os.path.join(out_dir, "tgt.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_full = sf.SoundFile(os.path.join(out_dir, "pred_full.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_nohf = sf.SoundFile(os.path.join(out_dir, "pred_nohf.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_hf   = sf.SoundFile(os.path.join(out_dir, "hf_only.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_gr   = sf.SoundFile(os.path.join(out_dir, "gate_raw.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_gt   = sf.SoundFile(os.path.join(out_dir, "gate_tone.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_gh   = sf.SoundFile(os.path.join(out_dir, "gate_hiss.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_reso = sf.SoundFile(os.path.join(out_dir, "reso_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_ir_only = sf.SoundFile(os.path.join(out_dir, "ir_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-
-    # Tone state (continuous phase across blocks)
-    tone_freq = gate_debug_tone_freq(sample_rate, HP_CUTOFF_HZ)
-    omega = 2.0 * np.pi * (tone_freq / float(sample_rate))
-    phase = 0.0
-
-    produced_model = 0
-
-    while produced_model < want_total_model:
-        core_model = min(block_core_model, want_total_model - produced_model)
-        left_this = left_ctx_model if produced_model > 0 else 0
-        right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
-
-        core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
-        core_start_file = START_FRAME + core_start_file_off
-
-        left_ctx_file = int(math.ceil(left_this * (file_sr / float(sample_rate))))
-        right_ctx_file = int(math.ceil(right_this * (file_sr / float(sample_rate))))
-        core_file_len = int(math.ceil(core_model * (file_sr / float(sample_rate))))
-
-        read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
-        read_b_desired = core_start_file + core_file_len + right_ctx_file + resample_margin_file
-        read_b = min(END_FRAME, read_b_desired)
-        n_read = max(0, read_b - read_a)
-        if n_read <= 0:
-            break
-
-        x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        x_file = x_blk_2d[:, 0]
-        y_file = y_blk_2d[:, 0]
-
-        if file_sr != sample_rate:
-            x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
-            y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
-        else:
-            x_resamp = x_file
-            y_resamp = y_file
-
-        left_off_file = (core_start_file - left_ctx_file) - read_a
-        left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
-        inp_start = max(0, min(left_off_model, len(x_resamp)))
-        inp_end = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
-        x_inp = x_resamp[inp_start:inp_end]
-        if x_inp.size == 0:
-            break
-
-        core_start_in_inp = min(left_this, len(x_inp))
-        core_end_in_inp = min(core_start_in_inp + core_model, len(x_inp))
-        core_len = max(0, core_end_in_inp - core_start_in_inp)
-        if core_len <= 0:
-            break
-
-        x_b = x_inp[None, :, None].astype(np.float32)
-        outs = debug_model.predict([x_b, style_in, force_in], verbose=0)
-        # outs is a dict with keys: "gate", "hf_scaled", "pick_c", "finger_c", "y_pred"
-        def _core_of(key):
-            arr = np.asarray(outs[key][0, :, 0], dtype=np.float32)
-            return arr[core_start_in_inp:core_end_in_inp]
-
-        gate_core   = np.clip(_core_of("gate"), 0.0, 1.0)
-        y_pred_core = _core_of("y_pred")
-        pick_c_core = _core_of("pick_c")
-        fins_c_core = _core_of("finger_c")
-        hf_s_core   = _core_of("hf_scaled")
-        y_nohf_core = pick_c_core + fins_c_core
-
-        # Write model-derived signals
-        w_full.write(y_pred_core)
-        w_nohf.write(y_nohf_core)
-        w_hf.write(hf_s_core)
-        w_reso.write(_core_of("reso"))
-        w_ir_only.write(_core_of("ir_only"))
-
-        # Write src/tgt (same cropping)
-        core_start_global = inp_start + core_start_in_inp
-        core_end_global   = inp_start + core_end_in_inp
-        w_src.write(x_resamp[core_start_global:core_end_global])
-        w_tgt.write(y_resamp[core_start_global:core_end_global])
-
-        # gate_raw [-0.8..+0.8]
-        gate_raw = 0.8 * (2.0 * (gate_core - 0.5))
-        w_gr.write(gate_raw)
-
-        # gate_tone and gate_hiss (streaming-safe)
-        t = np.arange(core_len, dtype=np.float32)
-        tone = np.sin(phase + omega * t).astype(np.float32)
-        phase = (phase + omega * float(core_len)) % (2.0 * np.pi)
-        w_gt.write(0.8 * gate_core * tone)
-
-        # simple HP hiss, scaled
-        # quick HP via 1st-order pre-emphasis (consistent with your other code)
-        hiss = np.random.randn(core_len).astype(np.float32)
-        if core_len > 1:
-            hiss[1:] = hiss[1:] - HP_PRE_EMPHASIS_HF * hiss[:-1]
-        w_gh.write(0.8 * gate_core * hiss)
-
-        produced_model += core_len
-
-    # Close all writers
-    for w in [w_src, w_tgt, w_full, w_nohf, w_hf, w_gr, w_gt, w_gh, w_reso, w_ir_only]:
-        try:
-            w.close()
-        except:
-            pass
-
-    print(f"Saved streaming audible gate debug ({style_mode}) to {out_dir}")
 
 def train_shared(
     kind,
@@ -4274,34 +4014,6 @@ def main ():
             sys.exit(1)
         realtime_dyn = None if not os.path.exists(realtime_dyn_path) else tf.keras.models.load_model(realtime_dyn_path, compile=False)
         generate_fine_tune_demo(model=realtime_dyn)
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]== "--summarize-offline-hf-usage":
-        resume, resume_ckpt_path = cleanup_and_prepare_train(
-            logs_out_dir=LOGS_OFFLINE_OUT_DIR,
-            checkpoints_out_dir=CHECKPOINT_OFFLINE_OUT_DIR,
-            demo_checkpoints_out_dir=DEMO_CHECKPOINTS_OFFLINE_OUT_DIR,
-            demo_generator_outputs_out_dir=DEMO_GENERATOR_OUTPUTS_OUT_DIR
-        )
-        if (resume and resume_ckpt_path is not None):
-            static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
-            dynamic_model = build_offline_model(dynamic_time=True)
-            dynamic_model.set_weights(static_model.get_weights())
-        elif os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
-            dynamic_model = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
-        else:
-            static_model = build_offline_model(dynamic_time=False)
-            dynamic_model = build_offline_model(dynamic_time=True)
-            dynamic_model.set_weights(static_model.get_weights())
-            
-        demo_src, demo_tgt = all_pairs[DEMO_PAIR_INDEX]
-            
-        summarize_offline_hf_usage(
-            src_path=demo_src,
-            tgt_path=demo_tgt,
-            style_true_flag=1.0,
-            offline_dyn=dynamic_model,
-            sample_rate=OFFLINE_SAMPLE_RATE
-        )
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
         if (len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only"):
