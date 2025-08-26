@@ -222,7 +222,7 @@ def log_spaced(f_lo, f_hi, n):
 OFFLINE_RESO_ENABLE     = True
 OFFLINE_RESO_MODES      = 12
 OFFLINE_RESO_LENGTH     = 161   # shorten a bit; still >3 ms at 96k
-OFFLINE_RESO_CENTERS_HZ = log_spaced(700.0, 2000.0, OFFLINE_RESO_MODES)
+OFFLINE_RESO_CENTERS_HZ = log_spaced(1400.0, 2000.0, OFFLINE_RESO_MODES)
 # longer decays at low end → shorter at high end
 OFFLINE_RESO_DECAYS_MS  = list(np.linspace(55.0, 22.0, OFFLINE_RESO_MODES))
 OFFLINE_RESO_STRIKE_GAIN= 2.5
