@@ -197,7 +197,7 @@ REALTIME_FEAT_DISTILL_ALPHA         = 1.0
 REALTIME_STEM_RESO_DISTILL_ALPHA    = 0.4
 
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
-REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 0.8   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
+REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 1.0   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
 REALTIME_STYLE_BLEND_INIT           = 0.7
 REALTIME_STYLE_BLEND_TRAINABLE      = True
 REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_film_apply"]
@@ -214,22 +214,28 @@ REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streamin
 REALTIME_GATE_DEPTH_LMAX                = 256
 
 # ─── Resonance branch params ─────────────────────────────────────────────
-# OFFLINE (96k): more modes and longer IRs
-OFFLINE_RESO_ENABLE           = True
-OFFLINE_RESO_MODES            = 16
-OFFLINE_RESO_LENGTH           = 257     # causal FIR length per mode
-OFFLINE_RESO_CENTERS_HZ       = [240, 320, 420, 540, 700, 900, 1150, 1450, 1800, 2250, 2800, 3400, 4100, 4900, 5800, 6800]
-OFFLINE_RESO_DECAYS_MS        = [70, 65, 60, 55, 50, 45, 40, 38, 35, 32, 30, 28, 26, 24, 22, 20]
-OFFLINE_RESO_STRIKE_GAIN      = 3.0
-OFFLINE_RESO_BOOST_DB         = 0.0
 
-REALTIME_RESO_ENABLE          = True
-REALTIME_RESO_MODES           = 12
-REALTIME_RESO_LENGTH          = 97
-REALTIME_RESO_CENTERS_HZ      = [280, 360, 460, 600, 780, 1000, 1300, 1700, 2200, 2900, 3600, 4300]
-REALTIME_RESO_DECAYS_MS       = [60, 55, 50, 45, 40, 35, 32, 28, 25, 22, 20, 18]
-REALTIME_RESO_STRIKE_GAIN     = 2.5
-REALTIME_RESO_BOOST_DB        = 0.0
+def log_spaced(f_lo, f_hi, n):
+    return [float(x) for x in np.geomspace(f_lo, f_hi, num=n)]
+
+# Offline (96 kHz)
+OFFLINE_RESO_ENABLE     = True
+OFFLINE_RESO_MODES      = 12
+OFFLINE_RESO_LENGTH     = 161   # shorten a bit; still >3 ms at 96k
+OFFLINE_RESO_CENTERS_HZ = log_spaced(700.0, 2000.0, OFFLINE_RESO_MODES)
+# longer decays at low end → shorter at high end
+OFFLINE_RESO_DECAYS_MS  = list(np.linspace(55.0, 22.0, OFFLINE_RESO_MODES))
+OFFLINE_RESO_STRIKE_GAIN= 2.5
+OFFLINE_RESO_BOOST_DB   = 0.0
+
+# Realtime (48 kHz)
+REALTIME_RESO_ENABLE    = True
+REALTIME_RESO_MODES     = 8
+REALTIME_RESO_LENGTH    = 97
+REALTIME_RESO_CENTERS_HZ= log_spaced(700.0, 2000.0, REALTIME_RESO_MODES)
+REALTIME_RESO_DECAYS_MS = list(np.linspace(45.0, 18.0, REALTIME_RESO_MODES))
+REALTIME_RESO_STRIKE_GAIN = 2.0
+REALTIME_RESO_BOOST_DB    = 0.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
@@ -1304,45 +1310,53 @@ class KDAlphaScheduler(tf.keras.callbacks.Callback):
 
 # Proper band-limited decimate-by-2 layer for 1-D sequences (applies same FIR per channel)
 @register_keras_serializable()
-class FIRDecimateBy2(Layer):
+class FIRDecimateBy2(tf.keras.layers.Layer):
+    """
+    Band-limited decimator-by-2, causal and TFLite-friendly.
+    - Uses a single 1-D FIR kernel shared across channels.
+    - Implementation: left-pad by (L-1), reshape (B,T,C)->(B*C,T,1),
+      tf.nn.conv1d with stride=2, then reshape back.
+    - Parameter size: O(L), not O(L*C) or O(L*C*C).
+    """
     def __init__(self, num_taps=127, cutoff=0.45, window="blackman", name=None, **kwargs):
-        """
-        Band-limited decimator-by-2. Tighter LP and more taps reduce aliasing and ripple.
-        - num_taps: 127 (was 63)
-        - cutoff:   0.45 (was 0.47)
-        - window:   blackman (was hamming)
-        """
         super().__init__(name=name, **kwargs)
         self.num_taps = int(num_taps)
         self.cutoff = float(cutoff)
         self.window = str(window)
 
     def build(self, input_shape):
-        c = int(input_shape[-1])
-        taps_np = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
-        W = np.zeros((self.num_taps, c, c), dtype=np.float32)
-        for ch in range(c):
-            W[:, ch, ch] = taps_np
+        # Design symmetric low-pass prototype and reverse for true convolution
+        taps = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
+        k = taps[::-1].reshape(-1, 1, 1).astype(np.float32)  # (L, 1, 1)
         self.kernel = self.add_weight(
-            name="fir_kernel_diag",
-            shape=W.shape,
-            initializer=tf.keras.initializers.Constant(W),
-            trainable=False
+            name="fir_kernel_shared",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False,
         )
         super().build(input_shape)
 
     def call(self, x):
-        pad = self.num_taps - 1
-        x_pad = tf.pad(x, [[0, 0], [pad, 0], [0, 0]])
-        y = tf.nn.conv1d(x_pad, filters=self.kernel, stride=2, padding='VALID')
+        # x: (B, T, C)
+        L = self.num_taps
+        # causal left pad by L-1
+        x_pad = tf.pad(x, [[0, 0], [L - 1, 0], [0, 0]])
+        b = tf.shape(x_pad)[0]
+        t = tf.shape(x_pad)[1]
+        c = tf.shape(x_pad)[2]
+
+        # Flatten channels into batch and apply 1-D conv with stride=2
+        x_flat = tf.reshape(x_pad, [b * c, t, 1])                  # (B*C, T+L-1, 1)
+        y_flat = tf.nn.conv1d(x_flat, filters=self.kernel, stride=2, padding='VALID')  # (B*C, ceil(T/2), 1)
+
+        # Restore channel dimension
+        out_t = tf.shape(y_flat)[1]
+        y = tf.reshape(y_flat, [b, out_t, c])                      # (B, ceil(T/2), C)
         return y
-    
+
     def compute_output_shape(self, input_shape):
         b, t, c = input_shape
-        if t is None:
-            return (b, None, c)
-        # With causal left pad (L-1), VALID conv with stride=2 ⇒ out_T = ceil(T/2)
-        out_t = (t + 1) // 2
+        out_t = None if t is None else (t + 1) // 2  # ceil(T/2)
         return (b, out_t, c)
 
     def get_config(self):
@@ -2450,7 +2464,13 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     )(exc)  # (B,T,M)
 
     # 4) per-mode gains (style) × (strike boost)
-    gains = Dense(OFFLINE_RESO_MODES, activation="softplus", name="offline_reso_gains")(style_embed)   # (B,M)
+    gains = Dense(
+        OFFLINE_RESO_MODES,
+        activation="softplus",
+        activity_regularizer=regularizers.l1(1e-3),
+        name="offline_reso_gains"
+    )(style_embed)
+    
     gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)                  # (B,1,M)
     sboost= Lambda(strike_boost, arguments={'gain': OFFLINE_RESO_STRIKE_GAIN}, name="offline_strike_boost")(strike)  # (B,T,1)
     gains_t = Multiply(name="offline_reso_gains_time")([gains, sboost])                                # broadcast to (B,T,M)
@@ -2482,7 +2502,14 @@ def _add_resonance_branch_realtime(inp, style_embed, gate):
     )(exc)
 
     # 4) per-mode gains (style) × (strike boost)
-    gains = Dense(REALTIME_RESO_MODES, activation="relu", name="realtime_reso_gains")(style_embed)
+    
+    gains = Dense(
+        REALTIME_RESO_MODES,
+        activation="relu",
+        activity_regularizer=regularizers.l1(1e-3),
+        name="realtime_reso_gains"
+    )(style_embed)
+    
     gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
     sboost= Lambda(strike_boost, arguments={'gain': REALTIME_RESO_STRIKE_GAIN}, name="realtime_strike_boost")(strike)
     gains_t = Multiply(name="realtime_reso_gains_time")([gains, sboost])
@@ -2928,7 +2955,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # Training-only penalty
     hf_final = HFLowbandPenalty(
         alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
-        cutoff_hz=2800.0,
+        cutoff_hz=2900.0,
         order=129,
         sample_rate=REALTIME_SAMPLE_RATE,
         name="realtime_hf_lowband_penalty"
