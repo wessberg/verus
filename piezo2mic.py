@@ -2500,45 +2500,56 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     if not OFFLINE_RESO_ENABLE:
         return None
 
-    # Long strike envelope (offline SR)
-    strike_on  = Lambda(gate_onset, name="offline_strike_onrise")(gate)
-    strike_env = CausalExpSmoother(
+    # Onset → long strike envelope → boost with baseline 1.0
+    strike_on   = Lambda(gate_onset, name="offline_strike_onrise")(gate)
+    strike_long = CausalExpSmoother(
         time_const_ms=OFFLINE_RESO_STRIKE_DECAY_MS,
         sample_rate=OFFLINE_SAMPLE_RATE,
         name="offline_strike_long"
     )(strike_on)  # (B,T,1)
+    # Boosted envelope: 1 + g * env
+    strike_boosted = Lambda(strike_boost, arguments={'gain': 2.5}, name="offline_strike_boost")(strike_long)
 
     # Excitation
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="offline_reso_pre_emph")(inp)
-    exc = Activation('tanh', name="offline_reso_drive")(exc)    
+    exc = Activation('tanh', name="offline_reso_drive")(exc)
+
+    # Decimate both excitation and boosted envelope
     fac = int(OFFLINE_RESO_DS_FACTOR)
     stages = int(round(math.log2(max(1, fac))))
     if (1 << stages) != fac:
         raise ValueError(f"OFFLINE_RESO_DS_FACTOR must be power-of-two, got {OFFLINE_RESO_DS_FACTOR}")  
-    x_ds, env_ds = exc, strike_env
+
+    x_ds, env_ds = exc, strike_boosted
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"offline_reso_ds2_{i}")(x_ds)
-        env_ds = FIRDecimateBy2(name=f"offline_reso_env_ds2_{i}")(env_ds)   
-    ds_sr = OFFLINE_SAMPLE_RATE // fac  
+        env_ds = FIRDecimateBy2(name=f"offline_reso_env_ds2_{i}")(env_ds)
+
+    ds_sr = OFFLINE_SAMPLE_RATE // fac
     modes = ModalBank(
         centers_hz=OFFLINE_RESO_CENTERS_HZ,
         decays_ms=OFFLINE_RESO_DECAYS_MS,
         length=OFFLINE_RESO_LENGTH_DS,
         sample_rate=ds_sr,
         name="offline_reso_modal_ds"
-    )(x_ds)  # (B, Tds, M)  
-    # Softplus OK offline; use ReLU if you prefer uniformity
+    )(x_ds)  # (B, Tds, M)
+
+    # Softplus + positive bias keeps modes alive
     gains = Dense(
         OFFLINE_RESO_MODES,
         activation="softplus",
-        activity_regularizer=regularizers.l1(1e-3),
+        bias_initializer=tf.keras.initializers.Constant(0.3),
+        kernel_regularizer=regularizers.l2(1e-5),         # lighter regularization than activity L1
         name="offline_reso_gains"
-    )(style_embed)
-    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)
-    gains_t = Multiply(name="offline_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M) 
+    )(style_embed)  # (B,M)
+
+    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)  # (B,1,M)
+    gains_t = Multiply(name="offline_reso_gains_time_ds")([gains, env_ds])             # (B,Tds,M)
+
     m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains_t])
-    reso_ds  = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)  
-    # Low-pass for 96k upsample: cutoff ~ 0.9 * (ds_sr/2)
+    reso_ds  = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)
+
+    # Upsample + lowpass to model SR
     offline_lp_taps = make_minphase_lp_kernel(
         order=REALTIME_LP_ORDER,
         cutoff_hz=0.9 * (OFFLINE_SAMPLE_RATE / (2.0 * OFFLINE_RESO_DS_FACTOR)),
@@ -2548,62 +2559,65 @@ def _add_resonance_branch_offline(inp, style_embed, gate):
     reso_us  = IRLowpass(taps=offline_lp_taps, name="offline_reso_lowpass")(reso_us)
     reso     = MatchTimeToRef(name="offline_reso_matchlen")([reso_us, inp])
 
-    reso = IrScale(init=1.0, name="offline_reso_scale")(reso)
+    reso = IrScale(init=1.2, name="offline_reso_scale")(reso)  # slightly >1 init helps
     return reso
 
+
 def _add_resonance_branch_realtime(inp, style_embed, gate):
-    """
-    Improved realtime resonance branch:
-      - Long strike envelope from gate_onset via causal EMA (REALTIME_RESO_STRIKE_DECAY_MS).
-      - Decimate excitation and strike envelope by REALTIME_RESO_DS_FACTOR.
-      - Convolve with long modal bank at DS rate (REALTIME_RESO_LENGTH_DS taps).
-      - Modulate per-mode gains over time with the long strike envelope (ReLU for positivity).
-      - Upsample with nearest neighbor and smooth with causal LPF.
-    """
     if not REALTIME_RESO_ENABLE:
         return None
 
-    # Long strike envelope (triggered on gate rising edges)
-    strike_on  = Lambda(gate_onset, name="realtime_strike_onrise")(gate)
-    strike_env = CausalExpSmoother(
+    # Onset → long strike envelope → boost with baseline 1.0
+    strike_on   = Lambda(gate_onset, name="realtime_strike_onrise")(gate)
+    strike_long = CausalExpSmoother(
         time_const_ms=REALTIME_RESO_STRIKE_DECAY_MS,
         sample_rate=REALTIME_SAMPLE_RATE,
         name="realtime_strike_long"
-    )(strike_on)  # (B,T,1)
+    )(strike_on)
+    strike_boosted = Lambda(strike_boost, arguments={'gain': 2.5}, name="realtime_strike_boost")(strike_long)
 
-    # Excitation (no ultra-short gate multiply here)
+    # Excitation and decimation
     exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="realtime_reso_pre_emph")(inp)
     exc = Activation('tanh', name="realtime_reso_drive")(exc)
+
     fac = int(REALTIME_RESO_DS_FACTOR)
     stages = int(round(math.log2(max(1, fac))))
     if (1 << stages) != fac:
-        raise ValueError(f"REALTIME_RESO_DS_FACTOR must be power-of-two, got {REALTIME_RESO_DS_FACTOR}")    
-    x_ds, env_ds = exc, strike_env
+        raise ValueError(f"REALTIME_RESO_DS_FACTOR must be power-of-two, got {REALTIME_RESO_DS_FACTOR}")
+
+    x_ds, env_ds = exc, strike_boosted
     for i in range(stages):
         x_ds   = FIRDecimateBy2(name=f"realtime_reso_ds2_{i}")(x_ds)
-        env_ds = FIRDecimateBy2(name=f"realtime_reso_env_ds2_{i}")(env_ds)  
-    ds_sr = REALTIME_SAMPLE_RATE // fac 
+        env_ds = FIRDecimateBy2(name=f"realtime_reso_env_ds2_{i}")(env_ds)
+
+    ds_sr = REALTIME_SAMPLE_RATE // fac
     modes = ModalBank(
         centers_hz=REALTIME_RESO_CENTERS_HZ,
         decays_ms=REALTIME_RESO_DECAYS_MS,
         length=REALTIME_RESO_LENGTH_DS,
         sample_rate=ds_sr,
         name="realtime_reso_modal_ds"
-    )(x_ds)  # (B, Tds, M)  
+    )(x_ds)  # (B, Tds, M)
+
+    # Softplus + positive bias avoids dead ReLUs at 0
     gains = Dense(
         REALTIME_RESO_MODES,
-        activation="relu",  # INT8-friendly positivity
-        activity_regularizer=regularizers.l1(1e-3),
+        activation="softplus",
+        bias_initializer=tf.keras.initializers.Constant(0.3),
+        kernel_regularizer=regularizers.l2(1e-5),
         name="realtime_reso_gains"
-    )(style_embed)  # (B, M)
+    )(style_embed)  # (B,M)
     gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
-    gains_t = Multiply(name="realtime_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M)    
+    gains_t = Multiply(name="realtime_reso_gains_time_ds")([gains, env_ds])  # (B,Tds,M)
+
     m_scaled = Multiply(name="realtime_reso_modes_scaled")([modes, gains_t])
-    reso_ds  = Conv1D(1, 1, padding="same", name="realtime_reso_mix")(m_scaled) 
+    reso_ds  = Conv1D(1, 1, padding="same", name="realtime_reso_mix")(m_scaled)
+
     reso_us  = ResizeNearest1D(factor=REALTIME_RESO_DS_FACTOR, name="realtime_reso_upsample")(reso_ds)
     reso_us  = IRLowpass(name="realtime_reso_lowpass")(reso_us)
-    reso     = MatchTimeToRef(name="realtime_reso_matchlen")([reso_us, inp])    
-    reso = IrScale(init=1.0, name="realtime_reso_scale")(reso)
+    reso     = MatchTimeToRef(name="realtime_reso_matchlen")([reso_us, inp])
+
+    reso = IrScale(init=1.2, name="realtime_reso_scale")(reso)
     return reso
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
