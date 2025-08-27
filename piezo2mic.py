@@ -229,16 +229,16 @@ OFFLINE_RESBP_BP_ORDER = 257
 REALTIME_RESBP_BP_ORDER = 257
 
 # Gate “linger” (keep gate open a bit longer than HF)
-OFFLINE_RESBP_LINGER_MS = 20.0
-REALTIME_RESBP_LINGER_MS = 40.0
+OFFLINE_RESBP_LINGER_MS = 200.0
+REALTIME_RESBP_LINGER_MS = 280.0
 # Bound the FIR length for realtime streaming (fits in left context)
-REALTIME_RESBP_LINGER_LMAX = 256
+REALTIME_RESBP_LINGER_LMAX = 512
 
 # Initial scalar (trainable) for the band-pass branch
 OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
-OFFLINE_RESBP_BOOST_DB    = 0.0
+OFFLINE_RESBP_BOOST_DB    = 40.0
 REALTIME_RESBP_BOOST_DB   = 0.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
@@ -263,6 +263,7 @@ STFT_HF_ONSET_GAIN        = 12.0
 
 L1_WEIGHT                 = 1.0
 HF_WEIGHT                 = 5.0
+RESBP_BAND_LOSS_WEIGHT    = 0.8
 STFT_WEIGHT               = 4.0
 MEL_WEIGHT                = 3.0
 RMS_ENV_WEIGHT            = 1.0
@@ -636,6 +637,20 @@ def waveform_l1_loss(y_true, y_pred):
     return tf.abs(y_true - y_pred)
 
 @register_keras_serializable()
+def band_limited_l1_loss(y_true, y_pred, sample_rate,
+                         low_hz=RESBP_LOW_HZ, high_hz=RESBP_HIGH_HZ,
+                         order_off=OFFLINE_RESBP_BP_ORDER, order_rt=REALTIME_RESBP_BP_ORDER):
+    """
+    L1 in the 0.7–2 kHz band (causal min-phase FIR applied to both).
+    Returns (B,T,1) so it plays nicely with sample_weights (B,T,1).
+    """
+    order = order_off if int(sample_rate) == OFFLINE_SAMPLE_RATE else order_rt
+    k = _get_minphase_bp_kernel(sample_rate, low_hz, high_hz, order)
+    t_bp = _causal_conv1d(y_true, k)
+    p_bp = _causal_conv1d(y_pred, k)
+    return tf.abs(t_bp - p_bp)
+
+@register_keras_serializable()
 def hf_loss(y_true, y_pred):
     α = HP_PRE_EMPHASIS_HF
     true_hp = y_true[:,1:,:] - α*y_true[:,:-1,:]
@@ -819,13 +834,16 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
         cplx = cplx_base
 
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=gate_env)
+    bl   = band_limited_l1_loss(y_true, y_pred, sample_rate)
+
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
           + STFT_WEIGHT     * spec
           + MEL_WEIGHT      * mel
           + RMS_ENV_WEIGHT  * env
           + COMPLEX_STFT_WEIGHT * cplx
-          + D2_WEIGHT       * d2)
+          + D2_WEIGHT       * d2
+          + RESBP_BAND_LOSS_WEIGHT * bl)
 
 # Replace mean_hf_metric with this version
 @register_keras_serializable()
@@ -987,17 +1005,14 @@ def _extract_audio_io(model, batch):
     return y_true_audio, y_pred_audio
 
 def analyze_loss_scales(model, batch, sample_rate):
-    # Extract audio tensors from (x, y, [sw]) batch
     y_true, y_pred = _extract_audio_io(model, batch)
 
-    # Use the model-appropriate gate (offline vs realtime) based on sample_rate
     gate_env = gate_weight_dynamic(y_true, sample_rate)
 
     l1   = tf.reduce_mean(waveform_l1_loss(y_true, y_pred)).numpy()
     mel  = tf.reduce_mean(log_mel_loss(y_true, y_pred, sample_rate)).numpy()
     env  = tf.reduce_mean(rms_env_loss(y_true, y_pred)).numpy()
 
-    # Match CombinedLoss behavior: gate-weighted HF and STFT terms
     hf_on  = tf.reduce_mean(hf_loss(y_true, y_pred) * (1.0 + HF_ONSET_GAIN * gate_env)).numpy()
     stft_on = tf.reduce_mean(
         mrstft_mag_loss_weighted_onset(
@@ -1009,13 +1024,18 @@ def analyze_loss_scales(model, batch, sample_rate):
         )
     ).numpy()
 
-    return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on}
+    bl = tf.reduce_mean(band_limited_l1_loss(y_true, y_pred, sample_rate)).numpy()
 
-def calibrate_loss_weights_consistent(model, dataset, sample_rate, n_batches=5,
-                                      normalize_keys=('l1','stft','mel','env','hf'),
+    return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on, 'resbp_bl': bl}
+
+def calibrate_loss_weights(model, dataset, sample_rate, n_batches=5,
+                                      normalize_keys=('l1','stft','mel','env','hf','resbp_bl'),
                                       declared=None):
     if declared is None:
-        declared = {'l1': L1_WEIGHT, 'stft': STFT_WEIGHT, 'mel': MEL_WEIGHT, 'env': RMS_ENV_WEIGHT, 'hf': HF_WEIGHT}
+        declared = {
+            'l1': L1_WEIGHT, 'stft': STFT_WEIGHT, 'mel': MEL_WEIGHT, 'env': RMS_ENV_WEIGHT, 'hf': HF_WEIGHT,
+            'resbp_bl': RESBP_BAND_LOSS_WEIGHT  # NEW
+        }
     sums = {k:0.0 for k in normalize_keys}
     count = 0
     for batch in dataset.take(n_batches):
@@ -2561,15 +2581,7 @@ def film_apply(x, style_embed, filters, prefix):
     ])
 
 def _add_resbp_branch_offline(inp, style_embed, gate):
-    """
-    HF-like branch for 700–2000 Hz using the same gate, with a short 'linger'.
-    - Pre-emphasis like HF
-    - Small conv stack (same as HF) with FiLM
-    - Multiply by a slightly longer gate envelope
-    - Band-pass to 700–2000 Hz (min-phase)
-    - Trainable scalar
-    """
-    # Keep the gate open a bit longer (causal smoothing)
+    # Lengthen linger so tails survive
     gate_linger = CausalExpSmoother(
         time_const_ms=OFFLINE_RESBP_LINGER_MS,
         sample_rate=OFFLINE_SAMPLE_RATE,
@@ -2578,7 +2590,6 @@ def _add_resbp_branch_offline(inp, style_embed, gate):
 
     rbp_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_resbp_pre_emph")(inp)
     rbp    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_resbp_init")(rbp_in)
-    # mirror the HF micro-architecture (3 gated_sep blocks + FiLM)
     rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b0", lookahead=0)
     rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b0")
     rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b1", lookahead=0)
@@ -2587,32 +2598,27 @@ def _add_resbp_branch_offline(inp, style_embed, gate):
     rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b2")
     rbp    = Conv1D(1, 1, padding="same", name="offline_resbp_out")(rbp)
 
-    # Gate first, then band-pass
-    rbp_g  = Multiply(name="offline_resbp_mult_gate")([rbp, gate_linger])
-
+    # Band-pass first (so conv sees full gradient), then apply gated mix with a floor
     rbp_bp = BandpassFIR(
         sample_rate=OFFLINE_SAMPLE_RATE,
         low_hz=RESBP_LOW_HZ,
         high_hz=RESBP_HIGH_HZ,
         order=OFFLINE_RESBP_BP_ORDER,
         name="offline_resbp_bandpass"
-    )(rbp_g)
+    )(rbp)
 
-    rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_bp)
+    # Avoid Multiply with rank-0 scalars; build broadcastable tensors via Lambda
+    gate_floor  = Lambda(lambda g: tf.ones_like(g) * tf.constant(0.25, tf.float32),
+                         name="offline_resbp_gate_floor")(gate_linger)
+    gate_scaled = Lambda(lambda g: 0.75 * g, name="offline_resbp_gate_scaled")(gate_linger)
+    gate_mix    = Add(name="offline_resbp_gate_mix")([gate_floor, gate_scaled])
+
+    rbp_g   = Multiply(name="offline_resbp_mult_gate")([rbp_bp, gate_mix])
+    rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_g)
     return rbp_fin
 
 
 def _add_resbp_branch_realtime(inp, gate):
-    """
-    Realtime HF-like band-pass branch (700–2000 Hz).
-    Structure mirrors realtime HF:
-      - pre-emphasis
-      - 3 small gated_sep blocks (no FiLM in realtime HF branch)
-      - multiply by gate with a small linger
-      - band-pass 700–2000 Hz
-      - trainable scalar
-    """
-    # Keep the gate open a bit longer, but bound kernel len for streaming
     gate_linger = CausalExpSmoother(
         time_const_ms=REALTIME_RESBP_LINGER_MS,
         sample_rate=REALTIME_SAMPLE_RATE,
@@ -2627,17 +2633,22 @@ def _add_resbp_branch_realtime(inp, gate):
     rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_resbp_b2", lookahead=0)
     rbp    = Conv1D(1, 1, padding="same", name="realtime_resbp_out")(rbp)
 
-    rbp_g  = Multiply(name="realtime_resbp_mult_gate")([rbp, gate_linger])
-
     rbp_bp = BandpassFIR(
         sample_rate=REALTIME_SAMPLE_RATE,
         low_hz=RESBP_LOW_HZ,
         high_hz=RESBP_HIGH_HZ,
         order=REALTIME_RESBP_BP_ORDER,
         name="realtime_resbp_bandpass"
-    )(rbp_g)
+    )(rbp)
 
-    rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_bp)
+    # Avoid Multiply with rank-0 scalars; build broadcastable tensors via Lambda
+    gate_floor  = Lambda(lambda g: tf.ones_like(g) * tf.constant(0.25, tf.float32),
+                         name="realtime_resbp_gate_floor")(gate_linger)
+    gate_scaled = Lambda(lambda g: 0.75 * g, name="realtime_resbp_gate_scaled")(gate_linger)
+    gate_mix    = Add(name="realtime_resbp_gate_mix")([gate_floor, gate_scaled])
+
+    rbp_g   = Multiply(name="realtime_resbp_mult_gate")([rbp_bp, gate_mix])
+    rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_g)
     return rbp_fin
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
@@ -3630,20 +3641,22 @@ def train_shared(
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
         initial_epoch = 0
   
-    new_w, _ = calibrate_loss_weights_consistent(
+    new_w, _ = calibrate_loss_weights(
         model=static_model, dataset=val_ds, sample_rate=sample_rate, n_batches=5
     )
-    L1_WEIGHT      = new_w['l1']
-    STFT_WEIGHT    = new_w['stft']
-    MEL_WEIGHT     = new_w['mel']
-    RMS_ENV_WEIGHT = new_w['env']
-    HF_WEIGHT      = new_w['hf']
+    L1_WEIGHT              = new_w['l1']
+    STFT_WEIGHT            = new_w['stft']
+    MEL_WEIGHT             = new_w['mel']
+    RMS_ENV_WEIGHT         = new_w['env']
+    HF_WEIGHT              = new_w['hf']
+    RESBP_BAND_LOSS_WEIGHT = new_w['resbp_bl']  # NEW
     print(f"→ normalized ({kind}) weights:"
         f" L1={L1_WEIGHT:.6f}"
         f" STFT={STFT_WEIGHT:.6f}"
         f" MEL={MEL_WEIGHT:.6f}"
         f" ENV={RMS_ENV_WEIGHT:.6f}"
-        f" HF={HF_WEIGHT:.6f}")
+        f" HF={HF_WEIGHT:.6f}"
+        f" RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
 
     # Instantiate the loss with the per-model smoothing
     _combined_loss = CombinedLoss(sample_rate, extra_small_cplx=(kind == 'offline'))
@@ -3784,14 +3797,6 @@ def fine_tune():
     global picked_pairs, finger_pairs, all_pairs, audio_cache
     global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
 
-    corrected_weights = {
-        'l1': FINETUNE_L1_WEIGHT,
-        'hf': HF_WEIGHT,
-        'stft': STFT_WEIGHT,
-        'mel': FINETUNE_MEL_WEIGHT,
-        'env': RMS_ENV_WEIGHT
-    }
-
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
     tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     if not os.path.exists(src) or not os.path.exists(tgt):
@@ -3876,7 +3881,7 @@ def fine_tune():
     dsS_val = dsS_val.take(CALIBRATION_CHUNK_COUNT)
 
     # Normalize weights consistently with the actual loss shape
-    new_w, _ = calibrate_loss_weights_consistent(
+    new_w, _ = calibrate_loss_weights(
         model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5
     )
     
@@ -3885,12 +3890,14 @@ def fine_tune():
     MEL_WEIGHT     = new_w['mel']
     RMS_ENV_WEIGHT = new_w['env']
     HF_WEIGHT      = new_w['hf']
+    RESBP_BAND_LOSS_WEIGHT = new_w['resbp_bl']
     print(f"→ normalized finetune weights:"
         f" L1={L1_WEIGHT:.6f}"
         f" STFT={STFT_WEIGHT:.6f}"
         f" MEL={MEL_WEIGHT:.6f}"
         f" ENV={RMS_ENV_WEIGHT:.6f}"
-        f" HF={HF_WEIGHT:.6f}")
+        f" HF={HF_WEIGHT:.6f}"
+        f" RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
 
     # Instantiate the loss with the per-model smoothing
     _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE, extra_small_cplx=False)
