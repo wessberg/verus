@@ -175,7 +175,7 @@ OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
 # HF loss shaping
 OFFLINE_HP_CUTOFF_HZ   = 3000.0
-REALTIME_HP_CUTOFF_HZ  = 5200.0
+REALTIME_HP_CUTOFF_HZ  = 3000.0
 
 # Realtime params
 REALTIME_FILTERS          = 48
@@ -198,7 +198,7 @@ REALTIME_STEM_FINGER_DISTILL_ALPHA  = 0.5   # KD weight for finger stem
 REALTIME_STEM_HF_DISTILL_ALPHA      = 0.8   # KD weight for HF stem
 REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (small; avoids cap conflict)
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
-REALTIME_STEM_RESO_DISTILL_ALPHA    = 0.0
+REALTIME_STEM_RESBP_DISTILL_ALPHA   = 0.4
 
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 1.0   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
@@ -214,36 +214,32 @@ REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 20.0
 REALTIME_GATE_ENV_MS                     = 0.02
-REALTIME_GATE_DEPTH_SMOOTH_MS            = 10.0
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 1.0
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
 # ─── Resonance branch params ─────────────────────────────────────────────
 
-def log_spaced(f_lo, f_hi, n):
-    return [float(x) for x in np.geomspace(f_lo, f_hi, num=n)]
+# Resonant band-pass (HF-like) branch params
+RESBP_LOW_HZ  = 700.0
+RESBP_HIGH_HZ = 2000.0
 
-OFFLINE_RESO_ENABLE       = True
-OFFLINE_RESO_MODES        = 12
-# Decimated resonance path to get long kernels cheaply:
-OFFLINE_RESO_DS_FACTOR    = 16     # 96k → 6 kHz
-OFFLINE_RESO_LENGTH_DS    = 384    # 384 @ 6 kHz ≈ 64 ms
-OFFLINE_RESO_CENTERS_HZ   = log_spaced(1400.0, 2000.0, OFFLINE_RESO_MODES)
-OFFLINE_RESO_DECAYS_MS    = list(np.linspace(55.0, 22.0, OFFLINE_RESO_MODES))
-OFFLINE_RESO_STRIKE_DECAY_MS = 120.0
-OFFLINE_RESO_ONSET_THR  = 0.02
-OFFLINE_RESO_BOOST_DB     = 0.0
+# FIR orders for the band-pass (min-phase)
+OFFLINE_RESBP_BP_ORDER = 257
+REALTIME_RESBP_BP_ORDER = 257
 
-# Realtime (48 kHz)
-REALTIME_RESO_ENABLE      = True
-REALTIME_RESO_MODES       = 8
-REALTIME_RESO_DS_FACTOR   = 8      # 48k → 6 kHz
-REALTIME_RESO_LENGTH_DS   = 384    # 384 @ 6 kHz ≈ 64 ms
-REALTIME_RESO_CENTERS_HZ  = log_spaced(700.0, 2000.0, REALTIME_RESO_MODES)
-REALTIME_RESO_DECAYS_MS   = list(np.linspace(45.0, 18.0, REALTIME_RESO_MODES))
-REALTIME_RESO_STRIKE_DECAY_MS = 120.0
-REALTIME_RESO_ONSET_THR = 0.02
-REALTIME_RESO_BOOST_DB    = 0.0
+# Gate “linger” (keep gate open a bit longer than HF)
+OFFLINE_RESBP_LINGER_MS = 20.0
+REALTIME_RESBP_LINGER_MS = 40.0
+# Bound the FIR length for realtime streaming (fits in left context)
+REALTIME_RESBP_LINGER_LMAX = 256
+
+# Initial scalar (trainable) for the band-pass branch
+OFFLINE_RESBP_SCALE_INIT  = 2.0
+REALTIME_RESBP_SCALE_INIT = 2.0
+
+OFFLINE_RESBP_BOOST_DB    = 0.0
+REALTIME_RESBP_BOOST_DB   = 0.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
@@ -892,7 +888,7 @@ def segment_generator(seg_len, chunks, is_pick_chunks, model_sample_rate):
         y_audio = mic_seg.astype('float32')[:, None]
         style_flag = 1.0 if is_pick_chunks else 0.0
         yield x, (y_audio, style_flag)
-        
+
 def segment_generator_dual(seg_len_realtime,
                            chunks,
                            is_pick_chunks,
@@ -1098,14 +1094,11 @@ def generate_demo_from_files(model,
     if sample_rate == REALTIME_SAMPLE_RATE and REALTIME_IR_BOOST_DB != 0.0:
         model = boost_hf_scale_in_model(model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
         
-    # Optional: resonance stem boost for quick A/B during demo generation
-    try:
-        if OFFLINE_RESO_BOOST_DB != 0.0 and sample_rate == OFFLINE_SAMPLE_RATE:
-            model = boost_hf_scale_in_model(model, "offline_reso_scale", gain_db=OFFLINE_RESO_BOOST_DB)
-        elif REALTIME_RESO_BOOST_DB != 0.0 and sample_rate == REALTIME_SAMPLE_RATE:
-            model = boost_hf_scale_in_model(model, "realtime_reso_scale", gain_db=REALTIME_RESO_BOOST_DB)
-    except Exception:
-        pass  # layer may not exist (e.g., older models)
+    if sample_rate == OFFLINE_SAMPLE_RATE and OFFLINE_RESBP_BOOST_DB != 0.0:
+        # new band-pass stem
+        model = boost_hf_scale_in_model(model, "offline_resbp_scale", gain_db=OFFLINE_RESBP_BOOST_DB)
+    elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESBP_BOOST_DB != 0.0:
+        model = boost_hf_scale_in_model(model, "realtime_resbp_scale", gain_db=REALTIME_RESBP_BOOST_DB)
 
     # Determine FILE sample-rate and region to render in file-frame domain
     info = sf.info(path_src)
@@ -1932,6 +1925,71 @@ def _get_minphase_hp_kernel(sample_rate, cutoff_hz, order=129):
     # Always materialize a new constant in the current graph.
     return tf.constant(k_np, dtype=tf.float32)
 
+# ─── Band-pass (700–2000 Hz) causal min-phase FIR ────────────────────────────
+_bp_kernel_cache = {}
+def _get_minphase_bp_kernel(sample_rate, f_lo, f_hi, order=257, window="hamming"):
+    """
+    Build a causal min-phase band-pass FIR kernel for tf.nn.conv1d (cross-correlation),
+    i.e. time-reversed taps. We do not normalize DC since it's a band-pass.
+    """
+    key = (int(sample_rate), float(f_lo), float(f_hi), int(order), str(window))
+    k_np = _bp_kernel_cache.get(key)
+    if k_np is None:
+        nyq = float(sample_rate) / 2.0
+        lo  = float(f_lo) / nyq
+        hi  = float(f_hi) / nyq
+        taps = firwin(order, [lo, hi], pass_zero=False, window=window).astype(np.float32)
+        # Convert to minimum-phase
+        taps_min = minimum_phase(taps, method="homomorphic").astype(np.float32)
+        # Reverse for conv1d (cross-correlation) to emulate convolution
+        k_np = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)
+        _bp_kernel_cache[key] = k_np
+    return tf.constant(k_np, dtype=tf.float32)
+
+@register_keras_serializable()
+class BandpassFIR(Layer):
+    """
+    Causal min-phase band-pass FIR. Non-trainable constant taps.
+    Usage: y = BandpassFIR(sample_rate=48000, low_hz=700.0, high_hz=2000.0, order=257)(x)
+    """
+    def __init__(self, sample_rate, low_hz, high_hz, order=257, window="hamming", **kwargs):
+        super().__init__(**kwargs)
+        self.sample_rate = int(sample_rate)
+        self.low_hz  = float(low_hz)
+        self.high_hz = float(high_hz)
+        self.order   = int(order)
+        self.window  = str(window)
+        self._taps_init = None
+
+    def build(self, input_shape):
+        k = _get_minphase_bp_kernel(self.sample_rate, self.low_hz, self.high_hz, self.order, self.window)
+        self.taps = self.add_weight(
+            name="bp_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        pad_amt = tf.shape(self.taps)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sample_rate": self.sample_rate,
+            "low_hz": self.low_hz,
+            "high_hz": self.high_hz,
+            "order": self.order,
+            "window": self.window
+        })
+        return cfg
+
 def _causal_conv1d(x, kernel):
     pad = tf.shape(kernel)[0] - 1
     x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
@@ -2502,152 +2560,85 @@ def film_apply(x, style_embed, filters, prefix):
         beta3
     ])
 
-def _add_resonance_branch_offline(inp, style_embed, gate, style_mask=None):
+def _add_resbp_branch_offline(inp, style_embed, gate):
     """
-    Offline resonance triggered by HF gate opening:
-      - gate: offline HF gate (same detector as HF)
-      - style_mask: offline style mask over time (pick-only)
-      - Longer decay envelope; single post‑mix gating
+    HF-like branch for 700–2000 Hz using the same gate, with a short 'linger'.
+    - Pre-emphasis like HF
+    - Small conv stack (same as HF) with FiLM
+    - Multiply by a slightly longer gate envelope
+    - Band-pass to 700–2000 Hz (min-phase)
+    - Trainable scalar
     """
-    if not OFFLINE_RESO_ENABLE:
-        return None
-
-    trig_on    = Lambda(gate_onset, name="offline_reso_onrise")(gate)
-    trig_pulse = Lambda(onset_binarize, arguments={'thr': OFFLINE_RESO_ONSET_THR}, name="offline_reso_on_bin")(trig_on)
-    if style_mask is not None:
-        trig_pulse = Multiply(name="offline_reso_pick_only")([trig_pulse, style_mask])
-
-    strike_env = CausalExpSmoother(
-        time_const_ms=OFFLINE_RESO_STRIKE_DECAY_MS,
+    # Keep the gate open a bit longer (causal smoothing)
+    gate_linger = CausalExpSmoother(
+        time_const_ms=OFFLINE_RESBP_LINGER_MS,
         sample_rate=OFFLINE_SAMPLE_RATE,
-        name="offline_reso_strike_env"
-    )(trig_pulse)  # (B,T,1)
+        name="offline_resbp_gate_linger"
+    )(gate)
 
-    exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="offline_reso_pre_emph")(inp)
-    exc = Activation('tanh', name="offline_reso_drive")(exc)
+    rbp_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_resbp_pre_emph")(inp)
+    rbp    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_resbp_init")(rbp_in)
+    # mirror the HF micro-architecture (3 gated_sep blocks + FiLM)
+    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b0", lookahead=0)
+    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b0")
+    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b1", lookahead=0)
+    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b1")
+    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_resbp_b2", lookahead=0)
+    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b2")
+    rbp    = Conv1D(1, 1, padding="same", name="offline_resbp_out")(rbp)
 
-    fac = int(OFFLINE_RESO_DS_FACTOR)
-    stages = int(round(math.log2(max(1, fac))))
-    if (1 << stages) != fac:
-        raise ValueError(f"OFFLINE_RESO_DS_FACTOR must be power-of-two, got {OFFLINE_RESO_DS_FACTOR}")
+    # Gate first, then band-pass
+    rbp_g  = Multiply(name="offline_resbp_mult_gate")([rbp, gate_linger])
 
-    x_ds, env_ds = exc, strike_env
-    for i in range(stages):
-        x_ds   = FIRDecimateBy2(name=f"offline_reso_ds2_{i}")(x_ds)
-        env_ds = FIRDecimateBy2(name=f"offline_reso_env_ds2_{i}")(env_ds)
+    rbp_bp = BandpassFIR(
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        low_hz=RESBP_LOW_HZ,
+        high_hz=RESBP_HIGH_HZ,
+        order=OFFLINE_RESBP_BP_ORDER,
+        name="offline_resbp_bandpass"
+    )(rbp_g)
 
-    ds_sr = OFFLINE_SAMPLE_RATE // fac
-    modes = ModalBank(
-        centers_hz=OFFLINE_RESO_CENTERS_HZ,
-        decays_ms=OFFLINE_RESO_DECAYS_MS,
-        length=OFFLINE_RESO_LENGTH_DS,
-        sample_rate=ds_sr,
-        name="offline_reso_modal_ds"
-    )(x_ds)  # (B,Tds,M)
+    rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_bp)
+    return rbp_fin
 
-    gains = Dense(
-        OFFLINE_RESO_MODES,
-        activation="softplus",
-        bias_initializer=tf.keras.initializers.Constant(0.3),
-        kernel_regularizer=regularizers.l2(1e-5),
-        name="offline_reso_gains"
-    )(style_embed)  # (B,M)
-    gains = Reshape((1, OFFLINE_RESO_MODES), name="offline_reso_gains_expand")(gains)
 
-    m_scaled = Multiply(name="offline_reso_modes_scaled")([modes, gains])
-    reso_ds  = Conv1D(1, 1, padding="same", name="offline_reso_mix")(m_scaled)
-
-    reso_ds = Multiply(name="offline_reso_apply_env_ds")([reso_ds, env_ds])
-
-    offline_lp_taps = make_minphase_lp_kernel(
-        order=REALTIME_LP_ORDER,
-        cutoff_hz=0.9 * (OFFLINE_SAMPLE_RATE / (2.0 * OFFLINE_RESO_DS_FACTOR)),
-        sr=OFFLINE_SAMPLE_RATE
-    )
-    reso_us  = ResizeNearest1D(factor=OFFLINE_RESO_DS_FACTOR, name="offline_reso_upsample")(reso_ds)
-    reso_us  = IRLowpass(taps=offline_lp_taps, name="offline_reso_lowpass")(reso_us)
-    reso     = MatchTimeToRef(name="offline_reso_matchlen")([reso_us, inp])
-
-    reso = IrScale(init=1.0, name="offline_reso_scale")(reso)
-    return reso
-
-def _add_resonance_branch_realtime(inp, style_embed, trigger, style_mask=None):
+def _add_resbp_branch_realtime(inp, gate):
     """
-    Resonance triggered by the HF gate opening:
-      - trigger: (B,T,1) gate you want to align to (use HF mask_used for realtime)
-      - style_mask: (B,1,1) or (B,T,1); multiply to enforce pick-only
-      - Longer decay envelope so it rings out after opening
-      - Single gating after mode mixing (stronger output)
+    Realtime HF-like band-pass branch (700–2000 Hz).
+    Structure mirrors realtime HF:
+      - pre-emphasis
+      - 3 small gated_sep blocks (no FiLM in realtime HF branch)
+      - multiply by gate with a small linger
+      - band-pass 700–2000 Hz
+      - trainable scalar
     """
-    if not REALTIME_RESO_ENABLE:
-        return None
-
-    # 1) Build a trigger envelope from the HF gate opening
-    # Rising edges -> binarized pulses
-    trig_on    = Lambda(gate_onset, name="realtime_reso_onrise")(trigger)
-    trig_pulse = Lambda(onset_binarize, arguments={'thr': REALTIME_RESO_ONSET_THR}, name="realtime_reso_on_bin")(trig_on)
-
-    # Enforce pick-only (soft gating by style mask; set hard gate if you prefer)
-    if style_mask is not None:
-        trig_pulse = Multiply(name="realtime_reso_pick_only")([trig_pulse, style_mask])
-
-    # Decay envelope that lasts longer than the HF gate
-    strike_env = CausalExpSmoother(
-        time_const_ms=REALTIME_RESO_STRIKE_DECAY_MS,  # make this larger if you want longer ring
+    # Keep the gate open a bit longer, but bound kernel len for streaming
+    gate_linger = CausalExpSmoother(
+        time_const_ms=REALTIME_RESBP_LINGER_MS,
         sample_rate=REALTIME_SAMPLE_RATE,
-        name="realtime_reso_strike_env"
-    )(trig_pulse)  # (B,T,1)
+        Lmax=REALTIME_RESBP_LINGER_LMAX,
+        name="realtime_resbp_gate_linger"
+    )(gate)
 
-    # 2) Excitation (no pre-gating; we gate once later, post‑mix)
-    exc = Lambda(pre_emphasis, arguments={'alpha': 0.95}, name="realtime_reso_pre_emph")(inp)
-    exc = Activation('tanh', name="realtime_reso_drive")(exc)
+    rbp_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_resbp_pre_emph")(inp)
+    rbp    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_resbp_init")(rbp_in)
+    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_resbp_b0", lookahead=0)
+    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_resbp_b1", lookahead=0)
+    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_resbp_b2", lookahead=0)
+    rbp    = Conv1D(1, 1, padding="same", name="realtime_resbp_out")(rbp)
 
-    # 3) Decimate excitation and envelope to modal rate
-    fac = int(REALTIME_RESO_DS_FACTOR)
-    stages = int(round(math.log2(max(1, fac))))
-    if (1 << stages) != fac:
-        raise ValueError(f"REALTIME_RESO_DS_FACTOR must be power-of-two, got {REALTIME_RESO_DS_FACTOR}")
+    rbp_g  = Multiply(name="realtime_resbp_mult_gate")([rbp, gate_linger])
 
-    x_ds, env_ds = exc, strike_env
-    for i in range(stages):
-        x_ds   = FIRDecimateBy2(name=f"realtime_reso_ds2_{i}")(x_ds)
-        env_ds = FIRDecimateBy2(name=f"realtime_reso_env_ds2_{i}")(env_ds)
+    rbp_bp = BandpassFIR(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        low_hz=RESBP_LOW_HZ,
+        high_hz=RESBP_HIGH_HZ,
+        order=REALTIME_RESBP_BP_ORDER,
+        name="realtime_resbp_bandpass"
+    )(rbp_g)
 
-    # 4) Modal bank (no time-gating inside; we’ll apply env_ds once after mixing)
-    ds_sr = REALTIME_SAMPLE_RATE // fac
-    modes = ModalBank(
-        centers_hz=REALTIME_RESO_CENTERS_HZ,
-        decays_ms=REALTIME_RESO_DECAYS_MS,
-        length=REALTIME_RESO_LENGTH_DS,
-        sample_rate=ds_sr,
-        name="realtime_reso_modal_ds"
-    )(x_ds)  # (B,Tds,M)
-
-    # Per-mode gains (positive)
-    gains = Dense(
-        REALTIME_RESO_MODES,
-        activation="softplus",
-        bias_initializer=tf.keras.initializers.Constant(0.3),
-        kernel_regularizer=regularizers.l2(1e-5),
-        name="realtime_reso_gains"
-    )(style_embed)  # (B,M)
-    gains = Reshape((1, REALTIME_RESO_MODES), name="realtime_reso_gains_expand")(gains)
-
-    # Mix modes
-    m_scaled = Multiply(name="realtime_reso_modes_scaled")([modes, gains])
-    reso_ds  = Conv1D(1, 1, padding="same", name="realtime_reso_mix")(m_scaled)
-
-    # 5) Apply the long strike envelope just once, after the mix (stronger)
-    reso_ds = Multiply(name="realtime_reso_apply_env_ds")([reso_ds, env_ds])
-
-    # 6) Upsample and low-pass back to 48 kHz
-    reso_us  = ResizeNearest1D(factor=REALTIME_RESO_DS_FACTOR, name="realtime_reso_upsample")(reso_ds)
-    reso_us  = IRLowpass(name="realtime_reso_lowpass")(reso_us)
-    reso     = MatchTimeToRef(name="realtime_reso_matchlen")([reso_us, inp])
-
-    # Final scalar
-    reso = IrScale(init=1.0, name="realtime_reso_scale")(reso)
-    return reso
+    rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_bp)
+    return rbp_fin
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
@@ -2755,18 +2746,15 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
     
-    offline_reso = _add_resonance_branch_offline(
+    # ─── New band‑pass branch (replaces old modal reso) ──────────────────────
+    offline_resbp = _add_resbp_branch_offline(
         inp=inp,
         style_embed=style_embed,
-        gate=offline_gate,           # same detector as HF branch
-        style_mask=style_time_used   # pick-only
+        gate=offline_gate
     )
 
-    # Final sum
-    if offline_reso is None:
-        out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final])
-    else:
-        out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final, offline_reso])
+    # Final sum (main + HF + band-pass)
+    out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final, offline_resbp])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
@@ -2819,18 +2807,12 @@ def build_realtime_model(offline=None, dynamic_time=False):
         pick_out   = teacher.get_layer("offline_final_pick").output
         finger_out = teacher.get_layer("offline_final_finger").output
         hf_scaled  = teacher.get_layer("offline_hf_scale").output
-
-        # Optional resonance stem
-        try:
-            reso_scaled = teacher.get_layer("offline_reso_scale").output
-            has_reso = True
-        except Exception:
-            reso_scaled = None
-            has_reso = False
+        
+        resbp_scaled = teacher.get_layer("offline_resbp_scale").output
 
         teacher_combo = tf.keras.Model(
             inputs=teacher.inputs,
-            outputs=feat_outs + [gate_out, audio_out, style_prob_out, pick_out, finger_out, hf_scaled] + ([reso_scaled] if has_reso else []),
+            outputs=feat_outs + [gate_out, audio_out, style_prob_out, pick_out, finger_out, hf_scaled, resbp_scaled],
             name="offline_teacher_combo"
         )
 
@@ -2847,7 +2829,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         off_pick           = combo[idx]; idx += 1
         off_finger         = combo[idx]; idx += 1
         off_hf_scaled      = combo[idx]; idx += 1
-        off_reso_scaled    = combo[idx] if has_reso else None
+        off_resbp_scaled    = combo[idx]
 
         # Style KD and blend
         style_prob_3d         = Reshape((1, 1), name="realtime_style_prob_3d")(style_prob)
@@ -2986,15 +2968,9 @@ def build_realtime_model(offline=None, dynamic_time=False):
     # Mix IR and HF into main
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
 
-    # Resonance branch (student)
-    realtime_reso = _add_resonance_branch_realtime(
-        inp=inp,
-        style_embed=style_embed,
-        trigger=realtime_gate,      # fast-attack → clear rising edge
-        style_mask=style_scalar_b3
-    )
-    
-    y_realtime = Add(name="realtime_with_ir_reso")([y_realtime, realtime_reso])
+    # New band‑pass branch, gated by the same realtime gate with a short linger
+    realtime_resbp = _add_resbp_branch_realtime(inp=inp, gate=realtime_gate)
+    y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
 
     # KD wiring (student vs teacher) — all based on the single teacher_combo call
     if offline is not None:
@@ -3035,9 +3011,15 @@ def build_realtime_model(offline=None, dynamic_time=False):
         kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48, hf_final]))
 
         # Resonance KD (optional)
-        if realtime_reso is not None and off_reso_scaled is not None:
-            off_reso_ds = FIRDecimateBy2(name="offline_reso_ds2")(off_reso_scaled)
-            kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_RESO_DISTILL_ALPHA, name="stem_reso_distill")([off_reso_ds, realtime_reso]))
+        
+        # Band‑pass (resbp) KD — optional, only if teacher has it
+        if realtime_resbp is not None and off_resbp_scaled is not None:
+            off_resbp_ds = FIRDecimateBy2(name="offline_resbp_ds2")(off_resbp_scaled)
+            kd_tensors.append(
+                DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")(
+                    [off_resbp_ds, realtime_resbp]
+                )
+            )
 
     # Ensure KD tensors are graph-reachable
     if kd_tensors:
@@ -3166,7 +3148,6 @@ def add_sw_realtime_finetune_nf(x, y):
 
     return inputs, outputs, (sw_audio, sw_style)
 
-
 @register_keras_serializable()
 def build_offline_debug_model(offline):
     outs = {
@@ -3178,17 +3159,21 @@ def build_offline_debug_model(offline):
         "finger_c":  offline.get_layer("offline_finger_contrib").output,
         "y_pred":    offline.get_layer("offline_mix_main").output,
     }
-    
-    outs.update({
-        "reso":     offline.get_layer("offline_reso_scale").output if "offline_reso_scale" in [l.name for l in offline.layers] else None
-    })
-    
+    # New band-pass stem if present
+    try:
+        outs["resbp"] = offline.get_layer("offline_resbp_scale").output
+    except:
+        pass
     return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
-
 
 @register_keras_serializable()
 def build_realtime_debug_model(realtime):
-    
+    # prefer the new with_ir_resbp if present; fall back to with_ir
+    try:
+        y_pred = realtime.get_layer("realtime_with_ir_resbp").output
+    except:
+        y_pred = realtime.get_layer("realtime_with_ir").output
+
     outs = {
         "gate":      realtime.get_layer("realtime_gate").output,
         "hf_pre":    realtime.get_layer("realtime_hf_out").output,
@@ -3198,12 +3183,15 @@ def build_realtime_debug_model(realtime):
         "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
         "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
-        "y_pred":    realtime.get_layer("realtime_with_ir_reso").output,
-        "reso":     realtime.get_layer("realtime_reso_scale").output,
-        "ir_only":  realtime.get_layer("realtime_ir_lowpass").output
+        "y_pred":    y_pred,
+        "ir_only":   realtime.get_layer("realtime_ir_lowpass").output
     }
-    
-    # Optional bypass exports if you added them
+    # New band-pass stem if present
+    try:
+        outs["resbp"] = realtime.get_layer("realtime_resbp_scale").output
+    except:
+        pass
+
     try:
         outs["hf_scaled_gate_only"] = realtime.get_layer("realtime_hf_scale_gate_only").output
     except:
@@ -3252,14 +3240,10 @@ def _boost_scales_for_stems(model, sample_rate):
             print(f"[stems] IR scale boost failed: {e}")
 
     # Resonance scale boost
-    try:
-        if sample_rate == OFFLINE_SAMPLE_RATE and OFFLINE_RESO_BOOST_DB > 0.0:
-            boost_hf_scale_in_model(model, "offline_reso_scale", OFFLINE_RESO_BOOST_DB)
-        elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESO_BOOST_DB > 0.0:
-            boost_hf_scale_in_model(model, "realtime_reso_scale", REALTIME_RESO_BOOST_DB)
-    except Exception as e:
-        # Some models may not have resonance branch
-        print(f"[stems] Resonance scale boost skipped or failed: {e}")
+    if sample_rate == OFFLINE_SAMPLE_RATE and OFFLINE_RESBP_BOOST_DB > 0.0:
+        boost_hf_scale_in_model(model, "offline_resbp_scale", OFFLINE_RESBP_BOOST_DB)
+    elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESBP_BOOST_DB > 0.0:
+        boost_hf_scale_in_model(model, "realtime_resbp_scale", REALTIME_RESBP_BOOST_DB)
 
 
 def render_isolated_stems(
@@ -3423,10 +3407,14 @@ def render_isolated_stems(
             if w_ir is None:
                 w_ir = sf.SoundFile(os.path.join(out_dir, "stem_ir_lowpass.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
             w_ir.write(ir_core)
-        if "reso" in outs_pred:
-            res_core = core_of(outs_pred, "reso")
+        
+        # New band-pass stem
+        if "resbp" in outs_pred:
+            res_core = core_of(outs_pred, "resbp")
             if w_reso is None:
-                w_reso = sf.SoundFile(os.path.join(out_dir, "stem_reso_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                # rename file for new branch
+                fname = "stem_resbp_only.wav"
+                w_reso = sf.SoundFile(os.path.join(out_dir, fname), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
             w_reso.write(res_core)
 
         # Pick/finger contributions (always present in both offline/realtime debug models)
@@ -3692,20 +3680,20 @@ def train_shared(
     if kind == 'realtime':
         kd_targets = {
             # audio KD
-            "audio_distill":       (REALTIME_DISTILL_ALPHA,        2.0,  0,  80),   # 8→2 example if you set REALTIME_DISTILL_ALPHA=8; adjust as needed
-            "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA, 0.2,  0,  80),
+            "audio_distill":       (REALTIME_DISTILL_ALPHA,              2.0,  0,  80),
+            "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA,   0.2,  0,  80),
             # feature/stem KD
-            "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
-            "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,   0.5,  0,  80),
-            "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,   0.2,  0,  80),
-            "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA, 0.2,  0,  80),
-            "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,     0.2,  0,  80),
+            "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
+            "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
+            "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,    0.2,  0,  80),
+            "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA,  0.2,  0,  80),
+            "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,      0.2,  0,  80),
+            "stem_resbp_distill":  (REALTIME_STEM_RESBP_DISTILL_ALPHA,   0.2,  0,  80),  # new
             # mask/gate KD
-            "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,     1.0,  0,  80),
-            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,   0.1,  0,  80),
-            # style blend schedule (not a KD layer, but exposes a scalar weight)
-            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,       0.3,  0, 100),
-            "stem_reso_distill":   (REALTIME_STEM_RESO_DISTILL_ALPHA, 0.2, 0, 80)
+            "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,      1.0,  0,  80),
+            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,    0.1,  0,  80),
+            # style blend schedule
+            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,           0.3,  0, 100)
         }
         cbs.append(KDAlphaScheduler(kd_targets))
 
