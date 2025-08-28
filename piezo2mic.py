@@ -241,6 +241,13 @@ REALTIME_RESBP_SCALE_INIT = 2.0
 OFFLINE_RESBP_BOOST_DB    = 40.0
 REALTIME_RESBP_BOOST_DB   = 0.0
 
+# ─── Resonance branch params (additional) ────────────────────────────────────
+RESBP_MASK_SMOOTH_MS_OFFLINE      = 120.0
+RESBP_MASK_SMOOTH_MS_REALTIME     = 160.0
+REALTIME_RESBP_MASK_SMOOTH_LMAX   = 512
+
+RESBP_LR_TARGET_SR = 12000  # 48k/4, 96k/8
+
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 
@@ -637,18 +644,44 @@ def waveform_l1_loss(y_true, y_pred):
     return tf.abs(y_true - y_pred)
 
 @register_keras_serializable()
-def band_limited_l1_loss(y_true, y_pred, sample_rate,
-                         low_hz=RESBP_LOW_HZ, high_hz=RESBP_HIGH_HZ,
-                         order_off=OFFLINE_RESBP_BP_ORDER, order_rt=REALTIME_RESBP_BP_ORDER):
+def band_limited_l1_loss_weighted(y_true, y_pred, sample_rate,
+                                  low_hz=RESBP_LOW_HZ, high_hz=RESBP_HIGH_HZ,
+                                  order_off=OFFLINE_RESBP_BP_ORDER, order_rt=REALTIME_RESBP_BP_ORDER,
+                                  onset_boost=4.0,
+                                  thr_db=-60.0,
+                                  ratio=6.0,
+                                  attack_ms=0.3,
+                                  hold_ms=20.0,
+                                  release_ms=200.0):
     """
-    L1 in the 0.7–2 kHz band (causal min-phase FIR applied to both).
-    Returns (B,T,1) so it plays nicely with sample_weights (B,T,1).
+    L1 in 0.7–2 kHz, weighted by an envelope computed from the band-passed TARGET,
+    so training emphasizes true resonance events even if the piezo has none.
+    Returns (B,T,1).
     """
     order = order_off if int(sample_rate) == OFFLINE_SAMPLE_RATE else order_rt
     k = _get_minphase_bp_kernel(sample_rate, low_hz, high_hz, order)
+
     t_bp = _causal_conv1d(y_true, k)
     p_bp = _causal_conv1d(y_pred, k)
-    return tf.abs(t_bp - p_bp)
+
+    # Build a resonance envelope from the TARGET band, not from the piezo HF gate.
+    g = gate_gain_signal(
+        t_bp,
+        sample_rate=sample_rate,
+        threshold_db=thr_db,
+        ratio=ratio,
+        attack_ms=attack_ms,
+        hold_ms=hold_ms,
+        release_ms=release_ms,
+        cutoff_hz=max(200.0, 0.5 * low_hz),  # HP sidechain near band’s lower edge
+        hp_order=129,
+        env_ms=1.0,
+        depth_smooth_ms=20.0,
+        env_lmax=512,
+        depth_lmax=512
+    )
+
+    return tf.abs(t_bp - p_bp) * (1.0 + onset_boost * g)
 
 @register_keras_serializable()
 def hf_loss(y_true, y_pred):
@@ -834,7 +867,7 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
         cplx = cplx_base
 
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=gate_env)
-    bl   = band_limited_l1_loss(y_true, y_pred, sample_rate)
+    bl   = band_limited_l1_loss_weighted(y_true, y_pred, sample_rate)
 
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
@@ -853,6 +886,339 @@ def mean_hf_metric(y_true, y_pred):
     return tf.reduce_mean(vals, axis=[1, 2], keepdims=True)
 
 # ────────────────────────────── DATA PIPELINE HELPERS ───────────────────────
+
+@register_keras_serializable()
+class MulConst(tf.keras.layers.Layer):
+    def __init__(self, k, **kwargs):
+        super().__init__(**kwargs)
+        self.k = float(k)
+    def call(self, x):
+        return x * tf.constant(self.k, tf.float32)
+    def get_config(self):
+        return {"k": self.k, **super().get_config()}
+
+@register_keras_serializable()
+class OnesLikeTimesConst(tf.keras.layers.Layer):
+    def __init__(self, k, **kwargs):
+        super().__init__(**kwargs)
+        self.k = float(k)
+    def call(self, x):
+        return tf.ones_like(x) * tf.constant(self.k, tf.float32)
+    def get_config(self):
+        return {"k": self.k, **super().get_config()}
+
+def _safe_get_attr(obj, attr, default=None):
+    try:
+        return getattr(obj, attr)
+    except Exception:
+        return default
+
+def _get_layer_config_val(layer, key, default=None):
+    try:
+        return layer.get_config().get(key, default)
+    except Exception:
+        return default
+
+def _find_layers(model, cls=None, name_prefix=None, name_regex=None):
+    layers = []
+    for l in model.layers:
+        if cls is not None and not isinstance(l, cls):
+            continue
+        if name_prefix is not None and not l.name.startswith(name_prefix):
+            continue
+        if name_regex is not None:
+            if re.match(name_regex, l.name) is None:
+                continue
+        layers.append(l)
+    return layers
+
+def _sorted_by_suffix_index(layers, prefix):
+    # Sort layers named like f"{prefix}_<idx>" by <idx>
+    def _key(l):
+        try:
+            tail = l.name[len(prefix):]
+            # strip leading separators/underscores
+            tail = tail.lstrip('_')
+            # take first numeric chunk
+            m = re.match(r'(\d+)', tail)
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+    return sorted(layers, key=_key)
+
+def _sum_sep_rf_for_prefix(model, name_regex):
+    """
+    Sum receptive field increments (k-1)*d across SeparableConv1D layers
+    whose names match name_regex (e.g., r'^realtime_resbp_lr_b\\d+_sep$').
+    Returns rf_samples = 1 + sum((k-1)*d)  (in 'the stack’s native rate').
+    """
+    rf_inc = 0
+    for l in model.layers:
+        if not isinstance(l, SeparableConv1D):
+            continue
+        if re.match(name_regex, l.name) is None:
+            continue
+        ks = _safe_get_attr(l, 'kernel_size', None)
+        ds = _safe_get_attr(l, 'dilation_rate', None)
+        k = int(ks[0]) if ks is not None else int(_get_layer_config_val(l, 'kernel_size', 1))
+        d = int(ds[0]) if ds is not None else int(_get_layer_config_val(l, 'dilation_rate', 1))
+        rf_inc += max(0, (k - 1) * d)
+    return 1 + rf_inc
+
+def _compute_gate_left_ctx_samples(sample_rate=REALTIME_SAMPLE_RATE,
+                                   threshold_db=REALTIME_GATE_THRESHOLD_DB,
+                                   ratio=REALTIME_GATE_RATIO,
+                                   attack_ms=REALTIME_GATE_ATTACK_MS,
+                                   hold_ms=REALTIME_GATE_HOLD_MS,
+                                   release_ms=REALTIME_GATE_RELEASE_MS,
+                                   hp_order=REALTIME_HF_HP_ORDER,
+                                   env_ms=REALTIME_GATE_ENV_MS,
+                                   depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS):
+    """
+    Conservative analytic left-context (samples) for GateInt8Linear pipeline:
+      hp (Lhp-1) + env_smooth (Lenv-1) + hold (Lhold-1) + max(Latt-1, Lrel-1)
+      + depth_smooth (Ldepth-1)
+    where L = ceil(scale * tau) and clamps used inside GateInt8Linear are:
+      - Attack/Release scale=4.0, Lmax=2048
+      - Env scale=2.0, Lmax=env_lmax (we use small ms → short kernels)
+      - Depth scale=2.0, Lmax=depth_lmax
+    """
+    def ema_len(samples, scale, Lmax):
+        L = int(np.ceil(scale * max(1, int(samples))))
+        if Lmax is not None:
+            L = min(L, int(Lmax))
+        return max(1, L)
+
+    # HP
+    L_hp = int(hp_order)  # taps count
+    lc_hp = L_hp - 1
+
+    # Env smoothing (scale=2, cap ~ small; conservative assume Lmax=512)
+    s_env = int(round((float(env_ms) / 1000.0) * float(sample_rate))) if env_ms is not None else 0
+    L_env = ema_len(s_env, scale=2.0, Lmax=512) if s_env > 0 else 1
+    lc_env = L_env - 1
+
+    # Hold (moving ones FIR)
+    s_hold = int(round((float(hold_ms) / 1000.0) * float(sample_rate))) if hold_ms is not None else 0
+    L_hold = max(1, s_hold) if s_hold > 0 else 1
+    lc_hold = L_hold - 1
+
+    # Attack/Release (scale=4, Lmax=2048)
+    s_att = int(round((float(attack_ms) / 1000.0) * float(sample_rate)))
+    s_rel = int(round((float(release_ms) / 1000.0) * float(sample_rate)))
+    L_att = ema_len(s_att, scale=4.0, Lmax=2048)
+    L_rel = ema_len(s_rel, scale=4.0, Lmax=2048)
+    lc_open = max(L_att - 1, L_rel - 1)
+
+    # Depth smoothing (scale=2, Lmax ~ 512)
+    s_depth = int(round((float(depth_smooth_ms) / 1000.0) * float(sample_rate))) if depth_smooth_ms is not None else 0
+    L_depth = ema_len(s_depth, scale=2.0, Lmax=512) if s_depth > 0 else 1
+    lc_depth = L_depth - 1
+
+    # Total gate left context
+    return lc_hp + lc_env + lc_hold + lc_open + lc_depth
+
+def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Compute resbp branch left context in 48k samples and ms:
+      LC_resbp_signal_hi = pre_emph(1) + sum_i 2^i*(L_ds[i]-1) + (F * (R_lr - 1)) + (L_bp - 1)
+      LC_resbp_gain_hi   = LC_gate + (L_linger - 1)
+      LC_resbp_total     = max(LC_resbp_signal_hi, LC_resbp_gain_hi)
+
+    Returns dict with per-part and total context in samples and ms.
+    """
+    sr = int(sample_rate)
+
+    # 1) Downsample chain: FIRDecimateBy2 named "realtime_resbp_ds2_<i>"
+    ds_layers = _sorted_by_suffix_index(_find_layers(model, FIRDecimateBy2, name_prefix="realtime_resbp_ds2_"), "realtime_resbp_ds2_")
+    if not ds_layers:
+        # Fallback to configured down-times
+        S = _resbp_down_times(sr, RESBP_LR_TARGET_SR)
+        ds_taps = [127] * S  # FIRDecimateBy2 default
+    else:
+        ds_taps = []
+        for l in ds_layers:
+            n = _safe_get_attr(l, "num_taps", None)
+            if n is None:
+                n = int(_get_layer_config_val(l, "num_taps", 127))
+            ds_taps.append(int(n))
+    S = len(ds_taps)
+    F = 2 ** S
+
+    # 2) Low-rate RF: sum over "realtime_resbp_lr_b{idx}_sep"
+    R_lr = _sum_sep_rf_for_prefix(model, r'^realtime_resbp_lr_b\d+_sep$')  # in 12 kHz samples
+
+    # 3) Band-pass taps length
+    bp_layers = _find_layers(model, BandpassFIR, name_prefix="realtime_resbp_bandpass")
+    if bp_layers:
+        L_bp = int(bp_layers[0].taps.shape[0])
+    else:
+        L_bp = int(REALTIME_RESBP_BP_ORDER)
+
+    # 4) Pre-emphasis is 2-tap FIR → left context = 1
+    lc_pre = 1
+
+    # 5) Compose high-rate signal path left context
+    lc_ds_hi = 0
+    for i, L in enumerate(ds_taps):
+        lc_ds_hi += (2 ** i) * (int(L) - 1)
+    lc_lr_hi = F * (int(R_lr) - 1)
+    lc_bp = L_bp - 1
+
+    LC_resbp_signal_hi = lc_pre + lc_ds_hi + lc_lr_hi + lc_bp
+
+    # 6) Gain path: realtime_gate → linger smoother
+    LC_gate = _compute_gate_left_ctx_samples(
+        sample_rate=sr,
+        threshold_db=REALTIME_GATE_THRESHOLD_DB,
+        ratio=REALTIME_GATE_RATIO,
+        attack_ms=REALTIME_GATE_ATTACK_MS,
+        hold_ms=REALTIME_GATE_HOLD_MS,
+        release_ms=REALTIME_GATE_RELEASE_MS,
+        hp_order=REALTIME_HF_HP_ORDER,
+        env_ms=REALTIME_GATE_ENV_MS,
+        depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
+    )
+    # Linger smoother length (CausalExpSmoother) is kernel_len-1
+    linger_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_gate_linger")
+    if linger_layers:
+        L_linger = int(linger_layers[0].kernel.shape[0])
+    else:
+        # Compute from config fallback
+        tau = int(round((REALTIME_RESBP_LINGER_MS / 1000.0) * sr))
+        L_linger = int(min(REALTIME_RESBP_LINGER_LMAX, max(8, int(np.ceil(4.0 * max(1, tau))))))
+    LC_resbp_gain_hi = LC_gate + (L_linger - 1)
+
+    LC_resbp_total = max(LC_resbp_signal_hi, LC_resbp_gain_hi)
+
+    to_ms = lambda s: 1000.0 * float(s) / float(sr)
+    out = {
+        "resbp_signal_left_ctx_samples": int(LC_resbp_signal_hi),
+        "resbp_signal_left_ctx_ms":      to_ms(LC_resbp_signal_hi),
+        "resbp_gain_left_ctx_samples":   int(LC_resbp_gain_hi),
+        "resbp_gain_left_ctx_ms":        to_ms(LC_resbp_gain_hi),
+        "resbp_left_ctx_samples":        int(LC_resbp_total),
+        "resbp_left_ctx_ms":             to_ms(LC_resbp_total),
+        "downsample_taps":               ds_taps,
+        "lowrate_rf_samples":            int(R_lr),
+        "bandpass_taps":                 int(L_bp),
+        "upsample_factor":               int(F),
+    }
+    if verbose:
+        print(f"[resbp] signal LC = {out['resbp_signal_left_ctx_samples']} samples ({out['resbp_signal_left_ctx_ms']:.2f} ms)")
+        print(f"[resbp] gain   LC = {out['resbp_gain_left_ctx_samples']} samples ({out['resbp_gain_left_ctx_ms']:.2f} ms)")
+        print(f"[resbp] TOTAL  LC = {out['resbp_left_ctx_samples']} samples ({out['resbp_left_ctx_ms']:.2f} ms)")
+    return out
+
+def compute_ir_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    IR branch LC (48k samples):
+      LC_ir = (L_ds8 - 1) + (8 * (R_ir - 1)) + (L_lp - 1)
+    where:
+      - L_ds8 = taps of RealtimeIrDownsampleFIR (e.g., 129)
+      - R_ir = 1 + sum((K - 1)*d) across realtime_ir_sep_* at 6k rate
+      - L_lp = taps of IRLowpass (e.g., 65)
+    """
+    sr = int(sample_rate)
+    # Downsample FIR by 8
+    ds8_layers = _find_layers(model, RealtimeIrDownsampleFIR, name_prefix="realtime_ir_downsample")
+    if ds8_layers:
+        L_ds8 = int(_safe_get_attr(ds8_layers[0], "kernel_size", REALTIME_IR_FIR_SIZE))
+    else:
+        L_ds8 = int(REALTIME_IR_FIR_SIZE)
+
+    # Low-rate stack (realtime_ir_sep_i)
+    R_ir = _sum_sep_rf_for_prefix(model, r'^realtime_ir_sep_\d+$')  # at 6 kHz
+    # Upsample factor = 8
+    F_ir = int(_safe_get_attr(ds8_layers[0], "factor", REALTIME_IR_DOWNSAMPLE_FACTOR)) if ds8_layers else int(REALTIME_IR_DOWNSAMPLE_FACTOR)
+
+    # Low-pass taps
+    lp_layers = _find_layers(model, IRLowpass, name_prefix="realtime_ir_lowpass")
+    if lp_layers:
+        L_lp = int(lp_layers[0].taps.shape[0])
+    else:
+        L_lp = int(REALTIME_LP_ORDER)
+
+    LC_ir = (L_ds8 - 1) + F_ir * (int(R_ir) - 1) + (L_lp - 1)
+    if verbose:
+        ms = 1000.0 * LC_ir / float(sr)
+        print(f"[ir] LC = {LC_ir} samples ({ms:.2f} ms)")
+    return int(LC_ir)
+
+def compute_main_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Main realtime stack LC (48k samples):
+      LC_main = sum((k-1)*d) across realtime_sep_* (causal padding) = REALTIME_RECEPTIVE_FIELD - 1
+    """
+    R_main = _sum_sep_rf_for_prefix(model, r'^realtime_sep_\d+$')
+    LC_main = int(R_main - 1)
+    if verbose:
+        ms = 1000.0 * LC_main / float(sample_rate)
+        print(f"[main] LC = {LC_main} samples ({ms:.2f} ms)")
+    return LC_main
+
+def compute_hf_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    HF branch conservative LC: max(left ctx from gate path, HF HPF)
+    """
+    LC_gate = _compute_gate_left_ctx_samples(
+        sample_rate=sample_rate,
+        threshold_db=REALTIME_GATE_THRESHOLD_DB,
+        ratio=REALTIME_GATE_RATIO,
+        attack_ms=REALTIME_GATE_ATTACK_MS,
+        hold_ms=REALTIME_GATE_HOLD_MS,
+        release_ms=REALTIME_GATE_RELEASE_MS,
+        hp_order=REALTIME_HF_HP_ORDER,
+        env_ms=REALTIME_GATE_ENV_MS,
+        depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
+    )
+    LC_hpf = int(REALTIME_HF_HP_ORDER) - 1
+    LC_hf = max(int(LC_gate), int(LC_hpf))
+    if verbose:
+        ms = 1000.0 * LC_hf / float(sample_rate)
+        print(f"[hf] LC = {LC_hf} samples ({ms:.2f} ms)")
+    return int(LC_hf)
+
+def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
+    """
+    Return max left context across realtime branches and 0 right context.
+    """
+    lc_main = compute_main_left_context_realtime(model, sample_rate, verbose=False)
+    lc_ir   = compute_ir_left_context_realtime(model, sample_rate, verbose=False)
+    rbp     = compute_resbp_left_context_realtime(model, sample_rate, verbose=False)
+    lc_rbp  = int(rbp["resbp_left_ctx_samples"])
+    lc_hf   = compute_hf_left_context_realtime(model, sample_rate, verbose=False)
+
+    left_ctx = max(lc_main, lc_ir, lc_rbp, lc_hf)
+    if verbose:
+        def as_ms(s): return 1000.0 * float(s) / float(sample_rate)
+        print(f"[streaming] realtime left ctx (samples): main={lc_main}, ir={lc_ir}, resbp={lc_rbp}, hf={lc_hf} → max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
+    return int(left_ctx), 0
+
+def _resbp_down_times(sr, target_sr=RESBP_LR_TARGET_SR):
+    assert (sr % target_sr) == 0, f"RESBP_LR_TARGET_SR must divide sample_rate, got sr={sr}"
+    factor = sr // target_sr
+    # must be power-of-two so we can chain FIRDecimateBy2
+    assert (factor & (factor - 1)) == 0, f"Downsample factor must be power-of-two, got {factor}"
+    return int(round(math.log2(factor)))
+
+def _apply_ds2_times(x, times, prefix):
+    y = x
+    for i in range(times):
+        y = FIRDecimateBy2(name=f"{prefix}_ds2_{i}")(y)
+    return y
+
+def _resbp_lowrate_stack(x_lr, filters, style_embed, prefix,
+                         kernel=9, dilations=(1,2,4,8,16,32,64,128,256)):
+    """
+    Long-memory stack at low rate. Each block is a gated sepconv + FiLM.
+    """
+    x = Conv1D(filters, 1, padding="same", name=f"{prefix}_lr_init_pw")(x_lr)
+    for bi, d in enumerate(dilations):
+        x = gated_sep_block(x, filters, kernel=kernel, dilation=d, prefix=f"{prefix}_lr_b{bi}", lookahead=0)
+        x = film_apply(x, style_embed, filters, prefix=f"{prefix}_lr_b{bi}")
+    x = Conv1D(1, 1, padding="same", name=f"{prefix}_lr_out")(x)
+    return x
 
 @register_keras_serializable()
 def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
@@ -1024,7 +1390,7 @@ def analyze_loss_scales(model, batch, sample_rate):
         )
     ).numpy()
 
-    bl = tf.reduce_mean(band_limited_l1_loss(y_true, y_pred, sample_rate)).numpy()
+    bl = tf.reduce_mean(band_limited_l1_loss_weighted(y_true, y_pred, sample_rate)).numpy()
 
     return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on, 'resbp_bl': bl}
 
@@ -1065,19 +1431,25 @@ def generate_demo (model, out_dir, sample_rate, prediction_name="demo_pred", onl
         only_prediction=only_prediction
     )
 
-def _get_model_context_for_streaming(model_sample_rate: int):
+def _get_model_context_for_streaming(model_sample_rate: int, model=None):
     """
     Returns (left_ctx_model, right_ctx_model) in samples at the model's sample-rate.
+    For realtime, if a model is provided, compute branch-aware left context automatically.
     """
     if model_sample_rate == OFFLINE_SAMPLE_RATE:
         # Left = receptive field - 1 (causal extent), Right = bounded look-ahead per layer
         return int(OFFLINE_RECEPTIVE_FIELD - 1), int(OFFLINE_LOOKAHEAD_SAMPLES)
     elif model_sample_rate == REALTIME_SAMPLE_RATE:
+        # Prefer automatic per-branch analysis when model is available
+        if model is not None:
+            try:
+                return compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+            except Exception as e:
+                print(f"[streaming] fallback to REALTIME_RECEPTIVE_FIELD due to: {e}")
         return int(REALTIME_RECEPTIVE_FIELD - 1), 0
     else:
         # Fallback: treat as causal with tiny RF (safe default)
         return 1024, 0  # adjust if you add other sample-rates
-        
 
 def generate_demo_from_files(model,
                              out_dir,
@@ -1136,7 +1508,7 @@ def generate_demo_from_files(model,
         style_true_flag = None
 
     # Model contexts and conversions
-    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=model)
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
     want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
@@ -2580,74 +2952,112 @@ def film_apply(x, style_embed, filters, prefix):
         beta3
     ])
 
-def _add_resbp_branch_offline(inp, style_embed, gate):
-    # Lengthen linger so tails survive
+def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
+    sr = OFFLINE_SAMPLE_RATE
+    # Keep the HF gate only as a weak cap (safety), not the main driver
     gate_linger = CausalExpSmoother(
         time_const_ms=OFFLINE_RESBP_LINGER_MS,
-        sample_rate=OFFLINE_SAMPLE_RATE,
+        sample_rate=sr,
         name="offline_resbp_gate_linger"
     )(gate)
 
+    # Learned mask on the full-rate signal (decoupled from HF gate)
     rbp_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_resbp_pre_emph")(inp)
-    rbp    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_resbp_init")(rbp_in)
-    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b0", lookahead=0)
-    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b0")
-    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_resbp_b1", lookahead=0)
-    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b1")
-    rbp    = gated_sep_block(rbp, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_resbp_b2", lookahead=0)
-    rbp    = film_apply(rbp, style_embed, OFFLINE_FILTERS, prefix="offline_resbp_b2")
-    rbp    = Conv1D(1, 1, padding="same", name="offline_resbp_out")(rbp)
+    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_resbp_mask_c1")(rbp_in)
+    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_resbp_mask_c2")(m)
+    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_resbp_mask_logits")(m)
+    mask_pred = Activation("sigmoid", name="offline_resbp_mask")(m)
+    mask_pred = Multiply(name="offline_resbp_mask_style_mul")([mask_pred, style_time_used])
+    mask_smoothed = CausalExpSmoother(
+        time_const_ms=RESBP_MASK_SMOOTH_MS_OFFLINE,
+        sample_rate=sr,
+        name="offline_resbp_mask_smooth"
+    )(mask_pred)
 
-    # Band-pass first (so conv sees full gradient), then apply gated mix with a floor
+    # Low-rate long-memory synthesis
+    times = _resbp_down_times(sr, RESBP_LR_TARGET_SR)  # 96k→12k -> 3
+    x_lr_in = _apply_ds2_times(rbp_in, times, prefix="offline_resbp")
+    rbp_lr  = _resbp_lowrate_stack(
+        x_lr=x_lr_in,
+        filters=OFFLINE_FILTERS,
+        style_embed=style_embed,
+        prefix="offline_resbp"
+    )
+    up_factor = 2 ** times
+    rbp_up = ResizeNearest1D(factor=up_factor, name="offline_resbp_upsample")(rbp_lr)
+    rbp_up = MatchTimeToRef(name="offline_resbp_matchlen")([rbp_up, inp])
+
+    # Band-pass (0.7–2 kHz) at full rate to remove upsampling images/out-of-band content
     rbp_bp = BandpassFIR(
-        sample_rate=OFFLINE_SAMPLE_RATE,
+        sample_rate=sr,
         low_hz=RESBP_LOW_HZ,
         high_hz=RESBP_HIGH_HZ,
         order=OFFLINE_RESBP_BP_ORDER,
         name="offline_resbp_bandpass"
-    )(rbp)
+    )(rbp_up)
 
-    # Avoid Multiply with rank-0 scalars; build broadcastable tensors via Lambda
-    gate_floor  = Lambda(lambda g: tf.ones_like(g) * tf.constant(0.25, tf.float32),
-                         name="offline_resbp_gate_floor")(gate_linger)
-    gate_scaled = Lambda(lambda g: 0.75 * g, name="offline_resbp_gate_scaled")(gate_linger)
-    gate_mix    = Add(name="offline_resbp_gate_mix")([gate_floor, gate_scaled])
+    # Final gain: mask dominates; gate contributes weakly; add a small floor
+    gain_floor  = OnesLikeTimesConst(0.15, name="offline_resbp_gain_floor")(mask_smoothed)
+    gain_mask   = MulConst(0.65, name="offline_resbp_gain_mask")(mask_smoothed)
+    gain_gate   = MulConst(0.20, name="offline_resbp_gain_gate")(gate_linger)
+    gain        = Add(name="offline_resbp_gain_mix")([gain_floor, gain_mask, gain_gate])
 
-    rbp_g   = Multiply(name="offline_resbp_mult_gate")([rbp_bp, gate_mix])
+    rbp_g   = Multiply(name="offline_resbp_mult_gain")([rbp_bp, gain])
     rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_g)
     return rbp_fin
 
-
-def _add_resbp_branch_realtime(inp, gate):
+def _add_resbp_branch_realtime(inp, gate, style_time_used):
+    sr = REALTIME_SAMPLE_RATE
     gate_linger = CausalExpSmoother(
         time_const_ms=REALTIME_RESBP_LINGER_MS,
-        sample_rate=REALTIME_SAMPLE_RATE,
+        sample_rate=sr,
         Lmax=REALTIME_RESBP_LINGER_LMAX,
         name="realtime_resbp_gate_linger"
     )(gate)
 
     rbp_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_resbp_pre_emph")(inp)
-    rbp    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_resbp_init")(rbp_in)
-    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_resbp_b0", lookahead=0)
-    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_resbp_b1", lookahead=0)
-    rbp    = gated_sep_block(rbp, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_resbp_b2", lookahead=0)
-    rbp    = Conv1D(1, 1, padding="same", name="realtime_resbp_out")(rbp)
+
+    # Learned mask at full rate
+    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_resbp_mask_c1")(rbp_in)
+    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_resbp_mask_c2")(m)
+    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_resbp_mask_logits")(m)
+    mask_pred = Activation("sigmoid", name="realtime_resbp_mask")(m)
+    mask_pred = Multiply(name="realtime_resbp_mask_style_mul")([mask_pred, style_time_used])
+    mask_smoothed = CausalExpSmoother(
+        time_const_ms=RESBP_MASK_SMOOTH_MS_REALTIME,
+        sample_rate=sr,
+        Lmax=REALTIME_RESBP_MASK_SMOOTH_LMAX,
+        name="realtime_resbp_mask_smooth"
+    )(mask_pred)
+
+    # Low-rate long-memory synthesis (48k→12k -> 2 decimate-by-2)
+    times = _resbp_down_times(sr, RESBP_LR_TARGET_SR)  # 48k→12k -> 2
+    x_lr_in = _apply_ds2_times(rbp_in, times, prefix="realtime_resbp")
+    rbp_lr  = _resbp_lowrate_stack(
+        x_lr=x_lr_in,
+        filters=REALTIME_FILTERS,
+        style_embed=style_time_used,  # FiLM expects a scalar embed; we already applied style upstream. Pass style_time_used to keep API simple.
+        prefix="realtime_resbp"
+    )
+    up_factor = 2 ** times
+    rbp_up = ResizeNearest1D(factor=up_factor, name="realtime_resbp_upsample")(rbp_lr)
+    rbp_up = MatchTimeToRef(name="realtime_resbp_matchlen")([rbp_up, inp])
 
     rbp_bp = BandpassFIR(
-        sample_rate=REALTIME_SAMPLE_RATE,
+        sample_rate=sr,
         low_hz=RESBP_LOW_HZ,
         high_hz=RESBP_HIGH_HZ,
         order=REALTIME_RESBP_BP_ORDER,
         name="realtime_resbp_bandpass"
-    )(rbp)
+    )(rbp_up)
 
-    # Avoid Multiply with rank-0 scalars; build broadcastable tensors via Lambda
-    gate_floor  = Lambda(lambda g: tf.ones_like(g) * tf.constant(0.25, tf.float32),
-                         name="realtime_resbp_gate_floor")(gate_linger)
-    gate_scaled = Lambda(lambda g: 0.75 * g, name="realtime_resbp_gate_scaled")(gate_linger)
-    gate_mix    = Add(name="realtime_resbp_gate_mix")([gate_floor, gate_scaled])
+    # Final gain: mask dominates; gate is a weak cap
+    gain_floor  = OnesLikeTimesConst(0.15, name="realtime_resbp_gain_floor")(mask_smoothed)
+    gain_mask   = MulConst(0.65, name="realtime_resbp_gain_mask")(mask_smoothed)
+    gain_gate   = MulConst(0.20, name="realtime_resbp_gain_gate")(gate_linger)
+    gain        = Add(name="realtime_resbp_gain_mix")([gain_floor, gain_mask, gain_gate])
 
-    rbp_g   = Multiply(name="realtime_resbp_mult_gate")([rbp_bp, gate_mix])
+    rbp_g   = Multiply(name="realtime_resbp_mult_gain")([rbp_bp, gain])
     rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_g)
     return rbp_fin
 
@@ -2757,10 +3167,10 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
     
-    # ─── New band‑pass branch (replaces old modal reso) ──────────────────────
     offline_resbp = _add_resbp_branch_offline(
         inp=inp,
         style_embed=style_embed,
+        style_time_used=style_time_used,
         gate=offline_gate
     )
 
@@ -2800,8 +3210,6 @@ def build_realtime_model(offline=None, dynamic_time=False):
     off_pick = None
     off_finger = None
     off_hf_scaled = None
-    off_reso_scaled = None
-    has_reso = False
 
     if offline is not None:
         teacher = offline
@@ -2978,9 +3386,13 @@ def build_realtime_model(offline=None, dynamic_time=False):
 
     # Mix IR and HF into main
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
-
-    # New band‑pass branch, gated by the same realtime gate with a short linger
-    realtime_resbp = _add_resbp_branch_realtime(inp=inp, gate=realtime_gate)
+    
+    realtime_resbp = _add_resbp_branch_realtime(
+        inp=inp,
+        gate=realtime_gate,
+        style_time_used=style_scalar_b3
+    )
+    
     y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
 
     # KD wiring (student vs teacher) — all based on the single teacher_combo call
@@ -3169,12 +3581,9 @@ def build_offline_debug_model(offline):
         "pick_c":    offline.get_layer("offline_pick_contrib").output,
         "finger_c":  offline.get_layer("offline_finger_contrib").output,
         "y_pred":    offline.get_layer("offline_mix_main").output,
+        "resbp_mask": offline.get_layer("offline_resbp_mask_smooth").output
     }
-    # New band-pass stem if present
-    try:
-        outs["resbp"] = offline.get_layer("offline_resbp_scale").output
-    except:
-        pass
+
     return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
 
 @register_keras_serializable()
@@ -3195,22 +3604,11 @@ def build_realtime_debug_model(realtime):
         "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
         "y_pred":    y_pred,
-        "ir_only":   realtime.get_layer("realtime_ir_lowpass").output
+        "ir_only":   realtime.get_layer("realtime_ir_lowpass").output,
+        "resbp_mask": realtime.get_layer("realtime_resbp_mask_smooth").output,
+        "hf_mask_smooth": realtime.get_layer("realtime_hf_mask_smooth").output,   
     }
-    # New band-pass stem if present
-    try:
-        outs["resbp"] = realtime.get_layer("realtime_resbp_scale").output
-    except:
-        pass
-
-    try:
-        outs["hf_scaled_gate_only"] = realtime.get_layer("realtime_hf_scale_gate_only").output
-    except:
-        pass
-    try:
-        outs["hf_mask_smooth"] = realtime.get_layer("realtime_hf_mask_smooth").output
-    except:
-        pass
+    
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
 
 def boost_hf_scale_in_model(model, layer_name, gain_db):
@@ -3305,7 +3703,7 @@ def render_isolated_stems(
     want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
 
     # Streaming contexts
-    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate)
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
 
