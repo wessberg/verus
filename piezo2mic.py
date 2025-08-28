@@ -238,7 +238,7 @@ REALTIME_RESBP_LINGER_LMAX = 512
 OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
-OFFLINE_RESBP_BOOST_DB    = 40.0
+OFFLINE_RESBP_BOOST_DB    = 0.0
 REALTIME_RESBP_BOOST_DB   = 0.0
 
 # ─── Resonance branch params (additional) ────────────────────────────────────
@@ -2954,7 +2954,8 @@ def film_apply(x, style_embed, filters, prefix):
 
 def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
     sr = OFFLINE_SAMPLE_RATE
-    # Keep the HF gate only as a weak cap (safety), not the main driver
+
+    # Keep the HF gate as the driver (with linger to allow decays)
     gate_linger = CausalExpSmoother(
         time_const_ms=OFFLINE_RESBP_LINGER_MS,
         sample_rate=sr,
@@ -2996,18 +2997,18 @@ def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
         name="offline_resbp_bandpass"
     )(rbp_up)
 
-    # Final gain: mask dominates; gate contributes weakly; add a small floor
-    gain_floor  = OnesLikeTimesConst(0.15, name="offline_resbp_gain_floor")(mask_smoothed)
-    gain_mask   = MulConst(0.65, name="offline_resbp_gain_mask")(mask_smoothed)
-    gain_gate   = MulConst(0.20, name="offline_resbp_gain_gate")(gate_linger)
-    gain        = Add(name="offline_resbp_gain_mix")([gain_floor, gain_mask, gain_gate])
+    # Final gain: open only when both mask and gate are open (no always-on floor)
+    gain_used = Minimum(name="offline_resbp_gain_used")([mask_smoothed, gate_linger])
 
-    rbp_g   = Multiply(name="offline_resbp_mult_gain")([rbp_bp, gain])
+    rbp_g   = Multiply(name="offline_resbp_mult_gain")([rbp_bp, gain_used])
     rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_g)
     return rbp_fin
 
+
 def _add_resbp_branch_realtime(inp, gate, style_time_used):
     sr = REALTIME_SAMPLE_RATE
+
+    # Gate with linger to allow decays; bounded for streaming
     gate_linger = CausalExpSmoother(
         time_const_ms=REALTIME_RESBP_LINGER_MS,
         sample_rate=sr,
@@ -3036,7 +3037,7 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
     rbp_lr  = _resbp_lowrate_stack(
         x_lr=x_lr_in,
         filters=REALTIME_FILTERS,
-        style_embed=style_time_used,  # FiLM expects a scalar embed; we already applied style upstream. Pass style_time_used to keep API simple.
+        style_embed=style_time_used,  # keep API consistent with existing code
         prefix="realtime_resbp"
     )
     up_factor = 2 ** times
@@ -3051,13 +3052,10 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
         name="realtime_resbp_bandpass"
     )(rbp_up)
 
-    # Final gain: mask dominates; gate is a weak cap
-    gain_floor  = OnesLikeTimesConst(0.15, name="realtime_resbp_gain_floor")(mask_smoothed)
-    gain_mask   = MulConst(0.65, name="realtime_resbp_gain_mask")(mask_smoothed)
-    gain_gate   = MulConst(0.20, name="realtime_resbp_gain_gate")(gate_linger)
-    gain        = Add(name="realtime_resbp_gain_mix")([gain_floor, gain_mask, gain_gate])
+    # Final gain: open only when both mask and gate are open (no always-on floor)
+    gain_used = Minimum(name="realtime_resbp_gain_used")([mask_smoothed, gate_linger])
 
-    rbp_g   = Multiply(name="realtime_resbp_mult_gain")([rbp_bp, gain])
+    rbp_g   = Multiply(name="realtime_resbp_mult_gain")([rbp_bp, gain_used])
     rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_g)
     return rbp_fin
 
@@ -3571,46 +3569,6 @@ def add_sw_realtime_finetune_nf(x, y):
 
     return inputs, outputs, (sw_audio, sw_style)
 
-@register_keras_serializable()
-def build_offline_debug_model(offline):
-    outs = {
-        "gate":      offline.get_layer("offline_gate").output,
-        "hf_pre":    offline.get_layer("offline_hf_out").output,
-        "hf_gated":  offline.get_layer("offline_hf_mult_gate").output,
-        "hf_scaled": offline.get_layer("offline_hf_scale").output,
-        "pick_c":    offline.get_layer("offline_pick_contrib").output,
-        "finger_c":  offline.get_layer("offline_finger_contrib").output,
-        "y_pred":    offline.get_layer("offline_mix_main").output,
-        "resbp_mask": offline.get_layer("offline_resbp_mask_smooth").output
-    }
-
-    return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
-
-@register_keras_serializable()
-def build_realtime_debug_model(realtime):
-    # prefer the new with_ir_resbp if present; fall back to with_ir
-    try:
-        y_pred = realtime.get_layer("realtime_with_ir_resbp").output
-    except:
-        y_pred = realtime.get_layer("realtime_with_ir").output
-
-    outs = {
-        "gate":      realtime.get_layer("realtime_gate").output,
-        "hf_pre":    realtime.get_layer("realtime_hf_out").output,
-        "hf_gated":  realtime.get_layer("realtime_hf_mult_gate").output,
-        "hf_scaled": realtime.get_layer("realtime_hf_scale").output,
-        "mask_pred": realtime.get_layer("realtime_hf_mask").output,
-        "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
-        "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
-        "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
-        "y_pred":    y_pred,
-        "ir_only":   realtime.get_layer("realtime_ir_lowpass").output,
-        "resbp_mask": realtime.get_layer("realtime_resbp_mask_smooth").output,
-        "hf_mask_smooth": realtime.get_layer("realtime_hf_mask_smooth").output,   
-    }
-    
-    return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
-
 def boost_hf_scale_in_model(model, layer_name, gain_db):
     """
     Multiplies the IrScale scalar in the specified layer by 10^(gain_db/20).
@@ -3654,6 +3612,79 @@ def _boost_scales_for_stems(model, sample_rate):
     elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESBP_BOOST_DB > 0.0:
         boost_hf_scale_in_model(model, "realtime_resbp_scale", REALTIME_RESBP_BOOST_DB)
 
+@register_keras_serializable()
+def build_offline_debug_model(offline):
+    """
+    Offline debug model exposing intermediate stems for rendering.
+    Includes:
+      - gate, hf_pre, hf_gated, hf_scaled
+      - pick_c, finger_c
+      - y_pred (full mix)
+      - resbp_mask (smoothed)
+      - resbp (band-pass resonance stem, scaled) if available
+    """
+    outs = {
+        "gate":      offline.get_layer("offline_gate").output,
+        "hf_pre":    offline.get_layer("offline_hf_out").output,
+        "hf_gated":  offline.get_layer("offline_hf_mult_gate").output,
+        "hf_scaled": offline.get_layer("offline_hf_scale").output,
+        "pick_c":    offline.get_layer("offline_pick_contrib").output,
+        "finger_c":  offline.get_layer("offline_finger_contrib").output,
+        "y_pred":    offline.get_layer("offline_mix_main").output,
+    }
+
+    # Optional resbp mask (smoothed)
+    try:
+        outs["resbp_mask"] = offline.get_layer("offline_resbp_mask_smooth").output
+    except Exception:
+        pass
+
+    # Optional resbp stem (scaled resonance band-pass)
+    try:
+        outs["resbp"] = offline.get_layer("offline_resbp_scale").output
+    except Exception:
+        pass
+
+    return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
+
+
+@register_keras_serializable()
+def build_realtime_debug_model(realtime):
+    """
+    Realtime debug model exposing intermediate stems for rendering.
+    Includes:
+      - gate, hf_pre, hf_gated, hf_scaled
+      - mask_pred, mask_used, hf_mask_smooth
+      - pick_c, finger_c
+      - y_pred (full mix)
+      - ir_only (IR branch output after low-pass)
+      - resbp_mask (smoothed)
+      - resbp (band-pass resonance stem, scaled) if available
+    """
+    # prefer the new with_ir_resbp if present; fall back to with_ir
+    try:
+        y_pred = realtime.get_layer("realtime_with_ir_resbp").output
+    except Exception:
+        y_pred = realtime.get_layer("realtime_with_ir").output
+
+    outs = {
+        "gate":      realtime.get_layer("realtime_gate").output,
+        "hf_pre":    realtime.get_layer("realtime_hf_out").output,
+        "hf_gated":  realtime.get_layer("realtime_hf_mult_gate").output,
+        "hf_scaled": realtime.get_layer("realtime_hf_scale").output,
+        "mask_pred": realtime.get_layer("realtime_hf_mask").output,
+        "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
+        "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
+        "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
+        "y_pred":    y_pred,
+        "ir_only":   realtime.get_layer("realtime_ir_lowpass").output,
+        "hf_mask_smooth": realtime.get_layer("realtime_hf_mask_smooth").output,
+        "resbp_mask": realtime.get_layer("realtime_resbp_mask_smooth").output,
+        "resbp": realtime.get_layer("realtime_resbp_scale").output
+    }
+
+    return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
+
 
 def render_isolated_stems(
     debug_model,
@@ -3674,12 +3705,13 @@ def render_isolated_stems(
       - pred_full_forced (if style is known)
       - stem_hf_only
       - stem_ir_lowpass (realtime only)
-      - stem_reso_only (if exists)
+      - stem_resbp_only (scaled resonance band-pass, if exists)
+      - resbp_mask_smooth (if exists)
       - stem_pick_only
       - stem_finger_only
     Uses the model's debug_model, which must expose outputs:
-      realtime: gate, hf_scaled, pick_c, finger_c, y_pred, reso, ir_only, (optionally others)
-      offline:  gate, hf_scaled, pick_c, finger_c, y_pred, (reso optional)
+      realtime: gate, hf_scaled, pick_c, finger_c, y_pred, ir_only, resbp (optional), resbp_mask (optional), hf_mask_smooth
+      offline:  gate, hf_scaled, pick_c, finger_c, y_pred, resbp (optional), resbp_mask (optional)
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -3728,14 +3760,14 @@ def render_isolated_stems(
 
     w_hf    = sf.SoundFile(os.path.join(out_dir, "stem_hf_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
     # Optional stems
-    w_ir    = None
-    w_reso  = None
+    w_ir          = None
+    w_reso        = None
+    w_resbp_mask  = None
     w_pick  = sf.SoundFile(os.path.join(out_dir, "stem_pick_only.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
     w_fing  = sf.SoundFile(os.path.join(out_dir, "stem_finger_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
     # Check which optional outputs exist in this debug model
     debug_out_layer_names = set([k.name if hasattr(k, "name") else str(k) for k in debug_model.outputs])
-    # If outputs was dict, Keras preserves keys in predict() dict; we still probe keys in returned dict below.
 
     produced_model = 0
 
@@ -3816,15 +3848,20 @@ def render_isolated_stems(
             if w_ir is None:
                 w_ir = sf.SoundFile(os.path.join(out_dir, "stem_ir_lowpass.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
             w_ir.write(ir_core)
-        
-        # New band-pass stem
+
+        # Band‑pass resonance stem (scaled)
         if "resbp" in outs_pred:
             res_core = core_of(outs_pred, "resbp")
             if w_reso is None:
-                # rename file for new branch
-                fname = "stem_resbp_only.wav"
-                w_reso = sf.SoundFile(os.path.join(out_dir, fname), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                w_reso = sf.SoundFile(os.path.join(out_dir, "stem_resbp_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
             w_reso.write(res_core)
+
+        # ResBP mask (smoothed), if exposed by the debug model
+        if "resbp_mask" in outs_pred:
+            mask_core = core_of(outs_pred, "resbp_mask")
+            if w_resbp_mask is None:
+                w_resbp_mask = sf.SoundFile(os.path.join(out_dir, "resbp_mask_smooth.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            w_resbp_mask.write(mask_core)
 
         # Pick/finger contributions (always present in both offline/realtime debug models)
         w_pick.write(core_of(outs_pred, "pick_c"))
@@ -3845,11 +3882,11 @@ def render_isolated_stems(
         produced_model += core_len
 
     # Close files
-    for w in [w_src, w_tgt, w_predp, w_predt, w_hf, w_ir, w_reso, w_pick, w_fing]:
+    for w in [w_src, w_tgt, w_predp, w_predt, w_hf, w_ir, w_reso, w_resbp_mask, w_pick, w_fing]:
         try:
             if w is not None:
                 w.close()
-        except:
+        except Exception:
             pass
 
     print(f"✅ Stems saved to {out_dir}")
