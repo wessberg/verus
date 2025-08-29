@@ -3335,6 +3335,23 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
     
+    # Training-only bias that pushes 0.7–2 kHz into the resbp stem ───
+    # Apply the penalty on the sum of pick+finger, but only during strike windows (gate).
+    main_core = Add(name="offline_main_core")([pick_c, finger_c])
+    main_core_for_pen = Multiply(name="offline_main_core_for_resbp_penalty")([main_core, offline_gate])
+    main_core_pen = BandpassEnergyPenalty(
+        alpha=OFFLINE_RESBP_TRAIN_BIAS_ALPHA,        # e.g., 0.2 (set 0.0 to disable)
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        low_hz=RESBP_LOW_HZ,
+        high_hz=RESBP_HIGH_HZ,
+        order=OFFLINE_RESBP_BP_ORDER,
+        name="offline_main_resbp_penalty"
+    )(main_core_for_pen)
+
+    # Ensure the penalty stays in the graph but pass the unmodified main_core downstream
+    main_core = LossTether(name="offline_main_resbp_penalty_tether")([main_core, main_core_pen])
+    
+    # Resonance band‑pass stem
     offline_resbp = _add_resbp_branch_offline(
         inp=inp,
         style_embed=style_embed,
@@ -3343,7 +3360,7 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     )
 
     # Final sum (main + HF + band-pass)
-    out = Add(name="offline_mix_main")([pick_c, finger_c, hf_final, offline_resbp])
+    out = Add(name="offline_mix_main")([main_core, hf_final, offline_resbp])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
@@ -3784,15 +3801,6 @@ def _boost_scales_for_stems(model, sample_rate):
 
 @register_keras_serializable()
 def build_offline_debug_model(offline):
-    """
-    Offline debug model exposing intermediate stems for rendering.
-    Includes:
-      - gate, hf_pre, hf_gated, hf_scaled
-      - pick_c, finger_c
-      - y_pred (full mix)
-      - resbp_mask (smoothed)
-      - resbp (band-pass resonance stem, scaled) if available
-    """
     outs = {
         "gate":      offline.get_layer("offline_gate").output,
         "hf_pre":    offline.get_layer("offline_hf_out").output,
@@ -3803,9 +3811,9 @@ def build_offline_debug_model(offline):
         "y_pred":    offline.get_layer("offline_mix_main").output,
     }
 
-    # Optional resbp mask (smoothed)
+    # Optional resbp mask (96 kHz version after upsample/match)
     try:
-        outs["resbp_mask"] = offline.get_layer("offline_resbp_mask_smooth").output
+        outs["resbp_mask"] = offline.get_layer("offline_resbp_mask_match").output
     except Exception:
         pass
 
@@ -3816,7 +3824,6 @@ def build_offline_debug_model(offline):
         pass
 
     return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
-
 
 @register_keras_serializable()
 def build_realtime_debug_model(realtime):
