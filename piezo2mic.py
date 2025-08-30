@@ -200,6 +200,7 @@ REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (s
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
 REALTIME_STEM_RESBP_DISTILL_ALPHA   = 0.4
 
+
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 1.0   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
 REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ = max(2900.0, 0.75 * REALTIME_HP_CUTOFF_HZ)
@@ -220,43 +221,34 @@ REALTIME_GATE_DEPTH_LMAX                = 256
 
 # ─── Resonance branch params ─────────────────────────────────────────────
 
-# Resonant band-pass (HF-like) branch params
-RESBP_LOW_HZ  = 700.0
-RESBP_HIGH_HZ = 2000.0
-
 # FIR orders for the band-pass (min-phase)
 OFFLINE_RESBP_BP_ORDER = 257
 REALTIME_RESBP_BP_ORDER = 257
-
-# Offline (96 kHz) AR driver and mask smoothing at 12 kHz
-OFFLINE_RESBP_ATTACK_MS          = 0.3
-OFFLINE_RESBP_RELEASE_MS         = 220.0
-OFFLINE_RESBP_LR_SMOOTH_LMAX     = 2048   # AR driver taps cap at 12 kHz
-OFFLINE_RESBP_MASK_SMOOTH_MS     = 120.0  # 12 kHz mask smoother time-constant
-OFFLINE_RESBP_LR_MASK_LMAX       = 1024   # 12 kHz mask smoother taps cap
-
-# Realtime (48 kHz) AR driver and mask smoothing (must not exceed RF budget)
-REALTIME_RESBP_ATTACK_MS         = 0.1
-REALTIME_RESBP_RELEASE_MS        = 6.0    # will be clamped to RF budget automatically
-REALTIME_RESBP_MASK_DS_TAPS      = 17     # short decimator taps for mask path (keep LC tiny)
-REALTIME_RESBP_MASK_SMOOTH_MS    = 2.0    # 12 kHz mask smoother time-constant
-REALTIME_RESBP_MASK_SMOOTH_LMAX  = 256    # 12 kHz mask smoother taps cap
-
-# Optional training-only bias (offline) to encourage 0.7–2 kHz energy in resbp
-OFFLINE_RESBP_TRAIN_BIAS_ALPHA   = 0.2     # set 0.0 to disable
-
-# Gain floor inside driver window (prevents full mute while driver is active)
-OFFLINE_RESBP_GATE_FLOOR         = 0.12
-REALTIME_RESBP_GATE_FLOOR        = 0.12
 
 # Initial scalar (trainable) for the band-pass branch
 OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
-OFFLINE_RESBP_BOOST_DB    = 20.0
+OFFLINE_RESBP_BOOST_DB    = 0.0
 REALTIME_RESBP_BOOST_DB   = 0.0
 
-RESBP_LR_TARGET_SR = 12000  # 48k/4, 96k/8
+
+# Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
+# Realtime kernels are short to keep left context low; offline can be longer.
+
+RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0]
+RESBP_MODAL_DECAYS_MS_OFFLINE  = [45.0,  40.0,  36.0,   32.0,   27.0,   24.0,   20.0,   18.0]
+RESBP_MODAL_LEN_OFFLINE        = 8192   # ~21.3 ms at 96k; ok for offline
+
+RESBP_MODAL_CENTERS_HZ_REALTIME = [780.0, 950.0, 1120.0, 1320.0, 1540.0, 1780.0, 2050.0]
+RESBP_MODAL_DECAYS_MS_REALTIME  = [18.0,  16.0,  14.0,   12.0,   10.0,    9.0,    8.0]
+RESBP_MODAL_LEN_REALTIME        = 192    # ~4.0 ms at 48k; keeps LC small
+
+# Strike envelope smoothing (controls amplitude vs pick intensity)
+RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
+RESBP_STRIKE_ENV_MS_REALTIME    = 6.0
+
+
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
@@ -655,7 +647,7 @@ def waveform_l1_loss(y_true, y_pred):
 
 @register_keras_serializable()
 def band_limited_l1_loss_weighted(y_true, y_pred, sample_rate,
-                                  low_hz=RESBP_LOW_HZ, high_hz=RESBP_HIGH_HZ,
+                                  low_hz, high_hz,
                                   order_off=OFFLINE_RESBP_BP_ORDER, order_rt=REALTIME_RESBP_BP_ORDER,
                                   onset_boost=4.0,
                                   thr_db=-60.0,
@@ -692,6 +684,24 @@ def band_limited_l1_loss_weighted(y_true, y_pred, sample_rate,
     )
 
     return tf.abs(t_bp - p_bp) * (1.0 + onset_boost * g)
+
+@register_keras_serializable()
+def resonance_band_loss(y_true, y_pred, sample_rate):
+    if int(sample_rate) == OFFLINE_SAMPLE_RATE:
+        lo = 0.9 * min(RESBP_MODAL_CENTERS_HZ_OFFLINE)
+        hi = 1.1 * max(RESBP_MODAL_CENTERS_HZ_OFFLINE)
+        order = OFFLINE_RESBP_BP_ORDER
+    else:
+        lo = 0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME)
+        hi = 1.1 * max(RESBP_MODAL_CENTERS_HZ_REALTIME)
+        order = REALTIME_RESBP_BP_ORDER
+    return band_limited_l1_loss_weighted(
+        y_true, y_pred, sample_rate,
+        low_hz=lo, high_hz=hi,
+        order_off=order, order_rt=order,
+        onset_boost=5.0,  # you can lift this to emphasize pick onsets more
+        thr_db=-60.0, ratio=6.0, attack_ms=0.3, hold_ms=20.0, release_ms=200.0
+    )
 
 @register_keras_serializable()
 def hf_loss(y_true, y_pred):
@@ -877,7 +887,7 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
         cplx = cplx_base
 
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=gate_env)
-    bl   = band_limited_l1_loss_weighted(y_true, y_pred, sample_rate)
+    bl   = resonance_band_loss(y_true, y_pred, sample_rate)
 
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
@@ -920,119 +930,6 @@ class Square1D(tf.keras.layers.Layer):
     def call(self, x):
         return x * x
 
-@register_keras_serializable()
-class AttackReleaseSmoother(tf.keras.layers.Layer):
-    """
-    Causal attack/release smoother using fixed FIRs built from _exp_smoothing_kernel.
-    Attack applies when input increases; release applies otherwise.
-    """
-    def __init__(self, attack_ms, release_ms, sample_rate, scale=4.0, Lmax=2048, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.attack_ms   = float(attack_ms)
-        self.release_ms  = float(release_ms)
-        self.sample_rate = int(sample_rate)
-        self.scale       = float(scale)
-        self.Lmax        = int(Lmax)
-    def build(self, input_shape):
-        atk_s = max(1, int(round((self.attack_ms  / 1000.0) * self.sample_rate)))
-        rel_s = max(1, int(round((self.release_ms / 1000.0) * self.sample_rate)))
-        k_att = _exp_smoothing_kernel(atk_s, scale=self.scale, Lmax=self.Lmax)
-        k_rel = _exp_smoothing_kernel(rel_s, scale=self.scale, Lmax=self.Lmax)
-        self.k_att = self.add_weight(
-            name="ar_attack_taps",
-            shape=k_att.shape,
-            initializer=tf.keras.initializers.Constant(k_att),
-            trainable=False
-        )
-        self.k_rel = self.add_weight(
-            name="ar_release_taps",
-            shape=k_rel.shape,
-            initializer=tf.keras.initializers.Constant(k_rel),
-            trainable=False
-        )
-        super().build(input_shape)
-    def call(self, x):
-        x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
-        inc = tf.cast(tf.greater(x, x_prev), tf.float32)
-        y_att = _causal_conv1d(x, self.k_att)
-        y_rel = _causal_conv1d(x, self.k_rel)
-        y = inc * y_att + (1.0 - inc) * y_rel
-        return tf.clip_by_value(y, 0.0, 1.0)
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
-            "attack_ms": self.attack_ms,
-            "release_ms": self.release_ms,
-            "sample_rate": self.sample_rate,
-            "scale": self.scale,
-            "Lmax": self.Lmax
-        })
-        return cfg
-
-def _apply_ds2_times_with_taps(x, times, prefix, num_taps):
-    """
-    Like _apply_ds2_times but with explicit FIR length per stage, to bound context.
-    """
-    y = x
-    for i in range(times):
-        y = FIRDecimateBy2(num_taps=int(num_taps), name=f"{prefix}_ds2_{i}")(y)
-    return y
-
-def _resbp_rf_ms(sample_rate, receptive_field_samples_minus_1):
-    return 1000.0 * float(max(0, int(receptive_field_samples_minus_1))) / float(int(sample_rate))
-
-@register_keras_serializable()
-class BandpassEnergyPenalty(tf.keras.layers.Layer):
-    """
-    Training-only penalty: add alpha * mean(|BP(x)|) and pass x unchanged.
-    Encourages 0.7–2 kHz energy to be realized by the resbp stem.
-    """
-    def __init__(self, alpha, sample_rate, low_hz, high_hz, order=257, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.alpha = float(alpha)
-        self.sample_rate = int(sample_rate)
-        self.low_hz = float(low_hz)
-        self.high_hz = float(high_hz)
-        self.order = int(order)
-    def build(self, input_shape):
-        k = _get_minphase_bp_kernel(self.sample_rate, self.low_hz, self.high_hz, self.order)
-        self.k = self.add_weight(
-            name="pen_bp_taps",
-            shape=k.shape,
-            initializer=tf.keras.initializers.Constant(k),
-            trainable=False
-        )
-        super().build(input_shape)
-    def call(self, x, training=None):
-        if training is not True or self.alpha <= 0.0:
-            return x
-        pad = tf.shape(self.k)[0] - 1
-        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
-        bp = tf.nn.conv1d(x_pad, filters=self.k, stride=1, padding="VALID")
-        loss = tf.reduce_mean(tf.abs(bp))
-        self.add_loss(self.alpha * loss)
-        return x
-
-@register_keras_serializable()
-class MulConst(tf.keras.layers.Layer):
-    def __init__(self, k, **kwargs):
-        super().__init__(**kwargs)
-        self.k = float(k)
-    def call(self, x):
-        return x * tf.constant(self.k, tf.float32)
-    def get_config(self):
-        return {"k": self.k, **super().get_config()}
-
-@register_keras_serializable()
-class OnesLikeTimesConst(tf.keras.layers.Layer):
-    def __init__(self, k, **kwargs):
-        super().__init__(**kwargs)
-        self.k = float(k)
-    def call(self, x):
-        return tf.ones_like(x) * tf.constant(self.k, tf.float32)
-    def get_config(self):
-        return {"k": self.k, **super().get_config()}
-
 def _safe_get_attr(obj, attr, default=None):
     try:
         return getattr(obj, attr)
@@ -1057,20 +954,6 @@ def _find_layers(model, cls=None, name_prefix=None, name_regex=None):
                 continue
         layers.append(l)
     return layers
-
-def _sorted_by_suffix_index(layers, prefix):
-    # Sort layers named like f"{prefix}_<idx>" by <idx>
-    def _key(l):
-        try:
-            tail = l.name[len(prefix):]
-            # strip leading separators/underscores
-            tail = tail.lstrip('_')
-            # take first numeric chunk
-            m = re.match(r'(\d+)', tail)
-            return int(m.group(1)) if m else 0
-        except Exception:
-            return 0
-    return sorted(layers, key=_key)
 
 def _sum_sep_rf_for_prefix(model, name_regex):
     """
@@ -1145,44 +1028,19 @@ def _compute_gate_left_ctx_samples(sample_rate=REALTIME_SAMPLE_RATE,
     return lc_hp + lc_env + lc_hold + lc_open + lc_depth
 def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
     """
-    Realtime resbp LC (48 kHz) with unified AR driver:
-      Signal LC: pre_emph(1) + sum_i 2^i*(L_ds[i]-1) + F*(R_lr-1) + (L_bp-1)
-      Gain   LC: LC_gate + (L_ar_hi - 1)
+    Realtime resbp LC (48 kHz) for the ModalBank stem:
+      - The only driver is the pick gate path (GateInt8Linear).
+      - The signal path is impulses from that gate (no piezo audio).
+      - Left context = LC_gate + (L_onset_env - 1) + (L_modal - 1)
+
+    Assumes layers:
+      - "realtime_gate" (GateInt8Linear)
+      - "realtime_resbp_onset_env" (CausalExpSmoother)
+      - "realtime_resbp_modalbank" (ModalBank)
     """
     sr = int(sample_rate)
 
-    # Signal path decimators: require "realtime_resbp_ds2_<i>"
-    ds_layers = _sorted_by_suffix_index(
-        _find_layers(model, FIRDecimateBy2, name_prefix="realtime_resbp_ds2_"),
-        "realtime_resbp_ds2_"
-    )
-    if not ds_layers:
-        raise ValueError("compute_resbp_left_context_realtime: missing realtime_resbp_ds2_* layers.")
-    ds_taps = [int(_safe_get_attr(l, "num_taps", 0)) for l in ds_layers]
-    S = len(ds_taps)
-    F = 2 ** S
-
-    # Low-rate RF from "realtime_resbp_lr_b<i>_sep"
-    R_lr = _sum_sep_rf_for_prefix(model, r'^realtime_resbp_lr_b\d+_sep$')
-    if R_lr <= 0:
-        raise ValueError("compute_resbp_left_context_realtime: could not find low-rate resbp sep blocks.")
-
-    # Band-pass taps at 48 kHz
-    bp_layers = _find_layers(model, BandpassFIR, name_prefix="realtime_resbp_bandpass")
-    if not bp_layers:
-        raise ValueError("compute_resbp_left_context_realtime: missing realtime_resbp_bandpass layer.")
-    L_bp = int(bp_layers[0].taps.shape[0])
-
-    # Signal LC
-    lc_pre = 1
-    lc_ds_hi = 0
-    for i, L in enumerate(ds_taps):
-        lc_ds_hi += (2 ** i) * (int(L) - 1)
-    lc_lr_hi = F * (int(R_lr) - 1)
-    lc_bp = L_bp - 1
-    lc_signal_hi = lc_pre + lc_ds_hi + lc_lr_hi + lc_bp
-
-    # Gate LC (same as HF gate)
+    # Gate LC (same computation as HF gate)
     LC_gate = _compute_gate_left_ctx_samples(
         sample_rate=sr,
         threshold_db=REALTIME_GATE_THRESHOLD_DB,
@@ -1195,32 +1053,39 @@ def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE,
         depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
     )
 
-    # AR driver kernel length at 48 kHz
-    ar_layers = _find_layers(model, AttackReleaseSmoother, name_prefix="realtime_resbp_driver_hi")
-    if not ar_layers:
-        raise ValueError("compute_resbp_left_context_realtime: missing realtime_resbp_driver_hi layer.")
-    # Use release kernel length (worst case)
-    L_ar_hi = int(ar_layers[0].k_rel.shape[0])
+    # Onset envelope smoother length (if present)
+    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_env")
+    if env_layers:
+        L_env = int(env_layers[0].kernel.shape[0])
+    else:
+        L_env = 1
 
-    lc_gain_hi = int(LC_gate) + int(L_ar_hi) - 1
-    LC_resbp_total = max(int(lc_signal_hi), int(lc_gain_hi))
+    # ModalBank kernel length
+    mb_layers = _find_layers(model, ModalBank, name_prefix="realtime_resbp_modalbank")
+    if not mb_layers:
+        raise ValueError("compute_resbp_left_context_realtime: missing realtime_resbp_modalbank layer.")
+    # Prefer the configured length if exposed, else read from weight shape
+    L_modal = int(getattr(mb_layers[0], "length", int(mb_layers[0].kernel.shape[0])))
+
+    LC_total = int(LC_gate) + (L_env - 1) + (L_modal - 1)
 
     if verbose:
         def as_ms(s): return 1000.0 * float(s) / float(sr)
-        print(f"[resbp] signal LC = {lc_signal_hi} samples ({as_ms(lc_signal_hi):.3f} ms)")
-        print(f"[resbp] gain   LC = {lc_gain_hi} samples ({as_ms(lc_gain_hi):.3f} ms)")
-        print(f"[resbp] TOTAL  LC = {LC_resbp_total} samples ({as_ms(LC_resbp_total):.3f} ms)")
+        print(f"[resbp] gate LC   = {LC_gate} samples ({as_ms(LC_gate):.3f} ms)")
+        print(f"[resbp] env  LC   = {L_env - 1} samples ({as_ms(L_env - 1):.3f} ms)")
+        print(f"[resbp] modal LC  = {L_modal - 1} samples ({as_ms(L_modal - 1):.3f} ms)")
+        print(f"[resbp] TOTAL  LC = {LC_total} samples ({as_ms(LC_total):.3f} ms)")
     return {
-        "resbp_signal_left_ctx_samples": int(lc_signal_hi),
-        "resbp_signal_left_ctx_ms":      1000.0 * float(lc_signal_hi) / float(sr),
-        "resbp_gain_left_ctx_samples":   int(lc_gain_hi),
-        "resbp_gain_left_ctx_ms":        1000.0 * float(lc_gain_hi) / float(sr),
-        "resbp_left_ctx_samples":        int(LC_resbp_total),
-        "resbp_left_ctx_ms":             1000.0 * float(LC_resbp_total) / float(sr),
-        "downsample_taps":               [int(x) for x in ds_taps],
-        "lowrate_rf_samples":            int(R_lr),
-        "bandpass_taps":                 int(L_bp),
-        "upsample_factor":               int(F),
+        "resbp_signal_left_ctx_samples": int(LC_total),
+        "resbp_signal_left_ctx_ms":      1000.0 * float(LC_total) / float(sr),
+        "resbp_gain_left_ctx_samples":   int(LC_total),  # same path in this design
+        "resbp_gain_left_ctx_ms":        1000.0 * float(LC_total) / float(sr),
+        "resbp_left_ctx_samples":        int(LC_total),
+        "resbp_left_ctx_ms":             1000.0 * float(LC_total) / float(sr),
+        "downsample_taps":               [],
+        "lowrate_rf_samples":            1,
+        "bandpass_taps":                 0,
+        "upsample_factor":               1,
     }
 
 def compute_ir_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
@@ -1307,31 +1172,6 @@ def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, 
         def as_ms(s): return 1000.0 * float(s) / float(sample_rate)
         print(f"[streaming] realtime left ctx (samples): main={lc_main}, ir={lc_ir}, resbp={lc_rbp}, hf={lc_hf} → max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
     return int(left_ctx), 0
-
-def _resbp_down_times(sr, target_sr=RESBP_LR_TARGET_SR):
-    assert (sr % target_sr) == 0, f"RESBP_LR_TARGET_SR must divide sample_rate, got sr={sr}"
-    factor = sr // target_sr
-    # must be power-of-two so we can chain FIRDecimateBy2
-    assert (factor & (factor - 1)) == 0, f"Downsample factor must be power-of-two, got {factor}"
-    return int(round(math.log2(factor)))
-
-def _apply_ds2_times(x, times, prefix):
-    y = x
-    for i in range(times):
-        y = FIRDecimateBy2(name=f"{prefix}_ds2_{i}")(y)
-    return y
-
-def _resbp_lowrate_stack(x_lr, filters, style_embed, prefix,
-                         kernel=9, dilations=(1,2,4,8,16,32,64,128,256)):
-    """
-    Long-memory stack at low rate. Each block is a gated sepconv + FiLM.
-    """
-    x = Conv1D(filters, 1, padding="same", name=f"{prefix}_lr_init_pw")(x_lr)
-    for bi, d in enumerate(dilations):
-        x = gated_sep_block(x, filters, kernel=kernel, dilation=d, prefix=f"{prefix}_lr_b{bi}", lookahead=0)
-        x = film_apply(x, style_embed, filters, prefix=f"{prefix}_lr_b{bi}")
-    x = Conv1D(1, 1, padding="same", name=f"{prefix}_lr_out")(x)
-    return x
 
 @register_keras_serializable()
 def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
@@ -1503,7 +1343,7 @@ def analyze_loss_scales(model, batch, sample_rate):
         )
     ).numpy()
 
-    bl = tf.reduce_mean(band_limited_l1_loss_weighted(y_true, y_pred, sample_rate)).numpy()
+    bl = tf.reduce_mean(resonance_band_loss(y_true, y_pred, sample_rate)).numpy()
 
     return {'l1': l1, 'stft': stft_on, 'mel': mel, 'env': env, 'hf': hf_on, 'resbp_bl': bl}
 
@@ -2189,6 +2029,7 @@ class AdjustableAlphaMixin:
         self.alpha_var.assign(float(new_alpha))
     def get_config(self):
         return {}
+    
 
 # ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
 
@@ -2451,50 +2292,6 @@ def _get_minphase_bp_kernel(sample_rate, f_lo, f_hi, order=257, window="hamming"
         _bp_kernel_cache[key] = k_np
     return tf.constant(k_np, dtype=tf.float32)
 
-@register_keras_serializable()
-class BandpassFIR(Layer):
-    """
-    Causal min-phase band-pass FIR. Non-trainable constant taps.
-    Usage: y = BandpassFIR(sample_rate=48000, low_hz=700.0, high_hz=2000.0, order=257)(x)
-    """
-    def __init__(self, sample_rate, low_hz, high_hz, order=257, window="hamming", **kwargs):
-        super().__init__(**kwargs)
-        self.sample_rate = int(sample_rate)
-        self.low_hz  = float(low_hz)
-        self.high_hz = float(high_hz)
-        self.order   = int(order)
-        self.window  = str(window)
-        self._taps_init = None
-
-    def build(self, input_shape):
-        k = _get_minphase_bp_kernel(self.sample_rate, self.low_hz, self.high_hz, self.order, self.window)
-        self.taps = self.add_weight(
-            name="bp_taps",
-            shape=k.shape,
-            initializer=tf.keras.initializers.Constant(k),
-            trainable=False
-        )
-        super().build(input_shape)
-
-    def call(self, x):
-        pad_amt = tf.shape(self.taps)[0] - 1
-        x_pad = tf.pad(x, [[0,0],[pad_amt,0],[0,0]])
-        return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
-            "sample_rate": self.sample_rate,
-            "low_hz": self.low_hz,
-            "high_hz": self.high_hz,
-            "order": self.order,
-            "window": self.window
-        })
-        return cfg
-
 def _causal_conv1d(x, kernel):
     pad = tf.shape(kernel)[0] - 1
     x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
@@ -2567,11 +2364,6 @@ class ModalBank(tf.keras.layers.Layer):
             "sample_rate":self.sample_rate
         })
         return cfg
-
-@register_keras_serializable()
-def strike_boost(x, gain=2.5):
-    # x: (B,T,1), returns (B,T,1) = 1 + gain*x
-    return 1.0 + tf.constant(float(gain), tf.float32) * x
 
 def _exp_smoothing_kernel(samples, scale=4.0, Lmax=2048):
     """
@@ -3064,170 +2856,99 @@ def film_apply(x, style_embed, filters, prefix):
         Multiply(name=f"{prefix}_film_scale")([x, gamma3]),
         beta3
     ])
-
 def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
     """
-    Offline resbp (96 kHz) with unified AR driver at 12 kHz and non-linear features.
+    Offline (96 kHz) resbp: synthetic resonances via ModalBank, excited by pick onsets.
+    - No piezo audio content is used in this stem.
+    - Only active when pick is engaged (style_time_used).
+    - Additive only.
     """
     sr = OFFLINE_SAMPLE_RATE
-    times = _resbp_down_times(sr, RESBP_LR_TARGET_SR)  # 96k→12k ⇒ 3
-    up_factor = 2 ** times
 
-    # Driver: gate → 12 kHz → AR → upsample to 96 kHz
-    g_lr = _apply_ds2_times(gate, times, prefix="offline_resbp_gate")
-    driver_lr = AttackReleaseSmoother(
-        attack_ms=OFFLINE_RESBP_ATTACK_MS,
-        release_ms=OFFLINE_RESBP_RELEASE_MS,
-        sample_rate=RESBP_LR_TARGET_SR,
-        scale=4.0,
-        Lmax=OFFLINE_RESBP_LR_SMOOTH_LMAX,
-        name="offline_resbp_driver_lr"
-    )(g_lr)
-    driver_hi = ResizeNearest1D(factor=up_factor, name="offline_resbp_driver_up")(driver_lr)
-    gain_driver = MatchTimeToRef(name="offline_resbp_driver_match")([driver_hi, gate])
+    # Gate limited to pick: g_pick ∈ [0,1]
+    g_pick = Multiply(name="offline_resbp_pick_gate")([gate, style_time_used])
 
-    # Non-linear excitations at 96 kHz
-    rbp_in  = PreEmphasis1D(alpha=HP_PRE_EMPHASIS_HF, name="offline_resbp_pre_emph")(inp)
-    rbp_abs = Abs1D(name="offline_resbp_abs")(rbp_in)
-    rbp_sq  = Square1D(name="offline_resbp_sq")(rbp_in)
+    # Onset impulses on pick openings
+    onset = Lambda(gate_onset, name="offline_resbp_onset")(g_pick)
+    onset_bin = Lambda(onset_binarize, arguments={'thr': 0.02}, name="offline_resbp_onset_bin")(onset)
 
-    # Downsample features to 12 kHz in one cascade (aligned channels)
-    feats_hi = tf.keras.layers.Concatenate(name="offline_resbp_feats_hi_cat")([rbp_in, rbp_abs, rbp_sq, gain_driver])
-    feats_lr = _apply_ds2_times(feats_hi, times, prefix="offline_resbp")
-
-    # Low-rate long-memory generator
-    rbp_lr  = _resbp_lowrate_stack(
-        x_lr=feats_lr,
-        filters=OFFLINE_FILTERS,
-        style_embed=style_embed,
-        prefix="offline_resbp"
-    )
-    rbp_up = ResizeNearest1D(factor=up_factor, name="offline_resbp_upsample")(rbp_lr)
-    rbp_up = MatchTimeToRef(name="offline_resbp_matchlen")([rbp_up, inp])
-
-    # Full-rate cleanup band-pass
-    rbp_bp = BandpassFIR(
+    # Strike envelope (amplitude vs intensity), smoothed a bit so stronger picks ring louder
+    strike_env = CausalExpSmoother(
+        time_const_ms=RESBP_STRIKE_ENV_MS_OFFLINE,
         sample_rate=sr,
-        low_hz=RESBP_LOW_HZ,
-        high_hz=RESBP_HIGH_HZ,
-        order=OFFLINE_RESBP_BP_ORDER,
-        name="offline_resbp_bandpass"
-    )(rbp_up)
+        Lmax=4096,
+        name="offline_resbp_onset_env"
+    )(g_pick)
 
-    # Mask: predict at 96 kHz → smooth at 12 kHz → upsample
-    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_resbp_mask_c1")(rbp_in)
-    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_resbp_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_resbp_mask_logits")(m)
-    mask_pred = Activation("sigmoid", name="offline_resbp_mask")(m)
+    # Final impulses scaled by the strike envelope
+    strike = Multiply(name="offline_resbp_strike")([onset_bin, strike_env])
 
-    m_lr = _apply_ds2_times(mask_pred, times, prefix="offline_resbp_mask")
-    m_lr_sm = CausalExpSmoother(
-        time_const_ms=OFFLINE_RESBP_MASK_SMOOTH_MS,
-        sample_rate=RESBP_LR_TARGET_SR,
-        Lmax=OFFLINE_RESBP_LR_MASK_LMAX,
-        name="offline_resbp_mask_smooth_lr"
-    )(m_lr)
-    mask_smoothed_up = ResizeNearest1D(factor=up_factor, name="offline_resbp_mask_up")(m_lr_sm)
-    mask_smoothed = MatchTimeToRef(name="offline_resbp_mask_match")([mask_smoothed_up, inp])
-    mask_smoothed = Multiply(name="offline_resbp_mask_style_mul")([mask_smoothed, style_time_used])
+    # ModalBank: fixed modes; each mode is a short decaying sinus FIR
+    modes = ModalBank(
+        centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
+        decays_ms=RESBP_MODAL_DECAYS_MS_OFFLINE,
+        length=RESBP_MODAL_LEN_OFFLINE,
+        sample_rate=sr,
+        name="offline_resbp_modalbank"
+    )(strike)
 
-    # Gain floor within driver
-    floor_in_gate = OFFLINE_RESBP_GATE_FLOOR
-    gain_within = Add(name="offline_resbp_gain_within")([
-        MulConst(1.0 - floor_in_gate, name="offline_resbp_gain_mask_weight")(mask_smoothed),
-        OnesLikeTimesConst(floor_in_gate, name="offline_resbp_gain_min_within")(mask_smoothed)
-    ])
-    gain_used = Multiply(name="offline_resbp_gain_used")([gain_driver, gain_within])
+    # Trainable 1x1 mix down to mono
+    mixed = Conv1D(1, 1, use_bias=False, padding="same", name="offline_resbp_mix")(modes)
 
-    rbp_g   = Multiply(name="offline_resbp_mult_gain")([rbp_bp, gain_used])
-    rbp_fin = IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(rbp_g)
-    return rbp_fin
+    # Safety HP to remove any LF numerical residue
+    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_OFFLINE), order=65, name="offline_resbp_post_hp")(mixed)
+
+    # Ensure strictly pick-only contribution (redundant since strike already uses pick gate)
+    mixed = Multiply(name="offline_resbp_pick_only")([mixed, style_time_used])
+
+    return IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(mixed)
+
 def _add_resbp_branch_realtime(inp, gate, style_time_used):
     """
-    Realtime resbp (48 kHz) unified with offline; tail is clamped by RF budget.
+    Realtime (48 kHz) resbp: synthetic resonances via ModalBank, excited by pick onsets.
+    - No piezo audio content is used in this stem.
+    - Only active when pick is engaged (style_time_used).
+    - Uses a short kernel to keep left-context small.
     """
     sr = REALTIME_SAMPLE_RATE
-    times = _resbp_down_times(sr, RESBP_LR_TARGET_SR)  # 48k→12k ⇒ 2
-    up_factor = 2 ** times
 
-    # RF budget (ms) from receptive field
-    rf_ms_budget = _resbp_rf_ms(
-        sample_rate=REALTIME_SAMPLE_RATE,
-        receptive_field_samples_minus_1=(REALTIME_RECEPTIVE_FIELD - 1)
-    )
-    # Clamp release to RF budget; cap AR kernel length to budget in samples
-    attack_ms_rt       = REALTIME_RESBP_ATTACK_MS
-    release_ms_rt      = REALTIME_RESBP_RELEASE_MS
-    release_ms_effect  = min(release_ms_rt, rf_ms_budget)
-    ar_Lmax_hi         = max(8, int(round((rf_ms_budget / 1000.0) * float(sr))))
+    # Gate limited to pick: g_pick ∈ [0,1]
+    g_pick = Multiply(name="realtime_resbp_pick_gate")([gate, style_time_used])
 
-    # Driver at 48 kHz
-    gain_driver = AttackReleaseSmoother(
-        attack_ms=attack_ms_rt,
-        release_ms=release_ms_effect,
+    # Onset impulses on pick openings
+    onset = Lambda(gate_onset, name="realtime_resbp_onset")(g_pick)
+    onset_bin = Lambda(onset_binarize, arguments={'thr': 0.02}, name="realtime_resbp_onset_bin")(onset)
+
+    # Strike envelope (shorter smoothing for realtime budget)
+    strike_env = CausalExpSmoother(
+        time_const_ms=RESBP_STRIKE_ENV_MS_REALTIME,
         sample_rate=sr,
-        scale=4.0,
-        Lmax=ar_Lmax_hi,
-        name="realtime_resbp_driver_hi"
-    )(gate)
+        Lmax=512,
+        name="realtime_resbp_onset_env"
+    )(g_pick)
 
-    # Non-linear excitations at 48 kHz
-    rbp_in  = PreEmphasis1D(alpha=HP_PRE_EMPHASIS_HF, name="realtime_resbp_pre_emph")(inp)
-    rbp_abs = Abs1D(name="realtime_resbp_abs")(rbp_in)
-    rbp_sq  = Square1D(name="realtime_resbp_sq")(rbp_in)
+    # Final impulses scaled by the strike envelope
+    strike = Multiply(name="realtime_resbp_strike")([onset_bin, strike_env])
 
-    # Downsample features to 12 kHz once (aligned channels)
-    feats_hi = tf.keras.layers.Concatenate(name="realtime_resbp_feats_hi_cat")([rbp_in, rbp_abs, rbp_sq, gain_driver])
-    feats_lr = _apply_ds2_times(feats_hi, times, prefix="realtime_resbp")
-
-    # Low-rate long-memory generator
-    rbp_lr  = _resbp_lowrate_stack(
-        x_lr=feats_lr,
-        filters=REALTIME_FILTERS,
-        style_embed=style_time_used,
-        prefix="realtime_resbp"
-    )
-    rbp_up = ResizeNearest1D(factor=up_factor, name="realtime_resbp_upsample")(rbp_lr)
-    rbp_up = MatchTimeToRef(name="realtime_resbp_matchlen")([rbp_up, inp])
-
-    # Full-rate cleanup band-pass
-    rbp_bp = BandpassFIR(
+    # ModalBank: fixed modes; short kernel to limit LC
+    modes = ModalBank(
+        centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
+        decays_ms=RESBP_MODAL_DECAYS_MS_REALTIME,
+        length=RESBP_MODAL_LEN_REALTIME,
         sample_rate=sr,
-        low_hz=RESBP_LOW_HZ,
-        high_hz=RESBP_HIGH_HZ,
-        order=REALTIME_RESBP_BP_ORDER,
-        name="realtime_resbp_bandpass"
-    )(rbp_up)
+        name="realtime_resbp_modalbank"
+    )(strike)
 
-    # Mask: predict at 48 kHz → short-tap ds to 12 kHz → smooth (clamped ms) → upsample
-    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_resbp_mask_c1")(rbp_in)
-    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_resbp_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_resbp_mask_logits")(m)
-    mask_pred = Activation("sigmoid", name="realtime_resbp_mask")(m)
+    # Trainable 1x1 mix to mono
+    mixed = Conv1D(1, 1, use_bias=False, padding="same", name="realtime_resbp_mix")(modes)
 
-    m_lr = _apply_ds2_times_with_taps(mask_pred, times, prefix="realtime_resbp_mask", num_taps=REALTIME_RESBP_MASK_DS_TAPS)
-    mask_smooth_ms_eff = min(REALTIME_RESBP_MASK_SMOOTH_MS, rf_ms_budget)
-    m_lr_sm = CausalExpSmoother(
-        time_const_ms=mask_smooth_ms_eff,
-        sample_rate=RESBP_LR_TARGET_SR,
-        Lmax=REALTIME_RESBP_MASK_SMOOTH_LMAX,
-        name="realtime_resbp_mask_smooth_lr"
-    )(m_lr)
-    mask_smoothed_up = ResizeNearest1D(factor=up_factor, name="realtime_resbp_mask_up")(m_lr_sm)
-    mask_smoothed = MatchTimeToRef(name="realtime_resbp_mask_match")([mask_smoothed_up, inp])
-    mask_smoothed = Multiply(name="realtime_resbp_mask_style_mul")([mask_smoothed, style_time_used])
+    # Safety HP to remove LF numerical residue
+    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65, name="realtime_resbp_post_hp")(mixed)
 
-    # Gain floor within driver
-    floor_in_gate = REALTIME_RESBP_GATE_FLOOR
-    gain_within = Add(name="realtime_resbp_gain_within")([
-        MulConst(1.0 - floor_in_gate, name="realtime_resbp_gain_mask_weight")(mask_smoothed),
-        OnesLikeTimesConst(floor_in_gate, name="realtime_resbp_gain_min_within")(mask_smoothed)
-    ])
-    gain_used = Multiply(name="realtime_resbp_gain_used")([gain_driver, gain_within])
+    # Ensure strictly pick-only contribution
+    mixed = Multiply(name="realtime_resbp_pick_only")([mixed, style_time_used])
 
-    rbp_g   = Multiply(name="realtime_resbp_mult_gain")([rbp_bp, gain_used])
-    rbp_fin = IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(rbp_g)
-    return rbp_fin
+    return IrScale(init=REALTIME_RESBP_SCALE_INIT, name="realtime_resbp_scale")(mixed)
 
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
@@ -3335,21 +3056,7 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
     
-    # Training-only bias that pushes 0.7–2 kHz into the resbp stem ───
-    # Apply the penalty on the sum of pick+finger, but only during strike windows (gate).
     main_core = Add(name="offline_main_core")([pick_c, finger_c])
-    main_core_for_pen = Multiply(name="offline_main_core_for_resbp_penalty")([main_core, offline_gate])
-    main_core_pen = BandpassEnergyPenalty(
-        alpha=OFFLINE_RESBP_TRAIN_BIAS_ALPHA,        # e.g., 0.2 (set 0.0 to disable)
-        sample_rate=OFFLINE_SAMPLE_RATE,
-        low_hz=RESBP_LOW_HZ,
-        high_hz=RESBP_HIGH_HZ,
-        order=OFFLINE_RESBP_BP_ORDER,
-        name="offline_main_resbp_penalty"
-    )(main_core_for_pen)
-
-    # Ensure the penalty stays in the graph but pass the unmodified main_core downstream
-    main_core = LossTether(name="offline_main_resbp_penalty_tether")([main_core, main_core_pen])
     
     # Resonance band‑pass stem
     offline_resbp = _add_resbp_branch_offline(
@@ -3809,15 +3516,10 @@ def build_offline_debug_model(offline):
         "pick_c":    offline.get_layer("offline_pick_contrib").output,
         "finger_c":  offline.get_layer("offline_finger_contrib").output,
         "y_pred":    offline.get_layer("offline_mix_main").output,
+        # Style probability (scalar)
+        "style_pred": offline.get_layer("offline_style_prob").output,
     }
 
-    # Optional resbp mask (96 kHz version after upsample/match)
-    try:
-        outs["resbp_mask"] = offline.get_layer("offline_resbp_mask_match").output
-    except Exception:
-        pass
-
-    # Optional resbp stem (scaled resonance band-pass)
     try:
         outs["resbp"] = offline.get_layer("offline_resbp_scale").output
     except Exception:
@@ -3827,18 +3529,6 @@ def build_offline_debug_model(offline):
 
 @register_keras_serializable()
 def build_realtime_debug_model(realtime):
-    """
-    Realtime debug model exposing intermediate stems for rendering.
-    Includes:
-      - gate, hf_pre, hf_gated, hf_scaled
-      - mask_pred, mask_used, hf_mask_smooth
-      - pick_c, finger_c
-      - y_pred (full mix)
-      - ir_only (IR branch output after low-pass)
-      - resbp_mask (smoothed)
-      - resbp (band-pass resonance stem, scaled) if available
-    """
-    # prefer the new with_ir_resbp if present; fall back to with_ir
     try:
         y_pred = realtime.get_layer("realtime_with_ir_resbp").output
     except Exception:
@@ -3851,17 +3541,17 @@ def build_realtime_debug_model(realtime):
         "hf_scaled": realtime.get_layer("realtime_hf_scale").output,
         "mask_pred": realtime.get_layer("realtime_hf_mask").output,
         "mask_used": realtime.get_layer("realtime_hf_mask_used").output,
+        "hf_mask_smooth": realtime.get_layer("realtime_hf_mask_smooth").output,
         "pick_c":    realtime.get_layer("realtime_pick_contrib").output,
         "finger_c":  realtime.get_layer("realtime_finger_contrib").output,
         "y_pred":    y_pred,
         "ir_only":   realtime.get_layer("realtime_ir_lowpass").output,
-        "hf_mask_smooth": realtime.get_layer("realtime_hf_mask_smooth").output,
-        "resbp_mask": realtime.get_layer("realtime_resbp_mask_smooth").output,
-        "resbp": realtime.get_layer("realtime_resbp_scale").output
+        "resbp":     realtime.get_layer("realtime_resbp_scale").output,
+        # Style probability (scalar)
+        "style_pred": realtime.get_layer("realtime_style_prob").output,
     }
 
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
-
 
 def render_isolated_stems(
     debug_model,
@@ -3875,35 +3565,49 @@ def render_isolated_stems(
     resample_margin_ms=50.0
 ):
     """
-    Render model stems to disk, streaming in blocks:
-      - piezo source
-      - mic target
-      - pred_full_predicted
-      - pred_full_forced (if style is known)
-      - stem_hf_only
-      - stem_ir_lowpass (realtime only)
-      - stem_resbp_only (scaled resonance band-pass, if exists)
-      - resbp_mask_smooth (if exists)
-      - stem_pick_only
-      - stem_finger_only
-    Uses the model's debug_model, which must expose outputs:
-      realtime: gate, hf_scaled, pick_c, finger_c, y_pred, ir_only, resbp (optional), resbp_mask (optional), hf_mask_smooth
-      offline:  gate, hf_scaled, pick_c, finger_c, y_pred, resbp (optional), resbp_mask (optional)
+    Render stems with both predicted and forced style variants:
+      - For each stem: write one predicted-style file and one (or two) forced-style file(s).
+      - If style is known from filename, forced uses that label (pick/finger).
+        Otherwise, both forced_pick and forced_finger are written.
+      - Prints average predicted style probability over the rendered region.
+
+    Files written (predicted):
+      piezo_source.wav
+      mic_target.wav
+      pred_full_predicted.wav
+      stem_hf_only.wav
+      stem_ir_lowpass.wav           (realtime only, if exposed)
+      stem_resbp_only.wav           (if exposed)
+      stem_pick_only.wav
+      stem_finger_only.wav
+
+    Files written (forced):
+      pred_full_forced_<style>.wav
+      stem_hf_only_forced_<style>.wav
+      stem_ir_lowpass_forced_<style>.wav
+      stem_resbp_only_forced_<style>.wav
+      stem_pick_only_forced_<style>.wav
+      stem_finger_only_forced_<style>.wav
     """
     os.makedirs(out_dir, exist_ok=True)
 
     # Apply any requested demo boosts
     _boost_scales_for_stems(debug_model, sample_rate)
 
-    # Decide forced style from filename
+    # Always render both forced variants, regardless of filename.
+    # Keep style_true_flag only for reporting (predicted style averaging stays unchanged).
     if "pick" in path_src:
         style_true_flag = 1.0
     elif "finger" in path_src:
         style_true_flag = 0.0
     else:
-        style_true_flag = None  # unknown/mixed
+        style_true_flag = None
 
-    # Resolve file SR and desired region
+    forced_variants = [
+        ("forced_pick",   np.array([[1.0]], dtype=np.float32)),
+        ("forced_finger", np.array([[0.0]], dtype=np.float32)),
+    ]
+
     info = sf.info(path_src)
     file_sr = info.samplerate
     START_FRAME = int(round(offset_sec * file_sr))
@@ -3911,53 +3615,71 @@ def render_isolated_stems(
     END_FRAME = START_FRAME + TOTAL_FRAMES
     want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
 
-    # Streaming contexts
     left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
 
-    # Style input tensors for predicted vs forced
-    style_pred_in  = np.zeros((1, 1), dtype=np.float32)  # dummy
-    force_pred_in  = np.zeros((1, 1), dtype=np.float32)  # 0 = use predicted style
+    # Inputs for predicted pass
+    style_pred_in  = np.zeros((1, 1), dtype=np.float32)  # ignored unless forced=0
+    force_pred_in  = np.zeros((1, 1), dtype=np.float32)  # 0 = use prediction
 
-    style_true_in  = None
-    force_true_in  = None
-    if style_true_flag is not None:
-        style_true_in = np.array([[style_true_flag]], dtype=np.float32)
-        force_true_in = np.ones((1, 1), dtype=np.float32)  # 1 = force true style
+    # Build pass spec list: predicted + forced set(s)
+    pass_specs = [("pred", style_pred_in, force_pred_in)]
+    for key, style_val in forced_variants:
+        pass_specs.append((key, style_val, np.ones((1, 1), dtype=np.float32)))  # 1 = force
 
-    # Open writers
-    w_src   = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_tgt   = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_predp = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_predt = None
-    if style_true_in is not None:
-        forced_name = "pick" if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else "finger"
-        w_predt = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced_{forced_name}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    # Open writers per pass
+    def open_writers_for_pass(pass_key):
+        is_pred = (pass_key == "pred")
+        suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"  # "_pick" or "_finger"
 
-    w_hf    = sf.SoundFile(os.path.join(out_dir, "stem_hf_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    # Optional stems
-    w_ir          = None
-    w_reso        = None
-    w_resbp_mask  = None
-    w_pick  = sf.SoundFile(os.path.join(out_dir, "stem_pick_only.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_fing  = sf.SoundFile(os.path.join(out_dir, "stem_finger_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers = {}
+        # Source/target are common (write only once in pred pass to avoid duplication)
+        if is_pred:
+            writers["src"] = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w',
+                                          samplerate=sample_rate, channels=1, subtype='FLOAT')
+            writers["tgt"] = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"), mode='w',
+                                          samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-    # Check which optional outputs exist in this debug model
-    debug_out_layer_names = set([k.name if hasattr(k, "name") else str(k) for k in debug_model.outputs])
+        # Full mix
+        if is_pred:
+            writers["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w',
+                                           samplerate=sample_rate, channels=1, subtype='FLOAT')
+        else:
+            writers["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w',
+                                           samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+        # Stems
+        name_hf = "stem_hf_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"
+        writers["hf"] = sf.SoundFile(os.path.join(out_dir, name_hf), mode='w',
+                                     samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+        # Optional stems opened lazily when the outputs exist
+        writers["ir"] = None
+        writers["resbp"] = None
+
+        name_pick = "stem_pick_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"
+        name_fing = "stem_finger_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"
+        writers["pick"] = sf.SoundFile(os.path.join(out_dir, name_pick), mode='w',
+                                       samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers["fing"] = sf.SoundFile(os.path.join(out_dir, name_fing), mode='w',
+                                       samplerate=sample_rate, channels=1, subtype='FLOAT')
+        return writers
+
+    pass_writers = {k: open_writers_for_pass(k) for k, _, _ in pass_specs}
 
     produced_model = 0
+    pred_prob_sum = 0.0
+    pred_prob_count = 0
 
     def _core_crop(arr, a, b):
         return arr[a:b]
 
     while produced_model < want_total_model:
-        # Determine core region for this iteration
         core_model = min(block_core_model, want_total_model - produced_model)
         left_this = left_ctx_model if produced_model > 0 else 0
         right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
 
-        # Map to file frames
         core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
         core_start_file = START_FRAME + core_start_file_off
 
@@ -3972,13 +3694,11 @@ def render_isolated_stems(
         if n_read <= 0:
             break
 
-        # Read file-rate audio
         x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
         y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
         x_file = x_blk_2d[:, 0]
         y_file = y_blk_2d[:, 0]
 
-        # Resample to model SR
         if file_sr != sample_rate:
             x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
             y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
@@ -3986,7 +3706,6 @@ def render_isolated_stems(
             x_resamp = x_file
             y_resamp = y_file
 
-        # Build input window with left/right context at model SR
         left_off_file = (core_start_file - left_ctx_file) - read_a
         left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
         inp_start = max(0, min(left_off_model, len(x_resamp)))
@@ -4003,71 +3722,75 @@ def render_isolated_stems(
 
         x_b = x_inp[None, :, None].astype(np.float32)
 
-        # 1) Predicted style pass
-        outs_pred = debug_model.predict([x_b, style_pred_in, force_pred_in], verbose=0)
-        # Keras returns a dict when you pass dict outputs in the Model; ensure we can index by keys
-        if isinstance(outs_pred, (list, tuple)):
-            raise RuntimeError("Expected dict outputs from debug_model; got list/tuple. Please update build_*_debug_model to return a dict of named outputs.")
-        def core_of(out_dict, key):
-            arr = np.asarray(out_dict[key][0, :, 0], dtype=np.float32)
-            return _core_crop(arr, core_start_in_inp, core_end_in_inp)
+        # Process each pass (predicted + forced variant(s))
+        for pass_key, style_in, force_in in pass_specs:
+            outs = debug_model.predict([x_b, style_in, force_in], verbose=0)
+            if isinstance(outs, (list, tuple)):
+                raise RuntimeError("Expected dict outputs from debug_model; got list/tuple.")
 
-        # Write full prediction (predicted style) and stems
-        y_pred_core = core_of(outs_pred, "y_pred")
-        w_predp.write(y_pred_core)
+            def core_of(key):
+                arr = np.asarray(outs[key][0, :, 0], dtype=np.float32)
+                return _core_crop(arr, core_start_in_inp, core_end_in_inp)
 
-        hf_core = core_of(outs_pred, "hf_scaled")
-        w_hf.write(hf_core)
+            wset = pass_writers[pass_key]
 
-        # Optional stems
-        if "ir_only" in outs_pred:
-            ir_core = core_of(outs_pred, "ir_only")
-            if w_ir is None:
-                w_ir = sf.SoundFile(os.path.join(out_dir, "stem_ir_lowpass.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-            w_ir.write(ir_core)
+            # Accumulate predicted style only on the predicted pass
+            if pass_key == "pred" and "style_pred" in outs:
+                sp = float(np.asarray(outs["style_pred"])[0, 0])
+                pred_prob_sum += sp * float(core_len)
+                pred_prob_count += core_len
 
-        # Band‑pass resonance stem (scaled)
-        if "resbp" in outs_pred:
-            res_core = core_of(outs_pred, "resbp")
-            if w_reso is None:
-                w_reso = sf.SoundFile(os.path.join(out_dir, "stem_resbp_only.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-            w_reso.write(res_core)
+            # Full mix
+            wset["full"].write(core_of("y_pred"))
 
-        # ResBP mask (smoothed), if exposed by the debug model
-        if "resbp_mask" in outs_pred:
-            mask_core = core_of(outs_pred, "resbp_mask")
-            if w_resbp_mask is None:
-                w_resbp_mask = sf.SoundFile(os.path.join(out_dir, "resbp_mask_smooth.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-            w_resbp_mask.write(mask_core)
+            # HF stem
+            wset["hf"].write(core_of("hf_scaled"))
 
-        # Pick/finger contributions (always present in both offline/realtime debug models)
-        w_pick.write(core_of(outs_pred, "pick_c"))
-        w_fing.write(core_of(outs_pred, "finger_c"))
+            # Optional IR stem
+            if "ir_only" in outs:
+                if wset["ir"] is None:
+                    fn = "stem_ir_lowpass.wav" if pass_key == "pred" else f"stem_ir_lowpass_{pass_key.replace('forced_', 'forced_')}.wav"
+                    wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w',
+                                              samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["ir"].write(core_of("ir_only"))
 
-        # 2) Forced style pass (if known)
-        if w_predt is not None:
-            outs_true = debug_model.predict([x_b, style_true_in, force_true_in], verbose=0)
-            y_true_core = core_of(outs_true, "y_pred")
-            w_predt.write(y_true_core)
+            # Optional resbp stem
+            if "resbp" in outs:
+                if wset["resbp"] is None:
+                    fn = "stem_resbp_only.wav" if pass_key == "pred" else f"stem_resbp_only_{pass_key.replace('forced_', 'forced_')}.wav"
+                    wset["resbp"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w',
+                                                 samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["resbp"].write(core_of("resbp"))
 
-        # Write source/target (same cropping)
+            # Pick/finger stems
+            wset["pick"].write(core_of("pick_c"))
+            wset["fing"].write(core_of("finger_c"))
+
+        # Source/target (write once using predicted cropping)
         core_start_global = inp_start + core_start_in_inp
         core_end_global = inp_start + core_end_in_inp
-        w_src.write(x_resamp[core_start_global:core_end_global])
-        w_tgt.write(y_resamp[core_start_global:core_end_global])
+        if "src" in pass_writers["pred"]:
+            pass_writers["pred"]["src"].write(x_resamp[core_start_global:core_end_global])
+            pass_writers["pred"]["tgt"].write(y_resamp[core_start_global:core_end_global])
 
         produced_model += core_len
 
-    # Close files
-    for w in [w_src, w_tgt, w_predp, w_predt, w_hf, w_ir, w_reso, w_resbp_mask, w_pick, w_fing]:
-        try:
-            if w is not None:
-                w.close()
-        except Exception:
-            pass
+    # Close all files
+    for wset in pass_writers.values():
+        for key, w in wset.items():
+            try:
+                if w is not None:
+                    w.close()
+            except Exception:
+                pass
 
-    print(f"✅ Stems saved to {out_dir}")
-
+    # Report predicted style over the rendered region
+    if pred_prob_count > 0:
+        p = pred_prob_sum / float(pred_prob_count)
+        label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        print(f"✅ Stems saved to {out_dir}. Predicted style (avg over region): {label} (p={p:.4f})")
+    else:
+        print(f"✅ Stems saved to {out_dir}.")
 
 def run_render_stems_offline():
     # Load offline dynamic or build from checkpoint
