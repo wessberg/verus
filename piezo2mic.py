@@ -174,8 +174,8 @@ OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline.keras"
 OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
 # HF loss shaping
-OFFLINE_HP_CUTOFF_HZ   = 3000.0
-REALTIME_HP_CUTOFF_HZ  = 3000.0
+OFFLINE_HP_CUTOFF_HZ   = 2500.0
+REALTIME_HP_CUTOFF_HZ  = 2500.0
 
 # Realtime params
 REALTIME_FILTERS          = 48
@@ -236,12 +236,12 @@ REALTIME_RESBP_BOOST_DB   = 0.0
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
 # Realtime kernels are short to keep left context low; offline can be longer.
 
-RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0]
-RESBP_MODAL_DECAYS_MS_OFFLINE  = [45.0,  40.0,  36.0,   32.0,   27.0,   24.0,   20.0,   18.0]
+RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
+RESBP_MODAL_DECAYS_MS_OFFLINE  = [45.0,  40.0,  36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
 RESBP_MODAL_LEN_OFFLINE        = 8192   # ~21.3 ms at 96k; ok for offline
 
-RESBP_MODAL_CENTERS_HZ_REALTIME = [780.0, 950.0, 1120.0, 1320.0, 1540.0, 1780.0, 2050.0]
-RESBP_MODAL_DECAYS_MS_REALTIME  = [18.0,  16.0,  14.0,   12.0,   10.0,    9.0,    8.0]
+RESBP_MODAL_CENTERS_HZ_REALTIME = [780.0, 950.0, 1120.0, 1320.0, 1540.0, 1780.0, 2050.0, 2200.0]
+RESBP_MODAL_DECAYS_MS_REALTIME  = [18.0,  16.0,  14.0,   12.0,   10.0,    9.0,    8.0, 16.0]
 RESBP_MODAL_LEN_REALTIME        = 192    # ~4.0 ms at 48k; keeps LC small
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
