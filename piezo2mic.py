@@ -135,7 +135,7 @@ STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 DEBUG               = False
 
 # Batch params
-OFFLINE_BATCH_SIZE          = 3
+OFFLINE_BATCH_SIZE          = 4
 REALTIME_BATCH_SIZE         = 12
 FINETUNE_BATCH_SIZE         = 32
 
