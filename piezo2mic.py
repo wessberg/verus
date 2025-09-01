@@ -229,7 +229,7 @@ REALTIME_RESBP_BP_ORDER = 257
 OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
-OFFLINE_RESBP_BOOST_DB    = 0.0
+OFFLINE_RESBP_BOOST_DB    = 30.0
 REALTIME_RESBP_BOOST_DB   = 0.0
 
 
@@ -301,7 +301,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_BOOST_DB = 22
+OFFLINE_PICK_BOOST_DB = 30
 REALTIME_PICK_BOOST_DB = 8
 
 SHUFFLE_BUF         = 1000
@@ -1725,6 +1725,41 @@ class FIRDecimateBy2(tf.keras.layers.Layer):
         return cfg
 
 @register_keras_serializable()
+class BandpassFIR(tf.keras.layers.Layer):
+    def __init__(self, low_hz, high_hz, order, sample_rate, window="hamming", name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.low_hz = float(low_hz)
+        self.high_hz = float(high_hz)
+        self.order = int(order)
+        self.sample_rate = int(sample_rate)
+        self.window = str(window)
+
+    def build(self, input_shape):
+        k = _get_minphase_bp_kernel(self.sample_rate, self.low_hz, self.high_hz, self.order, window=self.window)
+        self.taps = self.add_weight(
+            name="bp_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+
+    def call(self, x):
+        pad = tf.shape(self.taps)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.taps, stride=1, padding='VALID')
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "low_hz": self.low_hz,
+            "high_hz": self.high_hz,
+            "order": self.order,
+            "sample_rate": self.sample_rate,
+            "window": self.window
+        })
+        return cfg
+
+@register_keras_serializable()
 class HFHighpass(tf.keras.layers.Layer):
     def __init__(self, taps=None, sample_rate=None, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, **kwargs):
         """
@@ -2856,49 +2891,72 @@ def film_apply(x, style_embed, filters, prefix):
         Multiply(name=f"{prefix}_film_scale")([x, gamma3]),
         beta3
     ])
+
 def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
     """
-    Offline (96 kHz) resbp: synthetic resonances via ModalBank, excited by pick onsets.
-    - No piezo audio content is used in this stem.
-    - Only active when pick is engaged (style_time_used).
-    - Additive only.
+    Offline (96 kHz) resbp with dynamic per-mode weights driven by the input band (≈0.7–2.2 kHz).
+    Keeps modal kernels fixed and TFLite‑friendly; only the per‑mode gains vary over time.
     """
     sr = OFFLINE_SAMPLE_RATE
+    M  = len(RESBP_MODAL_CENTERS_HZ_OFFLINE)
 
-    # Gate limited to pick: g_pick ∈ [0,1]
-    g_pick = Multiply(name="offline_resbp_pick_gate")([gate, style_time_used])
-
-    # Onset impulses on pick openings
-    onset = Lambda(gate_onset, name="offline_resbp_onset")(g_pick)
-    onset_bin = Lambda(onset_binarize, arguments={'thr': 0.02}, name="offline_resbp_onset_bin")(onset)
-
-    # Strike envelope (amplitude vs intensity), smoothed a bit so stronger picks ring louder
+    # Pick gate (0..1) and onset detection
+    g_pick   = Multiply(name="offline_resbp_pick_gate")([gate, style_time_used])
+    onset    = Lambda(gate_onset, name="offline_resbp_onset")(g_pick)
+    # Use a soft onset (no hard binarization) to preserve intensity variation
+    # If you prefer, keep onset_binarize but the dynamic weights below will carry most "identity".
     strike_env = CausalExpSmoother(
         time_const_ms=RESBP_STRIKE_ENV_MS_OFFLINE,
         sample_rate=sr,
         Lmax=4096,
         name="offline_resbp_onset_env"
     )(g_pick)
+    strike = Multiply(name="offline_resbp_strike")([onset, strike_env])  # (B,T,1)
 
-    # Final impulses scaled by the strike envelope
-    strike = Multiply(name="offline_resbp_strike")([onset_bin, strike_env])
-
-    # ModalBank: fixed modes; each mode is a short decaying sinus FIR
+    # Fixed modal bank (LTI), as before
     modes = ModalBank(
         centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
         decays_ms=RESBP_MODAL_DECAYS_MS_OFFLINE,
         length=RESBP_MODAL_LEN_OFFLINE,
         sample_rate=sr,
         name="offline_resbp_modalbank"
-    )(strike)
+    )(strike)  # (B,T,M)
 
-    # Trainable 1x1 mix down to mono
-    mixed = Conv1D(1, 1, use_bias=False, padding="same", name="offline_resbp_mix")(modes)
+    # Analysis front‑end around the same band (causal, fixed), then envelope
+    ana = BandpassFIR(
+        low_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_OFFLINE),
+        high_hz=1.1 * max(RESBP_MODAL_CENTERS_HZ_OFFLINE),
+        order=OFFLINE_RESBP_BP_ORDER,
+        sample_rate=sr,
+        name="offline_resbp_ctrl_bp"
+    )(inp)
+    ana_env = CausalExpSmoother(
+        time_const_ms=4.0,  # short envelope for fast per-onset adaptation
+        sample_rate=sr,
+        Lmax=1024,
+        name="offline_resbp_ctrl_env"
+    )(Abs1D()(ana))  # (B,T,1)
 
-    # Safety HP to remove any LF numerical residue
+    # Tiny control net → per‑mode weights in [0,1], time‑varying
+    # Keep this tiny to stay embedded‑friendly if you later mirror to realtime.
+    ctrl = SeparableConv1D(16, 9, dilation_rate=1, padding="same", activation="relu", name="offline_resbp_ctrl_c1")(ana_env)
+    ctrl = SeparableConv1D(16, 9, dilation_rate=2, padding="same", activation="relu", name="offline_resbp_ctrl_c2")(ctrl)
+    ctrl_logits = SeparableConv1D(M, 3, dilation_rate=1, padding="same", name="offline_resbp_ctrl_logits")(ctrl)
+    ctrl_w = Activation("sigmoid", name="offline_resbp_ctrl_w")(ctrl_logits)  # (B,T,M) ∈ (0,1)
+
+    # Ensure strictly pick‑only contribution
+    ctrl_w = Multiply(name="offline_resbp_ctrl_pick_only")([ctrl_w, style_time_used])
+
+    # Apply per‑mode weights to modal outputs
+    modes_mod = Multiply(name="offline_resbp_modes_mod")([modes, ctrl_w])  # (B,T,M)
+
+    # Trainable 1x1 mix to mono
+    mixed = Conv1D(1, 1, use_bias=False, padding="same", name="offline_resbp_mix")(modes_mod)
+
+    # Safety HP
     mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_OFFLINE), order=65, name="offline_resbp_post_hp")(mixed)
 
-    # Ensure strictly pick-only contribution (redundant since strike already uses pick gate)
+    # Still pick‑only at the sum
     mixed = Multiply(name="offline_resbp_pick_only")([mixed, style_time_used])
 
     return IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(mixed)
@@ -2917,7 +2975,6 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
 
     # Onset impulses on pick openings
     onset = Lambda(gate_onset, name="realtime_resbp_onset")(g_pick)
-    onset_bin = Lambda(onset_binarize, arguments={'thr': 0.02}, name="realtime_resbp_onset_bin")(onset)
 
     # Strike envelope (shorter smoothing for realtime budget)
     strike_env = CausalExpSmoother(
@@ -2928,7 +2985,7 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
     )(g_pick)
 
     # Final impulses scaled by the strike envelope
-    strike = Multiply(name="realtime_resbp_strike")([onset_bin, strike_env])
+    strike = Multiply(name="realtime_resbp_strike")([onset, strike_env])
 
     # ModalBank: fixed modes; short kernel to limit LC
     modes = ModalBank(
@@ -3054,7 +3111,9 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
                       order=OFFLINE_HF_HP_ORDER,
                       name="offline_hf_highpass")(hf_gated)
     
+    
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
+    hf_final_pick = Multiply(name="offline_hf_pick_only")([hf_final, style_time_used])
     
     main_core = Add(name="offline_main_core")([pick_c, finger_c])
     
@@ -3067,7 +3126,7 @@ def build_offline_model(dynamic_time=False, lookahead_samples=OFFLINE_LOOKAHEAD_
     )
 
     # Final sum (main + HF + band-pass)
-    out = Add(name="offline_mix_main")([main_core, hf_final, offline_resbp])
+    out = Add(name="offline_mix_main")([main_core, hf_final_pick, offline_resbp])
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
@@ -3265,6 +3324,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         order=REALTIME_HF_HP_ORDER,
         name="realtime_hf_highpass"
     )(hf_gated)
+    
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
     # Training-only penalty
@@ -3275,9 +3335,11 @@ def build_realtime_model(offline=None, dynamic_time=False):
         sample_rate=REALTIME_SAMPLE_RATE,
         name="realtime_hf_lowband_penalty"
     )(hf_final)
+    
+    hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
     # Mix IR and HF into main
-    y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final])
+    y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final_pick])
     
     realtime_resbp = _add_resbp_branch_realtime(
         inp=inp,
@@ -3313,6 +3375,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
         # Stem KD
         off_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(off_pick)
         off_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(off_finger)
+
         off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
         off_hf_ds_hp48 = HFHighpass(
             sample_rate=REALTIME_SAMPLE_RATE,
@@ -3320,10 +3383,12 @@ def build_realtime_model(offline=None, dynamic_time=False):
             order=REALTIME_HF_HP_ORDER,
             name="offline_hf_ds_hp48"
         )(off_hf_ds)
+        
+        off_hf_ds_hp48_pick = Multiply(name="offline_hf_ds_hp48_pick_only")([off_hf_ds_hp48, style_scalar_b3])
 
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
-        kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48, hf_final]))
+        kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48_pick, hf_final_pick]))
 
         # Resonance KD (optional)
         
