@@ -299,8 +299,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_BOOST_DB = 28
-REALTIME_PICK_BOOST_DB = 12
+OFFLINE_HF_BOOST_DB = 28
+REALTIME_HF_BOOST_DB = 12
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -1420,7 +1420,7 @@ def generate_demo_from_files(model,
     os.makedirs(out_dir, exist_ok=True)
         
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
-    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
+    pick_boost_db = OFFLINE_HF_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_HF_BOOST_DB
     
     if pick_boost_db != 0.0:
         model = boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
@@ -3640,7 +3640,7 @@ def _boost_scales_for_stems(model, sample_rate):
     """
     # HF scale boost
     hf_scale_layer_name = "offline_hf_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_hf_scale"
-    pick_boost_db = OFFLINE_PICK_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_PICK_BOOST_DB
+    pick_boost_db = OFFLINE_HF_BOOST_DB if sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_HF_BOOST_DB
     if pick_boost_db > 0.0:
         try:
             boost_hf_scale_in_model(model, hf_scale_layer_name, pick_boost_db)
