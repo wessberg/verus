@@ -119,11 +119,11 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 EPOCHS      = 38
+FINETUNE_EPOCHS = 10
 
 # Audio sample‐rates
 OFFLINE_SAMPLE_RATE = 96000
 REALTIME_SAMPLE_RATE = 48000
-FINETUNE_SAMPLE_RATE = 48000
 
 #INPUT_AVG_RMS_DBFS_TARGET = -23.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
@@ -137,7 +137,6 @@ DEBUG               = False
 # Batch params
 OFFLINE_BATCH_SIZE          = 4
 REALTIME_BATCH_SIZE         = 12
-FINETUNE_BATCH_SIZE         = 32
 
 # Chunk ratios
 PICK_CHUNK_RATIO = 0.5
@@ -200,7 +199,6 @@ REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (s
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
 REALTIME_STEM_RESBP_DISTILL_ALPHA   = 0.4
 
-
 # Training-only penalty to suppress <~3 kHz energy in the realtime model's HF branch
 REALTIME_HF_LOWBAND_PENALTY_ALPHA   = 1.0   # L1 on LPF(hf_final) with ~2.8-3.0 kHz cutoff
 REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ = max(2900.0, 0.75 * REALTIME_HP_CUTOFF_HZ)
@@ -230,23 +228,23 @@ OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
 OFFLINE_RESBP_BOOST_DB    = 40.0
-REALTIME_RESBP_BOOST_DB   = 0.0
+REALTIME_RESBP_BOOST_DB   = 40.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
 # Realtime kernels are short to keep left context low; offline can be longer.
 
 RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_OFFLINE  = [45.0,  40.0,  36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
-RESBP_MODAL_LEN_OFFLINE        = 8192   # ~21.3 ms at 96k; ok for offline
+RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
+RESBP_MODAL_LEN_OFFLINE        = 8192
 
-RESBP_MODAL_CENTERS_HZ_REALTIME = [780.0, 950.0, 1120.0, 1320.0, 1540.0, 1780.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_REALTIME  = [18.0,  16.0,  14.0,   12.0,   10.0,    9.0,    8.0, 16.0]
-RESBP_MODAL_LEN_REALTIME        = 192    # ~4.0 ms at 48k; keeps LC small
+RESBP_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
+RESBP_MODAL_DECAYS_MS_REALTIME  = [ 22.0,  22.0,   20.0,   18.0,   16.0,   14.0,   13.0,   12.0,   20.0]
+RESBP_MODAL_LEN_REALTIME        = 2048
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
 RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
-RESBP_STRIKE_ENV_MS_REALTIME    = 6.0
+RESBP_STRIKE_ENV_MS_REALTIME    = 10.0
 
 
 
@@ -256,11 +254,11 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
 FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_realtime_dynamic.keras"
+FINETUNE_OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_offline.keras"
+FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.keras"
 
-FINETUNE_REALTIME_EPOCHS      = 10
-FINETUNE_REALTIME_LR          = 1e-4
-FINETUNE_L1_WEIGHT           = 15.0
-FINETUNE_MEL_WEIGHT          = 15.0
+FINETUNE_OFFLINE_LR     = 1e-4
+FINETUNE_REALTIME_LR     = 1e-4
 
 FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
@@ -302,7 +300,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_PICK_BOOST_DB = 28
-REALTIME_PICK_BOOST_DB = 8
+REALTIME_PICK_BOOST_DB = 12
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -1026,21 +1024,15 @@ def _compute_gate_left_ctx_samples(sample_rate=REALTIME_SAMPLE_RATE,
 
     # Total gate left context
     return lc_hp + lc_env + lc_hold + lc_open + lc_depth
+
 def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
     """
     Realtime resbp LC (48 kHz) for the ModalBank stem:
-      - The only driver is the pick gate path (GateInt8Linear).
-      - The signal path is impulses from that gate (no piezo audio).
-      - Left context = LC_gate + (L_onset_env - 1) + (L_modal - 1)
-
-    Assumes layers:
-      - "realtime_gate" (GateInt8Linear)
-      - "realtime_resbp_onset_env" (CausalExpSmoother)
-      - "realtime_resbp_modalbank" (ModalBank)
+      LC_total = LC_gate + (L_pulse - 1) + (L_modal - 1)
+    where L_pulse is the length of the onset pulse smoother.
     """
     sr = int(sample_rate)
 
-    # Gate LC (same computation as HF gate)
     LC_gate = _compute_gate_left_ctx_samples(
         sample_rate=sr,
         threshold_db=REALTIME_GATE_THRESHOLD_DB,
@@ -1053,18 +1045,15 @@ def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE,
         depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
     )
 
-    # Onset envelope smoother length (if present)
-    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_env")
-    if env_layers:
-        L_env = int(env_layers[0].kernel.shape[0])
-    else:
-        L_env = 1
+    # Find the pulse smoother first, or fall back to old onset_env name
+    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_pulse")
+    if not env_layers:
+        env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_env")
+    L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
 
-    # ModalBank kernel length
     mb_layers = _find_layers(model, ModalBank, name_prefix="realtime_resbp_modalbank")
     if not mb_layers:
         raise ValueError("compute_resbp_left_context_realtime: missing realtime_resbp_modalbank layer.")
-    # Prefer the configured length if exposed, else read from weight shape
     L_modal = int(getattr(mb_layers[0], "length", int(mb_layers[0].kernel.shape[0])))
 
     LC_total = int(LC_gate) + (L_env - 1) + (L_modal - 1)
@@ -1078,7 +1067,7 @@ def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE,
     return {
         "resbp_signal_left_ctx_samples": int(LC_total),
         "resbp_signal_left_ctx_ms":      1000.0 * float(LC_total) / float(sr),
-        "resbp_gain_left_ctx_samples":   int(LC_total),  # same path in this design
+        "resbp_gain_left_ctx_samples":   int(LC_total),
         "resbp_gain_left_ctx_ms":        1000.0 * float(LC_total) / float(sr),
         "resbp_left_ctx_samples":        int(LC_total),
         "resbp_left_ctx_ms":             1000.0 * float(LC_total) / float(sr),
@@ -2964,42 +2953,63 @@ def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
 def _add_resbp_branch_realtime(inp, gate, style_time_used):
     """
     Realtime (48 kHz) resbp: synthetic resonances via ModalBank, excited by pick onsets.
-    - No piezo audio content is used in this stem.
-    - Only active when pick is engaged (style_time_used).
-    - Uses a short kernel to keep left-context small.
+    Changes:
+      - strikes are formed by convolving the onset with a short causal smoother (a pulse),
+        instead of multiplying an onset delta by a slow env (which injects only 1 sample).
+      - optional causal band-pass analysis in the same band produces a gain that scales
+        the strike amplitude with pick intensity.
     """
     sr = REALTIME_SAMPLE_RATE
 
-    # Gate limited to pick: g_pick ∈ [0,1]
+    # Pick-only gate
     g_pick = Multiply(name="realtime_resbp_pick_gate")([gate, style_time_used])
 
-    # Onset impulses on pick openings
+    # Onset detection (rising edges of the pick gate)
     onset = Lambda(gate_onset, name="realtime_resbp_onset")(g_pick)
 
-    # Strike envelope (shorter smoothing for realtime budget)
-    strike_env = CausalExpSmoother(
+    # Form a short causal pulse from the onset (this injects energy over a few ms)
+    strike_pulse = CausalExpSmoother(
         time_const_ms=RESBP_STRIKE_ENV_MS_REALTIME,
         sample_rate=sr,
         Lmax=512,
-        name="realtime_resbp_onset_env"
-    )(g_pick)
+        name="realtime_resbp_onset_pulse"
+    )(onset)  # (B,T,1)
 
-    # Final impulses scaled by the strike envelope
-    strike = Multiply(name="realtime_resbp_strike")([onset, strike_env])
+    # Optional: scale pulse by a light causal BP envelope in the same band
+    ana = BandpassFIR(
+        low_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME),
+        high_hz=1.1 * max(RESBP_MODAL_CENTERS_HZ_REALTIME),
+        order=REALTIME_RESBP_BP_ORDER,
+        sample_rate=sr,
+        name="realtime_resbp_ctrl_bp"
+    )(inp)  # (B,T,1)
 
-    # ModalBank: fixed modes; short kernel to limit LC
+    ana_env = CausalExpSmoother(
+        time_const_ms=3.0,   # very short env for 'strike loudness'
+        sample_rate=sr,
+        Lmax=256,
+        name="realtime_resbp_ctrl_env"
+    )(Abs1D()(ana))  # (B,T,1)
+
+    # Simple, static compression to 0..1 (TFLite-friendly)
+    ctrl_gain = Lambda(lambda z: tf.clip_by_value(4.0 * z, 0.0, 1.0), name="realtime_resbp_ctrl_gain")(ana_env)
+
+    # Final strike: pick-only pulse, scaled by the BP-derived gain
+    strike = Multiply(name="realtime_resbp_strike")([strike_pulse, ctrl_gain])  # (B,T,1)
+
+    # ModalBank: fixed modes; longer kernel to allow audible ringing
     modes = ModalBank(
         centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
         decays_ms=RESBP_MODAL_DECAYS_MS_REALTIME,
         length=RESBP_MODAL_LEN_REALTIME,
         sample_rate=sr,
         name="realtime_resbp_modalbank"
-    )(strike)
+    )(strike)  # (B,T,M)
 
     # Trainable 1x1 mix to mono
     mixed = Conv1D(1, 1, use_bias=False, padding="same", name="realtime_resbp_mix")(modes)
 
-    # Safety HP to remove LF numerical residue
+    # Safety HP to remove LF residue
     mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65, name="realtime_resbp_post_hp")(mixed)
 
     # Ensure strictly pick-only contribution
@@ -3501,6 +3511,32 @@ def add_sw_realtime_dual(x, y):
     return inputs, outputs, sample_weights
 
 @register_keras_serializable()
+def add_sw_offline_finetune_nf(x, y):
+    # y = (y_audio, style_flag) but finetune uses no true style labels
+    y_audio, _ = y
+    b = tf.shape(x)[0]
+    T = tf.shape(x)[1]
+
+    # Dummy style label for the style head (B,1)
+    style_true  = tf.zeros((b, 1), dtype=tf.float32)
+    # Force the model to use its own classifier during finetune
+    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 = use prediction
+
+    inputs = {
+        'offline_piezo_input':        x,
+        'offline_style_true_input':   style_true,
+        'offline_style_force_input':  style_force,
+    }
+
+    outputs = (y_audio, style_true)
+
+    # Sample weights: train audio only, disable style BCE
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.zeros_like(style_true, dtype=tf.float32)
+
+    return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
 def add_sw_realtime_finetune_nf(x, y):
     # y = (y_audio, style_flag) but finetune uses no true style labels
     y_audio, _ = y
@@ -3527,6 +3563,59 @@ def add_sw_realtime_finetune_nf(x, y):
     sw_style = tf.zeros_like(style_true, dtype=tf.float32)
 
     return inputs, outputs, (sw_audio, sw_style)
+
+def set_trainable_for_finetune_offline(model):
+    """
+    Freeze most layers; enable only FiLM dense layers and a few small heads/scales.
+    """
+    trainable_names = set()
+    for layer in model.layers:
+        name = layer.name
+        # Default: frozen
+        layer.trainable = False
+        # FiLM parameter generators (per-block)
+        if "film_dense" in name:
+            layer.trainable = True; trainable_names.add(name)
+        # Style→embedding mapping to FiLM space
+        if name == "offline_style_embed":
+            layer.trainable = True; trainable_names.add(name)
+        # Heads and small scales
+        if name in ("offline_final_pick", "offline_final_finger", "offline_hf_scale", "offline_resbp_scale"):
+            layer.trainable = True; trainable_names.add(name)
+        # Allow small HF branch adaptation
+        if name.startswith("offline_hf_"):
+            layer.trainable = True; trainable_names.add(name)
+    print(f"[finetune/offline] trainable layers: {sorted(trainable_names)}")
+    return model
+
+def set_trainable_for_finetune_realtime(model):
+    """
+    Freeze most layers; enable FiLM dense layers and a few small heads/scales.
+    """
+    trainable_names = set()
+    LAST_REALTIME_DILATION = len(REALTIME_DILATIONS) - 1
+    for layer in model.layers:
+        name = layer.name
+        # Default: frozen
+        layer.trainable = False
+        # FiLM parameter generators
+        if "film_dense" in name:
+            layer.trainable = True; trainable_names.add(name)
+        # Style→embedding mapping into FiLM space
+        if name == "realtime_style_embed":
+            layer.trainable = True; trainable_names.add(name)
+        # Heads and small scales
+        if name.startswith("realtime_final_") or name in ("realtime_ir_scale", "realtime_resbp_scale"):
+            layer.trainable = True; trainable_names.add(name)
+        # Keep the existing tiny allowance on the last block to adjust timbre slightly
+        if name in (f"realtime_sep_{LAST_REALTIME_DILATION}", f"realtime_pw_{LAST_REALTIME_DILATION}",
+                    f"realtime_ir_sep_{LAST_REALTIME_DILATION}"):
+            layer.trainable = True; trainable_names.add(name)
+        # Allow small HF branch adaptation
+        if name.startswith("realtime_hf_"):
+            layer.trainable = True; trainable_names.add(name)
+    print(f"[finetune/realtime] trainable layers: {sorted(trainable_names)}")
+    return model
 
 def boost_hf_scale_in_model(model, layer_name, gain_db):
     """
@@ -4181,22 +4270,25 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         dual_offline=True  # keep dual-rate dataset (48k student + 96k teacher input)
     )
 
-def generate_fine_tune_demo(model):
+def generate_fine_tune_demo(model, sample_rate, subdir_name):
+    out_dir = os.path.join(FINETUNE_DEMOS_OUT_DIR, subdir_name)
+    os.makedirs(out_dir, exist_ok=True)
     return generate_demo_from_files(
         model=model,
-        sample_rate     = FINETUNE_SAMPLE_RATE,
+        sample_rate     = sample_rate,
         offset_sec      = FINETUNE_DEMO_OFFSET_SEC,
         sec             = FINETUNE_DEMO_SEC,
         path_src        = os.path.join(FINETUNE_SRC_DIR, "source.wav"),
         path_target     = os.path.join(FINETUNE_SRC_DIR, "target.wav"),
-        out_dir         = FINETUNE_DEMOS_OUT_DIR,
+        out_dir         = out_dir,
         prediction_name = "demo_pred"
     )
 
 def fine_tune():
     global picked_pairs, finger_pairs, all_pairs, audio_cache
-    global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
+    global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT, RESBP_BAND_LOSS_WEIGHT
 
+    # Load input pair
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
     tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     if not os.path.exists(src) or not os.path.exists(tgt):
@@ -4205,126 +4297,153 @@ def fine_tune():
 
     x_full, sr_x = sf.read(src, dtype='float32', always_2d=True)
     y_full, sr_y = sf.read(tgt, dtype='float32', always_2d=True)
-    assert sr_x == sr_y == FINETUNE_SAMPLE_RATE, f"Sample rate mismatch: {sr_x} vs {sr_y} vs {FINETUNE_SAMPLE_RATE}"
 
-    rms_x = compute_rms(x_full[:,0])
-    rms_y = compute_rms(y_full[:,0])
-    print(f"[fine_tune] input RMS: source={rms_x:.6f}, target={rms_y:.6f}")
-
-    #target_rms = 10 ** ( INPUT_AVG_RMS_DBFS_TARGET / 20.0 )
-    #gain_x     = target_rms / (rms_x + 1e-12)
-    #gain_y     = target_rms / (rms_y + 1e-12)
-    #print(f"[fine_tune] applying gains: source×{gain_x:.3f}, target×{gain_y:.3f}")
-
-    x_norm = x_full # * gain_x
-    y_norm = y_full # * gain_y
-
-    rms_x2 = compute_rms(x_norm[:,0])
-    rms_y2 = compute_rms(y_norm[:,0])
-    print(f"[fine_tune] post‐norm RMS: source={rms_x2:.6f} ({20*np.log10(rms_x2):.2f} dB), target={rms_y2:.6f} ({20*np.log10(rms_y2):.2f} dB)")
+    # No additional normalization/scaling (already normalized upstream per comments)
+    x_norm = x_full
+    y_norm = y_full
 
     picked_pairs = [(src, tgt)]
     finger_pairs = [(src, tgt)]
     all_pairs    = picked_pairs + finger_pairs
-    
     assert_has_pairs()
 
     audio_cache.clear()
     audio_cache[src] = x_norm
     audio_cache[tgt] = y_norm
 
-    def make_mixed_ds(seg_len):
-        chunks = build_chunks(pairs_list=all_pairs, seg_len=seg_len, sample_rate=FINETUNE_SAMPLE_RATE)
+    # Dataset factory that respects model SR (handles resampling inside segment_generator)
+    def make_mixed_ds(seg_len, model_sample_rate):
+        chunks = build_chunks(pairs_list=all_pairs, seg_len=seg_len, sample_rate=model_sample_rate)
         spec_x       = tf.TensorSpec((seg_len,1), tf.float32)
         spec_y_audio = tf.TensorSpec((seg_len,1), tf.float32)
         spec_y_style = tf.TensorSpec((),       tf.float32)
         spec_y       = (spec_y_audio, spec_y_style)
 
         def pu_gen():
-            for x, (y_audio, style_flag) in segment_generator(seg_len=seg_len, chunks=chunks, is_pick_chunks=True, model_sample_rate=FINETUNE_SAMPLE_RATE):
+            for x, (y_audio, style_flag) in segment_generator(seg_len=seg_len, chunks=chunks,
+                                                             is_pick_chunks=True, model_sample_rate=model_sample_rate):
                 yield x, (y_audio, style_flag)
 
         def fu_gen():
-            for x, (y_audio, style_flag) in segment_generator(seg_len=seg_len, chunks=chunks, is_pick_chunks=False, model_sample_rate=FINETUNE_SAMPLE_RATE):
+            for x, (y_audio, style_flag) in segment_generator(seg_len=seg_len, chunks=chunks,
+                                                             is_pick_chunks=False, model_sample_rate=model_sample_rate):
                 yield x, (y_audio, style_flag)
 
         ds_pu = tf.data.Dataset.from_generator(pu_gen, output_signature=(spec_x, spec_y))
         ds_fu = tf.data.Dataset.from_generator(fu_gen, output_signature=(spec_x, spec_y))
-        mixed = tf.data.Dataset.sample_from_datasets([ds_pu, ds_fu], weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO], seed=SEED)
-        return mixed.batch(FINETUNE_BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+        mixed = tf.data.Dataset.sample_from_datasets(
+            [ds_pu, ds_fu],
+            weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
+            seed=SEED
+        )
+        return mixed.batch(OFFLINE_BATCH_SIZE if model_sample_rate == OFFLINE_SAMPLE_RATE else REALTIME_BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
 
-    print("\n🔧 Fine-tuning REALTIME on new pair…")
-    base_realtime_full = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME), compile=False)
-    finetuned_realtime_small = build_realtime_model(offline=None, dynamic_time=False)
+    # ────────────── OFFLINE FINETUNE (96 kHz) ────────────────────────────────
+    print("\n🔧 Fine-tuning OFFLINE on new pair…")
+    offline_base_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+    if not os.path.exists(offline_base_path):
+        print("ERROR: baseline offline static model not found at", offline_base_path)
+        print("Run --train-offline first.")
+        sys.exit(1)
 
-    for layer in finetuned_realtime_small.layers:
-        if layer.name.startswith("realtime_"):
-            try:
-                layer.set_weights(base_realtime_full.get_layer(layer.name).get_weights())
-            except ValueError:
-                pass
+    base_offline = tf.keras.models.load_model(offline_base_path, compile=False)
+    finetuned_offline_static = build_offline_model(dynamic_time=False)  # same architecture
+    finetuned_offline_static.set_weights(base_offline.get_weights())
+    set_trainable_for_finetune_offline(finetuned_offline_static)
 
-    LAST_REALTIME_DILATION = len(REALTIME_DILATIONS) - 1
-    for layer in finetuned_realtime_small.layers:
-        name = layer.name
-        layer.trainable = \
-            "film_dense" in name \
-            or name.startswith("realtime_final_") \
-            or name == "realtime_ir_scale" \
-            or name == f"realtime_sep_{LAST_REALTIME_DILATION}" \
-            or name == f"realtime_ir_sep_{LAST_REALTIME_DILATION}" \
-            or name == f"realtime_pw_{LAST_REALTIME_DILATION}" \
-            or name.startswith("realtime_hf_")
+    # Build a small val set for loss weight normalization at 96k
+    dsO_val = make_mixed_ds(OFFLINE_SEG_LEN, OFFLINE_SAMPLE_RATE)
+    dsO_val = dsO_val.map(add_sw_offline_finetune_nf).take(CALIBRATION_CHUNK_COUNT)
 
-    dsS_val = make_mixed_ds(REALTIME_SEG_LEN)
-    dsS_val = dsS_val.map(add_sw_realtime_finetune_nf)
-    dsS_val = dsS_val.take(CALIBRATION_CHUNK_COUNT)
-
-    # Normalize weights consistently with the actual loss shape
-    new_w, _ = calibrate_loss_weights(
-        model=finetuned_realtime_small, dataset=dsS_val, sample_rate=FINETUNE_SAMPLE_RATE, n_batches=5
+    new_w_off, _ = calibrate_loss_weights(
+        model=finetuned_offline_static, dataset=dsO_val, sample_rate=OFFLINE_SAMPLE_RATE, n_batches=5
     )
-    
-    L1_WEIGHT      = new_w['l1']
-    STFT_WEIGHT    = new_w['stft']
-    MEL_WEIGHT     = new_w['mel']
-    RMS_ENV_WEIGHT = new_w['env']
-    HF_WEIGHT      = new_w['hf']
-    RESBP_BAND_LOSS_WEIGHT = new_w['resbp_bl']
-    print(f"→ normalized finetune weights:"
-        f" L1={L1_WEIGHT:.6f}"
-        f" STFT={STFT_WEIGHT:.6f}"
-        f" MEL={MEL_WEIGHT:.6f}"
-        f" ENV={RMS_ENV_WEIGHT:.6f}"
-        f" HF={HF_WEIGHT:.6f}"
-        f" RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
+    L1_WEIGHT              = new_w_off['l1']
+    STFT_WEIGHT            = new_w_off['stft']
+    MEL_WEIGHT             = new_w_off['mel']
+    RMS_ENV_WEIGHT         = new_w_off['env']
+    HF_WEIGHT              = new_w_off['hf']
+    RESBP_BAND_LOSS_WEIGHT = new_w_off['resbp_bl']
+    print(f"→ normalized finetune (offline) weights:"
+          f" L1={L1_WEIGHT:.6f} STFT={STFT_WEIGHT:.6f} MEL={MEL_WEIGHT:.6f}"
+          f" ENV={RMS_ENV_WEIGHT:.6f} HF={HF_WEIGHT:.6f} RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
 
-    # Instantiate the loss with the per-model smoothing
-    _combined_loss = CombinedLoss(FINETUNE_SAMPLE_RATE, extra_small_cplx=False)
-
-    finetuned_realtime_small.compile(
-        optimizer=tf.keras.optimizers.Adam(FINETUNE_REALTIME_LR),
-        loss=[_combined_loss, "binary_crossentropy"],
+    loss_off = CombinedLoss(OFFLINE_SAMPLE_RATE, extra_small_cplx=True)
+    finetuned_offline_static.compile(
+        optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
+        loss=[loss_off, "binary_crossentropy"],
         loss_weights=[1.0, 0.0],   # disable BCE during finetune
         metrics=[["mae"], []]
     )
+    finetuned_offline_static.summary()
 
-    dsS = make_mixed_ds(REALTIME_SEG_LEN)
-    dsS = dsS.map(add_sw_realtime_finetune_nf)
-    ft_chunks_T = build_chunks(pairs_list=[(src, tgt)], seg_len=REALTIME_SEG_LEN, sample_rate=FINETUNE_SAMPLE_RATE)
+    ds_offline = make_mixed_ds(OFFLINE_SEG_LEN, OFFLINE_SAMPLE_RATE).map(add_sw_offline_finetune_nf)
+    ft_chunks_offline = build_chunks(pairs_list=[(src, tgt)], seg_len=OFFLINE_SEG_LEN, sample_rate=OFFLINE_SAMPLE_RATE)
+    steps_offline = max(approx_steps_from_chunks(ft_chunks_offline, OFFLINE_SEG_LEN, OFFLINE_SAMPLE_RATE, OFFLINE_BATCH_SIZE), 1)
+    finetuned_offline_static.fit(ds_offline, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_offline, verbose=1)
 
-    stepsS = max(approx_steps_from_chunks(ft_chunks_T, REALTIME_SEG_LEN, FINETUNE_SAMPLE_RATE, FINETUNE_BATCH_SIZE), 1)
-    print("Finetune realtime model summary:")
-    finetuned_realtime_small.summary()
-    finetuned_realtime_small.fit(dsS, epochs=FINETUNE_REALTIME_EPOCHS, steps_per_epoch=stepsS, verbose=1)
+    ft_offline_static = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
+    finetuned_offline_static.save(ft_offline_static)
+    finetuned_offline_dynamic = build_offline_model(dynamic_time=True)
+    finetuned_offline_dynamic.set_weights(finetuned_offline_static.get_weights())
+    ft_offline_dyn = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
+    finetuned_offline_dynamic.save(ft_offline_dyn)
+    print("✅ Saved finetuned offline:", ft_offline_static, "and", ft_offline_dyn)
 
-    ft_s_static = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-    finetuned_realtime_small.save(ft_s_static)
-    finetuned_realtime_dyn = build_realtime_model(offline=None, dynamic_time=True)
-    finetuned_realtime_dyn.set_weights(finetuned_realtime_small.get_weights())
-    ft_s_dyn = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-    finetuned_realtime_dyn.save(ft_s_dyn)
-    return finetuned_realtime_dyn
+    # ────────────── REALTIME FINETUNE (48 kHz) ───────────────────────────────
+    print("\n🔧 Fine-tuning REALTIME on new pair…")
+    realtime_base_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+    if not os.path.exists(realtime_base_path):
+        print("ERROR: baseline realtime static model not found at", realtime_base_path)
+        print("Run --train-realtime first.")
+        sys.exit(1)
+
+    base_realtime_full = tf.keras.models.load_model(realtime_base_path, compile=False)
+    finetuned_realtime_static = build_realtime_model(offline=None, dynamic_time=False)  # independent of offline
+    # Copy by name for safety
+    copy_weights_by_name(finetuned_realtime_static, base_realtime_full, verbose=True)
+    set_trainable_for_finetune_realtime(finetuned_realtime_static)
+
+    # Calibrate loss weights on 48k
+    ds_realtime_val = make_mixed_ds(REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE)
+    ds_realtime_val = ds_realtime_val.map(add_sw_realtime_finetune_nf).take(CALIBRATION_CHUNK_COUNT)
+
+    new_w_rt, _ = calibrate_loss_weights(
+        model=finetuned_realtime_static, dataset=ds_realtime_val, sample_rate=REALTIME_SAMPLE_RATE, n_batches=5
+    )
+    L1_WEIGHT              = new_w_rt['l1']
+    STFT_WEIGHT            = new_w_rt['stft']
+    MEL_WEIGHT             = new_w_rt['mel']
+    RMS_ENV_WEIGHT         = new_w_rt['env']
+    HF_WEIGHT              = new_w_rt['hf']
+    RESBP_BAND_LOSS_WEIGHT = new_w_rt['resbp_bl']
+    print(f"→ normalized finetune (realtime) weights:"
+          f" L1={L1_WEIGHT:.6f} STFT={STFT_WEIGHT:.6f} MEL={MEL_WEIGHT:.6f}"
+          f" ENV={RMS_ENV_WEIGHT:.6f} HF={HF_WEIGHT:.6f} RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
+
+    loss_rt = CombinedLoss(REALTIME_SAMPLE_RATE, extra_small_cplx=False)
+    finetuned_realtime_static.compile(
+        optimizer=tf.keras.optimizers.Adam(FINETUNE_REALTIME_LR),
+        loss=[loss_rt, "binary_crossentropy"],
+        loss_weights=[1.0, 0.0],   # disable BCE during finetune
+        metrics=[["mae"], []]
+    )
+    finetuned_realtime_static.summary()
+
+    ds_realtime = make_mixed_ds(REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE).map(add_sw_realtime_finetune_nf)
+    ft_chunks_realtime = build_chunks(pairs_list=[(src, tgt)], seg_len=REALTIME_SEG_LEN, sample_rate=REALTIME_SAMPLE_RATE)
+    steps_realtime = max(approx_steps_from_chunks(ft_chunks_realtime, REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE, REALTIME_BATCH_SIZE), 1)
+    finetuned_realtime_static.fit(ds_realtime, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_realtime, verbose=1)
+
+    ft_realtime_static = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+    finetuned_realtime_static.save(ft_realtime_static)
+    finetuned_realtime_dynamic = build_realtime_model(offline=None, dynamic_time=True)
+    finetuned_realtime_dynamic.set_weights(finetuned_realtime_static.get_weights())
+    ft_realtime_dyn = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+    finetuned_realtime_dynamic.save(ft_realtime_dyn)
+    print("✅ Saved finetuned realtime:", ft_realtime_static, "and", ft_realtime_dyn)
+
+    return finetuned_offline_dynamic, finetuned_realtime_dynamic
 
 def compute_rms(sig):
     sig64 = sig.astype(np.float64, copy=False)
@@ -4415,16 +4534,27 @@ def main ():
                 use_safe_weight_copy=True
             )
     elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune":
-        realtime_dyn = fine_tune()
-        generate_fine_tune_demo(model=realtime_dyn)
+        offline_dyn, realtime_dyn = fine_tune()
+        # Write demos for both into separate subfolders
+        generate_fine_tune_demo(offline_dyn,  OFFLINE_SAMPLE_RATE,  subdir_name="offline")
+        generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune-demo":
+        # Load finetuned models if present and render both
+        offline_dyn_path  = os.path.join(MODELS_OFFLINE_OUT_DIR,  FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
         realtime_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(realtime_dyn_path):
-            print("Fine-tuned dynamic model not found, run --fine-tune first")
+
+        offline_dyn  = tf.keras.models.load_model(offline_dyn_path,  compile=False) if os.path.exists(offline_dyn_path)  else None
+        realtime_dyn = tf.keras.models.load_model(realtime_dyn_path, compile=False) if os.path.exists(realtime_dyn_path) else None
+
+        if offline_dyn is None and realtime_dyn is None:
+            print("Fine-tuned dynamic models not found, run --fine-tune first")
             sys.exit(1)
-        realtime_dyn = None if not os.path.exists(realtime_dyn_path) else tf.keras.models.load_model(realtime_dyn_path, compile=False)
-        generate_fine_tune_demo(model=realtime_dyn)
+
+        if offline_dyn is not None:
+            generate_fine_tune_demo(offline_dyn,  OFFLINE_SAMPLE_RATE,  subdir_name="offline")
+        if realtime_dyn is not None:
+            generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
         if (len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only"):
