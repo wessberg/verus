@@ -2350,8 +2350,8 @@ def _make_modal_kernels(centers_hz, decays_ms, length, sample_rate):
 class ModalBank(tf.keras.layers.Layer):
     """
     Fixed bank of causal decaying-sine FIRs (one output channel per mode).
-    - Inputs: (B,T,1), outputs: (B,T,M)
-    - Implementation: left-pad by (L-1), tf.nn.conv1d with fixed kernels.
+    - Normal input: (B,T,1)
+    - Output: (B,T,M)
     """
     def __init__(self, centers_hz, decays_ms, length, sample_rate, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
@@ -2371,12 +2371,28 @@ class ModalBank(tf.keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, x):
+        # Ensure rank >= 3 by collapsing all dims from axis=2 onward into the channel dim.
+        # This tolerates legacy rank-4 inputs like (B,T,1,1).
+        shp   = tf.shape(x)
+        b     = shp[0]
+        t     = shp[1]
+        # new_c = product of all trailing dims (must be 1 for our fixed 1-in channel kernels)
+        new_c = tf.reduce_prod(shp[2:])
+        # Enforce single-channel at runtime (keeps conv1d filter compatibility: (L,1,M))
+        assert_op = tf.debugging.assert_equal(
+            new_c, 1,
+            message="ModalBank expects a single input channel; got trailing dims product != 1."
+        )
+        with tf.control_dependencies([assert_op]):
+            x3 = tf.reshape(x, [b, t, new_c])  # becomes (B,T,1)
         pad = self.length - 1
-        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        x_pad = tf.pad(x3, [[0,0],[pad,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
 
     def compute_output_shape(self, input_shape):
-        b, t, _ = input_shape
+        # Works for (B,T,1) and legacy (B,T,1,1) since only B,T matter.
+        b = input_shape[0]
+        t = input_shape[1]
         return (b, t, len(self.centers_hz))
 
     def get_config(self):
@@ -3995,6 +4011,9 @@ def run_render_stems_realtime():
             copy_weights_by_name(realtime_dyn, static)
         else:
             static = build_realtime_model(dynamic_time=False)
+            
+            
+            
             realtime_dyn = build_realtime_model(dynamic_time=True)
             copy_weights_by_name(realtime_dyn, static)
 
