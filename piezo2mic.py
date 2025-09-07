@@ -2837,6 +2837,11 @@ def slice_film_beta(x, filters):
 def invert(x):
     return 1.0 - x
 
+@register_keras_serializable()
+def clip_01x4(z):
+    # Scale by 4 and clamp to [0, 1]
+    return tf.clip_by_value(4.0 * z, 0.0, 1.0)
+
 # Stabilized FiLM
 @register_keras_serializable()
 def film_gamma_stable(raw):
@@ -2992,7 +2997,7 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
     )(Abs1D()(ana))  # (B,T,1)
 
     # Simple, static compression to 0..1 (TFLite-friendly)
-    ctrl_gain = Lambda(lambda z: tf.clip_by_value(4.0 * z, 0.0, 1.0), name="realtime_resbp_ctrl_gain")(ana_env)
+    ctrl_gain = Lambda(clip_01x4, name="realtime_resbp_ctrl_gain")(ana_env)
 
     # Final strike: pick-only pulse, scaled by the BP-derived gain
     strike = Multiply(name="realtime_resbp_strike")([strike_pulse, ctrl_gain])  # (B,T,1)
@@ -3985,6 +3990,7 @@ def run_render_stems_realtime():
         if ckpts:
             print("Loading latest checkpoint:", ckpts[-1])
             static = tf.keras.models.load_model(ckpts[-1], compile=False)
+            
             realtime_dyn = build_realtime_model(dynamic_time=True)
             copy_weights_by_name(realtime_dyn, static)
         else:
