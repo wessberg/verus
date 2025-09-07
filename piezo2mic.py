@@ -174,7 +174,7 @@ OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
 # HF loss shaping
 OFFLINE_HP_CUTOFF_HZ   = 2500.0
-REALTIME_HP_CUTOFF_HZ  = 2500.0
+REALTIME_HP_CUTOFF_HZ  = 4000.0
 
 # Realtime params
 REALTIME_FILTERS          = 48
@@ -298,7 +298,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = 28
-REALTIME_HF_BOOST_DB = 4
+REALTIME_HF_BOOST_DB = 12
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -4147,7 +4147,15 @@ def train_shared(
 
     if resume and resume_ckpt_path:
         print(f"Resuming training from checkpoint: {resume_ckpt_path}")
-        static_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
+        # Load weights from the checkpoint, but rebuild the full graph (with teacher) first
+        ckpt_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
+
+        # Critical: rebuild the realtime model with the teacher again
+        static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
+
+        # Copy weights by layer name to keep shapes/graph, including KD heads
+        copy_weights_by_name(static_model, ckpt_model, verbose=True)
+
         initial_epoch = _extract_epoch_from_ckpt(resume_ckpt_path)
     else:
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
