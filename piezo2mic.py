@@ -209,11 +209,11 @@ REALTIME_OFFLINE_FEAT_LAYERS   = ["offline_dil_2_film_apply", "offline_dil_3_fil
 REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ   = OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ
 REALTIME_GATE_THRESHOLD_DB               = OFFLINE_GATE_THRESHOLD_DB
 REALTIME_GATE_RATIO                      = OFFLINE_GATE_RATIO
-REALTIME_GATE_ATTACK_MS                  = 0.1
+REALTIME_GATE_ATTACK_MS                  = 0.02
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 20.0
-REALTIME_GATE_ENV_MS                     = 0.02
-REALTIME_GATE_DEPTH_SMOOTH_MS            = 0.5
+REALTIME_GATE_ENV_MS                     = 0.0
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 0.25
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
@@ -239,7 +239,7 @@ RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0, 
 RESBP_MODAL_LEN_OFFLINE        = 8192
 
 RESBP_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_REALTIME  = [ 22.0,  22.0,   20.0,   18.0,   16.0,   14.0,   13.0,   12.0,   20.0]
+RESBP_MODAL_DECAYS_MS_REALTIME  = [ 30.0,  30.0,   28.0,   26.0,   24.0,   22.0,   21.0,   20.0,   28.0 ]
 RESBP_MODAL_LEN_REALTIME        = 2048
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
@@ -286,7 +286,7 @@ REALTIME_IR_FIR_SIZE          = 129
 REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
-REALTIME_IR_BOOST_DB = 1.0
+REALTIME_IR_BOOST_DB = 2.0
 
 REALTIME_LP_ORDER   = 65
 REALTIME_LP_CUTOFF  = 4000
@@ -298,7 +298,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = 28
-REALTIME_HF_BOOST_DB = 2
+REALTIME_HF_BOOST_DB = 4
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -3344,7 +3344,7 @@ def build_realtime_model(offline=None, dynamic_time=False):
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
     mask_smoothed = CausalExpSmoother(
-    time_const_ms=0.25,              # ~24 samples @48k
+    time_const_ms=0.08,              # ~24 samples @48k
     sample_rate=REALTIME_SAMPLE_RATE,
     Lmax=64,
     name="realtime_hf_mask_smooth"
