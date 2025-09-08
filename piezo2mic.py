@@ -174,7 +174,7 @@ OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_dynamic.keras"
 
 # HF loss shaping
 OFFLINE_HP_CUTOFF_HZ   = 2500.0
-REALTIME_HP_CUTOFF_HZ  = 4000.0
+REALTIME_HP_CUTOFF_HZ  = 2500.0
 
 # Realtime params
 REALTIME_FILTERS          = 48
@@ -213,7 +213,7 @@ REALTIME_GATE_ATTACK_MS                  = 0.1
 REALTIME_GATE_HOLD_MS                    = 4.0
 REALTIME_GATE_RELEASE_MS                 = 20.0
 REALTIME_GATE_ENV_MS                     = 0.02
-REALTIME_GATE_DEPTH_SMOOTH_MS            = 1.0
+REALTIME_GATE_DEPTH_SMOOTH_MS            = 0.5
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
@@ -244,7 +244,7 @@ RESBP_MODAL_LEN_REALTIME        = 2048
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
 RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
-RESBP_STRIKE_ENV_MS_REALTIME    = 10.0
+RESBP_STRIKE_ENV_MS_REALTIME    = 4.0
 
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
@@ -298,7 +298,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = 28
-REALTIME_HF_BOOST_DB = 12
+REALTIME_HF_BOOST_DB = 2
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -3343,7 +3343,12 @@ def build_realtime_model(offline=None, dynamic_time=False):
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
-    mask_smoothed = CausalMovingAverage(taps=96, name="realtime_hf_mask_smooth")(mask_pred)
+    mask_smoothed = CausalExpSmoother(
+    time_const_ms=0.25,              # ~24 samples @48k
+    sample_rate=REALTIME_SAMPLE_RATE,
+    Lmax=64,
+    name="realtime_hf_mask_smooth"
+)(mask_pred)
     mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
 
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
