@@ -45,7 +45,6 @@ PRE-PROCESSING
 ===============================
 
 - Automatic mic→piezo alignment using GCC-PHAT and fractional (sub-sample) shift (disabled by default because inputs are pre-aligned offline)
-- Finetuned audio is normalized to a target RMS level of -25 dBFS, both for base model training and finetuning.
 - Audio is split into contiguous non-overlapping 5-second chunks, plus an optional remainder.
 - Each chunk is split into pick and finger segments, with a 50% ratio of each style.
 
@@ -61,6 +60,8 @@ The training is done in two stages:
 2. Fine-tuning: The base models can then be fine-tuned on audio we do not control neither the structure nor the length of, that may combine playing styles,
    without any true style labels. These rely on the style classification layers from the base models and freeze most of the weights during training,
    allowing the model to adapt to potentially very short amounts of foreign audio, while preserving the learned features.
+   The finetuned realtime model distills from base offline model, as there may not necessarily exist a finetuned offline model.
+   Before training, the finetuned realtime models are normalized to the average RMS of the base training data (~25 dbFS) to ensure the gate and HF behavior is similar.
    
 ================================
 LOSS FUNCTIONS
