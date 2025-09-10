@@ -118,14 +118,16 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-EPOCHS      = 38
+EPOCHS      = 40
 FINETUNE_EPOCHS = 10
 
 # Audio sample‐rates
 OFFLINE_SAMPLE_RATE = 96000
 REALTIME_SAMPLE_RATE = 48000
 
-#INPUT_AVG_RMS_DBFS_TARGET = -23.0
+# We need to normalize the amplitude of the finetuned input audio to match that of the training data,
+# such that the gate params such as threshold can be shared
+FINETUNE_AVG_RMS_DBFS_TARGET = -23.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # NORMALIZED_PREFIX = "_normalized_"
@@ -258,7 +260,7 @@ FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.k
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 1e-4
 
-FINETUNE_DEMO_SEC = 60
+FINETUNE_DEMO_SEC = 10
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -286,7 +288,7 @@ REALTIME_IR_FIR_SIZE          = 129
 REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
-REALTIME_IR_BOOST_DB = 2.0
+REALTIME_IR_BOOST_DB = 0.5
 
 REALTIME_LP_ORDER   = 65
 REALTIME_LP_CUTOFF  = 4000
@@ -298,7 +300,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = 28
-REALTIME_HF_BOOST_DB = 4
+REALTIME_HF_BOOST_DB = 12
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -351,6 +353,10 @@ STEMS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "stems")
 STEMS_OFFLINE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "offline")
 STEMS_REALTIME_OUT_DIR = os.path.join(STEMS_OUT_DIR, "realtime")
 
+STEMS_FINETUNE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "finetune")
+STEMS_FINETUNE_OFFLINE_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "offline")
+STEMS_FINETUNE_REALTIME_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "realtime")
+
 SAVE_WEIGHTS           = False
 
 # ─── Minimum‑phase IR low‑pass taps for the realtime IR branch ──────────────
@@ -388,7 +394,8 @@ for dir_path in [
     LOGS_OFFLINE_OUT_DIR, LOGS_REALTIME_OUT_DIR, DEMO_CHECKPOINTS_OFFLINE_OUT_DIR,
     DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR,
     FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR,
-    STEMS_OFFLINE_OUT_DIR, STEMS_REALTIME_OUT_DIR
+    STEMS_OFFLINE_OUT_DIR, STEMS_REALTIME_OUT_DIR,
+    STEMS_FINETUNE_OFFLINE_OUT_DIR, STEMS_FINETUNE_REALTIME_OUT_DIR
 ]:
     os.makedirs(dir_path, exist_ok=True)
 
@@ -3588,6 +3595,35 @@ def add_sw_realtime_finetune_nf(x, y):
 
     return inputs, outputs, (sw_audio, sw_style)
 
+@register_keras_serializable()
+def add_sw_realtime_dual_finetune_nf(x, y):
+    """
+    Finetune (no labels) with teacher input:
+      x = (x_realtime_48k, x_offline_96k)
+      y = (y_audio_realtime, style_flag_unused)
+    Uses only the audio loss (style BCE disabled via loss_weights=[1.0, 0.0]).
+    Forces style to use the predicted path (style_force=0).
+    """
+    x_realtime, x_offline = x
+    y_audio, _ = y
+    b = tf.shape(x_realtime)[0]
+    T_realtime = tf.shape(x_realtime)[1]
+
+    style_true  = tf.zeros((b, 1), dtype=tf.float32)  # dummy
+    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 → use predicted style
+
+    inputs = {
+        'realtime_piezo_input':         x_realtime,
+        'realtime_offline_piezo_input': x_offline,
+        'realtime_style_true_input':    style_true,
+        'realtime_style_force_input':   style_force,
+    }
+    outputs = (y_audio, style_true)
+
+    sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
+    sw_style = tf.zeros_like(style_true, dtype=tf.float32)  # BCE disabled anyway
+    return inputs, outputs, (sw_audio, sw_style)
+
 def set_trainable_for_finetune_offline(model):
     """
     Freeze most layers; enable only FiLM dense layers and a few small heads/scales.
@@ -3970,65 +4006,143 @@ def render_isolated_stems(
     else:
         print(f"✅ Stems saved to {out_dir}.")
 
-def run_render_stems_offline():
-    # Load offline dynamic or build from checkpoint
-    if os.path.exists(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)):
-        offline_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
-    else:
-        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
-        if ckpts:
-            print("Loading latest checkpoint:", ckpts[-1])
-            static = tf.keras.models.load_model(ckpts[-1], compile=False)
-            offline_dyn = build_offline_model(dynamic_time=True)
-            offline_dyn.set_weights(static.get_weights())
-        else:
-            static = build_offline_model(dynamic_time=False)
-            offline_dyn = build_offline_model(dynamic_time=True)
-            offline_dyn.set_weights(static.get_weights())
+def run_render_stems_offline(use_finetuned=False):
+    """
+    Render offline stems from either baseline or fine-tuned dynamic model.
+    - If use_finetuned=True, tries FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME and finetune src/target.
+      Falls back to baseline if fine-tuned model is missing.
+    - If use_finetuned=False, uses baseline logic (dynamic->ckpt->fresh).
+    """
+    model_path = None
+    src = None
+    tgt = None
+    out_dir = STEMS_OFFLINE_OUT_DIR
+    sample_rate = OFFLINE_SAMPLE_RATE
 
-    assert_has_pairs()
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    if use_finetuned:
+        candidate = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(candidate):
+            model_path = candidate
+            out_dir = STEMS_FINETUNE_OFFLINE_OUT_DIR
+            # Prefer the finetune pair
+            src_ft = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+            tgt_ft = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+            if os.path.exists(src_ft) and os.path.exists(tgt_ft):
+                src, tgt = src_ft, tgt_ft
+            else:
+                # Fallback to baseline demo pair if finetune audio not present
+                if not all_pairs:
+                    print("ERROR: No baseline training pairs found and finetune source/target missing.")
+                    sys.exit(1)
+                src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        else:
+            print("[stems/offline] Fine-tuned dynamic model not found; falling back to baseline.")
+            use_finetuned = False
+
+    if not use_finetuned:
+        # Baseline dynamic model or fallback to (ckpt->static)
+        dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(dyn_path):
+            model_path = dyn_path
+        else:
+            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
+            if ckpts:
+                print("Loading latest checkpoint:", ckpts[-1])
+                static = tf.keras.models.load_model(ckpts[-1], compile=False)
+                offline_dyn = build_offline_model(dynamic_time=True)
+                offline_dyn.set_weights(static.get_weights())
+                # persist a temp dynamic to speed up next time
+                model_path = os.path.join(MODELS_OFFLINE_OUT_DIR, "_tmp_offline_dyn_from_ckpt.keras")
+                offline_dyn.save(model_path)
+            else:
+                static = build_offline_model(dynamic_time=False)
+                offline_dyn = build_offline_model(dynamic_time=True)
+                offline_dyn.set_weights(static.get_weights())
+                model_path = os.path.join(MODELS_OFFLINE_OUT_DIR, "_tmp_offline_dyn_fresh.keras")
+                offline_dyn.save(model_path)
+        # Baseline demo pair if not set already
+        if src is None or tgt is None:
+            assert_has_pairs()
+            src, tgt = all_pairs[DEMO_PAIR_INDEX]
+
+    # Load chosen model
+    offline_dyn = tf.keras.models.load_model(model_path, compile=False)
     dbg = build_offline_debug_model(offline_dyn)
     render_isolated_stems(
         debug_model=dbg,
         path_src=src,
         path_tgt=tgt,
-        out_dir=STEMS_OFFLINE_OUT_DIR,
-        sample_rate=OFFLINE_SAMPLE_RATE,
+        out_dir=out_dir,
+        sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
         offset_sec=LONG_DEMO_OFFSET_SEC
     )
 
+def run_render_stems_realtime(use_finetuned=False):
+    """
+    Render realtime stems from either baseline or fine-tuned dynamic model.
+    - If use_finetuned=True, tries FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME and finetune src/target.
+      Falls back to baseline if fine-tuned model is missing.
+    """
+    model_path = None
+    src = None
+    tgt = None
+    out_dir = STEMS_REALTIME_OUT_DIR
+    sample_rate = REALTIME_SAMPLE_RATE
 
-def run_render_stems_realtime():
-    # Load realtime dynamic or build from checkpoint
-    if os.path.exists(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)):
-        realtime_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
-    else:
-        ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
-        if ckpts:
-            print("Loading latest checkpoint:", ckpts[-1])
-            static = tf.keras.models.load_model(ckpts[-1], compile=False)
-            
-            realtime_dyn = build_realtime_model(dynamic_time=True)
-            copy_weights_by_name(realtime_dyn, static)
+    if use_finetuned:
+        candidate = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(candidate):
+            model_path = candidate
+            out_dir = STEMS_FINETUNE_REALTIME_OUT_DIR
+            # Prefer the finetune pair
+            src_ft = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+            tgt_ft = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+            if os.path.exists(src_ft) and os.path.exists(tgt_ft):
+                src, tgt = src_ft, tgt_ft
+            else:
+                # Fallback to baseline demo pair if finetune audio not present
+                if not all_pairs:
+                    print("ERROR: No baseline training pairs found and finetune source/target missing.")
+                    sys.exit(1)
+                src, tgt = all_pairs[DEMO_PAIR_INDEX]
         else:
-            static = build_realtime_model(dynamic_time=False)
-            
-            
-            
-            realtime_dyn = build_realtime_model(dynamic_time=True)
-            copy_weights_by_name(realtime_dyn, static)
+            print("[stems/realtime] Fine-tuned dynamic model not found; falling back to baseline.")
+            use_finetuned = False
 
-    assert_has_pairs()
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    if not use_finetuned:
+        dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(dyn_path):
+            model_path = dyn_path
+        else:
+            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
+            if ckpts:
+                print("Loading latest checkpoint:", ckpts[-1])
+                static = tf.keras.models.load_model(ckpts[-1], compile=False)
+                realtime_dyn = build_realtime_model(dynamic_time=True)
+                copy_weights_by_name(realtime_dyn, static)
+                model_path = os.path.join(MODELS_REALTIME_OUT_DIR, "_tmp_realtime_dyn_from_ckpt.keras")
+                realtime_dyn.save(model_path)
+            else:
+                static = build_realtime_model(dynamic_time=False)
+                realtime_dyn = build_realtime_model(dynamic_time=True)
+                copy_weights_by_name(realtime_dyn, static)
+                model_path = os.path.join(MODELS_REALTIME_OUT_DIR, "_tmp_realtime_dyn_fresh.keras")
+                realtime_dyn.save(model_path)
+        # Baseline demo pair if not set already
+        if src is None or tgt is None:
+            assert_has_pairs()
+            src, tgt = all_pairs[DEMO_PAIR_INDEX]
+
+    # Load chosen model
+    realtime_dyn = tf.keras.models.load_model(model_path, compile=False)
     dbg = build_realtime_debug_model(realtime_dyn)
     render_isolated_stems(
         debug_model=dbg,
         path_src=src,
         path_tgt=tgt,
-        out_dir=STEMS_REALTIME_OUT_DIR,
-        sample_rate=REALTIME_SAMPLE_RATE,
+        out_dir=out_dir,
+        sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
         offset_sec=LONG_DEMO_OFFSET_SEC
     )
@@ -4333,10 +4447,11 @@ def fine_tune():
 
     x_full, sr_x = sf.read(src, dtype='float32', always_2d=True)
     y_full, sr_y = sf.read(tgt, dtype='float32', always_2d=True)
-
-    # No additional normalization/scaling (already normalized upstream per comments)
-    x_norm = x_full
-    y_norm = y_full
+    
+        # JIT normalize both source and target using piezo RMS as reference
+    x_norm, y_norm, g_norm, rms_src_before = normalize_pair_in_memory(x_full, y_full, target_dbfs=FINETUNE_AVG_RMS_DBFS_TARGET, reference='source')
+    print(f"[finetune] JIT normalized pair by {20*np.log10(max(g_norm,1e-12)):+.2f} dB to target {FINETUNE_AVG_RMS_DBFS_TARGET} dBFS "
+          f"(piezo RMS before: {20*np.log10(max(rms_src_before,1e-12)):.2f} dBFS).")
 
     picked_pairs = [(src, tgt)]
     finger_pairs = [(src, tgt)]
@@ -4426,7 +4541,7 @@ def fine_tune():
     finetuned_offline_dynamic.save(ft_offline_dyn)
     print("✅ Saved finetuned offline:", ft_offline_static, "and", ft_offline_dyn)
 
-    # ────────────── REALTIME FINETUNE (48 kHz) ───────────────────────────────
+        # ────────────── REALTIME FINETUNE (48 kHz) — with base-teacher KD (training-only) ───────────────
     print("\n🔧 Fine-tuning REALTIME on new pair…")
     realtime_base_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
     if not os.path.exists(realtime_base_path):
@@ -4434,18 +4549,59 @@ def fine_tune():
         print("Run --train-realtime first.")
         sys.exit(1)
 
+    # Load baseline realtime (student weights init)
     base_realtime_full = tf.keras.models.load_model(realtime_base_path, compile=False)
-    finetuned_realtime_static = build_realtime_model(offline=None, dynamic_time=False)  # independent of offline
-    # Copy by name for safety
-    copy_weights_by_name(finetuned_realtime_static, base_realtime_full, verbose=True)
-    set_trainable_for_finetune_realtime(finetuned_realtime_static)
 
-    # Calibrate loss weights on 48k
-    ds_realtime_val = make_mixed_ds(REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE)
-    ds_realtime_val = ds_realtime_val.map(add_sw_realtime_finetune_nf).take(CALIBRATION_CHUNK_COUNT)
+    # Load the BASE offline teacher (not finetuned), causalized for KD
+    offline_base_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(offline_base_dyn_path):
+        print("ERROR: base offline dynamic model not found at", offline_base_dyn_path)
+        print("Run --train-offline first.")
+        sys.exit(1)
+    offline_nc_base = tf.keras.models.load_model(offline_base_dyn_path, compile=False)
+    offline_causal_base = build_offline_model_causal(offline_nc_base, dynamic_time=True)
 
+    # Build student training graph WITH teacher for KD, but BCE disabled
+    finetuned_realtime_train = build_realtime_model(offline=offline_causal_base, dynamic_time=False)
+    copy_weights_by_name(finetuned_realtime_train, base_realtime_full, verbose=True)
+    set_trainable_for_finetune_realtime(finetuned_realtime_train)
+
+    # Dual dataset: 48k student + 96k teacher input
+    def make_mixed_ds_dual(seg_len_realtime):
+        chunks = build_chunks(pairs_list=all_pairs, seg_len=seg_len_realtime, sample_rate=REALTIME_SAMPLE_RATE)
+        # Signatures: (x_rt, x_off), (y_audio_rt, style)
+        sig_x = (
+            tf.TensorSpec((seg_len_realtime, 1), tf.float32),                  # 48k
+            tf.TensorSpec((seg_len_realtime * (OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE), 1), tf.float32)  # 96k
+        )
+        sig_y = (tf.TensorSpec((seg_len_realtime, 1), tf.float32), tf.TensorSpec((), tf.float32))
+
+        def gen_pick():
+            for elt in segment_generator_dual(seg_len_realtime=seg_len_realtime,
+                                              chunks=chunks, is_pick_chunks=True,
+                                              realtime_sample_rate=REALTIME_SAMPLE_RATE,
+                                              offline_sample_rate=OFFLINE_SAMPLE_RATE):
+                yield elt
+        def gen_fing():
+            for elt in segment_generator_dual(seg_len_realtime=seg_len_realtime,
+                                              chunks=chunks, is_pick_chunks=False,
+                                              realtime_sample_rate=REALTIME_SAMPLE_RATE,
+                                              offline_sample_rate=OFFLINE_SAMPLE_RATE):
+                yield elt
+
+        ds_pu = tf.data.Dataset.from_generator(gen_pick, output_signature=(sig_x, sig_y))
+        ds_fu = tf.data.Dataset.from_generator(gen_fing, output_signature=(sig_x, sig_y))
+        mixed = tf.data.Dataset.sample_from_datasets(
+            [ds_pu, ds_fu],
+            weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
+            seed=SEED
+        )
+        return mixed.batch(REALTIME_BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+    # Calibrate loss weights on 48k (teacher-aware pipeline)
+    ds_realtime_val_dual = make_mixed_ds_dual(REALTIME_SEG_LEN).map(add_sw_realtime_dual_finetune_nf).take(CALIBRATION_CHUNK_COUNT)
     new_w_rt, _ = calibrate_loss_weights(
-        model=finetuned_realtime_static, dataset=ds_realtime_val, sample_rate=REALTIME_SAMPLE_RATE, n_batches=5
+        model=finetuned_realtime_train, dataset=ds_realtime_val_dual, sample_rate=REALTIME_SAMPLE_RATE, n_batches=5
     )
     L1_WEIGHT              = new_w_rt['l1']
     STFT_WEIGHT            = new_w_rt['stft']
@@ -4457,33 +4613,77 @@ def fine_tune():
           f" L1={L1_WEIGHT:.6f} STFT={STFT_WEIGHT:.6f} MEL={MEL_WEIGHT:.6f}"
           f" ENV={RMS_ENV_WEIGHT:.6f} HF={HF_WEIGHT:.6f} RESBP_BL={RESBP_BAND_LOSS_WEIGHT:.6f}")
 
+    # Compile with BCE disabled; keep KD losses active via the model graph
     loss_rt = CombinedLoss(REALTIME_SAMPLE_RATE, extra_small_cplx=False)
-    finetuned_realtime_static.compile(
+    finetuned_realtime_train.compile(
         optimizer=tf.keras.optimizers.Adam(FINETUNE_REALTIME_LR),
         loss=[loss_rt, "binary_crossentropy"],
-        loss_weights=[1.0, 0.0],   # disable BCE during finetune
+        loss_weights=[1.0, 0.0],   # disable BCE
         metrics=[["mae"], []]
     )
-    finetuned_realtime_static.summary()
 
-    ds_realtime = make_mixed_ds(REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE).map(add_sw_realtime_finetune_nf)
+    # Optional: gently anneal KD alphas down over the short finetune to let the student adapt
+    kd_targets_ft = {
+        # Reduce KD pressure progressively; keep some constraints to prevent drift
+        "audio_distill":       (REALTIME_DISTILL_ALPHA * 0.5,            0.15, 0, FINETUNE_EPOCHS),
+        "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA * 0.6, 0.10, 0, FINETUNE_EPOCHS),
+        "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA * 0.5,       0.2,  0, FINETUNE_EPOCHS),
+        "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA * 0.5,       0.2,  0, FINETUNE_EPOCHS),
+        "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA * 0.5,  0.2,  0, FINETUNE_EPOCHS),
+        "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA * 0.5,0.2,  0, FINETUNE_EPOCHS),
+        "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA * 0.6,    0.2,  0, FINETUNE_EPOCHS),
+        "stem_resbp_distill":  (REALTIME_STEM_RESBP_DISTILL_ALPHA * 0.6, 0.2,  0, FINETUNE_EPOCHS),
+        "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA * 0.6,    0.2,  0, FINETUNE_EPOCHS),
+        "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA * 0.5,  0.1,  0, FINETUNE_EPOCHS),
+        # Make the student’s own style dominate by the end (for deployment independence)
+        "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,               0.15, 0, FINETUNE_EPOCHS)
+    }
+    callbacks_rt = [TerminateOnNaN(), KDAlphaScheduler(kd_targets_ft)]
+
+    ds_realtime_dual = make_mixed_ds_dual(REALTIME_SEG_LEN).map(add_sw_realtime_dual_finetune_nf)
     ft_chunks_realtime = build_chunks(pairs_list=[(src, tgt)], seg_len=REALTIME_SEG_LEN, sample_rate=REALTIME_SAMPLE_RATE)
     steps_realtime = max(approx_steps_from_chunks(ft_chunks_realtime, REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE, REALTIME_BATCH_SIZE), 1)
-    finetuned_realtime_static.fit(ds_realtime, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_realtime, verbose=1)
 
-    ft_realtime_static = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-    finetuned_realtime_static.save(ft_realtime_static)
+    finetuned_realtime_train.fit(ds_realtime_dual, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_realtime, verbose=1, callbacks=callbacks_rt)
+
+    # Export TEACHER-FREE realtime models by copying weights by name into a teacher-less graph
+    ft_realtime_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+    finetuned_realtime_static = build_realtime_model(offline=None, dynamic_time=False)
+    copy_weights_by_name(finetuned_realtime_static, finetuned_realtime_train, verbose=True)
+    finetuned_realtime_static.save(ft_realtime_static_path)
+
+    ft_realtime_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
     finetuned_realtime_dynamic = build_realtime_model(offline=None, dynamic_time=True)
-    finetuned_realtime_dynamic.set_weights(finetuned_realtime_static.get_weights())
-    ft_realtime_dyn = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-    finetuned_realtime_dynamic.save(ft_realtime_dyn)
-    print("✅ Saved finetuned realtime:", ft_realtime_static, "and", ft_realtime_dyn)
+    copy_weights_by_name(finetuned_realtime_dynamic, finetuned_realtime_static, verbose=True)
+    finetuned_realtime_dynamic.save(ft_realtime_dyn_path)
+
+    print("✅ Saved finetuned realtime:", ft_realtime_static_path, "and", ft_realtime_dyn_path)
 
     return finetuned_offline_dynamic, finetuned_realtime_dynamic
 
 def compute_rms(sig):
     sig64 = sig.astype(np.float64, copy=False)
     return float(np.sqrt(np.mean(sig64 * sig64) + 1e-12))
+
+def normalize_pair_in_memory(x_full, y_full, target_dbfs=FINETUNE_AVG_RMS_DBFS_TARGET, reference='source'):
+    """
+    Scales both x_full (piezo) and y_full (mic) by the same factor, computed from 'reference':
+      - reference='source' uses the piezo RMS to compute the gain (recommended).
+      - The target is -23 dBFS RMS by default.
+
+    x_full, y_full: float32, shape (N, C)
+    Returns: (x_scaled, y_scaled, gain, rms_before_source)
+    """
+    target_rms = 10.0 ** (float(target_dbfs) / 20.0)
+    ref_sig = x_full[:, 0].astype(np.float32, copy=False)
+    rms_before = compute_rms(ref_sig)
+    if not np.isfinite(rms_before) or rms_before < 1e-12:
+        gain = 1.0
+    else:
+        gain = float(target_rms / rms_before)
+    x_scaled = (x_full.astype(np.float32, copy=False) * gain)
+    y_scaled = (y_full.astype(np.float32, copy=False) * gain)
+    return x_scaled, y_scaled, gain, rms_before
 
 def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir):
     for dir_path in [logs_out_dir, demo_checkpoints_out_dir, demo_generator_outputs_out_dir]:
@@ -4593,10 +4793,26 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
-        if (len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only"):
-            run_render_stems_offline()
-        if (len(sys.argv) <= 2 or sys.argv[2] !="--offline-only"):
-            run_render_stems_realtime()
+        # Optional flags (can be combined):
+        # --finetuned: render stems from finetuned dynamic models (if present)
+        # --both:      render both baseline and finetuned stems
+        # --offline-only / --realtime-only: restrict branches
+        args = set(sys.argv[2:])
+
+        do_offline  = ("--realtime-only" not in args)
+        do_realtime = ("--offline-only"  not in args)
+
+        do_finetuned = ("--finetuned" in args)
+        do_both      = ("--both" in args)
+
+        if do_both:
+            if do_offline:  run_render_stems_offline(use_finetuned=False)
+            if do_offline:  run_render_stems_offline(use_finetuned=True)
+            if do_realtime: run_render_stems_realtime(use_finetuned=False)
+            if do_realtime: run_render_stems_realtime(use_finetuned=True)
+        else:
+            if do_offline:  run_render_stems_offline(use_finetuned=do_finetuned)
+            if do_realtime: run_render_stems_realtime(use_finetuned=do_finetuned)
         sys.exit(0)
     else:
         print("No command given.")
