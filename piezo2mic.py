@@ -120,7 +120,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 EPOCHS      = 40
-FINETUNE_EPOCHS = 1
+FINETUNE_EPOCHS = 10
 
 # Audio sample‐rates
 OFFLINE_SAMPLE_RATE = 96000
@@ -4614,6 +4614,8 @@ def fine_tune():
         loss_weights=[1.0, 0.0],   # disable BCE
         metrics=[["mae"], []]
     )
+    
+    finetuned_realtime_train.summary()
 
     # Optional: gently anneal KD alphas down over the short finetune to let the student adapt
     kd_targets_ft = {
