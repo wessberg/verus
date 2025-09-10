@@ -119,7 +119,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 EPOCHS      = 40
-FINETUNE_EPOCHS = 10
+FINETUNE_EPOCHS = 1
 
 # Audio sample‐rates
 OFFLINE_SAMPLE_RATE = 96000
