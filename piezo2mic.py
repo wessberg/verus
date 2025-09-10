@@ -45,7 +45,7 @@ PRE-PROCESSING
 ===============================
 
 - Automatic mic→piezo alignment using GCC-PHAT and fractional (sub-sample) shift (disabled by default because inputs are pre-aligned offline)
-- Audio is normalized to a target RMS level of -23 dBFS, both for base model training and finetuning.
+- Finetuned audio is normalized to a target RMS level of -25 dBFS, both for base model training and finetuning.
 - Audio is split into contiguous non-overlapping 5-second chunks, plus an optional remainder.
 - Each chunk is split into pick and finger segments, with a 50% ratio of each style.
 
@@ -127,7 +127,7 @@ REALTIME_SAMPLE_RATE = 48000
 
 # We need to normalize the amplitude of the finetuned input audio to match that of the training data,
 # such that the gate params such as threshold can be shared
-FINETUNE_AVG_RMS_DBFS_TARGET = -23.0
+FINETUNE_AVG_RMS_DBFS_TARGET = -25.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # NORMALIZED_PREFIX = "_normalized_"
@@ -1408,7 +1408,8 @@ def generate_demo_from_files(model,
                              offset_sec=LONG_DEMO_OFFSET_SEC,
                              sec=LONG_DEMO_SEC,
                              block_sec=12.0,
-                             resample_margin_ms=50.0):
+                             resample_margin_ms=50.0,
+                             normalize_input_dbfs=None):
     """
     Streaming/chunked version: keeps memory flat by processing blocks with
     sufficient left/right context and a small resampling margin, and writes out
@@ -1416,11 +1417,10 @@ def generate_demo_from_files(model,
 
     - Handles sample-rate mismatch via resample_poly per block.
     - Uses overlap-and-trim so only the "valid" interior (free of edge effects) is written.
-    - For offline (96 kHz), also applies HF boost as in your original function.
-
-    Args:
-        block_sec: length (in seconds at model SR) of the core region written per iteration.
-        resample_margin_ms: extra margin (ms at file SR) around each block to absorb resampler transients.
+    - For offline (96 kHz), also applies HF/resbp demo boosts if requested.
+    - If normalize_input_dbfs is not None, compute a single scalar gain from the piezo
+      over the exact region and apply it JIT to both input (and written src/tgt) so
+      gate/HF behavior matches training operating point (e.g., -25 dBFS).
     """
     os.makedirs(out_dir, exist_ok=True)
         
@@ -1434,7 +1434,6 @@ def generate_demo_from_files(model,
         model = boost_hf_scale_in_model(model, "realtime_ir_scale", gain_db=REALTIME_IR_BOOST_DB)
         
     if sample_rate == OFFLINE_SAMPLE_RATE and OFFLINE_RESBP_BOOST_DB != 0.0:
-        # new band-pass stem
         model = boost_hf_scale_in_model(model, "offline_resbp_scale", gain_db=OFFLINE_RESBP_BOOST_DB)
     elif sample_rate == REALTIME_SAMPLE_RATE and REALTIME_RESBP_BOOST_DB != 0.0:
         model = boost_hf_scale_in_model(model, "realtime_resbp_scale", gain_db=REALTIME_RESBP_BOOST_DB)
@@ -1445,6 +1444,19 @@ def generate_demo_from_files(model,
     START_FRAME = int(round(offset_sec * file_sr))
     TOTAL_FRAMES = int(round(sec * file_sr))
     END_FRAME = START_FRAME + TOTAL_FRAMES
+
+    # Optional normalization gain computed once for the whole region at file SR
+    g_norm = 1.0
+    if normalize_input_dbfs is not None and TOTAL_FRAMES > 0:
+        x_full_2d, _ = sf.read(path_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
+        x_full = x_full_2d[:, 0]
+        rms_src = compute_rms(x_full)
+        target_rms = 10.0 ** (float(normalize_input_dbfs) / 20.0)
+        if np.isfinite(rms_src) and rms_src > 1e-12:
+            g_norm = float(target_rms / rms_src)
+        else:
+            g_norm = 1.0
+        print(f"[demo] Applying {20*np.log10(max(g_norm,1e-12)):+.2f} dB normalization to match {normalize_input_dbfs} dBFS (piezo RMS={20*np.log10(max(rms_src,1e-12)):.2f} dBFS)")
 
     # Style flag from filename (same logic as your original function)
     if "pick" in path_src:
@@ -1506,10 +1518,10 @@ def generate_demo_from_files(model,
 
         # Read source (and target if needed) in FILE SR
         x_block_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        x_file = x_block_2d[:, 0]
+        x_file = x_block_2d[:, 0] * g_norm
         if not only_prediction:
             y_block_2d, _ = sf.read(path_target, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-            y_file = y_block_2d[:, 0]
+            y_file = y_block_2d[:, 0] * g_norm
 
         # Resample block to MODEL SR
         if file_sr != sample_rate:
@@ -3776,32 +3788,13 @@ def render_isolated_stems(
     sec=LONG_DEMO_SEC,
     offset_sec=LONG_DEMO_OFFSET_SEC,
     block_sec=12.0,
-    resample_margin_ms=50.0
+    resample_margin_ms=50.0,
+    normalize_input_dbfs=None
 ):
     """
-    Render stems with both predicted and forced style variants:
-      - For each stem: write one predicted-style file and one (or two) forced-style file(s).
-      - If style is known from filename, forced uses that label (pick/finger).
-        Otherwise, both forced_pick and forced_finger are written.
-      - Prints average predicted style probability over the rendered region.
-
-    Files written (predicted):
-      piezo_source.wav
-      mic_target.wav
-      pred_full_predicted.wav
-      stem_hf_only.wav
-      stem_ir_lowpass.wav           (realtime only, if exposed)
-      stem_resbp_only.wav           (if exposed)
-      stem_pick_only.wav
-      stem_finger_only.wav
-
-    Files written (forced):
-      pred_full_forced_<style>.wav
-      stem_hf_only_forced_<style>.wav
-      stem_ir_lowpass_forced_<style>.wav
-      stem_resbp_only_forced_<style>.wav
-      stem_pick_only_forced_<style>.wav
-      stem_finger_only_forced_<style>.wav
+    Render stems with both predicted and forced style variants.
+    If normalize_input_dbfs is provided, the piezo input for the rendered region
+    is scaled by a single gain to match that RMS. Target is written with the same gain.
     """
     os.makedirs(out_dir, exist_ok=True)
 
@@ -3809,7 +3802,6 @@ def render_isolated_stems(
     _boost_scales_for_stems(debug_model, sample_rate)
 
     # Always render both forced variants, regardless of filename.
-    # Keep style_true_flag only for reporting (predicted style averaging stays unchanged).
     if "pick" in path_src:
         style_true_flag = 1.0
     elif "finger" in path_src:
@@ -3829,6 +3821,19 @@ def render_isolated_stems(
     END_FRAME = START_FRAME + TOTAL_FRAMES
     want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
 
+    # Normalization gain computed once for the region
+    g_norm = 1.0
+    if normalize_input_dbfs is not None and TOTAL_FRAMES > 0:
+        x_full_2d, _ = sf.read(path_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
+        x_full = x_full_2d[:, 0]
+        rms_src = compute_rms(x_full)
+        target_rms = 10.0 ** (float(normalize_input_dbfs) / 20.0)
+        if np.isfinite(rms_src) and rms_src > 1e-12:
+            g_norm = float(target_rms / rms_src)
+        else:
+            g_norm = 1.0
+        print(f"[stems] Applying {20*np.log10(max(g_norm,1e-12)):+.2f} dB normalization to match {normalize_input_dbfs} dBFS (piezo RMS={20*np.log10(max(rms_src,1e-12)):.2f} dBFS)")
+
     left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
@@ -3837,25 +3842,21 @@ def render_isolated_stems(
     style_pred_in  = np.zeros((1, 1), dtype=np.float32)  # ignored unless forced=0
     force_pred_in  = np.zeros((1, 1), dtype=np.float32)  # 0 = use prediction
 
-    # Build pass spec list: predicted + forced set(s)
     pass_specs = [("pred", style_pred_in, force_pred_in)]
     for key, style_val in forced_variants:
         pass_specs.append((key, style_val, np.ones((1, 1), dtype=np.float32)))  # 1 = force
 
-    # Open writers per pass
     def open_writers_for_pass(pass_key):
         is_pred = (pass_key == "pred")
-        suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"  # "_pick" or "_finger"
+        suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"
 
         writers = {}
-        # Source/target are common (write only once in pred pass to avoid duplication)
         if is_pred:
             writers["src"] = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w',
                                           samplerate=sample_rate, channels=1, subtype='FLOAT')
             writers["tgt"] = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"), mode='w',
                                           samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-        # Full mix
         if is_pred:
             writers["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w',
                                            samplerate=sample_rate, channels=1, subtype='FLOAT')
@@ -3863,12 +3864,10 @@ def render_isolated_stems(
             writers["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w',
                                            samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-        # Stems
         name_hf = "stem_hf_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"
         writers["hf"] = sf.SoundFile(os.path.join(out_dir, name_hf), mode='w',
                                      samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-        # Optional stems opened lazily when the outputs exist
         writers["ir"] = None
         writers["resbp"] = None
 
@@ -3910,8 +3909,8 @@ def render_isolated_stems(
 
         x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
         y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        x_file = x_blk_2d[:, 0]
-        y_file = y_blk_2d[:, 0]
+        x_file = x_blk_2d[:, 0] * g_norm
+        y_file = y_blk_2d[:, 0] * g_norm
 
         if file_sr != sample_rate:
             x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
@@ -3936,7 +3935,6 @@ def render_isolated_stems(
 
         x_b = x_inp[None, :, None].astype(np.float32)
 
-        # Process each pass (predicted + forced variant(s))
         for pass_key, style_in, force_in in pass_specs:
             outs = debug_model.predict([x_b, style_in, force_in], verbose=0)
             if isinstance(outs, (list, tuple)):
@@ -3948,19 +3946,14 @@ def render_isolated_stems(
 
             wset = pass_writers[pass_key]
 
-            # Accumulate predicted style only on the predicted pass
             if pass_key == "pred" and "style_pred" in outs:
                 sp = float(np.asarray(outs["style_pred"])[0, 0])
                 pred_prob_sum += sp * float(core_len)
                 pred_prob_count += core_len
 
-            # Full mix
             wset["full"].write(core_of("y_pred"))
-
-            # HF stem
             wset["hf"].write(core_of("hf_scaled"))
 
-            # Optional IR stem
             if "ir_only" in outs:
                 if wset["ir"] is None:
                     fn = "stem_ir_lowpass.wav" if pass_key == "pred" else f"stem_ir_lowpass_{pass_key.replace('forced_', 'forced_')}.wav"
@@ -3968,7 +3961,6 @@ def render_isolated_stems(
                                               samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["ir"].write(core_of("ir_only"))
 
-            # Optional resbp stem
             if "resbp" in outs:
                 if wset["resbp"] is None:
                     fn = "stem_resbp_only.wav" if pass_key == "pred" else f"stem_resbp_only_{pass_key.replace('forced_', 'forced_')}.wav"
@@ -3976,7 +3968,6 @@ def render_isolated_stems(
                                                  samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["resbp"].write(core_of("resbp"))
 
-            # Pick/finger stems
             wset["pick"].write(core_of("pick_c"))
             wset["fing"].write(core_of("finger_c"))
 
@@ -3989,7 +3980,6 @@ def render_isolated_stems(
 
         produced_model += core_len
 
-    # Close all files
     for wset in pass_writers.values():
         for key, w in wset.items():
             try:
@@ -3998,7 +3988,6 @@ def render_isolated_stems(
             except Exception:
                 pass
 
-    # Report predicted style over the rendered region
     if pred_prob_count > 0:
         p = pred_prob_sum / float(pred_prob_count)
         label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
@@ -4075,7 +4064,8 @@ def run_render_stems_offline(use_finetuned=False):
         out_dir=out_dir,
         sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC
+        offset_sec=LONG_DEMO_OFFSET_SEC,
+        normalize_input_dbfs = FINETUNE_AVG_RMS_DBFS_TARGET if use_finetuned else None
     )
 
 def run_render_stems_realtime(use_finetuned=False):
@@ -4144,7 +4134,8 @@ def run_render_stems_realtime(use_finetuned=False):
         out_dir=out_dir,
         sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC
+        offset_sec=LONG_DEMO_OFFSET_SEC,
+        normalize_input_dbfs = FINETUNE_AVG_RMS_DBFS_TARGET if use_finetuned else None
     )
 
 def train_shared(
@@ -4431,7 +4422,8 @@ def generate_fine_tune_demo(model, sample_rate, subdir_name):
         path_src        = os.path.join(FINETUNE_SRC_DIR, "source.wav"),
         path_target     = os.path.join(FINETUNE_SRC_DIR, "target.wav"),
         out_dir         = out_dir,
-        prediction_name = "demo_pred"
+        prediction_name = "demo_pred",
+        normalize_input_dbfs = FINETUNE_AVG_RMS_DBFS_TARGET  # JIT normalization for finetune demos
     )
 
 def fine_tune():
@@ -4669,7 +4661,7 @@ def normalize_pair_in_memory(x_full, y_full, target_dbfs=FINETUNE_AVG_RMS_DBFS_T
     """
     Scales both x_full (piezo) and y_full (mic) by the same factor, computed from 'reference':
       - reference='source' uses the piezo RMS to compute the gain (recommended).
-      - The target is -23 dBFS RMS by default.
+      - The target is -25 dBFS RMS by default.
 
     x_full, y_full: float32, shape (N, C)
     Returns: (x_scaled, y_scaled, gain, rms_before_source)
