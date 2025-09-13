@@ -1254,6 +1254,23 @@ def precache_finetune_resampled_pair(x_full, y_full, file_sr, sr_rt=REALTIME_SAM
     y48 = to_sr(y_m, file_sr, sr_rt).astype(np.float32, copy=False)
     return {"x96": x96, "y96": y96, "x48": x48, "y48": y48}
 
+# Helper: causal separable conv (left-pad only)
+@register_keras_serializable()
+def causal_sep_conv(x, filters, kernel, dilation, name, activation=None, bias_constraint=None):
+    pad_left = (int(kernel) - 1) * int(dilation)
+    x = ZeroPadding1D((pad_left, 0), name=f"{name}_pad")(x)
+    x = SeparableConv1D(
+        filters=filters,
+        kernel_size=kernel,
+        dilation_rate=dilation,
+        padding="valid",
+        bias_constraint=bias_constraint,
+        name=name
+    )(x)
+    if activation:
+        x = Activation(activation, name=f"{name}_{activation}")(x)
+    return x
+
 def segment_generator_from_arrays(seg_len, x, y, is_pick_chunks, min_amp=SEGMENT_GENERATOR_MIN_AMP_THRESH):
     """
     Simple, fast generator backed by already-resampled arrays.
@@ -1386,46 +1403,59 @@ def compute_ir_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, ve
     return int(LC_ir)
 
 def compute_main_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
-    """
-    Main realtime stack LC (48k samples):
-      LC_main = sum((k-1)*d) across realtime_sep_* (causal padding) = REALTIME_RECEPTIVE_FIELD - 1
-    """
     R_main = _sum_sep_rf_for_prefix(model, r'^realtime_sep_\d+$')
-    LC_main = int(R_main - 1)
+    R_pre  = _sum_sep_rf_for_prefix(model, r'^realtime_pre_\d+_sep$')
+    LC_main = int((R_main - 1) + (R_pre - 1))
     if verbose:
         ms = 1000.0 * LC_main / float(sample_rate)
         print(f"[main] LC = {LC_main} samples ({ms:.2f} ms)")
     return LC_main
 
 def compute_hf_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
-    """
-    HF branch conservative LC: if the fixed gate layer exists, use max(left ctx from gate path, HF HPF).
-    If gate is disabled (no 'realtime_gate' layer), fall back to the HF HPF left context only.
-    """
     sr = int(sample_rate)
 
-    # Gate may be missing when cap_mask_with_gate=False
-    has_gate = any(l.name == "realtime_gate" for l in model.layers)
+    # Gate path LC (already conservative)
+    LC_gate = _compute_gate_left_ctx_samples(
+        sample_rate=sr,
+        threshold_db=REALTIME_GATE_THRESHOLD_DB,
+        ratio=REALTIME_GATE_RATIO,
+        attack_ms=REALTIME_GATE_ATTACK_MS,
+        hold_ms=REALTIME_GATE_HOLD_MS,
+        release_ms=REALTIME_GATE_RELEASE_MS,
+        hp_order=REALTIME_HF_HP_ORDER,
+        env_ms=REALTIME_GATE_ENV_MS,
+        depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
+    )
 
+    # HF signal stack LC from GLU blocks
+    RF_hf_stack = _sum_sep_rf_for_prefix(model, r'^realtime_hf_b\d+_sep$')  # 1 + sum((k-1)*d)
+    LC_hf_stack = int(RF_hf_stack - 1)
+
+    # HF mask convs LC (now causal)
+    RF_mask = _sum_sep_rf_for_prefix(model, r'^realtime_hf_mask_(c1|c2|logits)$')
+    LC_mask = int(RF_mask - 1)
+
+    # Mask smoother LC
+    L_smooth = 1
+    try:
+        sm = model.get_layer("realtime_hf_mask_smooth")
+        L_smooth = int(sm.kernel.shape[0])
+    except Exception:
+        pass
+    LC_mask_total = LC_mask + (L_smooth - 1)
+
+    # Effective gating LC is max(gate, mask path)
+    LC_gate_or_mask = max(int(LC_gate), int(LC_mask_total))
+
+    # HF high-pass LC
     LC_hpf = int(REALTIME_HF_HP_ORDER) - 1
-    LC_gate = 0
-    if has_gate:
-        LC_gate = _compute_gate_left_ctx_samples(
-            sample_rate=sr,
-            threshold_db=REALTIME_GATE_THRESHOLD_DB,
-            ratio=REALTIME_GATE_RATIO,
-            attack_ms=REALTIME_GATE_ATTACK_MS,
-            hold_ms=REALTIME_GATE_HOLD_MS,
-            release_ms=REALTIME_GATE_RELEASE_MS,
-            hp_order=REALTIME_HF_HP_ORDER,
-            env_ms=REALTIME_GATE_ENV_MS,
-            depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS
-        )
 
-    LC_hf = max(int(LC_gate), int(LC_hpf))
+    # Final HF branch LC: HPF comes after gating; product needs max(signal, gate)
+    LC_hf = LC_hpf + max(LC_hf_stack, LC_gate_or_mask)
+
     if verbose:
-        ms = 1000.0 * LC_hf / float(sr)
-        print(f"[hf] LC = {LC_hf} samples ({ms:.3f} ms), has_gate={has_gate}")
+        def ms(x): return 1000.0 * float(x) / float(sr)
+        print(f"[hf] stack={LC_hf_stack} ({ms(LC_hf_stack):.3f} ms), mask={LC_mask_total} ({ms(LC_mask_total):.3f} ms), gate={LC_gate} ({ms(LC_gate):.3f} ms), hpf={LC_hpf} → total={LC_hf} ({ms(LC_hf):.3f} ms)")
     return int(LC_hf)
 
 def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
@@ -1997,22 +2027,37 @@ class FIRInterpByN(tf.keras.layers.Layer):
     Upsample by integer factor N using zeros-insertion + fixed FIR (anti-imaging).
     - factor=N
     - num_taps: e.g. 257
-    - cutoff is normalized to Nyquist of the upsampled rate as a fraction in (0,1); default 0.45
-    For N=8 and 48k final SR, practical cutoff ~0.45/8 ≈ 0.05625 (i.e., ~2700 Hz absolute), but we
-    specify cutoff as a fraction of Nyquist AFTER upsampling, so use cutoff=0.45/factor here.
+    - cutoff is normalized to Nyquist of the upsampled rate as a fraction in (0,1).
     """
-    def __init__(self, factor, num_taps=257, cutoff=None, window=('kaiser', 10.0), name=None, **kwargs):
+    def __init__(self, factor, num_taps=257, cutoff=None, window=('kaiser', 9.0), name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.factor = int(factor)
         self.num_taps = int(num_taps)
         self.cutoff = float(0.45 / self.factor) if cutoff is None else float(cutoff)
+        # Store as-is; we’ll normalize in build() to handle Keras TrackedList on load
         self.window = window
 
     def build(self, input_shape):
-        # Design a linear-phase LPF for the upsampled rate; reverse for conv1d
-        taps = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
+        # Normalize window to a SciPy-friendly type (str or tuple)
+        win = self.window
+        try:
+            # Keras may deserialize tuples/lists as a TrackedList; convert to tuple
+            if not isinstance(win, (str, tuple)):
+                win = tuple(win)
+        except TypeError:
+            # Last-resort: fall back to a string window
+            win = 'hann'
+
+        # Design linear-phase LPF and reverse for conv1d
+        try:
+            taps = firwin(self.num_taps, cutoff=self.cutoff, window=win, pass_zero=True).astype(np.float32)
+        except Exception:
+            # Fallback if SciPy still complains about the window object
+            taps = firwin(self.num_taps, cutoff=self.cutoff, window=('kaiser', 9.0), pass_zero=True).astype(np.float32)
+
         taps = taps / np.maximum(np.sum(taps), 1e-12)
         k = taps[::-1].reshape(-1, 1, 1).astype(np.float32)
+
         self.kernel = self.add_weight(
             name="fir_interp_taps",
             shape=k.shape,
@@ -2026,11 +2071,13 @@ class FIRInterpByN(tf.keras.layers.Layer):
         b = tf.shape(x)[0]
         t = tf.shape(x)[1]
         c = tf.shape(x)[2]
+
         # Insert zeros between samples along time axis
         x4 = tf.reshape(x, [b, t, 1, c])                         # (B,T,1,C)
         pad_zeros = tf.zeros([b, t, self.factor - 1, c], x.dtype)
-        xz = tf.concat([x4, pad_zeros], axis=2)                   # (B,T,F,C) with F-1 zeros after each sample
+        xz = tf.concat([x4, pad_zeros], axis=2)                   # (B,T,F,C)
         xu = tf.reshape(xz, [b, t * self.factor, c])              # (B,T*F,C)
+
         # Causal FIR
         L = self.num_taps
         xu_pad = tf.pad(xu, [[0,0],[L-1,0],[0,0]])
@@ -2042,6 +2089,7 @@ class FIRInterpByN(tf.keras.layers.Layer):
         return (b, None if t is None else t * self.factor, c)
 
     def get_config(self):
+        # Return JSON-serializable fields; tuples will become lists in JSON, which is fine
         return {
             "factor": self.factor,
             "num_taps": self.num_taps,
@@ -3527,7 +3575,6 @@ def build_offline_model(dynamic_time=False,
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
 
-    # NEW: learned pick mask (96k) + tiny smoother
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits")(m)
@@ -3744,9 +3791,11 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
 
     # HF mask (learned) first
     hf_in  = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="realtime_hf_mask_c1")(hf_in)
-    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="realtime_hf_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="realtime_hf_mask_logits")(m)
+
+    m = causal_sep_conv(hf_in, 8, 5, 1, name="realtime_hf_mask_c1", activation="relu", bias_constraint=BC)
+    m = causal_sep_conv(m,    8, 5, 2, name="realtime_hf_mask_c2", activation="relu", bias_constraint=BC)
+    m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits", bias_constraint=BC)
+
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
