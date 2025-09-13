@@ -119,6 +119,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
+# On/off flags
+DISABLE_SCALE_BOOSTS = False
+
 EPOCHS      = 40
 FINETUNE_EPOCHS = 3
 
@@ -131,7 +134,7 @@ REALTIME_SAMPLE_RATE = 48000
 
 # We need to normalize the amplitude of the finetuned input audio to match that of the training data,
 # such that the gate params such as threshold can be shared
-FINETUNE_AVG_RMS_DBFS_TARGET = -26.0
+#FINETUNE_AVG_RMS_DBFS_TARGET = -26.0
 STYLE_FLAG_PROB_THRESHOLD = 0.5  # threshold for pick vs finger style flag
 
 # Debugging params
@@ -228,6 +231,10 @@ REALTIME_GATE_DEPTH_SMOOTH_MS            = 0.25
 REALTIME_GATE_ENV_LMAX                  = 256     # keep kernels inside streaming left context
 REALTIME_GATE_DEPTH_LMAX                = 256
 
+# FILM
+REALTIME_FILM_GAMMA_SCALE = 0.5
+REALTIME_FILM_BETA_SCALE  = 0.0
+
 # ─── Resonance branch params ─────────────────────────────────────────────
 
 # FIR orders for the band-pass (min-phase)
@@ -238,11 +245,11 @@ REALTIME_RESBP_BP_ORDER = 257
 OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
-OFFLINE_RESBP_BOOST_DB    = 40.0
-REALTIME_RESBP_BOOST_DB   = 20.0
+OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
+REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
 
-FINETUNE_OFFLINE_RESBP_BOOST_DB    = 30.0
-FINETUNE_REALTIME_RESBP_BOOST_DB   = 20.0
+FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 30.0
+FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
@@ -272,7 +279,7 @@ FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.k
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
 
-FINETUNE_DEMO_SEC = 10
+FINETUNE_DEMO_SEC = 60
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -301,10 +308,10 @@ REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
-REALTIME_IR_BOOST_DB = 0.5
-FINETUNE_REALTIME_IR_BOOST_DB = 0.5
+REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.0
+FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.0
 
-REALTIME_LP_ORDER   = 65
+REALTIME_LP_ORDER   = 65 
 REALTIME_LP_CUTOFF  = 4000
 
 LR          = 1e-4
@@ -313,11 +320,11 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_HF_BOOST_DB = 28
-REALTIME_HF_BOOST_DB = 12
+OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 12
 
-FINETUNE_OFFLINE_HF_BOOST_DB = 18
-FINETUNE_REALTIME_HF_BOOST_DB = 8
+FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
+FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -349,11 +356,11 @@ CHUNK_SEC           = 5
 
 DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 0
+DEMO_PAIR_INDEX = 1
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 60
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_PAIR_INDEX = 1
 
 PICK_SRC_DIR   = "./input/pick/source"
 PICK_TGT_DIR   = "./input/pick/target"
@@ -543,6 +550,13 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     if verbose:
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
+
+@register_keras_serializable()
+class ZeroBias(constraints.Constraint):
+    def __call__(self, w):
+        return tf.zeros_like(w)
+    def get_config(self):
+        return {}
 
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
@@ -1723,7 +1737,6 @@ def generate_demo_from_files(model,
                              sec=LONG_DEMO_SEC,
                              block_sec=12.0,
                              resample_margin_ms=50.0,
-                             normalize_input_dbfs=None,
                              use_finetuned=False):
     """
     Streaming/chunked version: keeps memory flat by processing blocks with
@@ -1733,9 +1746,6 @@ def generate_demo_from_files(model,
     - Handles sample-rate mismatch via resample_poly per block.
     - Uses overlap-and-trim so only the "valid" interior (free of edge effects) is written.
     - For offline (96 kHz), also applies HF/resbp demo boosts if requested.
-    - If normalize_input_dbfs is not None, compute a single scalar gain from the piezo
-      over the exact region and apply it JIT to both input (and written src/tgt) so
-      gate/HF behavior matches training operating point (e.g., -25 dBFS).
     """
     os.makedirs(out_dir, exist_ok=True)
     
@@ -1750,16 +1760,6 @@ def generate_demo_from_files(model,
 
     # Optional normalization gain computed once for the whole region at file SR
     g_norm = 1.0
-    if normalize_input_dbfs is not None and TOTAL_FRAMES > 0:
-        x_full_2d, _ = sf.read(path_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
-        x_full = x_full_2d[:, 0]
-        rms_src = compute_rms(x_full)
-        target_rms = 10.0 ** (float(normalize_input_dbfs) / 20.0)
-        if np.isfinite(rms_src) and rms_src > 1e-12:
-            g_norm = float(target_rms / rms_src)
-        else:
-            g_norm = 1.0
-        print(f"[demo] Applying {20*np.log10(max(g_norm,1e-12)):+.2f} dB normalization to match {normalize_input_dbfs} dBFS (piezo RMS={20*np.log10(max(rms_src,1e-12)):.2f} dBFS)")
 
     # Style flag from filename (same logic as your original function)
     if "pick" in path_src:
@@ -3155,14 +3155,15 @@ def clip_01x4(z):
     # Scale by 4 and clamp to [0, 1]
     return tf.clip_by_value(4.0 * z, 0.0, 1.0)
 
-# Stabilized FiLM
 @register_keras_serializable()
-def film_gamma_stable(raw):
-    return 1.0 + 0.1 * tf.tanh(raw)
+def film_gamma_stable(raw, scale=1.0):
+    # γ = 1 + 0.1 * tanh(scale * raw)
+    return 1.0 + 0.1 * tf.tanh(scale * raw)
 
 @register_keras_serializable()
-def film_beta_stable(raw):
-    return 0.1 * tf.tanh(raw)
+def film_beta_stable(raw, scale=1.0):
+    # β = 0.1 * tanh(scale * raw)
+    return 0.1 * tf.tanh(scale * raw)
 
 def compute_pads(kernel, dilation, lookahead_samples):
     P_tot = (kernel - 1) * dilation
@@ -3170,28 +3171,27 @@ def compute_pads(kernel, dilation, lookahead_samples):
     pad_left  = P_tot - pad_right
     return pad_left, pad_right
 
-def gated_sep_block(x, filters, kernel, dilation, prefix, lookahead=0):
+def gated_sep_block(x, filters, kernel, dilation, prefix, lookahead=0, bias_constraint=None):
     res = x
     pad_left, pad_right = compute_pads(kernel=kernel, dilation=dilation, lookahead_samples=lookahead)
     x   = ZeroPadding1D((pad_left, pad_right), name=f"{prefix}_pad")(x)
-    g   = SeparableConv1D(2*filters, kernel, dilation_rate=dilation, padding="valid", name=f"{prefix}_sep")(x)
+    g   = SeparableConv1D(2*filters, kernel, dilation_rate=dilation, padding="valid",
+                          bias_constraint=bias_constraint, name=f"{prefix}_sep")(x)
     c   = Lambda(slice_content, arguments={"filters": filters}, name=f"{prefix}_slice_c")(g)
     g2  = Lambda(slice_gate,    arguments={"filters": filters}, name=f"{prefix}_slice_g")(g)
     x   = Multiply(name=f"{prefix}_gate_mul")([Activation("tanh", name=f"{prefix}_tanh")(c),
                                                Activation("sigmoid", name=f"{prefix}_sigmoid")(g2)])
-    x   = Conv1D(filters, 1, padding="same", name=f"{prefix}_pw")(x)
+    x   = Conv1D(filters, 1, padding="same", bias_constraint=bias_constraint, name=f"{prefix}_pw")(x)
     x   = Add(name=f"{prefix}_res_add")([x, res])
     return x
 
-def film_apply(x, style_embed, filters, prefix):
+def film_apply(x, style_embed, filters, prefix, gamma_scale=1.0, beta_scale=1.0):
     film_params = Dense(filters*2, name=f"{prefix}_film_dense")(style_embed)
     gamma_raw = Lambda(slice_film_gamma, arguments={'filters': filters}, name=f"{prefix}_film_gamma_raw")(film_params)
     beta_raw  = Lambda(slice_film_beta,  arguments={'filters': filters}, name=f"{prefix}_film_beta_raw")(film_params)
-    gamma = Lambda(film_gamma_stable, name=f"{prefix}_film_gamma")(gamma_raw)
-    beta  = Lambda(film_beta_stable,  name=f"{prefix}_film_beta")(beta_raw)
-    
-    
-    # Broadcast FiLM parameters across time: [B, F] -> [B, 1, F]
+    gamma = Lambda(film_gamma_stable, arguments={'scale': float(gamma_scale)}, name=f"{prefix}_film_gamma")(gamma_raw)
+    beta  = Lambda(film_beta_stable,  arguments={'scale': float(beta_scale)}, name=f"{prefix}_film_beta")(beta_raw)
+
     gamma3 = Reshape((1, filters), name=f"{prefix}_film_gamma_expand")(gamma)
     beta3  = Reshape((1, filters), name=f"{prefix}_film_beta_expand")(beta)
     return Add(name=f"{prefix}_film_apply")([
@@ -3267,7 +3267,7 @@ def _add_resbp_branch_offline(inp, style_embed, style_time_used, gate):
 
     return IrScale(init=OFFLINE_RESBP_SCALE_INIT, name="offline_resbp_scale")(mixed)
 
-def _add_resbp_branch_realtime(inp, gate, style_time_used):
+def _add_resbp_branch_realtime(inp, gate, style_time_used, bias_constraint=None):
     """
     Realtime (48 kHz) resbp: synthetic resonances via ModalBank, excited by pick onsets.
     Changes:
@@ -3324,7 +3324,7 @@ def _add_resbp_branch_realtime(inp, gate, style_time_used):
     )(strike)  # (B,T,M)
 
     # Trainable 1x1 mix to mono
-    mixed = Conv1D(1, 1, use_bias=False, padding="same", name="realtime_resbp_mix")(modes)
+    mixed = Conv1D(1, 1, use_bias=True, padding="same", bias_constraint=bias_constraint, name="realtime_resbp_mix")(modes)
 
     # Safety HP to remove LF residue
     mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65, name="realtime_resbp_post_hp")(mixed)
@@ -3503,6 +3503,8 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
 
     kd_tensors = []
     style_pred_source = style_prob
+    
+    BC = ZeroBias()
 
     # If teacher provided, build a single combo to fetch everything in one call
     T_feats = []
@@ -3577,12 +3579,16 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
     style_embed = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
     # Main causal stack
-    x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw")(inp)
+    x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
 
     # Pre-blocks
     for i in range(REALTIME_PRE_BLOCKS):
-        x = gated_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1, prefix=f"realtime_pre_{i}", lookahead=0)
-        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}")
+        x = gated_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1,
+                            prefix=f"realtime_pre_{i}", lookahead=0, bias_constraint=BC)
+        # FiLM with realtime scales
+        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}",
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
+                       beta_scale=REALTIME_FILM_BETA_SCALE)
 
     # Dilated stack
     realtime_feats = []
@@ -3590,24 +3596,29 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
         res = x
         pad_left, pad_right = compute_pads(kernel=REALTIME_KERNEL_SIZE, dilation=d, lookahead_samples=0)
         x = ZeroPadding1D((pad_left, pad_right), name=f"realtime_pad_{i}")(x)
-        g = SeparableConv1D(2 * REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid", name=f"realtime_sep_{i}")(x)
+        g = SeparableConv1D(2*REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid",
+                            bias_constraint=BC, name=f"realtime_sep_{i}")(x)
         c = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
         g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
         x = Multiply(name=f"realtime_gate_mul_{i}")([
             Activation("tanh",    name=f"realtime_tanh_{i}")(c),
             Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)
         ])
-        x = Conv1D(REALTIME_FILTERS, 1, padding="same", name=f"realtime_pw_{i}")(x)
+        x = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(x)
         x = Add(name=f"realtime_res_add_{i}")([x, res])
-        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}")
+        # FiLM with realtime scales
+        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
+                       beta_scale=REALTIME_FILM_BETA_SCALE)
 
         offline_feat_name = f"offline_dil_{i}_film_apply"
         if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
             realtime_feats.append(x)
 
     # Pick/finger heads and style mix
-    out_pick   = Conv1D(1, 1, padding="same", name="realtime_final_pick")(x)
-    out_finger = Conv1D(1, 1, padding="same", name="realtime_final_finger")(x)
+    out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
+    out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
+    
     inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
     pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
@@ -3627,6 +3638,7 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
             pointwise_regularizer=regularizers.l2(1e-4),
             depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
             pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+            bias_constraint=BC,                     # NEW
             name=f"realtime_ir_sep_{i}"
         )(ir)
 
@@ -3672,11 +3684,11 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
         mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
 
     # HF branch proper
-    hf    = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_hf_init")(hf_in)
-    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0)
-    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0)
-    hf    = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0)
-    hf    = Conv1D(1, 1, padding="same", name="realtime_hf_out")(hf)
+    hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
+    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0, bias_constraint=BC)
+    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0, bias_constraint=BC)
+    hf = gated_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0, bias_constraint=BC)
+    hf = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_hf_out")(hf)
 
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
     hf_hp    = HFHighpass(
@@ -3701,7 +3713,8 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
     realtime_resbp = _add_resbp_branch_realtime(
         inp=inp,
         gate=gate_for_resbp,
-        style_time_used=style_scalar_b3
+        style_time_used=style_scalar_b3,
+        bias_constraint=BC
     )
     y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
 
@@ -4448,6 +4461,121 @@ def build_realtime_debug_model(realtime):
 
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
 
+
+
+def measure_self_noise(model, sr=48000, sec=10.0, wav_path=None):
+    T = int(sr*sec)
+    x = np.zeros((1, T, 1), np.float32)
+    style_true  = np.zeros((1,1), np.float32)
+    style_force = np.zeros((1,1), np.float32)  # 0 = use predicted style
+    y, _ = model.predict([x, style_true, style_force], verbose=0)
+    y = y[0, :, 0]
+    rms = np.sqrt(np.mean(y.astype(np.float64)**2) + 1e-12)
+    db = 20*np.log10(rms + 1e-20)
+    print(f"Self-noise: {db:.2f} dBFS")
+    if wav_path:
+        sf.write(wav_path, y, sr, subtype="FLOAT")
+    return db
+
+def zero_conv_biases_realtime(model, include_ir=True, include_resbp_mix=True):
+    def want(l):
+        if not isinstance(l, (tf.keras.layers.Conv1D, tf.keras.layers.SeparableConv1D)):
+            return False
+        n = l.name
+        # Main stack and heads
+        if n.startswith(("realtime_init_pw", "realtime_pre_", "realtime_sep_", "realtime_pw_")): return True
+        if n in ("realtime_final_pick", "realtime_final_finger"): return True
+        # HF branch
+        if n.startswith(("realtime_hf_init", "realtime_hf_b", "realtime_hf_out")): return True
+        # IR low-rate stack (optional)
+        if include_ir and n.startswith("realtime_ir_sep_"): return True
+        # RESBP 1x1 mix (optional)
+        if include_resbp_mix and n == "realtime_resbp_mix": return True
+        return False
+
+    changed = 0
+    for l in model.layers:
+        if not want(l): continue
+        ws = l.get_weights()
+        if not ws: continue
+        if isinstance(l, tf.keras.layers.SeparableConv1D):
+            if len(ws) == 3:
+                d, p, b = ws
+                ws[-1] = np.zeros_like(b)
+                l.set_weights(ws); changed += 1
+        else:
+            if len(ws) == 2:
+                k, b = ws
+                ws[-1] = np.zeros_like(b)
+                l.set_weights(ws); changed += 1
+    print(f"Zeroed biases in {changed} conv layers.")
+    return model
+
+def clamp_realtime_film(model, gamma_scale=0.5, beta_scale=0.0):
+    """
+    Scale γ logits and zero (or shrink) β logits for all '*_film_dense' in realtime model.
+    γ = 1 + 0.1 * tanh(gamma_scale * raw_gamma)
+    β = 0.1 * tanh(beta_scale  * raw_beta)   (beta_scale=0 → β ~ 0)
+    """
+    adjusted = 0
+    for l in model.layers:
+        if re.search(r"_film_dense$", l.name) and l.name.startswith("realtime_"):
+            W, b = l.get_weights()
+            if W is None or b is None: continue
+            F2 = b.shape[0]
+            F  = F2 // 2
+            W[:, :F] *= float(gamma_scale)
+            b[:F]    *= float(gamma_scale)
+            W[:, F:] *= float(beta_scale)
+            b[F:]    *= float(beta_scale)
+            l.set_weights([W, b])
+            adjusted += 1
+    print(f"Adjusted {adjusted} realtime FiLM generators (gamma_scale={gamma_scale}, beta_scale={beta_scale}).")
+    return model
+
+def save_static_from_dynamic(patched_dynamic_model, static_out_path, build_realtime_model_fn):
+    """
+    Build a teacher-free static realtime model (dynamic_time=False), copy weights by name
+    from the patched dynamic model, and save it.
+    """
+    static_rt = build_realtime_model_fn(offline=None, dynamic_time=False)  # teacher-free static
+    copy_weights_by_name(static_rt, patched_dynamic_model, verbose=True)
+    static_rt.save(static_out_path)
+    print(f"✅ Saved patched realtime STATIC model: {static_out_path}")
+
+def patch_and_save_both(
+    dynamic_in_path,
+    dynamic_out_path,
+    static_out_path,
+    build_realtime_model_fn,
+    measure_wavs=("self_noise_before.wav","self_noise_after.wav"),
+    gamma_scale=0.5,
+    beta_scale=0.0
+):
+    # Load dynamic model
+    m = tf.keras.models.load_model(dynamic_in_path, compile=False)
+    print(f"Loaded dynamic model: {dynamic_in_path}")
+
+    # Measure before
+    if measure_wavs:
+        measure_self_noise(m, 48000, 10.0, wav_path=measure_wavs[0])
+
+    # Patch: zero biases + clamp FiLM
+    zero_conv_biases_realtime(m, include_ir=True, include_resbp_mix=True)
+    clamp_realtime_film(m, gamma_scale=gamma_scale, beta_scale=beta_scale)
+
+    # Measure after
+    if measure_wavs:
+        measure_self_noise(m, 48000, 10.0, wav_path=measure_wavs[1])
+
+    # Save patched dynamic
+    m.save(dynamic_out_path)
+    print(f"✅ Saved patched realtime DYNAMIC model: {dynamic_out_path}")
+
+    # Build and save patched static (teacher-free), copying weights from dynamic
+    save_static_from_dynamic(m, static_out_path, build_realtime_model_fn)
+
+
 def render_isolated_stems(
     debug_model,
     path_src,
@@ -4458,7 +4586,6 @@ def render_isolated_stems(
     offset_sec=LONG_DEMO_OFFSET_SEC,
     block_sec=12.0,
     resample_margin_ms=50.0,
-    normalize_input_dbfs=None,
     use_finetuned=False
 ):
     os.makedirs(out_dir, exist_ok=True)
@@ -4480,14 +4607,6 @@ def render_isolated_stems(
     want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
 
     g_norm = 1.0
-    if normalize_input_dbfs is not None and TOTAL_FRAMES > 0:
-        x_full_2d, _ = sf.read(path_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
-        x_full = x_full_2d[:, 0]
-        rms_src = compute_rms(x_full)
-        target_rms = 10.0 ** (float(normalize_input_dbfs) / 20.0)
-        if np.isfinite(rms_src) and rms_src > 1e-12:
-            g_norm = float(target_rms / rms_src)
-        print(f"[stems] Applying {20*np.log10(max(g_norm,1e-12)):+.2f} dB normalization to match {normalize_input_dbfs} dBFS")
 
     left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
@@ -4653,10 +4772,6 @@ def render_isolated_stems(
 def run_render_stems_offline(use_finetuned=False):
     """
     Render offline stems from either baseline or fine-tuned dynamic model.
-    - If use_finetuned=True and the finetune model is missing, build a preview model on-the-fly
-      (prefer baseline dynamic/ckpt) and still render into the finetune stems folder with
-      FINETUNE_AVG_RMS_DBFS_TARGET normalization applied. This lets you tweak gate/RMS
-      before training.
     """
     src = None
     tgt = None
@@ -4715,18 +4830,10 @@ def run_render_stems_offline(use_finetuned=False):
         sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
         offset_sec=LONG_DEMO_OFFSET_SEC,
-        normalize_input_dbfs=FINETUNE_AVG_RMS_DBFS_TARGET if use_finetuned else None,
         use_finetuned=use_finetuned
     )
 
 def run_render_stems_realtime(use_finetuned=False):
-    """
-    Render realtime stems from either baseline or fine-tuned dynamic model.
-    - If use_finetuned=True and the finetune model is missing, build a preview model on-the-fly
-      (prefer baseline dynamic/ckpt) and still render into the finetune stems folder with
-      FINETUNE_AVG_RMS_DBFS_TARGET normalization applied. This lets you tweak gate/RMS
-      before training.
-    """
     src = None
     tgt = None
     sample_rate = REALTIME_SAMPLE_RATE
@@ -4784,7 +4891,6 @@ def run_render_stems_realtime(use_finetuned=False):
         sample_rate=sample_rate,
         sec=LONG_DEMO_SEC,
         offset_sec=LONG_DEMO_OFFSET_SEC,
-        normalize_input_dbfs=FINETUNE_AVG_RMS_DBFS_TARGET if use_finetuned else None,
         use_finetuned=use_finetuned
     )
 
@@ -5073,7 +5179,6 @@ def generate_fine_tune_demo(model, sample_rate, subdir_name):
         path_target     = os.path.join(FINETUNE_SRC_DIR, "target.wav"),
         out_dir         = out_dir,
         prediction_name = "demo_pred",
-        normalize_input_dbfs = FINETUNE_AVG_RMS_DBFS_TARGET,  # JIT normalization for finetune demos
         use_finetuned=True
     )
 
@@ -5347,6 +5452,37 @@ def main ():
             if do_offline:  run_render_stems_offline(use_finetuned=do_finetuned)
             if do_realtime: run_render_stems_realtime(use_finetuned=do_finetuned)
         sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--measure-realtime-noise":
+        
+        realtime_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+        realtime_dyn = tf.keras.models.load_model(realtime_dyn_path, compile=False) if os.path.exists(realtime_dyn_path) else None
+        
+        # Paths
+        din  = os.path.join(MODELS_REALTIME_OUT_DIR, "backup_" + REALTIME_DYNAMIC_MODEL_FILENAME)
+        dout = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        sout = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+
+        # Load dynamic realtime model
+        m = tf.keras.models.load_model(din, compile=False)
+        print("Loaded:", din)
+
+        # Measure noise before (optional)
+        measure_self_noise(m, sr=REALTIME_SAMPLE_RATE, sec=10.0)
+
+        # Patch: zero conv biases + clamp FiLM (no retrain)
+        zero_conv_biases_realtime(m, include_ir=True, include_resbp_mix=True)
+        clamp_realtime_film(m, gamma_scale=0.5, beta_scale=0.0)  # try gamma_scale in [0.3, 0.6]
+
+        # Measure noise after (optional)
+        measure_self_noise(m, sr=REALTIME_SAMPLE_RATE, sec=10.0)
+
+        # Save patched dynamic
+        m.save(dout)
+        print("Saved dynamic (patched):", dout)
+
+        # Build teacher‑free static model and copy weights by name, then save
+        save_static_from_dynamic(m, static_out_path=sout, build_realtime_model_fn=build_realtime_model)
+        print("Saved static (patched):", sout)
     else:
         print("No command given.")
         sys.exit(1)
