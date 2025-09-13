@@ -242,7 +242,7 @@ OFFLINE_RESBP_BOOST_DB    = 40.0
 REALTIME_RESBP_BOOST_DB   = 20.0
 
 FINETUNE_OFFLINE_RESBP_BOOST_DB    = 30.0
-FINETUNE_REALTIME_RESBP_BOOST_DB   = 10.0
+FINETUNE_REALTIME_RESBP_BOOST_DB   = 20.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
@@ -316,8 +316,33 @@ LR_PLATEAU_PATIENCE = 5
 OFFLINE_HF_BOOST_DB = 28
 REALTIME_HF_BOOST_DB = 12
 
-FINETUNE_OFFLINE_HF_BOOST_DB = 28
-FINETUNE_REALTIME_HF_BOOST_DB = 12
+FINETUNE_OFFLINE_HF_BOOST_DB = 18
+FINETUNE_REALTIME_HF_BOOST_DB = 8
+
+# Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
+
+COLOREQ_BANDS_REALTIME_BODY = [
+    (80.0,   220.0),
+    (220.0,  600.0),
+    (600.0,  1500.0),
+    (1500.0, 3500.0),
+    (3500.0, 8000.0),
+    (8000.0, 16000.0)
+]
+
+COLOREQ_BANDS_OFFLINE_BODY = [
+    (80.0,    220.0),
+    (220.0,   600.0),
+    (600.0,   1500.0),
+    (1500.0,  4000.0),
+    (4000.0,  9000.0),
+    (9000.0,  18000.0),
+    (18000.0, 24000.0),
+]
+
+# Upper frequency limits for mel loss in finetune (body region only)
+FINETUNE_BODY_FMAX_REALTIME = 12000.0
+FINETUNE_BODY_FMAX_OFFLINE  = 16000.0
 
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
@@ -738,6 +763,34 @@ def waveform_l1_loss(y_true, y_pred):
     return tf.abs(y_true - y_pred)
 
 @register_keras_serializable()
+def log_mel_loss_band(y_true, y_pred, sample_rate, fmax_hz):
+    n_fft   = 1024
+    hop     = 256
+    win     = 1024
+    n_mels  = 64
+    fmin    = 20.0
+    fmax    = float(min(fmax_hz, 0.5 * sample_rate))
+    t   = tf.squeeze(y_true, axis=-1)
+    p   = tf.squeeze(y_pred, axis=-1)
+    st_t = tf.signal.stft(t, frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
+    st_p = tf.signal.stft(p, frame_length=win, frame_step=hop, fft_length=n_fft, pad_end=True)
+    mag_t = tf.abs(st_t)
+    mag_p = tf.abs(st_p)
+    fb = tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=n_mels,
+        num_spectrogram_bins=n_fft//2+1,
+        sample_rate=sample_rate,
+        lower_edge_hertz=fmin,
+        upper_edge_hertz=fmax
+    )
+    mel_t = tf.tensordot(mag_t, fb, axes=[[2],[0]])
+    mel_p = tf.tensordot(mag_p, fb, axes=[[2],[0]])
+    log_t = tf.math.log(mel_t + 1e-6)
+    log_p = tf.math.log(mel_p + 1e-6)
+    mel_diff = tf.reduce_mean(tf.abs(log_t - log_p), axis=[1,2])
+    return mel_diff[:,None,None]
+
+@register_keras_serializable()
 def band_limited_l1_loss_weighted(y_true, y_pred, sample_rate,
                                   low_hz, high_hz,
                                   order_off=OFFLINE_RESBP_BP_ORDER, order_rt=REALTIME_RESBP_BP_ORDER,
@@ -956,6 +1009,73 @@ def rms_env_loss(y_true, y_pred):
     env_diff = tf.reduce_mean(tf.abs(rms_t - rms_p), axis=1)
     return env_diff[:,None,None]
 
+@register_keras_serializable()
+def coloreq_band_energy_loss(y_true, y_pred, sample_rate, bands, order=129):
+    """
+    For each (lo,hi) band: L += |RMS(BP(y_true)) - RMS(BP(y_pred))|.
+    Returns (B,1,1).
+    """
+    losses = []
+    for (lo, hi) in bands:
+        k = _get_minphase_bp_kernel(sample_rate, lo, hi, order)
+        t = _causal_conv1d(y_true, k)
+        p = _causal_conv1d(y_pred, k)
+        # Global RMS per sample
+        rms_t = tf.sqrt(tf.reduce_mean(tf.square(t), axis=1, keepdims=True) + 1e-12)
+        rms_p = tf.sqrt(tf.reduce_mean(tf.square(p), axis=1, keepdims=True) + 1e-12)
+        losses.append(tf.abs(rms_t - rms_p))
+    return tf.add_n(losses) / float(max(len(bands), 1.0))
+
+@register_keras_serializable()
+class FinetuneAdapterLoss(tf.keras.losses.Loss):
+    """
+    Drives the post‑EQ adapter:
+      L = l1_w * L1 + mel_w * (band-limited LogMel) + band_w * BandEnergy(bands)
+    """
+    def __init__(self,
+                 sample_rate,
+                 bands,
+                 band_order=129,
+                 l1_w=0.5,
+                 mel_w=1.5,
+                 band_w=2.0,
+                 mel_upper_hz=None,
+                 name="finetune_adapter_loss",
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate = int(sample_rate)
+        self.bands = [(float(a), float(b)) for (a, b) in bands]
+        self.band_order = int(band_order)
+        self.l1_w  = float(l1_w)
+        self.mel_w = float(mel_w)
+        self.band_w= float(band_w)
+        self.mel_upper_hz = None if mel_upper_hz is None else float(mel_upper_hz)
+
+    def get_config(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "bands": self.bands,
+            "band_order": self.band_order,
+            "l1_w": self.l1_w, "mel_w": self.mel_w, "band_w": self.band_w,
+            "mel_upper_hz": self.mel_upper_hz,
+            **super().get_config()
+        }
+
+    def call(self, y_true, y_pred):
+        loss = 0.0
+        if self.l1_w != 0.0:
+            l1 = tf.reduce_mean(tf.abs(y_true - y_pred), axis=[1,2], keepdims=True)
+            loss = loss + self.l1_w * l1
+        if self.mel_w != 0.0:
+            if self.mel_upper_hz is None:
+                mel = log_mel_loss(y_true, y_pred, self.sample_rate)
+            else:
+                mel = log_mel_loss_band(y_true, y_pred, self.sample_rate, fmax_hz=self.mel_upper_hz)
+            loss = loss + self.mel_w * mel
+        if self.band_w != 0.0:
+            be = coloreq_band_energy_loss(y_true, y_pred, self.sample_rate, self.bands, order=self.band_order)
+            loss = loss + self.band_w * be
+        return loss
 
 @register_keras_serializable()
 def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
@@ -1315,20 +1435,51 @@ def compute_hf_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, ve
     return int(LC_hf)
 
 def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
-    """
-    Return max left context across realtime branches and 0 right context.
-    """
     lc_main = compute_main_left_context_realtime(model, sample_rate, verbose=False)
     lc_ir   = compute_ir_left_context_realtime(model, sample_rate, verbose=False)
     rbp     = compute_resbp_left_context_realtime(model, sample_rate, verbose=False)
     lc_rbp  = int(rbp["resbp_left_ctx_samples"])
     lc_hf   = compute_hf_left_context_realtime(model, sample_rate, verbose=False)
+    lc_col  = compute_coloreq_left_context_realtime(model, sample_rate, verbose=False)  # NEW
 
-    left_ctx = max(lc_main, lc_ir, lc_rbp, lc_hf)
+    left_ctx = max(lc_main, lc_ir, lc_rbp, lc_hf, lc_col)
     if verbose:
         def as_ms(s): return 1000.0 * float(s) / float(sample_rate)
-        print(f"[streaming] realtime left ctx (samples): main={lc_main}, ir={lc_ir}, resbp={lc_rbp}, hf={lc_hf} → max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
+        print(f"[streaming] realtime left ctx (samples): main={lc_main}, ir={lc_ir}, resbp={lc_rbp}, hf={lc_hf}, coloreq_ft={lc_col} → max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
     return int(left_ctx), 0
+
+@register_keras_serializable()
+def add_coloreq(x, bands, sample_rate, name_prefix, order=65):
+    """
+    Finetune-only post-EQ: y = x + sum_i g_i * BP_i(x)
+    - BP_i are fixed causal min-phase FIR band-pass filters (BandpassFIR).
+    - g_i are trainable IrScale scalars, init=0 (identity by default).
+    """
+    terms = [x]
+    for i, (lo, hi) in enumerate(bands):
+        bp = BandpassFIR(low_hz=lo, high_hz=hi, order=order, sample_rate=sample_rate,
+                         name=f"{name_prefix}_bp_{i}")(x)
+        terms.append(IrScale(init=0.0, name=f"{name_prefix}_g_{i}")(bp))
+    return Add(name=f"{name_prefix}_sum")(terms)
+
+def compute_coloreq_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Left context of the finetune adapter in realtime models (if present).
+    """
+    bp_layers = _find_layers(model, BandpassFIR, name_prefix="realtime_ft_coloreq_bp_")
+    if not bp_layers:
+        return 0
+    Ls = []
+    for l in bp_layers:
+        try:
+            Ls.append(int(l.taps.shape[0]))
+        except Exception:
+            pass
+    LC = max((L - 1) for L in Ls) if Ls else 0
+    if verbose:
+        ms = 1000.0 * LC / float(sample_rate)
+        print(f"[coloreq-ft] LC = {LC} samples ({ms:.3f} ms)")
+    return int(LC)
 
 @register_keras_serializable()
 def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
@@ -1776,6 +1927,14 @@ _ir_fir_kernel = h_min[::-1].reshape(-1, 1, 1).astype(np.float32)
 _ir_fir_tf  = tf.constant(_ir_fir_kernel, dtype=tf.float32)  # downsampling (analysis) FIR
 
 # ────────────────────────────── CUSTOM LAYERS ────────────────────────────────
+
+@register_keras_serializable()
+class Sub(tf.keras.layers.Layer):
+    def call(self, inputs):
+        a, b = inputs
+        return a - b
+    def compute_output_shape(self, input_shapes):
+        return input_shapes[0]
 
 @register_keras_serializable()
 class IdentityLayer(tf.keras.layers.Layer):
@@ -3802,6 +3961,255 @@ def _build_realtime_dynamic_for_preview():
     copy_weights_by_name(realtime_dyn, static)
     return realtime_dyn
 
+def _sum_bypass_terms(terms):
+    if not terms:
+        return None
+    if len(terms) == 1:
+        return terms[0]
+    return Add(name="ft_bypass_sum")(terms)
+
+def _apply_body_only_adapter(x_body, bands, sample_rate, prefix, order):
+    # y_body_eq = x_body + sum_i g_i * BP_i(x_body)
+    return add_coloreq(x_body, bands=bands, sample_rate=sample_rate, name_prefix=prefix, order=order)
+
+def _make_body_from_output(base_model, y_audio, sample_rate,
+                           exclude_hf=True, exclude_ir=False, exclude_resbp=False):
+    bypass_terms = []
+
+    if exclude_hf:
+        lname = "realtime_hf_pick_only" if sample_rate == REALTIME_SAMPLE_RATE else "offline_hf_pick_only"
+        try:
+            hf = base_model.get_layer(lname).output
+            bypass_terms.append(hf)
+        except Exception as e:
+            raise RuntimeError(f"Missing HF pick-only layer '{lname}' in base model.") from e
+
+    if exclude_ir and sample_rate == REALTIME_SAMPLE_RATE:
+        # Prefer the post-aligned IR tensor so time length matches the main path
+        try:
+            ir = base_model.get_layer("realtime_ir_matchlen").output
+        except Exception:
+            # Older models: align lowpass output to y_audio explicitly
+            ir_lp = base_model.get_layer("realtime_ir_lowpass").output
+            ir = MatchTimeToRef(name="ft_ir_matchlen")([ir_lp, y_audio])
+        bypass_terms.append(ir)
+
+    if exclude_resbp:
+        lname = "realtime_resbp_scale" if sample_rate == REALTIME_SAMPLE_RATE else "offline_resbp_scale"
+        try:
+            rbp = base_model.get_layer(lname).output
+            bypass_terms.append(rbp)
+        except Exception:
+            pass
+
+    bypass = _sum_bypass_terms(bypass_terms)
+    if bypass is None:
+        return y_audio, None
+
+    body = Sub(name="ft_body_minus_bypass")([y_audio, bypass])
+    return body, bypass
+
+def _add_back_bypass(y_body_eq, bypass):
+    if bypass is None:
+        return y_body_eq
+    return Add(name="ft_body_plus_bypass")([y_body_eq, bypass])
+
+def build_offline_finetune_wrapper(base_offline,
+                                   bands=COLOREQ_BANDS_OFFLINE_BODY,
+                                   order=97,
+                                   name="piezo2mic_offline_ft_adapter",
+                                   exclude_hf=True,
+                                   exclude_ir=True,
+                                   exclude_resbp=True):
+    """
+    Finetune adapter that only shapes the 'body' (default: excludes HF).
+    """
+    base_offline.trainable = False
+    y_audio, y_style = base_offline.outputs
+
+    body, bypass = _make_body_from_output(
+        base_offline, y_audio,
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        exclude_hf=exclude_hf,
+        exclude_ir=exclude_ir,
+        exclude_resbp=exclude_resbp
+    )
+
+    y_body_eq = _apply_body_only_adapter(body,
+                                         bands=bands,
+                                         sample_rate=OFFLINE_SAMPLE_RATE,
+                                         prefix="offline_ft_coloreq",
+                                         order=order)
+    y_tuned = _add_back_bypass(y_body_eq, bypass)
+    return tf.keras.Model(inputs=base_offline.inputs, outputs=[y_tuned, y_style], name=name)
+
+def build_realtime_finetune_wrapper(base_realtime,
+                                    bands=COLOREQ_BANDS_REALTIME_BODY,
+                                    order=65,
+                                    name="piezo2mic_realtime_ft_adapter",
+                                    exclude_hf=True,
+                                    exclude_ir=True,
+                                    exclude_resbp=True):
+    """
+    Finetune adapter that only shapes the 'body' (default: excludes HF).
+    """
+    base_realtime.trainable = False
+    y_audio, y_style = base_realtime.outputs
+
+    body, bypass = _make_body_from_output(
+        base_realtime, y_audio,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        exclude_hf=exclude_hf,
+        exclude_ir=exclude_ir,
+        exclude_resbp=exclude_resbp
+    )
+
+    y_body_eq = _apply_body_only_adapter(body,
+                                         bands=bands,
+                                         sample_rate=REALTIME_SAMPLE_RATE,
+                                         prefix="realtime_ft_coloreq",
+                                         order=order)
+    y_tuned = _add_back_bypass(y_body_eq, bypass)
+    return tf.keras.Model(inputs=base_realtime.inputs, outputs=[y_tuned, y_style], name=name)
+
+def set_trainable_for_finetune_adapter(model, prefix):
+    """
+    Freeze everything except IrScale layers named '{prefix}_g_*'.
+    """
+    for l in model.layers:
+        l.trainable = False
+    tr = []
+    for l in model.layers:
+        if isinstance(l, IrScale) and l.name.startswith(f"{prefix}_g_"):
+            l.trainable = True
+            tr.append(l.name)
+    print(f"[finetune/adapter] trainable: {sorted(tr)}")
+    return model
+
+def fine_tune(offline=True, realtime=True):
+    """
+    Finetune-only tone adapters on top of frozen baseline dynamic models.
+    Base models are not altered/saved over.
+    """
+    # Load finetune pair and pre-resample
+    src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+    tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+    if not os.path.exists(src) or not os.path.exists(tgt):
+        print("ERROR: finetune source/target not found in", FINETUNE_SRC_DIR); sys.exit(1)
+
+    x_full, sr_x = sf.read(src, dtype='float32', always_2d=True)
+    y_full, sr_y = sf.read(tgt, dtype='float32', always_2d=True)
+    if sr_x != sr_y:
+        print(f"Warning: finetune pair SR mismatch: {sr_x} vs {sr_y}")
+    y_full = denoise_target_if_enabled(y_full, sr_y)
+
+    cached = precache_finetune_resampled_pair(
+        x_full, y_full, file_sr=sr_x,
+        sr_rt=REALTIME_SAMPLE_RATE, sr_off=OFFLINE_SAMPLE_RATE
+    )
+    
+    loss_off = FinetuneAdapterLoss(
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        bands=COLOREQ_BANDS_OFFLINE_BODY,
+        band_order=129,
+        l1_w=0.4, mel_w=1.2, band_w=2.5,
+        mel_upper_hz=FINETUNE_BODY_FMAX_OFFLINE
+    )
+
+    loss_rt = FinetuneAdapterLoss(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        bands=COLOREQ_BANDS_REALTIME_BODY,
+        band_order=97,
+        l1_w=0.3, mel_w=1.5, band_w=3.0,
+        mel_upper_hz=FINETUNE_BODY_FMAX_REALTIME
+    )
+
+    off_dyn_wrap = None
+    rt_dyn_wrap  = None
+
+    if offline:
+        print("\n🔧 Finetuning OFFLINE adapter (base frozen)…")
+        base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+        if not os.path.exists(base_off_dyn_path):
+            print("ERROR: baseline offline dynamic model not found:", base_off_dyn_path); sys.exit(1)
+        base_off_dyn = tf.keras.models.load_model(base_off_dyn_path, compile=False)
+
+        off_dyn_wrap = build_offline_finetune_wrapper(base_off_dyn)  # now body-only by default
+        set_trainable_for_finetune_adapter(off_dyn_wrap, prefix="offline_ft_coloreq")
+        off_dyn_wrap.compile(
+            optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
+            loss=[loss_off, "binary_crossentropy"],
+            loss_weights=[1.0, 0.0],
+            metrics=[["mae"], []]
+        )
+
+        dsO = make_mixed_ds_from_arrays_offline(
+            cached["x96"], cached["y96"],
+            batch_size=FINETUNE_BATCH_SIZE,
+            seg_len=OFFLINE_SEG_LEN
+        ).map(add_sw_offline_finetune_nf).prefetch(tf.data.AUTOTUNE)
+
+        steps_off = approx_steps_from_length(len(cached["x96"]), OFFLINE_SEG_LEN,
+                                             FINETUNE_BATCH_SIZE, cap=FINETUNE_OFFLINE_STEPS_CAP)
+        off_dyn_wrap.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
+
+        # Save dynamic adapter
+        ft_offline_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
+        off_dyn_wrap.save(ft_offline_dyn_path)
+        print("✅ Saved finetuned offline adapter (dynamic):", ft_offline_dyn_path)
+
+        # Build and save static adapter by wrapping the baseline static
+        base_off_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+        base_off_static = tf.keras.models.load_model(base_off_static_path, compile=False)
+        off_static_wrap = build_offline_finetune_wrapper(base_off_static)
+        copy_weights_by_name(off_static_wrap, off_dyn_wrap, verbose=True)  # copies coloreq_g_* only
+        ft_offline_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
+        off_static_wrap.save(ft_offline_static_path)
+        print("✅ Saved finetuned offline adapter (static):", ft_offline_static_path)
+
+    if realtime:
+        print("\n🔧 Finetuning REALTIME adapter (base frozen)…")
+        base_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        if not os.path.exists(base_rt_dyn_path):
+            print("ERROR: baseline realtime dynamic model not found:", base_rt_dyn_path); sys.exit(1)
+        base_rt_dyn = tf.keras.models.load_model(base_rt_dyn_path, compile=False)
+
+        rt_dyn_wrap = build_realtime_finetune_wrapper(base_rt_dyn)   # now body-only by default
+        set_trainable_for_finetune_adapter(rt_dyn_wrap, prefix="realtime_ft_coloreq")
+        rt_dyn_wrap.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=max(1e-4, 3e-4), clipnorm=1.0),
+            loss=[loss_rt, "binary_crossentropy"],
+            loss_weights=[1.0, 0.0],
+            metrics=[["mae"], []]
+        )
+
+        dsRT = make_mixed_ds_from_arrays_realtime(
+            cached["x48"], cached["y48"],
+            batch_size=FINETUNE_BATCH_SIZE,
+            seg_len_rt=REALTIME_SEG_LEN
+        ).map(add_sw_realtime_finetune_nf).prefetch(tf.data.AUTOTUNE)
+
+        steps_rt = approx_steps_from_length(len(cached["x48"]), REALTIME_SEG_LEN,
+                                            FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP)
+        rt_dyn_wrap.fit(dsRT, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
+
+        # Save dynamic adapter
+        ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+        rt_dyn_wrap.save(ft_rt_dyn_path)
+        print("✅ Saved finetuned realtime adapter (dynamic):", ft_rt_dyn_path)
+
+        # Build teacher-free static base and wrap it, then copy EQ weights
+        base_rt_static = build_realtime_model(offline=None, dynamic_time=False)  # teacher-free, static
+        # Initialize with baseline dynamic weights
+        copy_weights_by_name(base_rt_static, base_rt_dyn, verbose=True)
+        rt_static_wrap = build_realtime_finetune_wrapper(base_rt_static)
+        copy_weights_by_name(rt_static_wrap, rt_dyn_wrap, verbose=True)
+        ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+        rt_static_wrap.save(ft_rt_static_path)
+        print("✅ Saved finetuned realtime adapter (static):", ft_rt_static_path)
+
+    return off_dyn_wrap, rt_dyn_wrap
+
 # REPLACE the existing set_trainable_for_finetune_offline with this version to also train the mask subnetwork when present
 def set_trainable_for_finetune_offline(model, train_scales=True, train_mask=False):
     """
@@ -3870,47 +4278,45 @@ def with_random_gain(input_key, out_scale_audio=True, db_lo=-24.0, db_hi=+12.0):
         return inputs, outputs, sw
     return _map
 
-def set_trainable_for_finetune_realtime(model, train_scales=True):
-    """
-    Fastest path for embedded: train only the FiLM generators (Dense layers named '*film_dense').
-    Optionally enable train_scales=True to also tune tiny IrScale scalars, but keep it False
-    for the absolute minimum runtime.
-    """
+def set_trainable_for_finetune_realtime(model, train_scales=False, train_mask=True):
     trainable = []
-
-    # Freeze everything by default
     for l in model.layers:
         l.trainable = False
 
-    # Enable only FiLM parameter generators
+    # FiLM generators
     for l in model.layers:
         if "film_dense" in l.name:
             l.trainable = True
             trainable.append(l.name)
 
-    # Optional: also allow the small IrScale scalars to adapt
+    # Optional: IrScale scalars
     if train_scales:
         for l in model.layers:
             if isinstance(l, IrScale):
                 l.trainable = True
                 trainable.append(l.name)
 
-    # Explicitly freeze style head and heads
-    freeze_names = {
+    # NEW: mask convs
+    if train_mask:
+        for lname in ["realtime_hf_mask_c1", "realtime_hf_mask_c2", "realtime_hf_mask_logits"]:
+            try:
+                layer = model.get_layer(lname)
+                layer.trainable = True
+                trainable.append(layer.name)
+            except:
+                pass
+
+    # Keep style head and heads frozen
+    for name in {
         "realtime_style_embed",
         "realtime_style_conv", "realtime_style_gap", "realtime_style_logit", "realtime_style_prob",
         "realtime_style_blend",
         "realtime_final_pick", "realtime_final_finger",
-    }
-    for name in freeze_names:
-        try:
-            model.get_layer(name).trainable = False
-        except Exception:
-            pass
+    }:
+        try: model.get_layer(name).trainable = False
+        except: pass
 
-    tot_trainable = int(np.sum([np.prod(v.shape) for v in model.trainable_weights]))
-    print(f"[finetune/realtime/film-only] trainable layers: {sorted(trainable)}")
-    print(f"[finetune/realtime/film-only] trainable params: {tot_trainable:,d}")
+    print(f"[finetune/realtime] trainable layers: {sorted(trainable)}")
     return model
 
 def boost_hf_scale_in_model(model, layer_name, gain_db):
@@ -4671,170 +5077,7 @@ def generate_fine_tune_demo(model, sample_rate, subdir_name):
         use_finetuned=True
     )
 
-# REPLACE the fine_tune() function with this version (updates BOTH offline and realtime finetuned models)
-def fine_tune(offline=True, realtime=True):
-    """
-    Ultra-fast finetune for BOTH branches with learned pick masks and no fixed gate dependence:
-      - OFFLINE (96 kHz): build with cap_mask_with_gate=False, copy baseline weights by name,
-                          train FiLM + tiny mask convs, no RMS normalization (+ random gain aug).
-      - REALTIME (48 kHz): build student-only with cap_mask_with_gate=False, copy baseline weights by name,
-                           train FiLM (mask already exists and has pretrained weights), no RMS normalization (+ random gain aug).
-    Losses remain light for fast convergence on embedded targets.
-    """
-    # Load finetune pair
-    src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
-    tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
-    if not os.path.exists(src) or not os.path.exists(tgt):
-        print("ERROR: finetune source/target not found in", FINETUNE_SRC_DIR)
-        sys.exit(1)
 
-    x_full, sr_x = sf.read(src, dtype='float32', always_2d=True)
-    y_full, sr_y = sf.read(tgt, dtype='float32', always_2d=True)
-    if sr_x != sr_y:
-        print(f"Warning: finetune pair SR mismatch: {sr_x} vs {sr_y}")
-
-    # Clean up preamp hiss in the MIC TARGET only (keep piezo untouched)
-    y_full = denoise_target_if_enabled(y_full, sr_y)
-
-    # Pre-resample once (NO RMS normalization for either branch)
-    cached = precache_finetune_resampled_pair(
-        x_full, y_full, file_sr=sr_x,
-        sr_rt=REALTIME_SAMPLE_RATE, sr_off=OFFLINE_SAMPLE_RATE
-    )
-
-    off_dyn = None
-    rt_serving_dyn = None
-
-    if offline:
-        print("\n🔧 Fine-tuning OFFLINE (96k) with learned mask (no fixed gate; no RMS normalization)…")
-
-        offline_base_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
-        if not os.path.exists(offline_base_path):
-            print("ERROR: baseline offline static model not found at", offline_base_path)
-            print("Run --train-offline first.")
-            sys.exit(1)
-
-        base_offline = tf.keras.models.load_model(offline_base_path, compile=False)
-
-        # Build finetune graph with mask and without gate cap
-        off_dyn = build_offline_model(dynamic_time=True, cap_mask_with_gate=False)
-        # Copy weights by name (tolerates extra mask layers)
-        copy_weights_by_name(off_dyn, base_offline, verbose=True)
-
-        # Train FiLM + tiny mask subnetwork (keep the rest frozen and fast)
-        set_trainable_for_finetune_offline(off_dyn, train_scales=True, train_mask=True)
-
-        # Ultra-lite loss: turn off onset weighting (onset_gain=0.0) since gate env is not used
-        loss_off = FinetuneCombinedLossLite(
-            sample_rate=OFFLINE_SAMPLE_RATE,
-            stft_scales=(),  # keep super light
-            l1_w=1.0, hf_w=2.0, stft_w=0.0, env_w=0.0,
-            onset_gain=0.0
-        )
-        
-        off_dyn.compile(
-            optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
-            loss=[loss_off, "binary_crossentropy"],
-            loss_weights=[1.0, 0.0],  # disable BCE
-            metrics=[["mae"], []]
-        )
-
-        # Dataset + random gain augmentation (amplitude invariance)
-        dsO = make_mixed_ds_from_arrays_offline(
-            cached["x96"], cached["y96"],
-            batch_size=FINETUNE_BATCH_SIZE,
-            seg_len=OFFLINE_SEG_LEN
-        ).map(add_sw_offline_finetune_nf).map(with_random_gain('offline_piezo_input'),
-                                              num_parallel_calls=tf.data.AUTOTUNE)
-
-        steps_off = approx_steps_from_length(
-            len(cached["x96"]),
-            OFFLINE_SEG_LEN,
-            FINETUNE_BATCH_SIZE,
-            cap=FINETUNE_OFFLINE_STEPS_CAP
-        )
-
-        print(f"[finetune/offline] seg={OFFLINE_SEG_LEN}, batch={FINETUNE_BATCH_SIZE}, "
-              f"epochs={FINETUNE_EPOCHS}, steps/epoch={steps_off}, lr={FINETUNE_OFFLINE_LR}")
-
-        off_dyn.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
-
-        # Save finetuned offline (static + dynamic)
-        ft_offline_static = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
-        off_static = build_offline_model(dynamic_time=False, cap_mask_with_gate=False)
-        copy_weights_by_name(off_static, off_dyn, verbose=True)
-        off_static.save(ft_offline_static)
-
-        ft_offline_dynamic = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
-        off_dyn.save(ft_offline_dynamic)
-        print("✅ Saved finetuned offline (mask-only serving):", ft_offline_static, "and", ft_offline_dynamic)
-
-    if realtime:
-        print("\n🔧 Fine-tuning REALTIME (48k) with learned mask (no fixed gate; no RMS normalization)…")
-        # Load baseline student (to initialize student weights)
-        realtime_base_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
-        if not os.path.exists(realtime_base_path):
-            print("ERROR: baseline realtime static model not found at", realtime_base_path)
-            sys.exit(1)
-        base_rt = tf.keras.models.load_model(realtime_base_path, compile=False)
-
-        # Build student-only (no teacher), with gate cap disabled
-        rt_dyn = build_realtime_model(offline=None, dynamic_time=True, cap_mask_with_gate=False)
-        copy_weights_by_name(rt_dyn, base_rt, verbose=True)
-        set_trainable_for_finetune_realtime(rt_dyn, train_scales=True)
-
-        # Light loss + no BCE
-        loss_rt = FinetuneCombinedLossLite(
-            sample_rate=REALTIME_SAMPLE_RATE,
-            stft_scales=(),
-            l1_w=1.0, hf_w=2.0, stft_w=0.0, env_w=0.0,
-            onset_gain=0.0
-        )
-        opt = tf.keras.optimizers.Adam(learning_rate=FINETUNE_REALTIME_LR, clipnorm=1.0)
-
-        rt_dyn.compile(
-            optimizer=opt,
-            loss=[loss_rt, "binary_crossentropy"],
-            loss_weights=[1.0, 0.0],  # no label supervision
-            metrics=[["mae"], []]
-        )
-
-        # Student-only dataset + random gain augmentation
-        dsRT = make_mixed_ds_from_arrays_realtime(
-            cached["x48"], cached["y48"],
-            batch_size=FINETUNE_BATCH_SIZE,
-            seg_len_rt=REALTIME_SEG_LEN
-        ).map(add_sw_realtime_finetune_nf).map(with_random_gain('realtime_piezo_input'),
-                                              num_parallel_calls=tf.data.AUTOTUNE)
-
-        steps_rt = approx_steps_from_length(
-            len(cached["x48"]),
-            REALTIME_SEG_LEN,
-            FINETUNE_BATCH_SIZE,
-            cap=FINETUNE_REALTIME_STEPS_CAP
-        )
-
-        print(f"[finetune/realtime student-only] seg={REALTIME_SEG_LEN}, batch={FINETUNE_BATCH_SIZE}, "
-              f"epochs={FINETUNE_EPOCHS}, steps/epoch={steps_rt}")
-
-        rt_dyn.fit(dsRT, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
-
-        # Build teacher-free serving graphs (dynamic and static) with cap disabled
-        rt_serving_dyn = build_realtime_model(offline=None, dynamic_time=True,  cap_mask_with_gate=False)
-        copy_weights_by_name(rt_serving_dyn, rt_dyn, verbose=True)
-
-        rt_serving_static = build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=False)
-        copy_weights_by_name(rt_serving_static, rt_serving_dyn, verbose=True)
-
-        # Save serving models to the usual finetune filenames
-        ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-        rt_serving_static.save(ft_rt_static_path)
-
-        ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        rt_serving_dyn.save(ft_rt_dyn_path)
-        print("✅ Saved finetuned realtime (mask-only serving):", ft_rt_static_path, "and", ft_rt_dyn_path)
-
-    return off_dyn, rt_serving_dyn
 
 def compute_rms(sig):
     sig64 = sig.astype(np.float64, copy=False)
@@ -4852,49 +5095,79 @@ def _spectral_denoise_target(y, sr,
                              noise_q=FINETUNE_TARGET_DENOISE_NOISE_Q,
                              min_noise_frames=FINETUNE_TARGET_DENOISE_MIN_FRAMES):
     """
-    Very light spectral denoise for stationary preamp hiss on the mic target:
-      - Estimate a noise spectrum from the lowest-energy frames of the target itself.
-      - Apply a Wiener-like mask with small oversubtraction and a dB floor.
+    Light spectral denoiser that is COLA/NOLA-safe and compatible with older SciPy
+    (no 'length' kw on istft). Falls back to manual trim/pad.
     """
+    import numpy as np
     import scipy.signal as spsig
 
     y = np.asarray(y, dtype=np.float32)
     if y.ndim != 1 or y.size < 8:
         return y
 
-    nper = max(64, int(round((win_ms / 1000.0) * sr)))
-    nper = _next_pow2(nper)
+    # Enforce Hann + 50% overlap → COLA/NOLA satisfied
     hop  = max(16, int(round((hop_ms / 1000.0) * sr)))
-    nover = max(0, nper - hop)
+    nper = max(64, 2 * hop)            # 50% overlap for Hann
+    if (nper % 2) == 1:
+        nper += 1
+    nover = nper - hop
+    nfft = nper                        # no need for extra zero-pad
 
-    f, t, Z = spsig.stft(y, fs=sr, window='hann', nperseg=nper, noverlap=nover, nfft=nper,
-                         boundary=None, padded=False)
-    mag = np.abs(Z)              # (F, T)
-    # Frame energy proxy
-    frame_energy = np.sqrt(np.mean(mag * mag, axis=0) + 1e-12)  # (T,)
+    # STFT with zero boundary and pad to keep edges NOLA-safe
+    f, t, Z = spsig.stft(
+        y, fs=sr,
+        window='hann',
+        nperseg=nper,
+        noverlap=nover,
+        nfft=nfft,
+        boundary='zeros',
+        padded=True
+    )
+
+    mag = np.abs(Z)
+    frame_energy = np.sqrt(np.mean(mag * mag, axis=0) + 1e-12)
     thr = np.quantile(frame_energy, float(noise_q))
     idx = np.where(frame_energy <= thr)[0]
-
     if idx.size >= int(min_noise_frames):
-        noise_profile = np.median(mag[:, idx], axis=1)  # (F,)
+        noise_profile = np.median(mag[:, idx], axis=1)
     else:
         noise_profile = np.percentile(mag, 20.0, axis=1)
 
     eps = 1e-8
     mag2 = mag * mag
     n2   = (noise_profile[:, None] ** 2)
-    G = mag2 / (mag2 + float(beta) * n2 + eps)  # Wiener-like
+    G = mag2 / (mag2 + float(beta) * n2 + eps)  # Wiener-like mask
     floor = 10.0 ** (float(floor_db) / 20.0)
     G = np.clip(G, floor, 1.0)
 
     Z_d = G * Z
-    _, y_rec = spsig.istft(Z_d, fs=sr, window='hann', nperseg=nper, noverlap=nover, nfft=nper,
-                           input_onesided=True, boundary=False)
-    if y_rec.size != y.size:
+
+    # Older SciPy has no 'length' kw; try it, then fallback and trim manually
+    try:
+        _, y_rec = spsig.istft(
+            Z_d, fs=sr,
+            window='hann',
+            nperseg=nper,
+            noverlap=nover,
+            nfft=nfft,
+            input_onesided=True,
+            length=y.size  # SciPy >= 1.10
+        )
+    except TypeError:
+        _, y_rec = spsig.istft(
+            Z_d, fs=sr,
+            window='hann',
+            nperseg=nper,
+            noverlap=nover,
+            nfft=nfft,
+            input_onesided=True
+        )
+        # Trim/pad to original length
         if y_rec.size > y.size:
             y_rec = y_rec[:y.size]
-        else:
+        elif y_rec.size < y.size:
             y_rec = np.pad(y_rec, (0, y.size - y_rec.size))
+
     return y_rec.astype(np.float32, copy=False)
 
 def denoise_target_if_enabled(y_full, sr):
@@ -4929,6 +5202,38 @@ def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoin
         return (resume, resume_ckpt)
     else:
         return (False, None)
+
+def print_coloreq_gains(model, prefix):
+    """
+    Print finetune-adapter band scales (IrScale) for debugging.
+    prefix: "realtime_ft_coloreq" or "offline_ft_coloreq"
+    """
+    import numpy as np
+    i = 0
+    while True:
+        lname = f"{prefix}_g_{i}"
+        try:
+            layer = model.get_layer(lname)
+        except Exception:
+            break
+        w = layer.get_weights()
+        g = float(w[0][0]) if (w and len(w[0]) == 1) else 0.0
+        print(f"{lname}: scale={g:+.4f}")
+        i += 1
+
+def set_coloreq_gain(model, prefix, band_idx, scale):
+    """
+    Manually set one adapter band gain to test audibility.
+    scale is linear (0.3 is a strong boost, -0.3 is a deep cut).
+    """
+    lname = f"{prefix}_g_{band_idx}"
+    layer = model.get_layer(lname)
+    w = layer.get_weights()
+    if not w:
+        w = [np.array([0.0], dtype=np.float32)]
+    w[0][0] = float(scale)
+    layer.set_weights(w)
+    print(f"Set {lname} to {scale:+.4f}")
 
 def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
     dpath = dynamic_model_filepath
