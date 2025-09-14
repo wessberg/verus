@@ -3881,29 +3881,43 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
                 DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
             )
 
-        # Mask/gate KD only if gate cap is present (otherwise no fixed-threshold behavior to mimic)
+        # Mask/gate KD — shift-aware; keep mask_used optional (can set alpha=0.0)
         if cap_mask_with_gate:
-            # AFTER: allow ±0.5–1.0 ms at 48 kHz
             kd_tensors.append(
                 DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=24, name="hf_mask_distill")
                 ([T_gate_ds, mask_pred])
             )
-
-            kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, max_shift=24, name="stem_hf_distill")
-                ([off_hf_ds_hp48_pick, hf_final_pick])
-            )
+            if REALTIME_MASK_USED_DISTILL_ALPHA > 0.0:
+                kd_tensors.append(
+                    DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=24, name="mask_used_distill")
+                    ([T_gate_ds, mask_used])
+                )
 
         # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime]))
-        kd_tensors.append(MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime]))
+        kd_tensors.append(
+            DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")
+            ([offline_audio_ds, y_realtime])
+        )
+        kd_tensors.append(
+            MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")
+            ([offline_audio_ds, y_realtime])
+        )
 
-        # Stem KD
+        # Stem KD (pick/finger)
         off_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(off_pick)
         off_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(off_finger)
+        kd_tensors.append(
+            DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")
+            ([off_pick_ds, out_pick])
+        )
+        kd_tensors.append(
+            DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")
+            ([off_finger_ds, out_finger])
+        )
 
-        off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
+        # HF stem KD — define teacher HF @48k first, then add KD
+        off_hf_ds = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
         off_hf_ds_hp48 = HFHighpass(
             sample_rate=REALTIME_SAMPLE_RATE,
             cutoff_hz=REALTIME_HP_CUTOFF_HZ,
@@ -3912,17 +3926,17 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
         )(off_hf_ds)
         off_hf_ds_hp48_pick = Multiply(name="offline_hf_ds_hp48_pick_only")([off_hf_ds_hp48, style_scalar_b3])
 
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
-        kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48_pick, hf_final_pick]))
+        kd_tensors.append(
+            DistillLossBestShift(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, max_shift=24, name="stem_hf_distill")
+            ([off_hf_ds_hp48_pick, hf_final_pick])
+        )
 
-        # Band‑pass (resbp) KD — optional, only if teacher has it
+        # Band‑pass (resbp) KD — optional
         if realtime_resbp is not None and off_resbp_scaled is not None:
             off_resbp_ds = FIRDecimateBy2(name="offline_resbp_ds2")(off_resbp_scaled)
             kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")(
-                    [off_resbp_ds, realtime_resbp]
-                )
+                DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")
+                ([off_resbp_ds, realtime_resbp])
             )
 
     # Ensure KD tensors are graph-reachable
