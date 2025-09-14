@@ -2115,9 +2115,11 @@ class FIRDecimateBy2(tf.keras.layers.Layer):
         self.window = str(window)
 
     def build(self, input_shape):
-        # Design symmetric low-pass prototype and reverse for true convolution
-        taps = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
-        k = taps[::-1].reshape(-1, 1, 1).astype(np.float32)  # (L, 1, 1)
+        taps_lin = firwin(self.num_taps, cutoff=self.cutoff, window=self.window, pass_zero=True).astype(np.float32)
+        # convert to minimum-phase to reduce group delay
+        taps_min = minimum_phase(taps_lin, method="homomorphic").astype(np.float32)
+        k = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)  # reversed for conv1d
+
         self.kernel = self.add_weight(
             name="fir_kernel_shared",
             shape=k.shape,
@@ -4928,6 +4930,7 @@ def run_render_stems_realtime(use_finetuned=False):
             src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
     dbg = build_realtime_debug_model(realtime_dyn)
+    
     render_isolated_stems(
         debug_model=dbg,
         path_src=src,
@@ -5487,6 +5490,7 @@ def main ():
 
         do_finetuned = ("--finetuned" in args)
         do_both      = ("--both" in args)
+        
 
         if do_both:
             if do_offline:  run_render_stems_offline(use_finetuned=False)
