@@ -260,8 +260,8 @@ RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0, 
 RESBP_MODAL_LEN_OFFLINE        = 8192
 
 RESBP_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_REALTIME  = [ 30.0,  30.0,   28.0,   26.0,   24.0,   22.0,   21.0,   20.0,   28.0 ]
-RESBP_MODAL_LEN_REALTIME        = 2048
+RESBP_MODAL_DECAYS_MS_REALTIME  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   20.0,   28.0]
+RESBP_MODAL_LEN_REALTIME        = 8192
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
 RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
@@ -1133,6 +1133,10 @@ def mean_hf_metric(y_true, y_pred):
 
 # ────────────────────────────── DATA PIPELINE HELPERS ───────────────────────
 
+@register_keras_serializable()
+def stop_grad(x):
+    return tf.stop_gradient(x)
+
 
 @register_keras_serializable()
 class Abs1D(tf.keras.layers.Layer):
@@ -1270,6 +1274,47 @@ def causal_sep_conv(x, filters, kernel, dilation, name, activation=None, bias_co
     if activation:
         x = Activation(activation, name=f"{name}_{activation}")(x)
     return x
+def segment_generator_from_arrays_dual(seg_len_rt, x48, y48, x96, is_pick_chunks,
+                                       factor=2, min_amp=SEGMENT_GENERATOR_MIN_AMP_THRESH):
+    """
+    Simple dual-rate generator backed by already-resampled arrays (48k and 96k).
+    - seg_len_rt: segment length at realtime rate (48k).
+    - x48, y48: mono float32 arrays at 48k.
+    - x96: mono float32 array at 96k (teacher input).
+    - is_pick_chunks: bool; unused for finetune labels (style disabled), but kept for symmetry.
+    """
+    T48 = len(x48)
+    L96 = seg_len_rt * int(factor)
+    while True:
+        if T48 <= 1:
+            raise RuntimeError("Input array too short for segment_generator_from_arrays_dual")
+        s48 = random.randrange(max(T48 - seg_len_rt, 1))
+        e48 = s48 + seg_len_rt
+
+        xs48 = x48[s48:e48]
+        ys48 = y48[s48:e48]
+
+        if np.max(np.abs(xs48)) < float(min_amp):
+            continue
+
+        s96 = s48 * int(factor)
+        e96 = s96 + L96
+        xs96 = x96[s96:e96]
+
+        # Pad to exact lengths if needed
+        if len(xs48) < seg_len_rt:
+            p = seg_len_rt - len(xs48)
+            xs48 = np.pad(xs48, (0, p))
+            ys48 = np.pad(ys48, (0, p))
+        if len(xs96) < L96:
+            p2 = L96 - len(xs96)
+            xs96 = np.pad(xs96, (0, p2))
+
+        style_flag = 1.0 if is_pick_chunks else 0.0  # ignored downstream (style loss disabled)
+        yield (xs48[:, None].astype(np.float32),
+               xs96[:, None].astype(np.float32)), \
+              (ys48[:, None].astype(np.float32),
+               np.float32(style_flag))
 
 def segment_generator_from_arrays(seg_len, x, y, is_pick_chunks, min_amp=SEGMENT_GENERATOR_MIN_AMP_THRESH):
     """
@@ -1290,6 +1335,32 @@ def segment_generator_from_arrays(seg_len, x, y, is_pick_chunks, min_amp=SEGMENT
             ys = np.pad(ys, (0, pad))
         style_flag = 1.0 if is_pick_chunks else 0.0
         yield xs[:, None].astype(np.float32), (ys[:, None].astype(np.float32), np.float32(style_flag))
+
+def make_mixed_ds_from_arrays_realtime_dual(x48, x96, y48, batch_size, seg_len_rt=REALTIME_SEG_LEN):
+    """
+    Dual-rate dataset for finetuning realtime model with a 96k teacher.
+    Returns a dataset of ((x48, x96), (y48, style_flag)).
+    """
+    factor = OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE
+    assert factor >= 2 and OFFLINE_SAMPLE_RATE == 96000 and REALTIME_SAMPLE_RATE == 48000, \
+        "Expected 96k offline and 48k realtime rates with integer ratio."
+
+    sig_x = (
+        tf.TensorSpec((seg_len_rt, 1), tf.float32),                 # realtime 48k
+        tf.TensorSpec((seg_len_rt * factor, 1), tf.float32)         # offline 96k
+    )
+    sig_y = (tf.TensorSpec((seg_len_rt, 1), tf.float32), tf.TensorSpec((), tf.float32))
+
+    ds_pu = tf.data.Dataset.from_generator(
+        lambda: segment_generator_from_arrays_dual(seg_len_rt, x48, y48, x96, is_pick_chunks=True, factor=factor),
+        output_signature=(sig_x, sig_y)
+    )
+    ds_fu = tf.data.Dataset.from_generator(
+        lambda: segment_generator_from_arrays_dual(seg_len_rt, x48, y48, x96, is_pick_chunks=False, factor=factor),
+        output_signature=(sig_x, sig_y)
+    )
+    return tf.data.Dataset.sample_from_datasets([ds_pu, ds_fu], weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO], seed=SEED)\
+             .batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 def make_mixed_ds_from_arrays_offline(x96, y96, batch_size, seg_len=OFFLINE_SEG_LEN):
     sig_x = tf.TensorSpec((seg_len, 1), tf.float32)
@@ -3616,7 +3687,13 @@ def build_offline_model(dynamic_time=False,
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
 @register_keras_serializable()
-def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=True):
+def build_realtime_model(offline=None,
+                         dynamic_time=False,
+                         cap_mask_with_gate=True,
+                         use_learned_hf_mask=True,
+                         enable_mask_kd=True,
+                         detach_mask_from_audio=True,
+                         mask_min_floor=0.0):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3762,6 +3839,7 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_realtime = Add(name="realtime_main")([pick_c, finger_c])
 
+    # IR branch
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -3781,12 +3859,12 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
 
     ir = IrScale(init=0.6, name="realtime_ir_scale")(ir)
 
-    # REPLACE nearest + IRLowpass with proper FIR interpolation
+    # Proper FIR interpolation to 48k
     ir = FIRInterpByN(
         factor=REALTIME_IR_DOWNSAMPLE_FACTOR,
-        num_taps=max(193, REALTIME_LP_ORDER),  # slightly longer than 257 if you can afford it
+        num_taps=max(193, REALTIME_LP_ORDER),
         cutoff=0.45/REALTIME_IR_DOWNSAMPLE_FACTOR,
-        window=('kaiser', 9.0),                # ~80 dB sidelobes
+        window=('kaiser', 9.0),
         name="realtime_ir_interp"
     )(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
@@ -3799,6 +3877,13 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
     m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits", bias_constraint=BC)
 
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
+    if float(mask_min_floor) > 0.0:
+        mask_pred = Lambda(
+            lambda z, eps: eps + (1.0 - eps) * z,
+            arguments={'eps': float(mask_min_floor)},
+            name="realtime_hf_mask_floor"
+        )(mask_pred)
+
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
     )(mask_pred)
@@ -3823,11 +3908,23 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
             name="realtime_gate"
         )(inp)
 
-    # If gate is disabled, use an explicit IdentityLayer (no anonymous lambda)
-    if realtime_gate is None:
-        mask_used = IdentityLayer(name="realtime_hf_mask_used")(mask_smoothed)
+    # Decide what actually gates the HF path
+    if use_learned_hf_mask:
+        if realtime_gate is not None and cap_mask_with_gate:
+            # Learned mask cannot exceed the fixed gate, but can still reduce it
+            mask_used_inner = Minimum(name="realtime_hf_mask_used_min")([mask_smoothed, realtime_gate])
+        else:
+            mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_id")(mask_smoothed)
     else:
-        mask_used = Minimum(name="realtime_hf_mask_used")([mask_smoothed, realtime_gate])
+        # Ignore learned mask for the signal path; use fixed gate or pass-through ones
+        if realtime_gate is not None:
+            mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(realtime_gate)
+        else:
+            ones = Lambda(lambda z: tf.ones_like(z), name="realtime_hf_mask_used_ones")(mask_smoothed)
+            mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(ones)
+
+    # Ensure the final tensor is consistently named "realtime_hf_mask_used"
+    mask_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_inner)
 
     # HF branch proper
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
@@ -3839,7 +3936,10 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
                     lookahead=0, residual_scale=0.35, bias_constraint=BC)
     hf = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_hf_out")(hf)
 
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used])
+    # Stop audio-loss gradients from flowing into the mask (so mask learns only from its own KD/aux losses)
+    mask_for_mult = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used) if detach_mask_from_audio else mask_used
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_for_mult])
+
     hf_hp    = HFHighpass(
         sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER,
         name="realtime_hf_highpass"
@@ -3857,7 +3957,7 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
     # Mix IR and HF into main
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final_pick])
 
-    # Resonance stem: use fixed gate if present, else the learned mask
+    # Resonance stem: use fixed gate if present, else the learned mask (or ones)
     gate_for_resbp = mask_used if (realtime_gate is None) else realtime_gate
     realtime_resbp = _add_resbp_branch_realtime(
         inp=inp,
@@ -3881,10 +3981,16 @@ def build_realtime_model(offline=None, dynamic_time=False, cap_mask_with_gate=Tr
                 DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
             )
 
-        # Mask/gate KD only if gate cap is present (otherwise no fixed-threshold behavior to mimic)
-        if cap_mask_with_gate:
-            kd_tensors.append(DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA,   name="hf_mask_distill")([T_gate_ds, mask_pred]))
-            kd_tensors.append(DistillLoss(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, name="mask_used_distill")([T_gate_ds, mask_used]))
+        # Mask/gate KD: only when enabled
+        if enable_mask_kd:
+            # Shift-tolerant KD to absorb small ds/filtering timing
+            kd_tensors.append(
+                DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=8, name="hf_mask_distill")([T_gate_ds, mask_pred])
+            )
+            if use_learned_hf_mask and cap_mask_with_gate:
+                kd_tensors.append(
+                    DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_used_distill")([T_gate_ds, mask_used])
+                )
 
         # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
@@ -3980,6 +4086,40 @@ def add_sw_realtime(x, y):
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
+def add_sw_realtime_dual_nf(x, y):
+    """
+    Finetune (no style labels) for realtime model with an offline teacher.
+    x = (x_realtime_48k, x_offline_96k)
+    y = (y_audio_realtime_48k, style_flag_unused)
+
+    - Forces the model to use its own classifier (style_force=0).
+    - Disables the style BCE by providing zero sample-weights for the style output.
+    """
+    x_realtime, x_offline = x
+    y_audio, _ = y
+    b = tf.shape(x_realtime)[0]
+    T_realtime = tf.shape(x_realtime)[1]
+
+    # Dummy style label (ignored)
+    style_true  = tf.zeros((b, 1), dtype=tf.float32)
+    # Force the model to use its own classifier during finetune
+    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 = use prediction
+
+    inputs = {
+        'realtime_piezo_input':         x_realtime,
+        'realtime_offline_piezo_input': x_offline,
+        'realtime_style_true_input':    style_true,
+        'realtime_style_force_input':   style_force,
+    }
+    outputs = (y_audio, style_true)
+
+    # Sample weights: train audio only, disable style BCE
+    sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
+    sw_style = tf.zeros_like(style_true, dtype=tf.float32)
+
     return inputs, outputs, (sw_audio, sw_style)
 
 @register_keras_serializable()
@@ -4250,8 +4390,11 @@ def set_trainable_for_finetune_adapter(model, prefix):
 
 def fine_tune(offline=True, realtime=True):
     """
-    Finetune-only tone adapters on top of frozen baseline dynamic models.
-    Base models are not altered/saved over.
+    Finetune stage.
+
+    - Offline: body-only adapter (post-EQ) on top of a frozen baseline dynamic offline model.
+    - Realtime: full model finetune to learn a causal HF gate (mask) without the fixed gate cap.
+                Distills from the baseline offline teacher (causalized) and trains only FiLM and mask.
     """
     # Load finetune pair and pre-resample
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
@@ -4270,6 +4413,7 @@ def fine_tune(offline=True, realtime=True):
         sr_rt=REALTIME_SAMPLE_RATE, sr_off=OFFLINE_SAMPLE_RATE
     )
     
+    # Losses (offline adapter and realtime full)
     loss_off = FinetuneAdapterLoss(
         sample_rate=OFFLINE_SAMPLE_RATE,
         bands=COLOREQ_BANDS_OFFLINE_BODY,
@@ -4278,16 +4422,15 @@ def fine_tune(offline=True, realtime=True):
         mel_upper_hz=FINETUNE_BODY_FMAX_OFFLINE
     )
 
-    loss_rt = FinetuneAdapterLoss(
+    loss_rt_lite = FinetuneCombinedLossLite(
         sample_rate=REALTIME_SAMPLE_RATE,
-        bands=COLOREQ_BANDS_REALTIME_BODY,
-        band_order=97,
-        l1_w=0.3, mel_w=1.5, band_w=3.0,
-        mel_upper_hz=FINETUNE_BODY_FMAX_REALTIME
+        stft_scales=((1024, 256, 1024),),
+        l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0,
+        onset_gain=HF_ONSET_GAIN
     )
 
     off_dyn_wrap = None
-    rt_dyn_wrap  = None
+    rt_dyn_full  = None
 
     if offline:
         print("\n🔧 Finetuning OFFLINE adapter (base frozen)…")
@@ -4296,7 +4439,7 @@ def fine_tune(offline=True, realtime=True):
             print("ERROR: baseline offline dynamic model not found:", base_off_dyn_path); sys.exit(1)
         base_off_dyn = tf.keras.models.load_model(base_off_dyn_path, compile=False)
 
-        off_dyn_wrap = build_offline_finetune_wrapper(base_off_dyn)  # now body-only by default
+        off_dyn_wrap = build_offline_finetune_wrapper(base_off_dyn)  # body-only by default
         set_trainable_for_finetune_adapter(off_dyn_wrap, prefix="offline_ft_coloreq")
         off_dyn_wrap.compile(
             optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
@@ -4330,47 +4473,74 @@ def fine_tune(offline=True, realtime=True):
         print("✅ Saved finetuned offline adapter (static):", ft_offline_static_path)
 
     if realtime:
-        print("\n🔧 Finetuning REALTIME adapter (base frozen)…")
+        print("\n🔧 Finetuning REALTIME model (learned HF mask; no fixed gate cap)…")
+
+        # Teacher: baseline offline dynamic → causal clone (no right-lookahead)
+        base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+        if not os.path.exists(base_off_dyn_path):
+            print("ERROR: baseline offline dynamic model not found for teacher:", base_off_dyn_path); sys.exit(1)
+        offline_nc = tf.keras.models.load_model(base_off_dyn_path, compile=False)
+        offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
+
+        # Student init from baseline realtime dynamic
         base_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(base_rt_dyn_path):
             print("ERROR: baseline realtime dynamic model not found:", base_rt_dyn_path); sys.exit(1)
         base_rt_dyn = tf.keras.models.load_model(base_rt_dyn_path, compile=False)
 
-        rt_dyn_wrap = build_realtime_finetune_wrapper(base_rt_dyn)   # now body-only by default
-        set_trainable_for_finetune_adapter(rt_dyn_wrap, prefix="realtime_ft_coloreq")
-        rt_dyn_wrap.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=max(1e-4, 3e-4), clipnorm=1.0),
-            loss=[loss_rt, "binary_crossentropy"],
+        # Build finetune student with learned mask (no fixed gate cap)
+        rt_dyn_full = build_realtime_model(
+            offline=offline_causal,
+            dynamic_time=True,
+            cap_mask_with_gate=False,        # remove fixed cap
+            use_learned_hf_mask=True,        # use learned mask for gating
+            enable_mask_kd=True,             # distill teacher gate → student mask
+            detach_mask_from_audio=True,     # stopgrad so mask learns from its own losses
+            mask_min_floor=0.02              # small floor to avoid early collapse
+        )
+        # Initialize from baseline realtime dynamic (safe by-name copy)
+        copy_weights_by_name(rt_dyn_full, base_rt_dyn, verbose=True)
+
+        # Train only FiLM generators and mask convs (keep small footprint)
+        set_trainable_for_finetune_realtime(rt_dyn_full, train_scales=False, train_mask=True)
+
+        # Compile: audio-only finetune loss; style BCE disabled by sample weights
+        rt_dyn_full.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=FINETUNE_REALTIME_LR, clipnorm=1.0),
+            loss=[loss_rt_lite, "binary_crossentropy"],
             loss_weights=[1.0, 0.0],
             metrics=[["mae"], []]
         )
 
-        dsRT = make_mixed_ds_from_arrays_realtime(
-            cached["x48"], cached["y48"],
+        # Dual-rate finetune dataset (48k student + 96k teacher input)
+        dsRT_dual = make_mixed_ds_from_arrays_realtime_dual(
+            cached["x48"], cached["x96"], cached["y48"],
             batch_size=FINETUNE_BATCH_SIZE,
             seg_len_rt=REALTIME_SEG_LEN
-        ).map(add_sw_realtime_finetune_nf).prefetch(tf.data.AUTOTUNE)
+        ).map(add_sw_realtime_dual_nf).prefetch(tf.data.AUTOTUNE)
 
         steps_rt = approx_steps_from_length(len(cached["x48"]), REALTIME_SEG_LEN,
                                             FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP)
-        rt_dyn_wrap.fit(dsRT, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
 
-        # Save dynamic adapter
+        rt_dyn_full.fit(dsRT_dual, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
+
+        # Save dynamic finetuned realtime model
         ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        rt_dyn_wrap.save(ft_rt_dyn_path)
-        print("✅ Saved finetuned realtime adapter (dynamic):", ft_rt_dyn_path)
+        rt_dyn_full.save(ft_rt_dyn_path)
+        print("✅ Saved finetuned realtime model (dynamic, learned mask):", ft_rt_dyn_path)
 
-        # Build teacher-free static base and wrap it, then copy EQ weights
-        base_rt_static = build_realtime_model(offline=None, dynamic_time=False)  # teacher-free, static
-        # Initialize with baseline dynamic weights
-        copy_weights_by_name(base_rt_static, base_rt_dyn, verbose=True)
-        rt_static_wrap = build_realtime_finetune_wrapper(base_rt_static)
-        copy_weights_by_name(rt_static_wrap, rt_dyn_wrap, verbose=True)
+        # Build teacher-free static base and copy weights
+        base_rt_static = build_realtime_model(
+            offline=None, dynamic_time=False,
+            cap_mask_with_gate=False, use_learned_hf_mask=True,
+            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02
+        )
+        copy_weights_by_name(base_rt_static, rt_dyn_full, verbose=True)
         ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-        rt_static_wrap.save(ft_rt_static_path)
-        print("✅ Saved finetuned realtime adapter (static):", ft_rt_static_path)
+        base_rt_static.save(ft_rt_static_path)
+        print("✅ Saved finetuned realtime model (static, learned mask):", ft_rt_static_path)
 
-    return off_dyn_wrap, rt_dyn_wrap
+    return off_dyn_wrap, rt_dyn_full
 
 # REPLACE the existing set_trainable_for_finetune_offline with this version to also train the mask subnetwork when present
 def set_trainable_for_finetune_offline(model, train_scales=True, train_mask=False):
@@ -5207,8 +5377,23 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         static_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_realtime_model,
-        build_model_fn_args_static={ 'offline': offline_causal },
-        build_model_fn_args_dynamic={ },
+        build_model_fn_args_static={
+            'offline': offline_causal,
+            'cap_mask_with_gate': True,       # rely on fixed gate in base training
+            'use_learned_hf_mask': False,     # learned mask not used to gate audio in base model
+            'enable_mask_kd': False,          # do not KD the mask in base training
+            'detach_mask_from_audio': True,   # if/when enabled later, keep mask grads clean
+            'mask_min_floor': 0.0
+        },
+        build_model_fn_args_dynamic={
+            # dynamic preview model used by DemoCallback; mirror the static gating behavior
+            'offline': None,
+            'cap_mask_with_gate': True,
+            'use_learned_hf_mask': False,
+            'enable_mask_kd': False,
+            'detach_mask_from_audio': True,
+            'mask_min_floor': 0.0
+        },
         checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
         logs_out_dir=LOGS_REALTIME_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_REALTIME_OUT_DIR,
