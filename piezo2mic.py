@@ -246,7 +246,7 @@ OFFLINE_RESBP_SCALE_INIT  = 2.0
 REALTIME_RESBP_SCALE_INIT = 2.0
 
 OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
-REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
+REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 10.0
 
 FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 30.0
 FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
@@ -308,7 +308,7 @@ REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
-REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.0
+REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.5
 FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 REALTIME_LP_ORDER   = 257 
@@ -321,10 +321,13 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 12
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
+
+REALTIME_HF_TIME_SHIFT_SAMPLES = -1
+OFFLINE_HF_TIME_SHIFT_SAMPLES  = 0
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -550,6 +553,61 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     if verbose:
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
+
+@register_keras_serializable()
+class MaskFloor(Layer):
+    """
+    y = eps + (1 - eps) * x; used to enforce a minimum mask floor without Lambda(lambda ...)
+    """
+    def __init__(self, eps=0.02, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.eps = float(eps)
+    def call(self, x):
+        eps = tf.constant(self.eps, dtype=x.dtype)
+        return eps + (1.0 - eps) * x
+    def get_config(self):
+        return {**super().get_config(), "eps": self.eps}
+
+@register_keras_serializable()
+class OnesLike(Layer):
+    """
+    Stateless replacement for Lambda(lambda z: tf.ones_like(z)).
+    """
+    def call(self, x):
+        return tf.ones_like(x)
+
+@register_keras_serializable()
+class TimeShift1D(Layer):
+    """
+    Causal, Keras-serializable integer time shift with constant length.
+    - shift > 0: delay by 'shift' samples (left-pad zeros, crop end)
+    - shift < 0: advance by 'abs(shift)' samples (drop head, pad zeros at end)
+    Output length is the same as input; no lookahead; no extra latency at I/O.
+    """
+    def __init__(self, shift=0, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.shift = int(shift)
+
+    def call(self, x):
+        if self.shift == 0:
+            return x
+        T = tf.shape(x)[1]
+        s = abs(self.shift)
+        if self.shift > 0:
+            # Delay: pad on the left, then crop to original length
+            x_pad = tf.pad(x, [[0,0], [s,0], [0,0]])
+            return x_pad[:, :T, :]
+        else:
+            # Advance: drop 's' from the head, pad zeros at the end
+            x_crop = x[:, s:, :]
+            x_pad  = tf.pad(x_crop, [[0,0], [0, s], [0,0]])
+            return x_pad[:, :T, :]
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        return {**super().get_config(), "shift": self.shift}
 
 @register_keras_serializable()
 class ZeroBias(constraints.Constraint):
@@ -3559,7 +3617,8 @@ def build_offline_model_causal(offline_src, dynamic_time=True):
 def build_offline_model(dynamic_time=False,
                         lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
                         name="piezo2mic_offline",
-                        cap_mask_with_gate=True):
+                        cap_mask_with_gate=True,
+                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES):
     """
     Offline (96 kHz) model.
     New: optional learned pick mask for HF/resonance branches.
@@ -3668,6 +3727,10 @@ def build_offline_model(dynamic_time=False,
                           order=OFFLINE_HF_HP_ORDER,
                           name="offline_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
+    
+    if int(hf_time_shift_samples) != 0:
+        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="offline_hf_timeshift")(hf_final)
+
     hf_final_pick = Multiply(name="offline_hf_pick_only")([hf_final, style_time_used])
     
     main_core = Add(name="offline_main_core")([pick_c, finger_c])
@@ -3693,7 +3756,8 @@ def build_realtime_model(offline=None,
                          use_learned_hf_mask=True,
                          enable_mask_kd=True,
                          detach_mask_from_audio=True,
-                         mask_min_floor=0.0):
+                         mask_min_floor=0.0,
+                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3877,12 +3941,9 @@ def build_realtime_model(offline=None,
     m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits", bias_constraint=BC)
 
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
+    
     if float(mask_min_floor) > 0.0:
-        mask_pred = Lambda(
-            lambda z, eps: eps + (1.0 - eps) * z,
-            arguments={'eps': float(mask_min_floor)},
-            name="realtime_hf_mask_floor"
-        )(mask_pred)
+        mask_pred = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_floor")(mask_pred)
 
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
@@ -3920,7 +3981,7 @@ def build_realtime_model(offline=None,
         if realtime_gate is not None:
             mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(realtime_gate)
         else:
-            ones = Lambda(lambda z: tf.ones_like(z), name="realtime_hf_mask_used_ones")(mask_smoothed)
+            ones = OnesLike(name="realtime_hf_mask_used_ones")(mask_smoothed)
             mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(ones)
 
     # Ensure the final tensor is consistently named "realtime_hf_mask_used"
@@ -3952,6 +4013,10 @@ def build_realtime_model(offline=None,
         sample_rate=REALTIME_SAMPLE_RATE,
         name="realtime_hf_lowband_penalty"
     )(hf_final)
+    
+    if int(hf_time_shift_samples) != 0:
+        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)
+    
     hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
     # Mix IR and HF into main
@@ -4315,6 +4380,61 @@ def _add_back_bypass(y_body_eq, bypass):
     if bypass is None:
         return y_body_eq
     return Add(name="ft_body_plus_bypass")([y_body_eq, bypass])
+
+def _load_baseline_realtime_dyn():
+    """
+    Load the baseline realtime dynamic model if present; else fall back to preview.
+    """
+    dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+    if os.path.exists(dyn_path):
+        print("[hf-shift] Loading baseline realtime dynamic:", dyn_path)
+        return tf.keras.models.load_model(dyn_path, compile=False)
+    print("[hf-shift] Baseline dynamic not found; building preview.")
+    return _build_realtime_dynamic_for_preview()
+
+def make_realtime_dynamic_with_hf_shift(shift_samples):
+    """
+    Build a dynamic realtime model with a given HF shift and copy weights by name
+    from the baseline dynamic model. The timeshift layer has no weights.
+    """
+    base_dyn = _load_baseline_realtime_dyn()
+    # Mirror baseline dynamic gating behavior (teacher-free, masked by fixed gate)
+    rt_dyn_shift = build_realtime_model(
+        offline=None,
+        dynamic_time=True,
+        cap_mask_with_gate=True,
+        use_learned_hf_mask=False,
+        enable_mask_kd=False,
+        detach_mask_from_audio=True,
+        mask_min_floor=0.0,
+        hf_time_shift_samples=int(shift_samples)
+    )
+    copy_weights_by_name(rt_dyn_shift, base_dyn, verbose=True)
+    return rt_dyn_shift
+
+def render_hf_shift_sweep_realtime(min_shift=-8, max_shift=8, sec=DEMO_SEC, offset=DEMO_OFFSET_SEC):
+    """
+    For each integer shift in [min_shift, max_shift], render a short demo so you can listen.
+    Outputs go to ./out/demos/hf_shift_sweep/realtime/shift_{+/-d}/
+    """
+    assert_has_pairs()
+    path_src, path_tgt = all_pairs[DEMO_PAIR_INDEX]
+    for s in range(int(min_shift), int(max_shift) + 1):
+        model = make_realtime_dynamic_with_hf_shift(s)
+        out_dir = os.path.join(DEMOS_OUT_DIR, "hf_shift_sweep", "realtime", f"shift_{s:+d}")
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"[hf-shift] Rendering shift={s} samples → {out_dir}")
+        generate_demo_from_files(
+            model=model,
+            out_dir=out_dir,
+            sample_rate=REALTIME_SAMPLE_RATE,
+            path_src=path_src,
+            path_target=path_tgt,
+            prediction_name=f"demo_pred_shift_{s:+d}",
+            only_prediction=False,
+            offset_sec=offset,
+            sec=sec
+        )
 
 def build_offline_finetune_wrapper(base_offline,
                                    bands=COLOREQ_BANDS_OFFLINE_BODY,
@@ -4747,49 +4867,53 @@ def build_offline_debug_model(offline):
 
 
 def build_realtime_debug_model(realtime):
-    try:
-        y_pred = realtime.get_layer("realtime_with_ir_resbp").output
-    except Exception:
-        y_pred = realtime.get_layer("realtime_with_ir").output
+    # Robustly pick the final audio tensor (depends on model version)
+    def _get_first(names):
+        for n in names:
+            try:
+                return realtime.get_layer(n).output
+            except Exception:
+                pass
+        return None
 
-    outs = {
-        "hf_pre":        realtime.get_layer("realtime_hf_out").output,
-        "hf_gated":      realtime.get_layer("realtime_hf_mult_gate").output,
-        "hf_hp":         realtime.get_layer("realtime_hf_highpass").output,
-        "hf_scaled":     realtime.get_layer("realtime_hf_scale").output,
-        "hf_pick":       realtime.get_layer("realtime_hf_pick_only").output,
-        "mask_pred":     realtime.get_layer("realtime_hf_mask").output,
-        "mask_used":     realtime.get_layer("realtime_hf_mask_used").output,
-        "hf_mask_smooth":realtime.get_layer("realtime_hf_mask_smooth").output,
-        "pick_c":        realtime.get_layer("realtime_pick_contrib").output,
-        # IMPORTANT: use 'finger_c' (not 'fing_c') to match render_isolated_stems
-        "finger_c":      realtime.get_layer("realtime_finger_contrib").output,
-        "y_pred":        y_pred,
-        "resbp":         realtime.get_layer("realtime_resbp_scale").output,
-        "style_pred":    realtime.get_layer("realtime_style_prob").output,
-    }
+    y_pred = _get_first(["realtime_with_ir_resbp", "realtime_with_ir", "realtime_main"])
+    if y_pred is None:
+        raise RuntimeError("Could not find a final audio tensor in the realtime model.")
 
-    # IR-only tensor fallback chain
-    ir_tensor = None
-    for lname in ("realtime_ir_matchlen", "realtime_ir_lowpass", "realtime_ir_interp", "realtime_ir_upsample"):
+    outs = {"y_pred": y_pred}
+
+    # Helper to add an output only if the layer exists
+    def add(key, lname):
         try:
-            ir_tensor = realtime.get_layer(lname).output
-            break
+            outs[key] = realtime.get_layer(lname).output
         except Exception:
             pass
-    if ir_tensor is not None:
-        outs["ir_only"] = ir_tensor
 
-    # Optional gate
-    try:
-        outs["gate"] = realtime.get_layer("realtime_gate").output
-    except Exception:
-        pass
+    # HF branch probes (add what exists)
+    add("hf_pre",   "realtime_hf_out")
+    add("hf_gated", "realtime_hf_mult_gate")
+    add("hf_hp",    "realtime_hf_highpass")
+    add("hf_scaled","realtime_hf_scale")
+    add("hf_pick",  "realtime_hf_pick_only")
 
-    g_last = _find_last_layer_with_suffix(realtime, "_film_gamma_expand")
-    b_last = _find_last_layer_with_suffix(realtime, "_film_beta_expand")
-    if g_last is not None: outs["film_gamma_last"] = g_last.output
-    if b_last is not None: outs["film_beta_last"]  = b_last.output
+    # Optional learned mask probes (older baselines may not have these)
+    add("mask_pred",      "realtime_hf_mask")
+    add("hf_mask_smooth", "realtime_hf_mask_smooth")
+    add("mask_used",      "realtime_hf_mask_used")
+
+    # Stems and style
+    add("pick_c",     "realtime_pick_contrib")
+    add("finger_c",   "realtime_finger_contrib")
+    add("resbp",      "realtime_resbp_scale")
+    add("style_pred", "realtime_style_prob")
+
+    # IR-only probe (name depends on version)
+    ir = _get_first(["realtime_ir_matchlen", "realtime_ir_interp", "realtime_ir_lowpass", "realtime_ir_upsample"])
+    if ir is not None:
+        outs["ir_only"] = ir
+
+    # Optional fixed gate
+    add("gate", "realtime_gate")
 
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
 
@@ -5685,6 +5809,14 @@ def main ():
         else:
             if do_offline:  run_render_stems_offline(use_finetuned=do_finetuned)
             if do_realtime: run_render_stems_realtime(use_finetuned=do_finetuned)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--hf-shift-sweep":
+        # Optional range: --hf-shift-sweep [-6:6]
+        rng = (-8, 8)
+        if len(sys.argv) > 2 and ":" in sys.argv[2]:
+            a, b = sys.argv[2].split(":")
+            rng = (int(a), int(b))
+        render_hf_shift_sweep_realtime(min_shift=rng[0], max_shift=rng[1])
         sys.exit(0)
     else:
         print("No command given.")
