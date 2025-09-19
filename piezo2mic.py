@@ -308,8 +308,8 @@ REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
-REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.5
-FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0.0
+REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
+FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
 
 REALTIME_LP_ORDER   = 257 
 REALTIME_LP_CUTOFF  = 2800
@@ -321,7 +321,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 2
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
@@ -357,11 +357,11 @@ FINETUNE_BODY_FMAX_OFFLINE  = 16000.0
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 10
+DEMO_SEC        = 60
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 60
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -4513,8 +4513,8 @@ def fine_tune(offline=True, realtime=True):
     Finetune stage.
 
     - Offline: body-only adapter (post-EQ) on top of a frozen baseline dynamic offline model.
-    - Realtime: full model finetune to learn a causal HF gate (mask) without the fixed gate cap.
-                Distills from the baseline offline teacher (causalized) and trains only FiLM and mask.
+    - Realtime: train a static student that distills from the baseline offline teacher;
+                export a separate dynamic student that is teacher-free.
     """
     # Load finetune pair and pre-resample
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
@@ -4550,7 +4550,7 @@ def fine_tune(offline=True, realtime=True):
     )
 
     off_dyn_wrap = None
-    rt_dyn_full  = None
+    rt_dyn_export = None
 
     if offline:
         print("\n🔧 Finetuning OFFLINE adapter (base frozen)…")
@@ -4593,7 +4593,7 @@ def fine_tune(offline=True, realtime=True):
         print("✅ Saved finetuned offline adapter (static):", ft_offline_static_path)
 
     if realtime:
-        print("\n🔧 Finetuning REALTIME model (learned HF mask; no fixed gate cap)…")
+        print("\n🔧 Finetuning REALTIME model (static student distills from teacher; dynamic export is teacher-free)…")
 
         # Teacher: baseline offline dynamic → causal clone (no right-lookahead)
         base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
@@ -4608,24 +4608,24 @@ def fine_tune(offline=True, realtime=True):
             print("ERROR: baseline realtime dynamic model not found:", base_rt_dyn_path); sys.exit(1)
         base_rt_dyn = tf.keras.models.load_model(base_rt_dyn_path, compile=False)
 
-        # Build finetune student with learned mask (no fixed gate cap)
-        rt_dyn_full = build_realtime_model(
+        # Build the TRAINING MODEL as STATIC with teacher attached (KD heads live here)
+        rt_static_train = build_realtime_model(
             offline=offline_causal,
-            dynamic_time=True,
-            cap_mask_with_gate=False,        # remove fixed cap
-            use_learned_hf_mask=True,        # use learned mask for gating
-            enable_mask_kd=True,             # distill teacher gate → student mask
+            dynamic_time=False,               # fixed-T static model holds the reference to teacher
+            cap_mask_with_gate=False,        # remove fixed cap (learned mask controls HF)
+            use_learned_hf_mask=True,
+            enable_mask_kd=True,             # KD: teacher gate → student mask
             detach_mask_from_audio=True,     # stopgrad so mask learns from its own losses
-            mask_min_floor=0.02              # small floor to avoid early collapse
+            mask_min_floor=0.02
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
-        copy_weights_by_name(rt_dyn_full, base_rt_dyn, verbose=True)
+        copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
         # Train only FiLM generators and mask convs (keep small footprint)
-        set_trainable_for_finetune_realtime(rt_dyn_full, train_scales=False, train_mask=True)
+        set_trainable_for_finetune_realtime(rt_static_train, train_scales=False, train_mask=True)
 
         # Compile: audio-only finetune loss; style BCE disabled by sample weights
-        rt_dyn_full.compile(
+        rt_static_train.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=FINETUNE_REALTIME_LR, clipnorm=1.0),
             loss=[loss_rt_lite, "binary_crossentropy"],
             loss_weights=[1.0, 0.0],
@@ -4642,25 +4642,30 @@ def fine_tune(offline=True, realtime=True):
         steps_rt = approx_steps_from_length(len(cached["x48"]), REALTIME_SEG_LEN,
                                             FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP)
 
-        rt_dyn_full.fit(dsRT_dual, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
+        rt_static_train.fit(dsRT_dual, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
 
-        # Save dynamic finetuned realtime model
-        ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        rt_dyn_full.save(ft_rt_dyn_path)
-        print("✅ Saved finetuned realtime model (dynamic, learned mask):", ft_rt_dyn_path)
-
-        # Build teacher-free static base and copy weights
-        base_rt_static = build_realtime_model(
-            offline=None, dynamic_time=False,
-            cap_mask_with_gate=False, use_learned_hf_mask=True,
-            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02
-        )
-        copy_weights_by_name(base_rt_static, rt_dyn_full, verbose=True)
+        # 1) Save STATIC finetuned realtime model WITH teacher reference (for inspection/retraining)
         ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-        base_rt_static.save(ft_rt_static_path)
-        print("✅ Saved finetuned realtime model (static, learned mask):", ft_rt_static_path)
+        rt_static_train.save(ft_rt_static_path)
+        print("✅ Saved finetuned realtime model (static WITH teacher):", ft_rt_static_path)
 
-    return off_dyn_wrap, rt_dyn_full
+        # 2) Build a teacher‑FREE DYNAMIC export and copy weights by name
+        rt_dyn_export = build_realtime_model(
+            offline=None,
+            dynamic_time=True,               # dynamic export for streaming/inference
+            cap_mask_with_gate=False,
+            use_learned_hf_mask=True,
+            enable_mask_kd=False,            # no KD layers/heads in export
+            detach_mask_from_audio=True,
+            mask_min_floor=0.02
+        )
+        copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
+
+        ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+        rt_dyn_export.save(ft_rt_dyn_path)
+        print("✅ Saved finetuned realtime model (dynamic, teacher‑free):", ft_rt_dyn_path)
+
+    return off_dyn_wrap, rt_dyn_export
 
 # REPLACE the existing set_trainable_for_finetune_offline with this version to also train the mask subnetwork when present
 def set_trainable_for_finetune_offline(model, train_scales=True, train_mask=False):
