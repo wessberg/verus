@@ -125,7 +125,7 @@ DISABLE_SCALE_BOOSTS = False
 EPOCHS      = 40
 FINETUNE_EPOCHS = 3
 
-FINETUNE_OFFLINE_STEPS_CAP       = 500
+FINETUNE_OFFLINE_STEPS_CAP       = 250
 FINETUNE_REALTIME_STEPS_CAP      = FINETUNE_OFFLINE_STEPS_CAP * 10
 
 # Audio sample‐rates
@@ -264,7 +264,7 @@ REALTIME_RESBP_SCALE_INIT = 2.0
 OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
 REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 10.0
 
-FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 60.0
+FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 100.0
 FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 60.0
 
 
@@ -339,7 +339,7 @@ LR_PLATEAU_PATIENCE = 5
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
 REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 2
 
-FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
+FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
 
 REALTIME_HF_TIME_SHIFT_SAMPLES = -1
@@ -3681,7 +3681,8 @@ def build_offline_student_for_finetune(teacher, dynamic_time=False, name="piezo2
     # 1) Build the student (learned mask controls gating)
     student = build_offline_model(
         dynamic_time=dynamic_time,
-        cap_mask_with_gate=False,                # NO fixed gate in signal path (learned mask used)
+        cap_mask_with_gate=False,
+        mask_min_floor=0.05,
         name="piezo2mic_offline_ft_student"
     )
     y_audio_s, y_style_s = student.outputs
@@ -3745,7 +3746,8 @@ def build_offline_model(dynamic_time=False,
                         lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
                         name="piezo2mic_offline",
                         cap_mask_with_gate=True,
-                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES):
+                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES,
+                        mask_min_floor=0.0):
     """
     Offline (96 kHz) model.
     New: optional learned pick mask for HF/resonance branches.
@@ -3848,6 +3850,10 @@ def build_offline_model(dynamic_time=False,
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits")(m)
     mask_pred = Activation("sigmoid", name="offline_hf_mask")(m)
+
+    if float(mask_min_floor) > 0.0:
+        mask_pred = MaskFloor(eps=float(mask_min_floor), name="offline_hf_mask_floor")(mask_pred)
+
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="offline_hf_mask_smooth"
     )(mask_pred)
@@ -4821,7 +4827,8 @@ def fine_tune(offline=True, realtime=True):
         # Export DYNAMIC teacher‑free (cap OFF; learned mask gates)
         off_dyn_export = build_offline_model(
             dynamic_time=True,
-            cap_mask_with_gate=False,     # no fixed threshold; use learned mask
+            cap_mask_with_gate=False,
+            mask_min_floor=0.05,
             name="piezo2mic_offline_ft_dynamic"
         )
         copy_weights_by_name(off_dyn_export, off_static_train, verbose=True)
@@ -4834,6 +4841,7 @@ def fine_tune(offline=True, realtime=True):
         off_static_export = build_offline_model(
             dynamic_time=False,
             cap_mask_with_gate=False,
+            mask_min_floor=0.05,
             name="piezo2mic_offline_ft_static"
         )
         copy_weights_by_name(off_static_export, off_static_train, verbose=True)
