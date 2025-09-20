@@ -242,6 +242,14 @@ REALTIME_GATE_DEPTH_LMAX                = 256
 # FILM
 REALTIME_FILM_GAMMA_SCALE = 0.5
 REALTIME_FILM_BETA_SCALE  = 0.0
+OFFLINE_FILM_GAMMA_SCALE = 1.0
+OFFLINE_FILM_BETA_SCALE  = 1.0
+
+REALTIME_FILM_GAMMA_MAG = 0.10  # gamma ∈ [1 - 0.10, 1 + 0.10]
+REALTIME_FILM_BETA_MAG  = 0.00  # beta ≡ 0 for realtime
+
+OFFLINE_FILM_GAMMA_MAG  = 0.20  # allow a bit more for offline finetune
+OFFLINE_FILM_BETA_MAG   = 0.05
 
 # ─── Resonance branch params ─────────────────────────────────────────────
 
@@ -3434,15 +3442,14 @@ def clip_01x4(z):
     # Scale by 4 and clamp to [0, 1]
     return tf.clip_by_value(4.0 * z, 0.0, 1.0)
 
-@register_keras_serializable()
-def film_gamma_stable(raw, scale=1.0):
-    # γ = 1 + 0.1 * tanh(scale * raw)
-    return 1.0 + 0.1 * tf.tanh(scale * raw)
+def film_gamma_stable(raw, scale=1.0, mag=0.1):
+    # γ = 1 + mag * tanh(scale * raw)
+    return 1.0 + float(mag) * tf.tanh(scale * raw)
 
 @register_keras_serializable()
-def film_beta_stable(raw, scale=1.0):
-    # β = 0.1 * tanh(scale * raw)
-    return 0.1 * tf.tanh(scale * raw)
+def film_beta_stable(raw, scale=1.0, mag=0.1):
+    # β = mag * tanh(scale * raw)
+    return float(mag) * tf.tanh(scale * raw)
 
 def compute_pads(kernel, dilation, lookahead_samples):
     P_tot = (kernel - 1) * dilation
@@ -3486,12 +3493,21 @@ def gated_sep_block(x, filters, kernel, dilation, prefix, lookahead=0, bias_cons
     x   = Add(name=f"{prefix}_res_add")([x, res])
     return x
 
-def film_apply(x, style_embed, filters, prefix, gamma_scale=1.0, beta_scale=1.0):
+def film_apply(x, style_embed, filters, prefix,
+               gamma_scale=1.0, beta_scale=1.0,
+               gamma_mag=0.1, beta_mag=0.1):
     film_params = Dense(filters*2, name=f"{prefix}_film_dense")(style_embed)
-    gamma_raw = Lambda(slice_film_gamma, arguments={'filters': filters}, name=f"{prefix}_film_gamma_raw")(film_params)
-    beta_raw  = Lambda(slice_film_beta,  arguments={'filters': filters}, name=f"{prefix}_film_beta_raw")(film_params)
-    gamma = Lambda(film_gamma_stable, arguments={'scale': float(gamma_scale)}, name=f"{prefix}_film_gamma")(gamma_raw)
-    beta  = Lambda(film_beta_stable,  arguments={'scale': float(beta_scale)}, name=f"{prefix}_film_beta")(beta_raw)
+    gamma_raw = Lambda(slice_film_gamma, arguments={'filters': filters},
+                       name=f"{prefix}_film_gamma_raw")(film_params)
+    beta_raw  = Lambda(slice_film_beta,  arguments={'filters': filters},
+                       name=f"{prefix}_film_beta_raw")(film_params)
+
+    gamma = Lambda(film_gamma_stable,
+                   arguments={'scale': float(gamma_scale), 'mag': float(gamma_mag)},
+                   name=f"{prefix}_film_gamma")(gamma_raw)
+    beta  = Lambda(film_beta_stable,
+                   arguments={'scale': float(beta_scale), 'mag': float(beta_mag)},
+                   name=f"{prefix}_film_beta")(beta_raw)
 
     gamma3 = Reshape((1, filters), name=f"{prefix}_film_gamma_expand")(gamma)
     beta3  = Reshape((1, filters), name=f"{prefix}_film_beta_expand")(beta)
@@ -3763,7 +3779,12 @@ def build_offline_model(dynamic_time=False,
     # Pre-blocks with configurable look-ahead
     for i in range(OFFLINE_PRE_BLOCKS):
         x = gated_sep_block(x, OFFLINE_FILTERS, OFFLINE_PRE_KERNEL, 1, prefix=f"offline_pre_{i}", lookahead=lookahead_samples)
-        x = film_apply(x, style_embed, OFFLINE_FILTERS, prefix=f"offline_pre_{i}")
+        x = film_apply(x, style_embed, OFFLINE_FILTERS, prefix=f"offline_pre_{i}",
+                        gamma_scale=OFFLINE_FILM_GAMMA_SCALE,
+                        beta_scale=OFFLINE_FILM_BETA_SCALE,
+                        gamma_mag=OFFLINE_FILM_GAMMA_MAG,
+                        beta_mag=OFFLINE_FILM_BETA_MAG
+                    )
 
     # Dilated stack with configurable look-ahead
     for idx, d in enumerate(OFFLINE_DILATIONS):
@@ -3777,7 +3798,12 @@ def build_offline_model(dynamic_time=False,
                                                Activation('sigmoid', name=f"sigmoid_{idx}")(g2)])
         x = Conv1D(OFFLINE_FILTERS,1,padding='same', name=f"pw_{idx}")(x)
         x = Add(name=f"res_add_{idx}")([x, res])
-        x = film_apply(x, style_embed, OFFLINE_FILTERS, prefix=f"offline_dil_{idx}")
+        x = film_apply(x, style_embed, OFFLINE_FILTERS, prefix=f"offline_dil_{idx}",
+                        gamma_scale=OFFLINE_FILM_GAMMA_SCALE,
+                        beta_scale=OFFLINE_FILM_BETA_SCALE,
+                        gamma_mag=OFFLINE_FILM_GAMMA_MAG,
+                        beta_mag=OFFLINE_FILM_BETA_MAG
+                    )
         
     # Final pick/finger outputs
     main_pick   = Conv1D(1,1,padding="same",name="offline_final_pick")(x)
@@ -3971,9 +3997,12 @@ def build_realtime_model(offline=None,
         x = glu_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1,
                         prefix=f"realtime_pre_{i}", lookahead=0,
                         residual_scale=0.35, bias_constraint=BC)
+        
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}",
-                    gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-                    beta_scale=REALTIME_FILM_BETA_SCALE)
+               gamma_scale=REALTIME_FILM_GAMMA_SCALE,
+               beta_scale=REALTIME_FILM_BETA_SCALE,
+               gamma_mag=REALTIME_FILM_GAMMA_MAG,
+               beta_mag=REALTIME_FILM_BETA_MAG)
 
     # Dilated stack
     realtime_feats = []
@@ -3998,7 +4027,9 @@ def build_realtime_model(offline=None,
         # FiLM after the residual, same as before
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
                     gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-                    beta_scale=REALTIME_FILM_BETA_SCALE)
+                    beta_scale=REALTIME_FILM_BETA_SCALE,
+                    gamma_mag=REALTIME_FILM_GAMMA_MAG,
+                    beta_mag=REALTIME_FILM_BETA_MAG)
 
         offline_feat_name = f"offline_dil_{i}_film_apply"
         if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
