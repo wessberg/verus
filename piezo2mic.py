@@ -2598,11 +2598,11 @@ class AdjustableAlphaMixin:
 @register_keras_serializable()
 class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
     """
-    Training-only penalty: when the teacher gate is closed (gate≈0), suppress student HF.
-    Inputs: [hf_final (B,T,1), teacher_gate_ds (B,T,1)]
-    Adds loss = alpha * mean(|hf_final| * (1 - teacher_gate_ds)), returns hf_final unchanged.
+    Training-only penalty: suppress student HF when the teacher gate is closed.
+    Adds loss = alpha * mean(|hf| * (1 - gate)), after aligning to min time length.
+    Returns the HF input unchanged so it can be used as a side tap in kd_tensors.
     """
-    def __init__(self, alpha=1.0, name=None, **kwargs):
+    def __init__(self, alpha=0.7, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.init_alpha = float(alpha)
 
@@ -2611,11 +2611,14 @@ class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
         super().build(input_shape)
 
     def call(self, inputs, training=None):
-        hf_final, gate = inputs
+        hf, gate = inputs  # (B,T,1), (B,Tg,1)
         if training is True:
-            leak = tf.abs(hf_final) * tf.stop_gradient(1.0 - gate)
+            t = tf.minimum(tf.shape(hf)[1], tf.shape(gate)[1])
+            hf_t   = hf[:,   :t, :]
+            gate_t = gate[:, :t, :]
+            leak = tf.abs(hf_t) * tf.stop_gradient(1.0 - gate_t)
             self.add_loss(self.alpha_var * tf.reduce_mean(leak))
-        return hf_final
+        return hf  # passthrough
 
     def get_config(self):
         return {"alpha": float(self.init_alpha), **super().get_config()}
