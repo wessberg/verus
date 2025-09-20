@@ -248,7 +248,7 @@ REALTIME_RESBP_SCALE_INIT = 2.0
 OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
 REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 10.0
 
-FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 30.0
+FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 60.0
 FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
 
 
@@ -309,7 +309,7 @@ REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
 REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
-FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 2
+FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
 
 REALTIME_LP_ORDER   = 257 
 REALTIME_LP_CUTOFF  = 2800
@@ -324,7 +324,7 @@ OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
 REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 2
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
-FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
+FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 0
 
 REALTIME_HF_TIME_SHIFT_SAMPLES = -1
 OFFLINE_HF_TIME_SHIFT_SAMPLES  = 0
@@ -359,11 +359,11 @@ CHUNK_SEC           = 5
 
 DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 0
+DEMO_PAIR_INDEX = 1
 
 LONG_DEMO_SEC        = 10
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_PAIR_INDEX = 1
 
 PICK_SRC_DIR   = "./input/pick/source"
 PICK_TGT_DIR   = "./input/pick/target"
@@ -553,6 +553,22 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     if verbose:
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
+
+@register_keras_serializable()
+class MaskDeadzone(tf.keras.layers.Layer):
+    """
+    Clamp small mask values to 0: y = max(0, x - eps)/(1-eps), then clip to [0,1].
+    This creates exact silence for x < eps while preserving [0,1] range for x ≥ eps.
+    """
+    def __init__(self, eps=0.12, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.eps = float(eps)
+    def call(self, x):
+        eps = tf.constant(self.eps, dtype=x.dtype)
+        y = tf.nn.relu(x - eps) / (1.0 - eps)
+        return tf.clip_by_value(y, 0.0, 1.0)
+    def get_config(self):
+        return {**super().get_config(), "eps": self.eps}
 
 @register_keras_serializable()
 class MaskFloor(Layer):
@@ -3757,7 +3773,8 @@ def build_realtime_model(offline=None,
                          enable_mask_kd=True,
                          detach_mask_from_audio=True,
                          mask_min_floor=0.0,
-                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES):
+                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
+                         mask_deadzone_eps=0.0):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3948,6 +3965,9 @@ def build_realtime_model(offline=None,
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
     )(mask_pred)
+    
+    if float(mask_deadzone_eps) > 0.0:
+        mask_smoothed = MaskDeadzone(eps=float(mask_deadzone_eps), name="realtime_hf_mask_deadzone")(mask_smoothed)
 
     # Optional fixed gate (INT8-friendly) as a safety cap
     realtime_gate = None
@@ -4046,16 +4066,14 @@ def build_realtime_model(offline=None,
                 DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
             )
 
-        # Mask/gate KD: only when enabled
+        # Distill both the raw mask and the actually used mask (smoothed)
         if enable_mask_kd:
-            # Shift-tolerant KD to absorb small ds/filtering timing
             kd_tensors.append(
                 DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=8, name="hf_mask_distill")([T_gate_ds, mask_pred])
             )
-            if use_learned_hf_mask and cap_mask_with_gate:
-                kd_tensors.append(
-                    DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_used_distill")([T_gate_ds, mask_used])
-                )
+            kd_tensors.append(
+                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_used_distill")([T_gate_ds, mask_used])
+            )
 
         # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
@@ -4152,6 +4170,31 @@ def add_sw_realtime(x, y):
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
     return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
+def add_shared_random_gain_dual(db_lo=-24.0, db_hi=+12.0):
+    """
+    Apply the same random gain (in dB) to:
+      - realtime_piezo_input (student, 48k)
+      - realtime_offline_piezo_input (teacher, 96k)
+      - y_audio target (mic)
+    This makes mask KD invariant to absolute input level.
+    """
+    def _map(inputs, outputs, sw):
+        g_db = tf.random.uniform((), db_lo, db_hi, dtype=tf.float32)
+        g = tf.pow(10.0, g_db / 20.0)
+
+        xr  = inputs['realtime_piezo_input']
+        xrt = inputs.get('realtime_offline_piezo_input', None)
+
+        inputs['realtime_piezo_input'] = xr * g
+        if xrt is not None:
+            inputs['realtime_offline_piezo_input'] = xrt * g
+
+        y_audio, y_style = outputs
+        outputs = (y_audio * g, y_style)
+        return inputs, outputs, sw
+    return _map
 
 @register_keras_serializable()
 def add_sw_realtime_dual_nf(x, y):
@@ -4611,18 +4654,19 @@ def fine_tune(offline=True, realtime=True):
         # Build the TRAINING MODEL as STATIC with teacher attached (KD heads live here)
         rt_static_train = build_realtime_model(
             offline=offline_causal,
-            dynamic_time=False,               # fixed-T static model holds the reference to teacher
-            cap_mask_with_gate=False,        # remove fixed cap (learned mask controls HF)
+            dynamic_time=False,
+            cap_mask_with_gate=False,
             use_learned_hf_mask=True,
-            enable_mask_kd=True,             # KD: teacher gate → student mask
-            detach_mask_from_audio=True,     # stopgrad so mask learns from its own losses
-            mask_min_floor=0.02
+            enable_mask_kd=True,
+            detach_mask_from_audio=False,         # let audio losses shape the mask
+            mask_min_floor=0.0,
+            mask_deadzone_eps=0.12                
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
         # Train only FiLM generators and mask convs (keep small footprint)
-        set_trainable_for_finetune_realtime(rt_static_train, train_scales=False, train_mask=True)
+        set_trainable_for_finetune_realtime(rt_static_train, train_scales=True, train_mask=True)
 
         # Compile: audio-only finetune loss; style BCE disabled by sample weights
         rt_static_train.compile(
@@ -4637,7 +4681,9 @@ def fine_tune(offline=True, realtime=True):
             cached["x48"], cached["x96"], cached["y48"],
             batch_size=FINETUNE_BATCH_SIZE,
             seg_len_rt=REALTIME_SEG_LEN
-        ).map(add_sw_realtime_dual_nf).prefetch(tf.data.AUTOTUNE)
+        ).map(add_sw_realtime_dual_nf
+        ).map(add_shared_random_gain_dual(db_lo=-30.0, db_hi=+18.0)  # ← new
+        ).prefetch(tf.data.AUTOTUNE)
 
         steps_rt = approx_steps_from_length(len(cached["x48"]), REALTIME_SEG_LEN,
                                             FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP)
@@ -4652,12 +4698,13 @@ def fine_tune(offline=True, realtime=True):
         # 2) Build a teacher‑FREE DYNAMIC export and copy weights by name
         rt_dyn_export = build_realtime_model(
             offline=None,
-            dynamic_time=True,               # dynamic export for streaming/inference
-            cap_mask_with_gate=False,
+            dynamic_time=True,
+            cap_mask_with_gate=False,             # keep gate off if you want to avoid it
             use_learned_hf_mask=True,
-            enable_mask_kd=False,            # no KD layers/heads in export
+            enable_mask_kd=False,
             detach_mask_from_audio=True,
-            mask_min_floor=0.02
+            mask_min_floor=0.0,
+            mask_deadzone_eps=0.12                
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
