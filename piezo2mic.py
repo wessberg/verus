@@ -3442,6 +3442,7 @@ def clip_01x4(z):
     # Scale by 4 and clamp to [0, 1]
     return tf.clip_by_value(4.0 * z, 0.0, 1.0)
 
+@register_keras_serializable()
 def film_gamma_stable(raw, scale=1.0, mag=0.1):
     # γ = 1 + mag * tanh(scale * raw)
     return 1.0 + float(mag) * tf.tanh(scale * raw)
