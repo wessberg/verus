@@ -555,6 +555,31 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     return matched
 
 @register_keras_serializable()
+class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    """
+    Training-only penalty: when the teacher gate is closed (gate≈0), suppress student HF.
+    Inputs: [hf_final (B,T,1), teacher_gate_ds (B,T,1)]
+    Adds loss = alpha * mean(|hf_final| * (1 - teacher_gate_ds)), returns hf_final unchanged.
+    """
+    def __init__(self, alpha=1.0, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        hf_final, gate = inputs
+        if training is True:
+            leak = tf.abs(hf_final) * tf.stop_gradient(1.0 - gate)
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return hf_final
+
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
+
+@register_keras_serializable()
 class MaskFloor(Layer):
     """
     y = eps + (1 - eps) * x; used to enforce a minimum mask floor without Lambda(lambda ...)
@@ -4017,6 +4042,9 @@ def build_realtime_model(offline=None,
     if int(hf_time_shift_samples) != 0:
         hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)
     
+    if offline is not None and T_gate_ds is not None:
+        hf_final = HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds])
+    
     hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
     # Mix IR and HF into main
@@ -4072,6 +4100,22 @@ def build_realtime_model(offline=None,
             name="offline_hf_ds_hp48"
         )(off_hf_ds)
         off_hf_ds_hp48_pick = Multiply(name="offline_hf_ds_hp48_pick_only")([off_hf_ds_hp48, style_scalar_b3])
+        
+        
+        # Teacher HF envelope (96k) → downsample to 48k → soft-normalize to [0,1]
+        off_hf_env96 = CausalExpSmoother(
+            time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="off_hf_env96"
+        )(Abs1D()(off_hf_scaled))
+
+        off_hf_env48 = FIRDecimateBy2(name="off_hf_env_ds2")(off_hf_env96)
+        off_hf_env48_norm = Lambda(clip_01x4, name="off_hf_env48_norm")(off_hf_env48)
+
+        # Distill student mask from the teacher HF envelope
+        kd_tensors.append(
+            DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA * 0.5, name="hf_env_mask_distill")(
+                [off_hf_env48_norm, mask_pred]
+            )
+        )        
 
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
@@ -4635,11 +4679,11 @@ def fine_tune(offline=True, realtime=True):
         rt_static_train = build_realtime_model(
             offline=offline_causal,
             dynamic_time=False,
-            cap_mask_with_gate=False,
+            cap_mask_with_gate=True,        # cap ON during finetune (safety)
             use_learned_hf_mask=True,
             enable_mask_kd=True,
-            detach_mask_from_audio=False,         # let audio losses shape the mask
-            mask_min_floor=0.0
+            detach_mask_from_audio=True,    # isolate mask learning from audio
+            mask_min_floor=0.05             # small floor only during training
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -4678,11 +4722,11 @@ def fine_tune(offline=True, realtime=True):
         rt_dyn_export = build_realtime_model(
             offline=None,
             dynamic_time=True,
-            cap_mask_with_gate=False,             # keep gate off if you want to avoid it
+            cap_mask_with_gate=False,       # cap OFF at runtime
             use_learned_hf_mask=True,
             enable_mask_kd=False,
-            detach_mask_from_audio=True,
-            mask_min_floor=0.0
+            detach_mask_from_audio=True,    # no effect at inference
+            mask_min_floor=0.0              # no floor at runtime
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
