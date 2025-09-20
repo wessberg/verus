@@ -555,22 +555,6 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     return matched
 
 @register_keras_serializable()
-class MaskDeadzone(tf.keras.layers.Layer):
-    """
-    Clamp small mask values to 0: y = max(0, x - eps)/(1-eps), then clip to [0,1].
-    This creates exact silence for x < eps while preserving [0,1] range for x ≥ eps.
-    """
-    def __init__(self, eps=0.12, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.eps = float(eps)
-    def call(self, x):
-        eps = tf.constant(self.eps, dtype=x.dtype)
-        y = tf.nn.relu(x - eps) / (1.0 - eps)
-        return tf.clip_by_value(y, 0.0, 1.0)
-    def get_config(self):
-        return {**super().get_config(), "eps": self.eps}
-
-@register_keras_serializable()
 class MaskFloor(Layer):
     """
     y = eps + (1 - eps) * x; used to enforce a minimum mask floor without Lambda(lambda ...)
@@ -3773,8 +3757,7 @@ def build_realtime_model(offline=None,
                          enable_mask_kd=True,
                          detach_mask_from_audio=True,
                          mask_min_floor=0.0,
-                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
-                         mask_deadzone_eps=0.0):
+                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3965,9 +3948,6 @@ def build_realtime_model(offline=None,
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
     )(mask_pred)
-    
-    if float(mask_deadzone_eps) > 0.0:
-        mask_smoothed = MaskDeadzone(eps=float(mask_deadzone_eps), name="realtime_hf_mask_deadzone")(mask_smoothed)
 
     # Optional fixed gate (INT8-friendly) as a safety cap
     realtime_gate = None
@@ -4659,8 +4639,7 @@ def fine_tune(offline=True, realtime=True):
             use_learned_hf_mask=True,
             enable_mask_kd=True,
             detach_mask_from_audio=False,         # let audio losses shape the mask
-            mask_min_floor=0.0,
-            mask_deadzone_eps=0.12                
+            mask_min_floor=0.0
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -4703,8 +4682,7 @@ def fine_tune(offline=True, realtime=True):
             use_learned_hf_mask=True,
             enable_mask_kd=False,
             detach_mask_from_audio=True,
-            mask_min_floor=0.0,
-            mask_deadzone_eps=0.12                
+            mask_min_floor=0.0
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
