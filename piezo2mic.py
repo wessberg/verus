@@ -4736,7 +4736,7 @@ def fine_tune(offline=True, realtime=True):
     off_dyn_wrap = None
     rt_dyn_export = None
 
-        if offline:
+    if offline:
         print("\n🔧 Finetuning OFFLINE HF mask (student distills from frozen offline teacher)…")
 
         base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
