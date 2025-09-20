@@ -554,30 +554,7 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
 
-@register_keras_serializable()
-class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
-    """
-    Training-only penalty: when the teacher gate is closed (gate≈0), suppress student HF.
-    Inputs: [hf_final (B,T,1), teacher_gate_ds (B,T,1)]
-    Adds loss = alpha * mean(|hf_final| * (1 - teacher_gate_ds)), returns hf_final unchanged.
-    """
-    def __init__(self, alpha=1.0, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.init_alpha = float(alpha)
 
-    def build(self, input_shape):
-        self.build_alpha(self.init_alpha, name="alpha")
-        super().build(input_shape)
-
-    def call(self, inputs, training=None):
-        hf_final, gate = inputs
-        if training is True:
-            leak = tf.abs(hf_final) * tf.stop_gradient(1.0 - gate)
-            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
-        return hf_final
-
-    def get_config(self):
-        return {"alpha": float(self.init_alpha), **super().get_config()}
 
 @register_keras_serializable()
 class MaskFloor(Layer):
@@ -2618,6 +2595,30 @@ class AdjustableAlphaMixin:
     def get_config(self):
         return {}
     
+@register_keras_serializable()
+class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    """
+    Training-only penalty: when the teacher gate is closed (gate≈0), suppress student HF.
+    Inputs: [hf_final (B,T,1), teacher_gate_ds (B,T,1)]
+    Adds loss = alpha * mean(|hf_final| * (1 - teacher_gate_ds)), returns hf_final unchanged.
+    """
+    def __init__(self, alpha=1.0, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        hf_final, gate = inputs
+        if training is True:
+            leak = tf.abs(hf_final) * tf.stop_gradient(1.0 - gate)
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return hf_final
+
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
 
 # ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
 
