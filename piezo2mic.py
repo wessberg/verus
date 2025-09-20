@@ -4041,10 +4041,7 @@ def build_realtime_model(offline=None,
     )(hf_final)
     
     if int(hf_time_shift_samples) != 0:
-        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)
-    
-    if offline is not None and T_gate_ds is not None:
-        hf_final = HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds])
+        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)   
     
     hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
@@ -4066,6 +4063,10 @@ def build_realtime_model(offline=None,
         # Downsample teacher features/gate (96k → 48k)
         T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{i}")(t) for i, t in enumerate(T_feats)]
         T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
+        
+        kd_tensors.append(
+            HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds])
+        )
 
         # Feature KD
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
