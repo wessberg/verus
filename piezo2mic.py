@@ -201,7 +201,16 @@ REALTIME_TRAIN_BLOCK_SIZE = 4096
 REALTIME_SEG_LEN          = REALTIME_RECEPTIVE_FIELD + REALTIME_TRAIN_BLOCK_SIZE
 REALTIME_EMBED_DIM        = 16
 REALTIME_DISTILL_ALPHA    = 5.0
+
+# Offline (96k) mask distillation strengths
+OFFLINE_HF_MASK_DISTILL_ALPHA   = 2.0   # KD weight for teacher gate → student learned mask
 REALTIME_HF_MASK_DISTILL_ALPHA = 2.0  # KD strength for the learned HF mask (teacher gate → student mask)
+
+OFFLINE_MASK_USED_DISTILL_ALPHA = 0.3   # KD weight for teacher gate → student mask_used (smaller)
+REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (small; avoids cap conflict)
+
+OFFLINE_HF_SUPPRESS_ALPHA       = 0.7   # suppress student HF when teacher gate is closed
+
 REALTIME_HF_HP_ORDER          = OFFLINE_HF_HP_ORDER
 REALTIME_STYLE_DISTILL_ALPHA = 1.0   # KD strength for the style probability (teacher→student)
 
@@ -209,7 +218,6 @@ REALTIME_AUDIO_STFT_DISTILL_ALPHA   = 0.6   # KD weight for STFT KD (teacher aud
 REALTIME_STEM_PICK_DISTILL_ALPHA    = 0.5   # KD weight for pick stem
 REALTIME_STEM_FINGER_DISTILL_ALPHA  = 0.5   # KD weight for finger stem
 REALTIME_STEM_HF_DISTILL_ALPHA      = 0.8   # KD weight for HF stem
-REALTIME_MASK_USED_DISTILL_ALPHA    = 0.3   # KD of mask_used vs teacher gate (small; avoids cap conflict)
 REALTIME_FEAT_DISTILL_ALPHA         = 1.0
 REALTIME_STEM_RESBP_DISTILL_ALPHA   = 0.4
 
@@ -3642,97 +3650,85 @@ def build_offline_model_causal(offline_src, dynamic_time=True):
     return offline_causal
 
 @register_keras_serializable()
-def build_offline_finetune_student_with_kd(teacher_offline,
-                                           dynamic_time=False,
-                                           detach_mask_from_audio=True,
-                                           mask_min_floor=0.05,
-                                           name="piezo2mic_offline_ft_student_kd"):
+def build_offline_student_for_finetune(teacher, dynamic_time=False, name="piezo2mic_offline_ft_train"):
     """
-    Student offline model (96 kHz) that learns a HF pick mask by distilling
-    from the frozen baseline offline teacher's fixed gate and HF envelope.
-    Removes the fixed gate from the student (cap_mask_with_gate=False).
+    Offline finetune student (96k) with learned HF mask, distilled from a teacher with a fixed gate.
+    - Student is build_offline_model(cap_mask_with_gate=False) so the learned mask actually gates HF/resbp.
+    - KD losses:
+        * teacher fixed gate → student mask_pred (strong)
+        * teacher fixed gate → student mask_used (small)
+        * teacher HF envelope (0.08ms EMA) → student mask_pred (aux)
+        * suppress student HF when teacher gate is closed
+    Only the mask subnetwork and IrScale scalars are meant to be trainable.
     """
-    # 1) Student: offline model with no fixed gate; optional detach and mask floor
+    # 1) Build the student (learned mask controls gating)
     student = build_offline_model(
         dynamic_time=dynamic_time,
-        lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
-        name="piezo2mic_offline_ft_student",
-        cap_mask_with_gate=False,
-        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES,
-        detach_mask_from_audio=detach_mask_from_audio,
-        mask_min_floor=mask_min_floor
+        cap_mask_with_gate=False,                # NO fixed gate in signal path (learned mask used)
+        name="piezo2mic_offline_ft_student"
     )
+    y_audio_s, y_style_s = student.outputs
 
-    # 2) Teacher combo (frozen)
-    teacher_offline.trainable = False
-    gate_out = teacher_offline.get_layer("offline_gate").output
-    hf_scaled = teacher_offline.get_layer("offline_hf_scale").output
-    audio_t, style_prob_t = teacher_offline.outputs
+    # 2) Build a teacher combo to fetch the fixed gate and HF stem
+    #    (we re-use the student's inputs so both see the same style gating and level)
+    gate_t = teacher.get_layer("offline_gate").output
+    hf_t   = teacher.get_layer("offline_hf_scale").output  # scaled HF stem (pre-pick-only)
 
     teacher_combo = tf.keras.Model(
-        inputs=teacher_offline.inputs,
-        outputs=[gate_out, hf_scaled, audio_t, style_prob_t],
-        name="offline_teacher_combo"
+        inputs=teacher.inputs,
+        outputs=[gate_t, hf_t],
+        name="offline_teacher_combo_ft"
     )
+    gate_teacher, hf_teacher = teacher_combo(student.inputs)  # feed the same (x, style_true, style_force)
 
-    # 3) Wire teacher on the same input tensors the student uses
-    inp, style_true_in, style_force_in = student.inputs
-    T_gate, T_hf_scaled, _, _ = teacher_combo([inp, style_true_in, style_force_in])
+    # 3) Student internal taps for KD/penalties
+    mask_pred_s = student.get_layer("offline_hf_mask").output
+    mask_used_s = student.get_layer("offline_hf_mask_used").output
+    hf_final_s  = student.get_layer("offline_hf_scale").output
 
-    # 4) Student taps
-    y_audio_s, y_style_s = student.outputs
-    mask_pred_s  = student.get_layer("offline_hf_mask").output
-    mask_used_s  = student.get_layer("offline_hf_mask_used").output
-    hf_final_s   = student.get_layer("offline_hf_scale").output
+    # 4) Teacher HF envelope → normalize to [0,1] via clip_01x4 (like in realtime)
+    hf_env_96   = CausalExpSmoother(
+        time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64,
+        name="off_ft_hf_env96")(Abs1D()(hf_teacher))
+    hf_env_96_n = Lambda(clip_01x4, name="off_ft_hf_env96_norm")(hf_env_96)
 
-    # Teacher HF envelope (normalize to [0,1] softly)
-    T_hf_env = CausalExpSmoother(
-        time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="offline_t_hf_env"
-    )(Abs1D()(T_hf_scaled))
-    T_hf_env_norm = Lambda(clip_01x4, name="offline_t_hf_env_norm")(T_hf_env)
-
-    # 5) KD/aux losses (training-only via add_loss)
+    # 5) KD + penalties
     kd_tensors = []
+
+    # Gate → student mask (best-shift)
     kd_tensors.append(
-        DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=8, name="off_hf_mask_distill")
-        ([T_gate, mask_pred_s])
+        DistillLossBestShift(alpha=OFFLINE_HF_MASK_DISTILL_ALPHA, max_shift=12, name="off_hf_mask_distill")(
+            [gate_teacher, mask_pred_s]
+        )
     )
     kd_tensors.append(
-        DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="off_mask_used_distill")
-        ([T_gate, mask_used_s])
+        DistillLossBestShift(alpha=OFFLINE_MASK_USED_DISTILL_ALPHA, max_shift=12, name="off_mask_used_distill")(
+            [gate_teacher, mask_used_s]
+        )
     )
+    # HF env → student mask (auxiliary; lighter)
     kd_tensors.append(
-        DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA * 0.5, name="off_hf_env_mask_distill")
-        ([T_hf_env_norm, mask_pred_s])
+        DistillLoss(alpha=0.5 * OFFLINE_HF_MASK_DISTILL_ALPHA, name="off_hf_env_mask_distill")(
+            [hf_env_96_n, mask_pred_s]
+        )
     )
+    # Suppress student HF when the teacher gate is closed
     kd_tensors.append(
-        HFSuppressWhenClosed(alpha=0.7, name="off_hf_suppress_closed")
-        ([hf_final_s, T_gate])
-    )
-    
-    # Optional soft audio KD (kept small)
-    kd_tensors.append(
-        DistillLossBestShift(alpha=0.5, max_shift=8, name="off_audio_distill")
-        ([audio_t, y_audio_s])
+        HFSuppressWhenClosed(alpha=OFFLINE_HF_SUPPRESS_ALPHA, name="off_hf_suppress_closed")(
+            [hf_final_s, gate_teacher]
+        )
     )
 
-    # Make KD tensors reachable
-    y_audio_kd = LossTether(name="offline_kd_tether")([y_audio_s] + kd_tensors)
-
-    # Wrapper model shares the student’s inputs/outputs, just adds KD aux
-    model = tf.keras.Model(inputs=[inp, style_true_in, style_force_in],
-                           outputs=[y_audio_kd, y_style_s],
-                           name=name)
-    return model
+    # 6) Keep the same outputs, but anchor KD tensors into the graph
+    y_audio_s = LossTether(name="offline_kd_tether")([y_audio_s] + kd_tensors)
+    return tf.keras.Model(inputs=student.inputs, outputs=[y_audio_s, y_style_s], name=name)
 
 @register_keras_serializable()
 def build_offline_model(dynamic_time=False,
                         lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
                         name="piezo2mic_offline",
                         cap_mask_with_gate=True,
-                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES,
-                        detach_mask_from_audio=False,
-                        mask_min_floor=0.0):
+                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES):
     """
     Offline (96 kHz) model.
     New: optional learned pick mask for HF/resonance branches.
@@ -3825,25 +3821,17 @@ def build_offline_model(dynamic_time=False,
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
     m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits")(m)
     mask_pred = Activation("sigmoid", name="offline_hf_mask")(m)
-
-    # NEW: optional min floor for stability during finetune
-    if float(mask_min_floor) > 0.0:
-        mask_pred = MaskFloor(eps=float(mask_min_floor), name="offline_hf_mask_floor")(mask_pred)
-
     mask_smoothed = CausalExpSmoother(
         time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="offline_hf_mask_smooth"
     )(mask_pred)
-
+        
     if offline_gate is None:
         mask_used = IdentityLayer(name="offline_hf_mask_used")(mask_smoothed)
     else:
         mask_used = Minimum(name="offline_hf_mask_used")([mask_smoothed, offline_gate])
 
     # Apply mask BEFORE the HPF (same place the fixed gate used to be)
-    # NEW: optionally detach mask from audio loss to make it learn only from KD/aux
-    mask_for_mult = Lambda(stop_grad, name="offline_hf_mask_stopgrad")(mask_used) if detach_mask_from_audio else mask_used
-    hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_for_mult])
-
+    hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_used])
     hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE,
                           cutoff_hz=OFFLINE_HP_CUTOFF_HZ,
                           order=OFFLINE_HF_HP_ORDER,
@@ -4737,73 +4725,93 @@ def fine_tune(offline=True, realtime=True):
     rt_dyn_export = None
 
     if offline:
-        print("\n🔧 Finetuning OFFLINE HF mask (student distills from frozen offline teacher)…")
+        print("\n🔧 Finetuning OFFLINE student (learn pick via mask distillation from fixed‑gate teacher)…")
 
+        # Teacher: baseline offline dynamic (96k) with fixed gate
         base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(base_off_dyn_path):
             print("ERROR: baseline offline dynamic model not found:", base_off_dyn_path); sys.exit(1)
         teacher_off_dyn = tf.keras.models.load_model(base_off_dyn_path, compile=False)
+        teacher_off_dyn.trainable = False
 
-        # Build student+KD (STATIC for training)
-        off_ft_static = build_offline_finetune_student_with_kd(
-            teacher_offline=teacher_off_dyn,
-            dynamic_time=False,
-            detach_mask_from_audio=True,
-            mask_min_floor=0.05
+        # Student TRAIN model (static) with KD heads attached
+        off_static_train = build_offline_student_for_finetune(
+            teacher=teacher_off_dyn,
+            dynamic_time=False
         )
 
-        # Init student weights from the teacher by name (safe copy)
-        copy_weights_by_name(off_ft_static, teacher_off_dyn, verbose=True)
+        # Init student weights from baseline offline (copy by name)
+        # Prefer baseline offline STATIC if available; else copy from dynamic
+        base_off_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+        if os.path.exists(base_off_static_path):
+            base_off_static = tf.keras.models.load_model(base_off_static_path, compile=False)
+            copy_weights_by_name(off_static_train, base_off_static, verbose=True)
+        else:
+            copy_weights_by_name(off_static_train, teacher_off_dyn, verbose=True)
 
-        # Train only the tiny HF mask subnetwork (and optionally HF IrScale)
-        set_trainable_for_finetune_offline(off_ft_static, train_scales=False, train_mask=True)
+        # Train only the small parts: FiLM generators (optional) and mask convs
+        set_trainable_for_finetune_offline(off_static_train, train_scales=True, train_mask=True)
 
-        # Lightweight loss at 96k (same form as realtime finetune but 96k SR)
-        loss_off_lite = FinetuneCombinedLossLite(
+        # Lightweight finetune loss at 96 kHz; gate-aware HF/stft weighting is inside the loss
+        loss_offlite = FinetuneCombinedLossLite(
             sample_rate=OFFLINE_SAMPLE_RATE,
             stft_scales=((1024, 256, 1024),),
             l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0,
             onset_gain=HF_ONSET_GAIN
         )
 
-        off_ft_static.compile(
+        off_static_train.compile(
             optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
-            loss=[loss_off_lite, "binary_crossentropy"],
-            loss_weights=[1.0, 0.0],   # disable style BCE by sample weights
+            loss=[loss_offlite, "binary_crossentropy"],
+            loss_weights=[1.0, 0.0],       # disable style BCE via sample-weights, too
             metrics=[["mae"], []]
         )
 
+        # 96k dataset (student and teacher read the same student inputs)
         dsO = make_mixed_ds_from_arrays_offline(
             cached["x96"], cached["y96"],
             batch_size=FINETUNE_BATCH_SIZE,
             seg_len=OFFLINE_SEG_LEN
-        ).map(add_sw_offline_finetune_nf
-        ).map(add_shared_random_gain_offline(db_lo=-30.0, db_hi=+18.0)
+        ).map(add_sw_offline_finetune_nf            # style_force=0, style weights = 0
+        ).map(add_shared_random_gain_offline(       # level-invariance for KD
+            db_lo=-30.0, db_hi=+18.0)
         ).prefetch(tf.data.AUTOTUNE)
 
-        steps_off = approx_steps_from_length(len(cached["x96"]), OFFLINE_SEG_LEN,
-                                             FINETUNE_BATCH_SIZE, cap=FINETUNE_OFFLINE_STEPS_CAP)
-        off_ft_static.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
+        steps_off = approx_steps_from_length(
+            total_samples=len(cached["x96"]),
+            seg_len=OFFLINE_SEG_LEN,
+            batch_size=FINETUNE_BATCH_SIZE,
+            cap=FINETUNE_OFFLINE_STEPS_CAP
+        )
 
-        # Save finetuned OFFLINE models (teacher-free exports)
-        # 1) Static
-        ft_offline_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
-        off_ft_static.save(ft_offline_static_path)
-        print("✅ Saved finetuned offline model (static WITH KD graph):", ft_offline_static_path)
+        off_static_train.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
 
-        # 2) Dynamic teacher-free export (no KD, no teacher subgraph)
+        # Export DYNAMIC teacher‑free (cap OFF; learned mask gates)
         off_dyn_export = build_offline_model(
             dynamic_time=True,
-            lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
-            name="piezo2mic_offline_finetuned_dynamic",
-            cap_mask_with_gate=False,            # learned mask drives HF at runtime
-            detach_mask_from_audio=True,         # has no effect at inference
-            mask_min_floor=0.0                   # no floor at runtime
+            cap_mask_with_gate=False,     # no fixed threshold; use learned mask
+            name="piezo2mic_offline_ft_dynamic"
         )
-        copy_weights_by_name(off_dyn_export, off_ft_static, verbose=True)
+        copy_weights_by_name(off_dyn_export, off_static_train, verbose=True)
+
         ft_offline_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
         off_dyn_export.save(ft_offline_dyn_path)
-        print("✅ Saved finetuned offline model (dynamic, teacher-free):", ft_offline_dyn_path)
+        print("✅ Saved finetuned offline model (dynamic, learned pick mask):", ft_offline_dyn_path)
+
+        # Export STATIC teacher‑free
+        off_static_export = build_offline_model(
+            dynamic_time=False,
+            cap_mask_with_gate=False,
+            name="piezo2mic_offline_ft_static"
+        )
+        copy_weights_by_name(off_static_export, off_static_train, verbose=True)
+
+        ft_offline_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
+        off_static_export.save(ft_offline_static_path)
+        print("✅ Saved finetuned offline model (static, learned pick mask):", ft_offline_static_path)
+
+        # Use this for demo rendering
+        off_dyn_wrap = off_dyn_export
 
     if realtime:
         print("\n🔧 Finetuning REALTIME model (static student distills from teacher; dynamic export is teacher-free)…")
