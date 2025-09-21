@@ -4267,7 +4267,7 @@ def build_realtime_model(offline=None,
     mask_smooth_down = CausalExpSmoother(time_const_ms=down_tc, sample_rate=REALTIME_SAMPLE_RATE, Lmax=256, name="realtime_hf_mask_smooth")(mask_pred)
     mask_smooth_up   = CausalExpSmoother(time_const_ms=0.08,    sample_rate=REALTIME_SAMPLE_RATE, Lmax=128, name="realtime_hf_mask_smooth_up")(mask_pred)
 
-    mask_prev = Lambda(lambda z: tf.pad(z, [[0,0],[1,0],[0,0]])[:, :-1, :], name="realtime_hf_mask_prev")(mask_pred)
+    mask_prev = TimeShift1D(shift=1, name="realtime_hf_mask_prev")(mask_pred)
     mask_diff = Sub(name="realtime_hf_mask_diff")([mask_pred, mask_prev])
     rising_soft = Activation("relu", name="realtime_hf_mask_rising_relu")(mask_diff)
     rising = Lambda(clip_01x4, name="realtime_hf_mask_rising")(rising_soft)
