@@ -290,8 +290,8 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_learned_pick.keras"
 REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_learned_pick_dynamic.keras"
 
-LEARNED_PICK_MASK_EPOCHS    = 10
-LEARNED_PICK_MASK_STEPS_CAP = 2500
+LEARNED_PICK_MASK_EPOCHS    = 15
+LEARNED_PICK_MASK_STEPS_CAP = 3000
 LEARNED_PICK_MASK_LR        = 1e-4
 
 # Finetune params
@@ -1344,9 +1344,9 @@ def precache_finetune_resampled_pair(x_full, y_full, file_sr, sr_rt=REALTIME_SAM
     y48 = to_sr(y_m, file_sr, sr_rt).astype(np.float32, copy=False)
     return {"x96": x96, "y96": y96, "x48": x48, "y48": y48}
 
-# Helper: causal separable conv (left-pad only)
 @register_keras_serializable()
-def causal_sep_conv(x, filters, kernel, dilation, name, activation=None, bias_constraint=None):
+def causal_sep_conv(x, filters, kernel, dilation, name, activation=None,
+                    bias_constraint=None, bias_initializer=None):
     pad_left = (int(kernel) - 1) * int(dilation)
     x = ZeroPadding1D((pad_left, 0), name=f"{name}_pad")(x)
     x = SeparableConv1D(
@@ -1355,11 +1355,13 @@ def causal_sep_conv(x, filters, kernel, dilation, name, activation=None, bias_co
         dilation_rate=dilation,
         padding="valid",
         bias_constraint=bias_constraint,
+        bias_initializer=bias_initializer,
         name=name
     )(x)
     if activation:
         x = Activation(activation, name=f"{name}_{activation}")(x)
     return x
+
 def segment_generator_from_arrays_dual(seg_len_rt, x48, y48, x96, is_pick_chunks,
                                        factor=2, min_amp=SEGMENT_GENERATOR_MIN_AMP_THRESH):
     """
@@ -2834,6 +2836,51 @@ class MaskSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
         return m
     def get_config(self):
         return {"alpha": float(self.init_alpha), **super().get_config()}
+    
+@register_keras_serializable()
+class MaskMarginKD(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    """
+    Margin penalty on the mask against a [0,1] teacher gate:
+      - When gate is closed (weight ~ 1-g), push mask below m_close.
+      - When gate is open   (weight ~ g), push mask above m_open.
+    """
+    def __init__(self, alpha=1.0, g_lo=0.15, g_hi=0.85, m_close=0.03, m_open=0.85, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+        self.g_lo = float(g_lo); self.g_hi = float(g_hi)
+        self.m_close = float(m_close); self.m_open = float(m_open)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        m, g = inputs  # (B,T,1)
+        if training is False:
+            return m
+        t = tf.minimum(tf.shape(m)[1], tf.shape(g)[1])
+        m = m[:, :t, :]; g = g[:, :t, :]
+
+        # Closed weight ~ 1 - g (smooth)
+        w_close = tf.clip_by_value(1.0 - g, 0.0, 1.0)
+        # Open weight ~ g (smooth)
+        w_open  = tf.clip_by_value(g, 0.0, 1.0)
+
+        # Hinge terms
+        close_term = tf.nn.relu(m - self.m_close) * w_close
+        open_term  = tf.nn.relu(self.m_open - m) * w_open
+
+        loss = tf.reduce_mean(close_term + open_term)
+        self.add_loss(self.alpha_var * loss)
+        return m
+
+    def get_config(self):
+        return {
+            "alpha": float(self.init_alpha),
+            "g_lo": self.g_lo, "g_hi": self.g_hi,
+            "m_close": self.m_close, "m_open": self.m_open,
+            **super().get_config()
+        }
 
 @register_keras_serializable()
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
@@ -4129,7 +4176,11 @@ def build_realtime_model(offline=None,
 
     m = causal_sep_conv(hf_in, 8, 5, 1, name="realtime_hf_mask_c1", activation="relu", bias_constraint=BC)
     m = causal_sep_conv(m,    8, 5, 2, name="realtime_hf_mask_c2", activation="relu", bias_constraint=BC)
-    m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits", bias_constraint=BC)
+    m = causal_sep_conv(
+        m, 1, 3, 1, name="realtime_hf_mask_logits",
+        bias_constraint=BC,
+        bias_initializer=tf.keras.initializers.Constant(-2.5)
+    )
 
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
     
@@ -4232,7 +4283,11 @@ def build_realtime_model(offline=None,
         # Already present; keep it
         kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
         # Optional extra push directly on the mask (add this if you defined it)
-        kd_tensors.append(MaskSuppressWhenClosed(alpha=0.3, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
+        kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
+        
+        kd_tensors.append(
+            MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
+        )
 
         # Feature KD
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
@@ -4282,7 +4337,12 @@ def build_realtime_model(offline=None,
             # Optional: envelope → mask_pred KD (keep weight modest)
             kd_tensors.append(
                 DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
-            )    
+            )
+
+            # Crisp margins to push baseline down and openings up
+            kd_tensors.append(
+                MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
+            )
 
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
@@ -5140,7 +5200,7 @@ def fine_tune(offline=True, realtime=True):
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
         # Train only FiLM generators and mask convs (keep small footprint)
-        set_trainable_for_finetune_realtime(rt_static_train, train_scales=True, train_film=True)
+        set_trainable_for_finetune_realtime(rt_static_train, train_scales=True, train_film=False)
 
         # Compile: audio-only finetune loss; style BCE disabled by sample weights
         rt_static_train.compile(
