@@ -4242,21 +4242,6 @@ def build_realtime_model(offline=None,
                 DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
             )
 
-        # Distill both the raw mask and the actually used mask (smoothed)
-        if enable_mask_kd:
-            # Primary: BCE on raw mask logits (sigmoid output) vs teacher gate (downsampled)
-            kd_tensors.append(
-                DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_pred])
-            )
-            # Auxiliary: MSE on the smoothed pre-cap mask
-            kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed])
-            )
-            # Optional: envelope → mask_pred KD (keep weight modest)
-            kd_tensors.append(
-                DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
-            )
-
         # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime]))
@@ -4283,13 +4268,21 @@ def build_realtime_model(offline=None,
 
         off_hf_env48 = FIRDecimateBy2(name="off_hf_env_ds2")(off_hf_env96)
         off_hf_env48_norm = Lambda(clip_01x4, name="off_hf_env48_norm")(off_hf_env48)
-
-        # Distill student mask from the teacher HF envelope
-        kd_tensors.append(
-            DistillLoss(alpha=REALTIME_HF_MASK_DISTILL_ALPHA * 0.5, name="hf_env_mask_distill")(
-                [off_hf_env48_norm, mask_pred]
+        
+        # Distill both the raw mask and the actually used mask (smoothed)
+        if enable_mask_kd:
+            # Primary: BCE on raw mask logits (sigmoid output) vs teacher gate (downsampled)
+            kd_tensors.append(
+                DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_pred])
             )
-        )        
+            # Auxiliary: MSE on the smoothed pre-cap mask
+            kd_tensors.append(
+                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed])
+            )
+            # Optional: envelope → mask_pred KD (keep weight modest)
+            kd_tensors.append(
+                DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
+            )    
 
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
