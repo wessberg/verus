@@ -300,6 +300,11 @@ REALTIME_MASK_SOFTKNEE_K = 10.0
 REALTIME_MASK_SOFTKNEE_T = 0.35
 REALTIME_HF_SOFTCLIP_DRIVE = 2.0  # set to 1.5–2.0 to tame rare spikes; None disables
 
+REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
+REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
+REALTIME_MASK_SHARPEN_P = 2      # integer power (>=2) for mask sharpening
+REALTIME_MASK_LOGIT_BIAS = -3.5  # more negative initializes mask closed
+
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
 FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_realtime_dynamic.keras"
@@ -351,7 +356,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 38
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
@@ -649,6 +654,77 @@ class ZeroBias(constraints.Constraint):
         return tf.zeros_like(w)
     def get_config(self):
         return {}
+    
+@register_keras_serializable()
+class MaskRemapLinear(tf.keras.layers.Layer):
+    """
+    Static 2-threshold remap with dead zone:
+      y = clip((x - close_t) / (open_t - close_t), 0, 1)
+    - close_t < open_t in [0,1]
+    """
+    def __init__(self, close_t=0.25, open_t=0.60, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.close_t = float(close_t)
+        self.open_t  = float(open_t)
+        self._scale  = None
+
+    def build(self, input_shape):
+        denom = max(1e-6, (self.open_t - self.close_t))
+        self._scale = np.float32(1.0 / denom)
+        super().build(input_shape)
+
+    def call(self, x):
+        y = (x - self.close_t) * self._scale
+        return tf.clip_by_value(y, 0.0, 1.0)
+
+    def get_config(self):
+        return {"close_t": self.close_t, "open_t": self.open_t, **super().get_config()}
+
+
+@register_keras_serializable()
+class MaskSharpen(tf.keras.layers.Layer):
+    """
+    Monotonic sharpening using repeated multiply: y = x^power (power integer >=2)
+    Implemented with multiplies only (TFLite-friendly).
+    """
+    def __init__(self, power=2, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.power = int(power)
+
+    def call(self, x):
+        y = x
+        for _ in range(max(1, self.power) - 1):
+            y = y * x
+        return y
+
+    def get_config(self):
+        return {"power": self.power, **super().get_config()}
+
+
+@register_keras_serializable()
+class HFSuppressByMask(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    """
+    Training-only leak penalty using the STUDENT mask:
+      loss += alpha * mean( |hf| * (1 - stop_grad(mask_audio)) )
+    """
+    def __init__(self, alpha=0.4, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        hf, mask_audio = inputs
+        if training is not False:
+            w = tf.stop_gradient(1.0 - tf.clip_by_value(mask_audio, 0.0, 1.0))
+            leak = tf.abs(hf) * w
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return hf
+
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
 
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
@@ -4255,9 +4331,11 @@ def build_realtime_model(offline=None,
     hf_in  = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     m = causal_sep_conv(hf_in, 8, 5, 1, name="realtime_hf_mask_c1", activation="relu", bias_constraint=BC)
     m = causal_sep_conv(m,    8, 5, 2, name="realtime_hf_mask_c2", activation="relu", bias_constraint=BC)
-    m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits",
-                        bias_constraint=BC,
-                        bias_initializer=tf.keras.initializers.Constant(-2.5))
+    
+    m = causal_sep_conv(m, 1, 3, 1, name="realtime_hf_mask_logits",
+                    bias_constraint=BC,
+                    bias_initializer=tf.keras.initializers.Constant(REALTIME_MASK_LOGIT_BIAS))
+    
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
     if float(mask_min_floor) > 0.0:
         mask_pred = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_floor")(mask_pred)
@@ -4308,11 +4386,18 @@ def build_realtime_model(offline=None,
             ones = OnesLike(name="realtime_hf_mask_used_ones")(mask_smoothed)
             mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(ones)
 
-    mask_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_inner)
+    mask_remap = MaskRemapLinear(
+        close_t=REALTIME_MASK_CLOSE_T,
+        open_t=REALTIME_MASK_OPEN_T,
+        name="realtime_hf_mask_remap"
+    )(mask_used_inner)
 
-    # Soft‑knee shaping for audio path
+    # Keep the original debug name pointing to the remapped mask (pre-softknee)
+    mask_used = IdentityLayer(name="realtime_hf_mask_used")(mask_remap)
+
+    # Soft‑knee for audio
     if mask_softknee is not None:
-        k_val, t_val = (float(mask_softknee[0]), float(mask_softknee[1])) if isinstance(mask_softknee, (tuple, list)) else (float(mask_softknee.get("k", 10.0)), float(mask_softknee.get("t", 0.35)))
+        k_val, t_val = (float(mask_softknee[0]), float(mask_softknee[1])) if isinstance(mask_softknee, (tuple, list)) else (float(mask_softknee.get("k", 10.0)), float(mask_softknee.get("t", 0.55)))
         ones_knee = OnesLike(name="realtime_hf_mask_softknee_ones")(mask_used)
         neg_t = ConstScale(-t_val, name="realtime_hf_mask_softknee_neg_t")(ones_knee)
         shifted = Add(name="realtime_hf_mask_softknee_shift")([mask_used, neg_t])
@@ -4320,6 +4405,10 @@ def build_realtime_model(offline=None,
         mask_used_audio = Activation("sigmoid", name="realtime_hf_mask_softknee")(scaled)
     else:
         mask_used_audio = IdentityLayer(name="realtime_hf_mask_passthru")(mask_used)
+
+    # Gentle sharpening (x^power) to make mid values close faster
+    if REALTIME_MASK_SHARPEN_P and REALTIME_MASK_SHARPEN_P >= 2:
+        mask_used_audio = MaskSharpen(power=int(REALTIME_MASK_SHARPEN_P), name="realtime_hf_mask_sharpen")(mask_used_audio)
 
     if float(mask_min_floor) > 0.0:
         mask_used_audio = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_audio_floor")(mask_used_audio)
@@ -4370,7 +4459,14 @@ def build_realtime_model(offline=None,
 
         kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
         kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
-        kd_tensors.append(MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds]))
+        kd_tensors.append(
+            MaskMarginKD(alpha=1.5, m_close=0.01, m_open=0.90, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
+        )
+        
+        # Penalize HF when the student's mask says "closed"
+        kd_tensors.append(
+            HFSuppressByMask(alpha=0.4, name="hf_suppress_by_student_mask")([hf_final, mask_used_audio])
+        )
 
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
             chan = int(T_f_ds.shape[-1])
@@ -4906,8 +5002,8 @@ def make_base_realtime_learned_pick(
         enable_mask_kd=True,
         detach_mask_from_audio=False,
         mask_min_floor=0.0,
-        mask_release_ms=REALTIME_MASK_RELEASE_MS,
-        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+        mask_release_ms=2.0,
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
         hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
     copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -5001,11 +5097,9 @@ def make_base_realtime_learned_pick(
         enable_mask_kd=False,
         detach_mask_from_audio=True,
         mask_min_floor=0.0,
-        # NEW
-        mask_release_ms=REALTIME_MASK_RELEASE_MS,
-        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE,
-        hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES
+        mask_release_ms=2.0,
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
+        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
     copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -5546,6 +5640,9 @@ def build_realtime_debug_model(realtime):
     add("mask_pred",      "realtime_hf_mask")
     add("hf_mask_smooth", "realtime_hf_mask_smooth")
     add("mask_used",      "realtime_hf_mask_used")
+    add("mask_audio",     "realtime_hf_mask_softknee")      # post-softknee
+    add("mask_sharpen",   "realtime_hf_mask_sharpen")       # if present
+    
 
     # Stems and style
     add("pick_c",     "realtime_pick_contrib")
