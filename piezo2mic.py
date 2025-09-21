@@ -290,9 +290,15 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_learned_pick.keras"
 REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_learned_pick_dynamic.keras"
 
-LEARNED_PICK_MASK_EPOCHS    = 15
-LEARNED_PICK_MASK_STEPS_CAP = 3000
-LEARNED_PICK_MASK_LR        = 1e-4
+REALTIME_LEARNED_PICK_MASK_EPOCHS    = 15
+REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 3000
+REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
+
+# Learned-pick shaping defaults for realtime
+REALTIME_MASK_RELEASE_MS = 4.0
+REALTIME_MASK_SOFTKNEE_K = 10.0
+REALTIME_MASK_SOFTKNEE_T = 0.35
+REALTIME_HF_SOFTCLIP_DRIVE = 2.0  # set to 1.5–2.0 to tame rare spikes; None disables
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -345,7 +351,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 2
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 38
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
@@ -2608,6 +2614,100 @@ class CausalExpSmoother(tf.keras.layers.Layer):
             'Lmax': self.Lmax
         })
         return cfg
+    
+@register_keras_serializable()
+class CausalAsymExpSmoother(tf.keras.layers.Layer):
+    """
+    Causal asymmetric EMA: fast attack, slow release.
+    y = up(x) when rising, y = down(x) when falling, chosen per‑sample by the sign of x[n]-x[n-1].
+    """
+    def __init__(self, attack_ms, release_ms, sample_rate, up_scale=4.0, down_scale=4.0, Lmax=1024, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.attack_ms   = float(attack_ms)
+        self.release_ms  = float(release_ms)
+        self.sample_rate = int(sample_rate)
+        self.up_scale    = float(up_scale)
+        self.down_scale  = float(down_scale)
+        self.Lmax        = int(Lmax)
+
+    def build(self, input_shape):
+        up_smpl   = max(1, int(round((self.attack_ms  / 1000.0) * self.sample_rate)))
+        down_smpl = max(1, int(round((self.release_ms / 1000.0) * self.sample_rate)))
+
+        k_up   = _exp_smoothing_kernel(up_smpl,   scale=self.up_scale,   Lmax=self.Lmax)
+        k_down = _exp_smoothing_kernel(down_smpl, scale=self.down_scale, Lmax=self.Lmax)
+
+        self.k_up = self.add_weight(
+            name="asym_up_taps", shape=k_up.shape,
+            initializer=tf.keras.initializers.Constant(k_up),
+            trainable=False
+        )
+        self.k_down = self.add_weight(
+            name="asym_down_taps", shape=k_down.shape,
+            initializer=tf.keras.initializers.Constant(k_down),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (B,T,1) in [0,1]
+        # Rising flag
+        x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(x > x_prev, x.dtype)
+
+        y_up   = _causal_conv1d(x, self.k_up)
+        y_down = _causal_conv1d(x, self.k_down)
+        y = rising * y_up + (1.0 - rising) * y_down
+        return tf.clip_by_value(y, 0.0, 1.0)
+
+    def get_config(self):
+        return {
+            "attack_ms": self.attack_ms, "release_ms": self.release_ms,
+            "sample_rate": self.sample_rate,
+            "up_scale": self.up_scale, "down_scale": self.down_scale, "Lmax": self.Lmax,
+            **super().get_config()
+        }
+
+@register_keras_serializable()
+class GateSoftKnee(tf.keras.layers.Layer):
+    """
+    Soft‑knee shaping for a mask in [0,1]:
+      y = sigmoid(k * (x - t))
+    k: slope, t: knee center in [0,1]
+    """
+    def __init__(self, k=10.0, t=0.35, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.k = float(k)
+        self.t = float(t)
+
+    def call(self, m):
+        m = tf.clip_by_value(m, 0.0, 1.0)
+        y = tf.math.sigmoid(self.k * (m - self.t))
+        return y
+
+    def get_config(self):
+        return {"k": self.k, "t": self.t, **super().get_config()}
+
+@register_keras_serializable()
+class SoftClip(tf.keras.layers.Layer):
+    """
+    Very light soft‑clipper: y = tanh(g*x)/tanh(g), with g in [1..4].
+    Keeps the HF “spikes” tame when you boost.
+    """
+    def __init__(self, drive=2.0, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.drive = float(drive)
+        self._norm = None
+
+    def build(self, input_shape):
+        self._norm = np.tanh(self.drive).astype(np.float32)
+        super().build(input_shape)
+
+    def call(self, x):
+        return tf.math.tanh(self.drive * x) / self._norm
+
+    def get_config(self):
+        return {"drive": self.drive, **super().get_config()}
 
 @register_keras_serializable()
 class AdjustableAlphaMixin:
@@ -3990,13 +4090,16 @@ def build_realtime_model(offline=None,
                          enable_mask_kd=True,
                          detach_mask_from_audio=True,
                          mask_min_floor=0.0,
-                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES):
+                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
+                         # learned-pick shaping
+                         mask_release_ms=REALTIME_MASK_RELEASE_MS,
+                         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+                         hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
     offline_inp = None
     if offline is not None:
-        # Use dynamic time for teacher input to keep compatibility with any seg_len
         offline_inp = Input(shape=(None, 1), name="realtime_offline_piezo_input")
 
     # Style IO
@@ -4011,10 +4114,9 @@ def build_realtime_model(offline=None,
 
     kd_tensors = []
     style_pred_source = style_prob
-    
     BC = ZeroBias()
 
-    # If teacher provided, build a single combo to fetch everything in one call
+    # Teacher bundle (optional)
     T_feats = []
     T_gate = None
     offline_audio = None
@@ -4029,13 +4131,10 @@ def build_realtime_model(offline=None,
         teacher.trainable = False
 
         feat_names = REALTIME_OFFLINE_FEAT_LAYERS or []
-        feat_outs = [teacher.get_layer(n).output for n in feat_names]
+        feat_outs  = [teacher.get_layer(n).output for n in feat_names]
 
-        # Always available in the teacher
         gate_out = teacher.get_layer("offline_gate").output
         audio_out, style_prob_out = teacher.outputs
-
-        # Stems
         pick_out   = teacher.get_layer("offline_final_pick").output
         finger_out = teacher.get_layer("offline_final_finger").output
         hf_scaled  = teacher.get_layer("offline_hf_scale").output
@@ -4046,14 +4145,11 @@ def build_realtime_model(offline=None,
             outputs=feat_outs + [gate_out, audio_out, style_prob_out, pick_out, finger_out, hf_scaled, resbp_scaled],
             name="offline_teacher_combo"
         )
-
         combo = teacher_combo([offline_inp, style_true_in, style_force_in])
 
         idx = 0
         if feat_names:
-            T_feats = combo[idx: idx + len(feat_names)]
-            idx += len(feat_names)
-
+            T_feats = combo[idx: idx + len(feat_names)]; idx += len(feat_names)
         T_gate             = combo[idx]; idx += 1
         offline_audio      = combo[idx]; idx += 1
         offline_style_prob = combo[idx]; idx += 1
@@ -4076,32 +4172,27 @@ def build_realtime_model(offline=None,
             name="realtime_style_blend"
         )([style_prob, offline_style_prob])
 
-    # Use either the blended teacher/student style or the true one based on style_force
+    # Style selection
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
     style_used_scalar = Add(name="realtime_style_used_scalar")([
         Multiply(name="realtime_style_pred_part")([one_minus_force, style_pred_source]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
-
     style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
     style_embed = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
-    # Main causal stack
+    # Main stack
     x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
-
-    # Pre-blocks
     for i in range(REALTIME_PRE_BLOCKS):
         x = glu_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1,
-                        prefix=f"realtime_pre_{i}", lookahead=0,
-                        residual_scale=0.35, bias_constraint=BC)
-        
+                          prefix=f"realtime_pre_{i}", lookahead=0,
+                          residual_scale=0.35, bias_constraint=BC)
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}",
-               gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-               beta_scale=REALTIME_FILM_BETA_SCALE,
-               gamma_mag=REALTIME_FILM_GAMMA_MAG,
-               beta_mag=REALTIME_FILM_BETA_MAG)
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
+                       beta_scale=REALTIME_FILM_BETA_SCALE,
+                       gamma_mag=REALTIME_FILM_GAMMA_MAG,
+                       beta_mag=REALTIME_FILM_BETA_MAG)
 
-    # Dilated stack
     realtime_feats = []
     for i, d in enumerate(REALTIME_DILATIONS):
         res = x
@@ -4111,31 +4202,23 @@ def build_realtime_model(offline=None,
                             bias_constraint=BC, name=f"realtime_sep_{i}")(x)
         c  = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
         g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
-        # GLU: linear content * sigmoid gate (no tanh)
-        x_block = Multiply(name=f"realtime_gate_mul_{i}")([
-            c,
-            Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)
-        ])
+        x_block = Multiply(name=f"realtime_gate_mul_{i}")([c, Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
         x_block = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(x_block)
-        # Residual scaling
         x_block = ConstScale(0.35, name=f"realtime_res_scale_{i}")(x_block)
         x = Add(name=f"realtime_res_add_{i}")([x_block, res])
 
-        # FiLM after the residual, same as before
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
-                    gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-                    beta_scale=REALTIME_FILM_BETA_SCALE,
-                    gamma_mag=REALTIME_FILM_GAMMA_MAG,
-                    beta_mag=REALTIME_FILM_BETA_MAG)
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
+                       beta_scale=REALTIME_FILM_BETA_SCALE,
+                       gamma_mag=REALTIME_FILM_GAMMA_MAG,
+                       beta_mag=REALTIME_FILM_BETA_MAG)
 
         offline_feat_name = f"offline_dil_{i}_film_apply"
         if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
             realtime_feats.append(x)
 
-    # Pick/finger heads and style mix
     out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
     out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
-    
     inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
     pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
@@ -4158,10 +4241,7 @@ def build_realtime_model(offline=None,
             bias_constraint=BC,
             name=f"realtime_ir_sep_{i}"
         )(ir)
-
     ir = IrScale(init=0.6, name="realtime_ir_scale")(ir)
-
-    # Proper FIR interpolation to 48k
     ir = FIRInterpByN(
         factor=REALTIME_IR_DOWNSAMPLE_FACTOR,
         num_taps=max(193, REALTIME_LP_ORDER),
@@ -4171,27 +4251,35 @@ def build_realtime_model(offline=None,
     )(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
-    # HF mask (learned) first
+    # HF mask path
     hf_in  = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-
     m = causal_sep_conv(hf_in, 8, 5, 1, name="realtime_hf_mask_c1", activation="relu", bias_constraint=BC)
     m = causal_sep_conv(m,    8, 5, 2, name="realtime_hf_mask_c2", activation="relu", bias_constraint=BC)
-    m = causal_sep_conv(
-        m, 1, 3, 1, name="realtime_hf_mask_logits",
-        bias_constraint=BC,
-        bias_initializer=tf.keras.initializers.Constant(-2.5)
-    )
-
+    m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits",
+                        bias_constraint=BC,
+                        bias_initializer=tf.keras.initializers.Constant(-2.5))
     mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
-    
     if float(mask_min_floor) > 0.0:
         mask_pred = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_floor")(mask_pred)
-    
-    mask_smoothed = CausalExpSmoother(
-        time_const_ms=0.25, sample_rate=REALTIME_SAMPLE_RATE, Lmax=128, name="realtime_hf_mask_smooth"
-    )(mask_pred)
 
-    # Optional fixed gate (INT8-friendly) as a safety cap
+    # Asymmetric smoothing: fast up (0.08 ms), slower down (mask_release_ms)
+    down_tc = float(mask_release_ms) if (mask_release_ms is not None and mask_release_ms > 0.0) else 0.25
+    mask_smooth_down = CausalExpSmoother(time_const_ms=down_tc, sample_rate=REALTIME_SAMPLE_RATE, Lmax=256, name="realtime_hf_mask_smooth")(mask_pred)
+    mask_smooth_up   = CausalExpSmoother(time_const_ms=0.08,    sample_rate=REALTIME_SAMPLE_RATE, Lmax=128, name="realtime_hf_mask_smooth_up")(mask_pred)
+
+    mask_prev = Lambda(lambda z: tf.pad(z, [[0,0],[1,0],[0,0]])[:, :-1, :], name="realtime_hf_mask_prev")(mask_pred)
+    mask_diff = Sub(name="realtime_hf_mask_diff")([mask_pred, mask_prev])
+    rising_soft = Activation("relu", name="realtime_hf_mask_rising_relu")(mask_diff)
+    rising = Lambda(clip_01x4, name="realtime_hf_mask_rising")(rising_soft)
+    not_rising = Lambda(invert, name="realtime_hf_mask_not_rising")(rising)
+
+    mask_asym = Add(name="realtime_hf_mask_asym_combine")([
+        Multiply(name="realtime_hf_mask_asym_up")([rising,      mask_smooth_up]),
+        Multiply(name="realtime_hf_mask_asym_down")([not_rising, mask_smooth_down])
+    ])
+    mask_smoothed = IdentityLayer(name="realtime_hf_mask_asym")(mask_asym)
+
+    # Optional fixed gate cap during training/static builds
     realtime_gate = None
     if cap_mask_with_gate:
         realtime_gate = GateInt8Linear(
@@ -4211,152 +4299,114 @@ def build_realtime_model(offline=None,
             name="realtime_gate"
         )(inp)
 
-    # Decide what actually gates the HF path
     if use_learned_hf_mask:
-        if realtime_gate is not None and cap_mask_with_gate:
-            # Learned mask cannot exceed the fixed gate, but can still reduce it
-            mask_used_inner = Minimum(name="realtime_hf_mask_used_min")([mask_smoothed, realtime_gate])
-        else:
-            mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_id")(mask_smoothed)
+        mask_used_inner = Minimum(name="realtime_hf_mask_used_min")([mask_smoothed, realtime_gate]) if realtime_gate is not None else IdentityLayer(name="realtime_hf_mask_used_id")(mask_smoothed)
     else:
-        # Ignore learned mask for the signal path; use fixed gate or pass-through ones
         if realtime_gate is not None:
             mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(realtime_gate)
         else:
             ones = OnesLike(name="realtime_hf_mask_used_ones")(mask_smoothed)
             mask_used_inner = IdentityLayer(name="realtime_hf_mask_used_gate")(ones)
 
-    # Ensure the final tensor is consistently named "realtime_hf_mask_used"
     mask_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_inner)
+
+    # Soft‑knee shaping for audio path
+    if mask_softknee is not None:
+        k_val, t_val = (float(mask_softknee[0]), float(mask_softknee[1])) if isinstance(mask_softknee, (tuple, list)) else (float(mask_softknee.get("k", 10.0)), float(mask_softknee.get("t", 0.35)))
+        ones_knee = OnesLike(name="realtime_hf_mask_softknee_ones")(mask_used)
+        neg_t = ConstScale(-t_val, name="realtime_hf_mask_softknee_neg_t")(ones_knee)
+        shifted = Add(name="realtime_hf_mask_softknee_shift")([mask_used, neg_t])
+        scaled  = ConstScale(k_val, name="realtime_hf_mask_softknee_scale")(shifted)
+        mask_used_audio = Activation("sigmoid", name="realtime_hf_mask_softknee")(scaled)
+    else:
+        mask_used_audio = IdentityLayer(name="realtime_hf_mask_passthru")(mask_used)
+
+    if float(mask_min_floor) > 0.0:
+        mask_used_audio = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_audio_floor")(mask_used_audio)
+
+    mask_for_mult = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
 
     # HF branch proper
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0",
-                    lookahead=0, residual_scale=0.35, bias_constraint=BC)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1",
-                    lookahead=0, residual_scale=0.35, bias_constraint=BC)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2",
-                    lookahead=0, residual_scale=0.35, bias_constraint=BC)
+    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0, residual_scale=0.35, bias_constraint=BC)
+    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0, residual_scale=0.35, bias_constraint=BC)
+    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0, residual_scale=0.35, bias_constraint=BC)
     hf = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_hf_out")(hf)
 
-    # Stop audio-loss gradients from flowing into the mask (so mask learns only from its own KD/aux losses)
-    mask_for_mult = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used) if detach_mask_from_audio else mask_used
     hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_for_mult])
 
-    hf_hp    = HFHighpass(
-        sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER,
-        name="realtime_hf_highpass"
-    )(hf_gated)
+    hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
-    hf_final = HFLowbandPenalty(
-        alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
-        cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
-        order=129,
-        sample_rate=REALTIME_SAMPLE_RATE,
-        name="realtime_hf_lowband_penalty"
-    )(hf_final)
-    
+
+    # Optional soft‑clip to tame rare spikes after big boosts
+    if hf_softclip_drive is not None and float(hf_softclip_drive) > 0.0:
+        d = float(hf_softclip_drive)
+        hf_scaled = ConstScale(d, name="realtime_hf_softclip_drive")(hf_final)
+        hf_tanh   = Activation("tanh", name="realtime_hf_softclip_tanh")(hf_scaled)
+        norm = 1.0 / float(np.tanh(d))
+        hf_final = ConstScale(norm, name="realtime_hf_softclip_renorm")(hf_tanh)
+
+    hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
+                                cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
+                                order=129,
+                                sample_rate=REALTIME_SAMPLE_RATE,
+                                name="realtime_hf_lowband_penalty")(hf_final)
     if int(hf_time_shift_samples) != 0:
-        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)   
-    
+        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)
     hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
-    # Mix IR and HF into main
+    # Mix
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final_pick])
 
-    # Resonance stem: use fixed gate if present, else the learned mask (or ones)
+    # Resonance stem
     gate_for_resbp = mask_used if (realtime_gate is None) else realtime_gate
-    realtime_resbp = _add_resbp_branch_realtime(
-        inp=inp,
-        gate=gate_for_resbp,
-        style_time_used=style_scalar_b3,
-        bias_constraint=BC
-    )
+    realtime_resbp = _add_resbp_branch_realtime(inp=inp, gate=gate_for_resbp, style_time_used=style_scalar_b3, bias_constraint=BC)
     y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
 
-    # KD wiring (student vs teacher) — all based on the single teacher_combo call
+    # KD wiring
     if offline is not None:
-        # Downsample teacher features/gate (96k → 48k)
         T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{i}")(t) for i, t in enumerate(T_feats)]
         T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
-        
-        # Already present; keep it
-        kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
-        # Optional extra push directly on the mask (add this if you defined it)
-        kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
-        
-        kd_tensors.append(
-            MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
-        )
 
-        # Feature KD
+        kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
+        kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
+        kd_tensors.append(MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds]))
+
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
             chan = int(T_f_ds.shape[-1])
             proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{i}")(S_f)
-            kd_tensors.append(
-                DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj])
-            )
+            kd_tensors.append(DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj]))
 
-        # Audio KD
         offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime]))
         kd_tensors.append(MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime]))
 
-        # Stem KD
         off_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(off_pick)
         off_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(off_finger)
-
         off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
-        off_hf_ds_hp48 = HFHighpass(
-            sample_rate=REALTIME_SAMPLE_RATE,
-            cutoff_hz=REALTIME_HP_CUTOFF_HZ,
-            order=REALTIME_HF_HP_ORDER,
-            name="offline_hf_ds_hp48"
-        )(off_hf_ds)
+        off_hf_ds_hp48 = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="offline_hf_ds_hp48")(off_hf_ds)
         off_hf_ds_hp48_pick = Multiply(name="offline_hf_ds_hp48_pick_only")([off_hf_ds_hp48, style_scalar_b3])
-        
-        
-        # Teacher HF envelope (96k) → downsample to 48k → soft-normalize to [0,1]
-        off_hf_env96 = CausalExpSmoother(
-            time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="off_hf_env96"
-        )(Abs1D()(off_hf_scaled))
 
-        off_hf_env48 = FIRDecimateBy2(name="off_hf_env_ds2")(off_hf_env96)
-        off_hf_env48_norm = Lambda(clip_01x4, name="off_hf_env48_norm")(off_hf_env48)
-        
-        # Distill both the raw mask and the actually used mask (smoothed)
         if enable_mask_kd:
-            # Primary: BCE on raw mask logits (sigmoid output) vs teacher gate (downsampled)
-            kd_tensors.append(
-                DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_pred])
-            )
-            # Auxiliary: MSE on the smoothed pre-cap mask
-            kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed])
-            )
-            # Optional: envelope → mask_pred KD (keep weight modest)
-            kd_tensors.append(
-                DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
-            )
+            off_hf_env96 = CausalExpSmoother(time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="off_hf_env96")(Abs1D()(off_hf_scaled))
+            off_hf_env48 = FIRDecimateBy2(name="off_hf_env_ds2")(off_hf_env96)
+            off_hf_env48_norm = Lambda(clip_01x4, name="off_hf_env48_norm")(off_hf_env48)
+
+            kd_tensors.append(DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_pred]))
+            kd_tensors.append(DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed]))
+            kd_tensors.append(DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred]))
 
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
         kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48_pick, hf_final_pick]))
 
-        # Band‑pass (resbp) KD — optional, only if teacher has it
         if realtime_resbp is not None and off_resbp_scaled is not None:
             off_resbp_ds = FIRDecimateBy2(name="offline_resbp_ds2")(off_resbp_scaled)
-            kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")(
-                    [off_resbp_ds, realtime_resbp]
-                )
-            )
+            kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")([off_resbp_ds, realtime_resbp]))
 
-    # Ensure KD tensors are graph-reachable
     if kd_tensors:
         y_realtime = LossTether(name="realtime_kd_tether")([y_realtime] + kd_tensors)
 
-    # Assemble inputs/outputs
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
@@ -4644,35 +4694,32 @@ def _build_offline_dynamic_for_preview():
     return offline_dyn
 
 def _build_realtime_dynamic_learned_pick_for_preview():
-    """
-    Prefer the saved learned-pick dynamic model; else try learned-pick STATIC to copy weights;
-    else fall back to baseline dynamic (structure differs, copy by name best-effort).
-    """
     dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
     if os.path.exists(dyn_path):
-        print("[stems/realtime/learned] Loading dynamic learned-pick:", dyn_path)
         return tf.keras.models.load_model(dyn_path, compile=False)
 
-    # Try static learned-pick for weight seeding
     stat_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME)
     if os.path.exists(stat_path):
-        print("[stems/realtime/learned] Building dynamic preview from static learned-pick:", stat_path)
         static_src = tf.keras.models.load_model(stat_path, compile=False)
         realtime_dyn = build_realtime_model(
             offline=None, dynamic_time=True,
             cap_mask_with_gate=False, use_learned_hf_mask=True,
-            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0
+            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
+            mask_release_ms=REALTIME_MASK_RELEASE_MS,
+            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
         )
         copy_weights_by_name(realtime_dyn, static_src, verbose=True)
         return realtime_dyn
 
-    # Last resort: seed from baseline dynamic (mask may be untrained → rough preview)
-    print("[stems/realtime/learned] No learned-pick models found; preview from baseline dynamic.")
     base_dyn = _build_realtime_dynamic_for_preview()
     realtime_dyn = build_realtime_model(
         offline=None, dynamic_time=True,
         cap_mask_with_gate=False, use_learned_hf_mask=True,
-        enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0
+        enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
+        mask_release_ms=REALTIME_MASK_RELEASE_MS,
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
     copy_weights_by_name(realtime_dyn, base_dyn, verbose=True)
     return realtime_dyn
@@ -4811,10 +4858,12 @@ def render_hf_shift_sweep_realtime(min_shift=-8, max_shift=8, sec=DEMO_SEC, offs
             sec=sec
         )
         
+
+        
 def make_base_realtime_learned_pick(
-    epochs=LEARNED_PICK_MASK_EPOCHS,
-    steps_cap=LEARNED_PICK_MASK_STEPS_CAP,
-    lr=LEARNED_PICK_MASK_LR
+    epochs=REALTIME_LEARNED_PICK_MASK_EPOCHS,
+    steps_cap=REALTIME_LEARNED_PICK_MASK_STEPS_CAP,
+    lr=REALTIME_LEARNED_PICK_MASK_LR
 ):
     """
     Create a learned‑pick variant of the baseline realtime model WITHOUT touching the baseline files.
@@ -4852,11 +4901,14 @@ def make_base_realtime_learned_pick(
     rt_static_train = build_realtime_model(
         offline=offline_causal,
         dynamic_time=False,
-        cap_mask_with_gate=True,          # safety cap ON during conversion
+        cap_mask_with_gate=True,
         use_learned_hf_mask=True,
         enable_mask_kd=True,
-        detach_mask_from_audio=False,     # <-- allow HFSuppressWhenClosed to push via mask
-        mask_min_floor=0.0                # <-- let the mask fully close while learning
+        detach_mask_from_audio=False,
+        mask_min_floor=0.0,
+        mask_release_ms=REALTIME_MASK_RELEASE_MS,
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
     copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
@@ -4944,11 +4996,16 @@ def make_base_realtime_learned_pick(
     rt_dyn_export = build_realtime_model(
         offline=None,
         dynamic_time=True,
-        cap_mask_with_gate=False,      # remove fixed gate at runtime
-        use_learned_hf_mask=True,      # learned mask drives pick
+        cap_mask_with_gate=False,
+        use_learned_hf_mask=True,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.0
+        mask_min_floor=0.0,
+        # NEW
+        mask_release_ms=REALTIME_MASK_RELEASE_MS,
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE,
+        hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES
     )
     copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -5185,11 +5242,15 @@ def fine_tune(offline=True, realtime=True):
         rt_static_train = build_realtime_model(
             offline=offline_causal,
             dynamic_time=False,
-            cap_mask_with_gate=True,        # cap ON during finetune (safety)
+            cap_mask_with_gate=True,
             use_learned_hf_mask=True,
             enable_mask_kd=True,
-            detach_mask_from_audio=True,    # isolate mask learning from audio
-            mask_min_floor=0.05             # small floor only during training
+            detach_mask_from_audio=True,
+            mask_min_floor=0.05,
+            # NEW
+            mask_release_ms=REALTIME_MASK_RELEASE_MS,
+            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -5228,11 +5289,16 @@ def fine_tune(offline=True, realtime=True):
         rt_dyn_export = build_realtime_model(
             offline=None,
             dynamic_time=True,
-            cap_mask_with_gate=False,       # cap OFF at runtime
+            cap_mask_with_gate=False,
             use_learned_hf_mask=True,
             enable_mask_kd=False,
-            detach_mask_from_audio=True,    # no effect at inference
-            mask_min_floor=0.0              # no floor at runtime
+            detach_mask_from_audio=True,
+            mask_min_floor=0.0,
+            # NEW
+            mask_release_ms=REALTIME_MASK_RELEASE_MS,
+            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE,
+            hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -6145,9 +6211,9 @@ def train_realtime(resume=False, resume_ckpt_path=None):
     print("\n🔁 Converting baseline realtime → learned‑pick (mask‑only KD)…")
     try:
         make_base_realtime_learned_pick(
-            epochs=LEARNED_PICK_MASK_EPOCHS,
-            steps_cap=LEARNED_PICK_MASK_STEPS_CAP,
-            lr=LEARNED_PICK_MASK_LR
+            epochs=REALTIME_LEARNED_PICK_MASK_EPOCHS,
+            steps_cap=REALTIME_LEARNED_PICK_MASK_STEPS_CAP,
+            lr=REALTIME_LEARNED_PICK_MASK_LR
         )
     except NameError as e:
         print("ERROR: make_base_realtime_learned_pick is not defined. "
@@ -6399,11 +6465,14 @@ def main ():
                 build_model_fn=build_realtime_model,
                 build_model_fn_args_dynamic={
                     'offline': None,
-                    'cap_mask_with_gate': True,
-                    'use_learned_hf_mask': False,
+                    'cap_mask_with_gate': False,
+                    'use_learned_hf_mask': True,
                     'enable_mask_kd': False,
                     'detach_mask_from_audio': True,
-                    'mask_min_floor': 0.0
+                    'mask_min_floor': 0.0,
+                    'mask_release_ms': REALTIME_MASK_RELEASE_MS,
+                    'mask_softknee': (REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
+                    'hf_softclip_drive': REALTIME_HF_SOFTCLIP_DRIVE
                 },
                 use_safe_weight_copy=True
             )
@@ -6453,6 +6522,8 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
+        #export_learned_pick_sharp_all(gamma=REALTIME_GATE_MASK_SHARPEN)
+        #sys.exit(0)
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
         # --learned-pick     → base realtime learned-pick dynamic (if present)
@@ -6512,9 +6583,9 @@ def main ():
                     try: return cast(args[i+1])
                     except: pass
             return default
-        ep   = _get_arg("--epochs",   int, LEARNED_PICK_MASK_EPOCHS)
-        sc   = _get_arg("--steps-cap",int, LEARNED_PICK_MASK_STEPS_CAP)
-        lr   = _get_arg("--lr",     float, LEARNED_PICK_MASK_LR)
+        ep   = _get_arg("--epochs",   int, REALTIME_LEARNED_PICK_MASK_EPOCHS)
+        sc   = _get_arg("--steps-cap",int, REALTIME_LEARNED_PICK_MASK_STEPS_CAP)
+        lr   = _get_arg("--lr",     float, REALTIME_LEARNED_PICK_MASK_LR)
 
         print("Converting baseline realtime → learned‑pick (mask‑only KD)…")
         model = make_base_realtime_learned_pick(epochs=ep, steps_cap=sc, lr=lr)
