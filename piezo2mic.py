@@ -286,6 +286,14 @@ RESBP_STRIKE_ENV_MS_REALTIME    = 4.0
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 
+# Baseline realtime (learned pick) export filenames
+REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_learned_pick.keras"
+REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_learned_pick_dynamic.keras"
+
+LEARNED_PICK_MASK_EPOCHS    = 10
+LEARNED_PICK_MASK_STEPS_CAP = 2500
+LEARNED_PICK_MASK_LR        = 1e-4
+
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
 FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_realtime_dynamic.keras"
@@ -295,8 +303,8 @@ FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.k
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
 
-FINETUNE_DEMO_SEC = 120
-FINETUNE_DEMO_OFFSET_SEC = 30
+FINETUNE_DEMO_SEC = 10
+FINETUNE_DEMO_OFFSET_SEC = 0
 
 HP_PRE_EMPHASIS_HF        = 0.98
 HF_ONSET_GAIN             = 8.0
@@ -373,13 +381,13 @@ FINETUNE_BODY_FMAX_OFFLINE  = 16000.0
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 60
+DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 1
+DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
+LONG_DEMO_SEC        = 10
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 1
+LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
 PICK_TGT_DIR   = "./input/pick/target"
@@ -418,6 +426,7 @@ DEMO_CHECKPOINTS_REALTIME_OUT_DIR = os.path.join(DEMO_CHECKPOINTS_OUT_DIR, "real
 STEMS_OUT_DIR = os.path.join(DEMOS_OUT_DIR, "stems")
 STEMS_OFFLINE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "offline")
 STEMS_REALTIME_OUT_DIR = os.path.join(STEMS_OUT_DIR, "realtime")
+STEMS_REALTIME_LEARNED_OUT_DIR = os.path.join(STEMS_OUT_DIR, "realtime_learned_pick")
 
 STEMS_FINETUNE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "finetune")
 STEMS_FINETUNE_OFFLINE_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "offline")
@@ -459,7 +468,8 @@ for dir_path in [
     DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR,
     FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR,
     STEMS_OFFLINE_OUT_DIR, STEMS_REALTIME_OUT_DIR,
-    STEMS_FINETUNE_OFFLINE_OUT_DIR, STEMS_FINETUNE_REALTIME_OUT_DIR
+    STEMS_FINETUNE_OFFLINE_OUT_DIR, STEMS_FINETUNE_REALTIME_OUT_DIR,
+    STEMS_REALTIME_LEARNED_OUT_DIR
 ]:
     os.makedirs(dir_path, exist_ok=True)
 
@@ -2639,6 +2649,24 @@ class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
     def get_config(self):
         return {"alpha": float(self.init_alpha), **super().get_config()}
 
+@register_keras_serializable()
+class MaskSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    def __init__(self, alpha=0.3, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+    def call(self, inputs, training=None):
+        m, gate = inputs  # (B,T,1), (B,T,1)
+        if training is True:
+            t = tf.minimum(tf.shape(m)[1], tf.shape(gate)[1])
+            leak = tf.abs(m[:, :t, :] * (1.0 - tf.stop_gradient(gate[:, :t, :])))
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return m
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
+
 # ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
 
 @register_keras_serializable()
@@ -4092,9 +4120,9 @@ def build_realtime_model(offline=None,
     
     if float(mask_min_floor) > 0.0:
         mask_pred = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_floor")(mask_pred)
-
+    
     mask_smoothed = CausalExpSmoother(
-        time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=64, name="realtime_hf_mask_smooth"
+        time_const_ms=0.25, sample_rate=REALTIME_SAMPLE_RATE, Lmax=128, name="realtime_hf_mask_smooth"
     )(mask_pred)
 
     # Optional fixed gate (INT8-friendly) as a safety cap
@@ -4203,8 +4231,13 @@ def build_realtime_model(offline=None,
             kd_tensors.append(
                 DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=8, name="hf_mask_distill")([T_gate_ds, mask_pred])
             )
+            # Distill to the pre-cap smoothed mask to keep gradients alive under the cap
             kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_used_distill")([T_gate_ds, mask_used])
+                DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed])
+            )
+            
+            kd_tensors.append(
+                MaskSuppressWhenClosed(alpha=0.3, name="mask_suppress_closed")([mask_smoothed, T_gate_ds])
             )
 
         # Audio KD
@@ -4459,6 +4492,39 @@ def add_sw_offline_finetune_nf(x, y):
     return inputs, outputs, (sw_audio, sw_style)
 
 @register_keras_serializable()
+def add_sw_realtime_dual_kd_only(x, y):
+    """
+    KD‑only mapping for converting the baseline realtime model to learned‑pick.
+    x = (x_realtime_48k, x_offline_96k)
+    y = (y_audio_realtime_48k, style_flag_unused)
+
+    - Forces style_force=0 (use predicted) but disables both audio and style losses via sample weights.
+    - Only the KD add_loss terms (teacher gate → student mask, etc.) will drive learning.
+    """
+    x_realtime, x_offline = x
+    y_audio, _ = y
+    b = tf.shape(x_realtime)[0]
+    T = tf.shape(x_realtime)[1]
+
+    # Dummy style label target (ignored)
+    style_true  = tf.zeros((b, 1), dtype=tf.float32)
+    # Force model to use its own style classifier
+    style_force = tf.zeros((b, 1), dtype=tf.float32)
+
+    inputs = {
+        'realtime_piezo_input':         x_realtime,
+        'realtime_offline_piezo_input': x_offline,
+        'realtime_style_true_input':    style_true,
+        'realtime_style_force_input':   style_force,
+    }
+    outputs = (y_audio, style_true)
+
+    # Zero sample‑weights → disable the primary task losses; KD add_loss still applies
+    sw_audio = tf.zeros((b, T, 1), dtype=tf.float32)
+    sw_style = tf.zeros_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+@register_keras_serializable()
 def add_sw_realtime_finetune_nf(x, y):
     # y = (y_audio, style_flag) but finetune uses no true style labels
     y_audio, _ = y
@@ -4511,6 +4577,40 @@ def _build_offline_dynamic_for_preview():
     offline_dyn = build_offline_model(dynamic_time=True)
     offline_dyn.set_weights(static.get_weights())
     return offline_dyn
+
+def _build_realtime_dynamic_learned_pick_for_preview():
+    """
+    Prefer the saved learned-pick dynamic model; else try learned-pick STATIC to copy weights;
+    else fall back to baseline dynamic (structure differs, copy by name best-effort).
+    """
+    dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    if os.path.exists(dyn_path):
+        print("[stems/realtime/learned] Loading dynamic learned-pick:", dyn_path)
+        return tf.keras.models.load_model(dyn_path, compile=False)
+
+    # Try static learned-pick for weight seeding
+    stat_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME)
+    if os.path.exists(stat_path):
+        print("[stems/realtime/learned] Building dynamic preview from static learned-pick:", stat_path)
+        static_src = tf.keras.models.load_model(stat_path, compile=False)
+        realtime_dyn = build_realtime_model(
+            offline=None, dynamic_time=True,
+            cap_mask_with_gate=False, use_learned_hf_mask=True,
+            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0
+        )
+        copy_weights_by_name(realtime_dyn, static_src, verbose=True)
+        return realtime_dyn
+
+    # Last resort: seed from baseline dynamic (mask may be untrained → rough preview)
+    print("[stems/realtime/learned] No learned-pick models found; preview from baseline dynamic.")
+    base_dyn = _build_realtime_dynamic_for_preview()
+    realtime_dyn = build_realtime_model(
+        offline=None, dynamic_time=True,
+        cap_mask_with_gate=False, use_learned_hf_mask=True,
+        enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0
+    )
+    copy_weights_by_name(realtime_dyn, base_dyn, verbose=True)
+    return realtime_dyn
 
 def _build_realtime_dynamic_for_preview():
     """
@@ -4645,6 +4745,153 @@ def render_hf_shift_sweep_realtime(min_shift=-8, max_shift=8, sec=DEMO_SEC, offs
             offset_sec=offset,
             sec=sec
         )
+        
+def make_base_realtime_learned_pick(
+    epochs=LEARNED_PICK_MASK_EPOCHS,
+    steps_cap=LEARNED_PICK_MASK_STEPS_CAP,
+    lr=LEARNED_PICK_MASK_LR
+):
+    """
+    Create a learned‑pick variant of the baseline realtime model WITHOUT touching the baseline files.
+
+    Flow:
+      - Load baseline offline dynamic (teacher) → causal clone.
+      - Load baseline realtime dynamic (student init).
+      - Build a STATIC training student with: cap_mask_with_gate=True, use_learned_hf_mask=True, enable_mask_kd=True.
+      - Freeze everything except the tiny HF mask subnetwork; compile with KD‑only sample weights.
+      - Train briefly (few epochs) to mimic the teacher gate/envelope.
+      - Export a TEACHER‑FREE DYNAMIC runtime model with cap_mask_with_gate=False (no fixed gate), use_learned_hf_mask=True.
+
+    Saves:
+      ./out/models/realtime/piezo2mic_baseline_realtime_learned_pick_dynamic.keras   (live)
+      ./out/models/realtime/piezo2mic_baseline_realtime_learned_pick.keras           (static, with teacher; for inspection)
+    """
+    # 1) Locate teacher (offline baseline dynamic)
+    base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(base_off_dyn_path):
+        print("ERROR: baseline offline dynamic model not found:", base_off_dyn_path)
+        print("Run: python piezo2mic.py --train-offline")
+        sys.exit(1)
+    offline_nc = tf.keras.models.load_model(base_off_dyn_path, compile=False)
+    offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
+
+    # 2) Load baseline realtime dynamic as student initializer (kept intact on disk)
+    base_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(base_rt_dyn_path):
+        print("ERROR: baseline realtime dynamic model not found:", base_rt_dyn_path)
+        print("Run: python piezo2mic.py --train-realtime")
+        sys.exit(1)
+    base_rt_dyn = tf.keras.models.load_model(base_rt_dyn_path, compile=False)
+
+    # 3) Build STATIC training model (with teacher and mask KD enabled)
+    rt_static_train = build_realtime_model(
+        offline=offline_causal,
+        dynamic_time=False,
+        cap_mask_with_gate=True,          # safety cap ON during conversion
+        use_learned_hf_mask=True,
+        enable_mask_kd=True,
+        detach_mask_from_audio=False,     # <-- allow HFSuppressWhenClosed to push via mask
+        mask_min_floor=0.0                # <-- let the mask fully close while learning
+    )
+    copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
+
+    # 4) Only train the tiny HF mask layers
+    set_trainable_for_finetune_realtime(rt_static_train, train_mask=True)
+
+    # 5) Dataset: dual‑rate (48k student + 96k teacher input), KD‑only sample weights + shared random gain
+    # Build chunks from the original training pairs (no re‑segmentation on disk)
+    pick_chunks   = build_chunks(pairs_list=picked_pairs, seg_len=REALTIME_SEG_LEN, sample_rate=REALTIME_SAMPLE_RATE)
+    finger_chunks = build_chunks(pairs_list=finger_pairs, seg_len=REALTIME_SEG_LEN, sample_rate=REALTIME_SAMPLE_RATE)
+
+    def make_dual_ds(chunks, is_pick):
+        sig_x = (
+            tf.TensorSpec((REALTIME_SEG_LEN, 1), tf.float32),
+            tf.TensorSpec((REALTIME_SEG_LEN * (OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE), 1), tf.float32)
+        )
+        sig_y = (tf.TensorSpec((REALTIME_SEG_LEN, 1), tf.float32), tf.TensorSpec((), tf.float32))
+        return tf.data.Dataset.from_generator(
+            lambda: segment_generator_dual(
+                seg_len_realtime=REALTIME_SEG_LEN,
+                chunks=chunks,
+                is_pick_chunks=is_pick,
+                realtime_sample_rate=REALTIME_SAMPLE_RATE,
+                offline_sample_rate=OFFLINE_SAMPLE_RATE
+            ),
+            output_signature=(sig_x, sig_y)
+        )
+
+    ds_pick   = make_dual_ds(pick_chunks,   True)
+    ds_finger = make_dual_ds(finger_chunks, False)
+
+    train_ds = tf.data.Dataset.sample_from_datasets(
+        [ds_pick, ds_finger],
+        weights=[PICK_CHUNK_RATIO, FINGER_CHUNK_RATIO],
+        seed=SEED
+    ).shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True)\
+     .batch(FINETUNE_BATCH_SIZE)\
+     .map(add_sw_realtime_dual_kd_only)\
+     .map(add_shared_random_gain_dual(db_lo=-30.0, db_hi=+18.0))\
+     .prefetch(tf.data.AUTOTUNE)
+
+    # Conservative steps/epoch from both pools, then cap
+    steps_pk = approx_steps_from_chunks(pick_chunks, REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE, FINETUNE_BATCH_SIZE)
+    steps_fg = approx_steps_from_chunks(finger_chunks, REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE, FINETUNE_BATCH_SIZE)
+    steps_per_epoch = min(max(1, steps_pk + steps_fg), int(steps_cap))
+
+    # 6) Compile with any placeholder losses (weights irrelevant due to zero sample‑weights)
+    loss_rt_lite = FinetuneCombinedLossLite(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        stft_scales=((1024, 256, 1024),),
+        l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0,
+        onset_gain=HF_ONSET_GAIN
+    )
+
+    rt_static_train.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
+        loss=[loss_rt_lite, "binary_crossentropy"],
+        loss_weights=[1.0, 0.0],  # style BCE disabled; audio loss silenced by sample‑weights=0
+        metrics=[["mae"], []]
+    )
+
+    # Optional: gently anneal mask KD strengths (short schedule)
+    kd_targets = {
+        "hf_mask_distill":   (REALTIME_HF_MASK_DISTILL_ALPHA,   0.4, 0, epochs),
+        "mask_used_distill": (REALTIME_MASK_USED_DISTILL_ALPHA, 0.1, 0, epochs),
+    }
+    cbs = [
+        KDAlphaScheduler(kd_targets),
+        TerminateOnNaN(),
+    ]
+
+    print(f"[convert] Training mask‑only KD: epochs={epochs}, steps/epoch≈{steps_per_epoch}, lr={lr}")
+    rt_static_train.fit(train_ds,
+                        epochs=int(epochs),
+                        steps_per_epoch=int(steps_per_epoch),
+                        verbose=1,
+                        callbacks=cbs)
+
+    # 7) Save STATIC (with teacher; for inspection/retraining if needed)
+    out_static = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME)
+    rt_static_train.save(out_static)
+    print("✅ Saved base realtime learned‑pick (STATIC with teacher):", out_static)
+
+    # 8) Export DYNAMIC teacher‑free runtime: cap OFF, learned mask gates HF/resbp.
+    rt_dyn_export = build_realtime_model(
+        offline=None,
+        dynamic_time=True,
+        cap_mask_with_gate=False,      # remove fixed gate at runtime
+        use_learned_hf_mask=True,      # learned mask drives pick
+        enable_mask_kd=False,
+        detach_mask_from_audio=True,
+        mask_min_floor=0.0
+    )
+    copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
+
+    out_dynamic = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    rt_dyn_export.save(out_dynamic)
+    print("✅ Saved base realtime learned‑pick (DYNAMIC, teacher‑free):", out_dynamic)
+
+    return rt_dyn_export
 
 def build_offline_finetune_wrapper(base_offline,
                                    bands=COLOREQ_BANDS_OFFLINE_BODY,
@@ -4788,7 +5035,7 @@ def fine_tune(offline=True, realtime=True):
             copy_weights_by_name(off_static_train, teacher_off_dyn, verbose=True)
 
         # Train only the small parts: FiLM generators (optional) and mask convs
-        set_trainable_for_finetune_offline(off_static_train, train_scales=True, train_mask=True)
+        set_trainable_for_finetune_offline(off_static_train, train_scales=True, train_film=True)
 
         # Lightweight finetune loss at 96 kHz; gate-aware HF/stft weighting is inside the loss
         loss_offlite = FinetuneCombinedLossLite(
@@ -4883,7 +5130,7 @@ def fine_tune(offline=True, realtime=True):
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
         # Train only FiLM generators and mask convs (keep small footprint)
-        set_trainable_for_finetune_realtime(rt_static_train, train_scales=True, train_mask=True)
+        set_trainable_for_finetune_realtime(rt_static_train, train_scales=True, train_film=True)
 
         # Compile: audio-only finetune loss; style BCE disabled by sample weights
         rt_static_train.compile(
@@ -4930,8 +5177,7 @@ def fine_tune(offline=True, realtime=True):
 
     return off_dyn_wrap, rt_dyn_export
 
-# REPLACE the existing set_trainable_for_finetune_offline with this version to also train the mask subnetwork when present
-def set_trainable_for_finetune_offline(model, train_scales=True, train_mask=False):
+def set_trainable_for_finetune_offline(model, train_scales=False, train_mask=False, train_film=False):
     """
     Fast path for embedded:
       - Train only FiLM generators (Dense '*film_dense') + optional IrScale scalars
@@ -4944,10 +5190,11 @@ def set_trainable_for_finetune_offline(model, train_scales=True, train_mask=Fals
         l.trainable = False
 
     # Enable only FiLM parameter generators
-    for l in model.layers:
-        if "film_dense" in l.name:
-            l.trainable = True
-            trainable.append(l.name)
+    if train_film:
+        for l in model.layers:
+            if "film_dense" in l.name:
+                l.trainable = True
+                trainable.append(l.name)
 
     # Optional: also allow the small IrScale scalars to adapt
     if train_scales:
@@ -4998,16 +5245,17 @@ def with_random_gain(input_key, out_scale_audio=True, db_lo=-24.0, db_hi=+12.0):
         return inputs, outputs, sw
     return _map
 
-def set_trainable_for_finetune_realtime(model, train_scales=False, train_mask=True):
+def set_trainable_for_finetune_realtime(model, train_scales=False, train_film=False, train_mask=False):
     trainable = []
     for l in model.layers:
         l.trainable = False
 
     # FiLM generators
-    for l in model.layers:
-        if "film_dense" in l.name:
-            l.trainable = True
-            trainable.append(l.name)
+    if train_film:
+        for l in model.layers:
+            if "film_dense" in l.name:
+                l.trainable = True
+                trainable.append(l.name)
 
     # Optional: IrScale scalars
     if train_scales:
@@ -5016,7 +5264,6 @@ def set_trainable_for_finetune_realtime(model, train_scales=False, train_mask=Tr
                 l.trainable = True
                 trainable.append(l.name)
 
-    # NEW: mask convs
     if train_mask:
         for lname in ["realtime_hf_mask_c1", "realtime_hf_mask_c2", "realtime_hf_mask_logits"]:
             try:
@@ -5442,6 +5689,42 @@ def run_render_stems_offline(use_finetuned=False):
         use_finetuned=use_finetuned
     )
 
+def run_render_stems_realtime_learned_pick():
+    """
+    Render stems from the base realtime learned-pick dynamic model (teacher-free, no fixed gate).
+    """
+    src = None
+    tgt = None
+    sample_rate = REALTIME_SAMPLE_RATE
+    out_dir = STEMS_REALTIME_LEARNED_OUT_DIR
+
+    # Choose a pair (prefer baseline training pair for consistency)
+    if not all_pairs:
+        print("ERROR: No baseline training pairs found.")
+        sys.exit(1)
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+
+    # Load learned-pick dynamic or build a preview
+    cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    if os.path.exists(cand):
+        print("[stems/realtime/learned] Loading learned-pick dynamic model:", cand)
+        realtime_dyn = tf.keras.models.load_model(cand, compile=False)
+    else:
+        print("[stems/realtime/learned] Learned-pick dynamic not found; building preview.")
+        realtime_dyn = _build_realtime_dynamic_learned_pick_for_preview()
+
+    dbg = build_realtime_debug_model(realtime_dyn)
+    render_isolated_stems(
+        debug_model=dbg,
+        path_src=src,
+        path_tgt=tgt,
+        out_dir=out_dir,
+        sample_rate=sample_rate,
+        sec=LONG_DEMO_SEC,
+        offset_sec=LONG_DEMO_OFFSET_SEC,
+        use_finetuned=False
+    )
+
 def run_render_stems_realtime(use_finetuned=False):
     src = None
     tgt = None
@@ -5759,7 +6042,8 @@ def train_realtime(resume=False, resume_ckpt_path=None):
     offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
     print("Built causal teacher clone for KD (right-lookahead=0).")
 
-    train_shared(
+    # 1) Train the baseline realtime model (fixed gate)
+    static_model, dynamic_model = train_shared(
         kind='realtime',
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
@@ -5791,6 +6075,19 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_REALTIME_OUT_DIR,
         dual_offline=True  # keep dual-rate dataset (48k student + 96k teacher input)
     )
+
+    # 2) Immediately derive and save the learned-pick variant (teacher-free, no fixed gate)
+    print("\n🔁 Converting baseline realtime → learned‑pick (mask‑only KD)…")
+    try:
+        make_base_realtime_learned_pick(
+            epochs=LEARNED_PICK_MASK_EPOCHS,
+            steps_cap=LEARNED_PICK_MASK_STEPS_CAP,
+            lr=LEARNED_PICK_MASK_LR
+        )
+    except NameError as e:
+        print("ERROR: make_base_realtime_learned_pick is not defined. "
+              "Please add the conversion function and constants as provided earlier.")
+        raise e
 
 def generate_fine_tune_demo(model, sample_rate, subdir_name):
     out_dir = os.path.join(FINETUNE_DEMOS_OUT_DIR, subdir_name)
@@ -6011,7 +6308,13 @@ def main ():
             train_realtime()
     elif (len(sys.argv)>1 and sys.argv[1]=="--demo"):
         print("Generating demo audio files...")
-        if (len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only"):
+        args = set(sys.argv[2:])
+        do_offline   = ("--realtime-only" not in args)
+        do_realtime  = ("--offline-only"  not in args)
+        do_rt_learned = ("--learned-pick" in args)
+
+        # Offline baseline (unchanged)
+        if do_offline:
             prepare_and_generate_demo(
                 sample_rate=OFFLINE_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_OFFLINE_OUT_DIR,
@@ -6020,13 +6323,42 @@ def main ():
                 build_model_fn=build_offline_model,
                 use_safe_weight_copy=False
             )
-        if (len(sys.argv) <= 2 or sys.argv[2] !="--offline-only"):
+
+        # Realtime baseline (fixed gate)
+        if do_realtime:
             prepare_and_generate_demo(
                 sample_rate=REALTIME_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_REALTIME_OUT_DIR,
                 dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
                 checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
                 build_model_fn=build_realtime_model,
+                build_model_fn_args_dynamic={
+                    'offline': None,
+                    'cap_mask_with_gate': True,
+                    'use_learned_hf_mask': False,
+                    'enable_mask_kd': False,
+                    'detach_mask_from_audio': True,
+                    'mask_min_floor': 0.0
+                },
+                use_safe_weight_copy=True
+            )
+
+        # Realtime learned-pick (teacher-free, no fixed gate)
+        if do_realtime and do_rt_learned:
+            prepare_and_generate_demo(
+                sample_rate=REALTIME_SAMPLE_RATE,
+                demo_out_dir=os.path.join(DEMOS_OUT_DIR, "realtime_learned_pick"),
+                dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME),
+                checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
+                build_model_fn=build_realtime_model,
+                build_model_fn_args_dynamic={
+                    'offline': None,
+                    'cap_mask_with_gate': False,   # learned pick active (no fixed gate)
+                    'use_learned_hf_mask': True,
+                    'enable_mask_kd': False,
+                    'detach_mask_from_audio': True,
+                    'mask_min_floor': 0.0
+                },
                 use_safe_weight_copy=True
             )
     elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune":
@@ -6056,27 +6388,46 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
-        # Optional flags (can be combined):
-        # --finetuned: render stems from finetuned dynamic models (if present)
-        # --both:      render both baseline and finetuned stems
-        # --offline-only / --realtime-only: restrict branches
+        # Flags (can be combined):
+        # --finetuned        → finetuned dynamic models (if present)
+        # --learned-pick     → base realtime learned-pick dynamic (if present)
+        # --both             → baseline + finetuned
+        # --all              → baseline + finetuned + learned-pick
+        # --offline-only / --realtime-only limits branches
         args = set(sys.argv[2:])
 
-        do_offline  = ("--realtime-only" not in args)
-        do_realtime = ("--offline-only"  not in args)
+        do_offline   = ("--realtime-only" not in args)
+        do_realtime  = ("--offline-only"  not in args)
+        do_finetuned = ("--finetuned"     in args)
+        do_both      = ("--both"          in args)
+        do_learned   = ("--learned-pick"  in args)
+        do_all       = ("--all"           in args)
 
-        do_finetuned = ("--finetuned" in args)
-        do_both      = ("--both" in args)
-        
+        # OFFLINE: baseline or finetuned (existing behavior)
+        if do_offline:
+            if do_both or do_all:
+                run_render_stems_offline(use_finetuned=False)
+                run_render_stems_offline(use_finetuned=True)
+            else:
+                run_render_stems_offline(use_finetuned=do_finetuned)
 
-        if do_both:
-            if do_offline:  run_render_stems_offline(use_finetuned=False)
-            if do_offline:  run_render_stems_offline(use_finetuned=True)
-            if do_realtime: run_render_stems_realtime(use_finetuned=False)
-            if do_realtime: run_render_stems_realtime(use_finetuned=True)
-        else:
-            if do_offline:  run_render_stems_offline(use_finetuned=do_finetuned)
-            if do_realtime: run_render_stems_realtime(use_finetuned=do_finetuned)
+        # REALTIME: baseline / finetuned / learned-pick
+        if do_realtime:
+            if do_all:
+                run_render_stems_realtime(use_finetuned=False)
+                run_render_stems_realtime(use_finetuned=True)
+                run_render_stems_realtime_learned_pick()
+            elif do_both:
+                run_render_stems_realtime(use_finetuned=False)
+                run_render_stems_realtime(use_finetuned=True)
+                if do_learned:
+                    run_render_stems_realtime_learned_pick()
+            else:
+                # single selection
+                if do_learned and not do_finetuned:
+                    run_render_stems_realtime_learned_pick()
+                else:
+                    run_render_stems_realtime(use_finetuned=do_finetuned)
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--hf-shift-sweep":
         # Optional range: --hf-shift-sweep [-6:6]
@@ -6086,6 +6437,40 @@ def main ():
             rng = (int(a), int(b))
         render_hf_shift_sweep_realtime(min_shift=rng[0], max_shift=rng[1])
         sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--make-base-realtime-learned-pick":
+        # Optional overrides: --epochs N --steps-cap M --lr X
+        args = sys.argv[2:]
+        def _get_arg(flag, cast, default):
+            if flag in args:
+                i = args.index(flag)
+                if i+1 < len(args):
+                    try: return cast(args[i+1])
+                    except: pass
+            return default
+        ep   = _get_arg("--epochs",   int, LEARNED_PICK_MASK_EPOCHS)
+        sc   = _get_arg("--steps-cap",int, LEARNED_PICK_MASK_STEPS_CAP)
+        lr   = _get_arg("--lr",     float, LEARNED_PICK_MASK_LR)
+
+        print("Converting baseline realtime → learned‑pick (mask‑only KD)…")
+        model = make_base_realtime_learned_pick(epochs=ep, steps_cap=sc, lr=lr)
+
+        # Optional quick demo using the newly saved dynamic model
+        prepare_and_generate_demo(
+            sample_rate=REALTIME_SAMPLE_RATE,
+            demo_out_dir=os.path.join(DEMOS_OUT_DIR, "realtime_learned_pick"),
+            dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME),
+            checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
+            build_model_fn=build_realtime_model,
+            build_model_fn_args_dynamic={
+                'offline': None,
+                'cap_mask_with_gate': False,
+                'use_learned_hf_mask': True,
+                'enable_mask_kd': False,
+                'detach_mask_from_audio': True,
+                'mask_min_floor': 0.0
+            },
+            use_safe_weight_copy=True
+        )
     else:
         print("No command given.")
         sys.exit(1)
