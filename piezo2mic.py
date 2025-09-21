@@ -4339,11 +4339,6 @@ def build_realtime_model(offline=None,
                 DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
             )
 
-            # Crisp margins to push baseline down and openings up
-            kd_tensors.append(
-                MaskMarginKD(alpha=1.0, m_close=0.03, m_open=0.85, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
-            )
-
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
         kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
         kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48_pick, hf_final_pick]))
