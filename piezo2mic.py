@@ -2621,51 +2621,6 @@ class AdjustableAlphaMixin:
     def get_config(self):
         return {}
     
-@register_keras_serializable()
-class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
-    """
-    Training-only penalty: suppress student HF when the teacher gate is closed.
-    Adds loss = alpha * mean(|hf| * (1 - gate)), after aligning to min time length.
-    Returns the HF input unchanged so it can be used as a side tap in kd_tensors.
-    """
-    def __init__(self, alpha=0.7, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.init_alpha = float(alpha)
-
-    def build(self, input_shape):
-        self.build_alpha(self.init_alpha, name="alpha")
-        super().build(input_shape)
-
-    def call(self, inputs, training=None):
-        hf, gate = inputs  # (B,T,1), (B,Tg,1)
-        if training is True:
-            t = tf.minimum(tf.shape(hf)[1], tf.shape(gate)[1])
-            hf_t   = hf[:,   :t, :]
-            gate_t = gate[:, :t, :]
-            leak = tf.abs(hf_t) * tf.stop_gradient(1.0 - gate_t)
-            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
-        return hf  # passthrough
-
-    def get_config(self):
-        return {"alpha": float(self.init_alpha), **super().get_config()}
-
-@register_keras_serializable()
-class MaskSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
-    def __init__(self, alpha=0.3, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.init_alpha = float(alpha)
-    def build(self, input_shape):
-        self.build_alpha(self.init_alpha, name="alpha")
-        super().build(input_shape)
-    def call(self, inputs, training=None):
-        m, gate = inputs  # (B,T,1), (B,T,1)
-        if training is True:
-            t = tf.minimum(tf.shape(m)[1], tf.shape(gate)[1])
-            leak = tf.abs(m[:, :t, :] * (1.0 - tf.stop_gradient(gate[:, :t, :])))
-            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
-        return m
-    def get_config(self):
-        return {"alpha": float(self.init_alpha), **super().get_config()}
 
 # ───────── Training-aware KD/penalty layers (drop-in replacements) ─────────
 
@@ -2757,6 +2712,27 @@ class DistillLossBestShift(Layer, AdjustableAlphaMixin):
         cfg.update({'alpha': float(self.init_alpha), 'max_shift': self.max_shift})
         return cfg
 
+@register_keras_serializable()
+class DistillBCE(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    def __init__(self, alpha, eps=1e-6, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+        self.eps = float(eps)
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+    def call(self, inputs, training=None):
+        y_t, y_s = inputs  # (B,T,1) in [0,1]
+        if training is False:
+            return y_s
+        t = tf.minimum(tf.shape(y_t)[1], tf.shape(y_s)[1])
+        yt = tf.clip_by_value(y_t[:, :t, :], self.eps, 1.0 - self.eps)
+        ys = tf.clip_by_value(y_s[:, :t, :], self.eps, 1.0 - self.eps)
+        bce = -(yt * tf.math.log(ys) + (1.0 - yt) * tf.math.log(1.0 - ys))
+        self.add_loss(self.alpha_var * tf.reduce_mean(bce))
+        return y_s
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), "eps": self.eps, **super().get_config()}
 
 @register_keras_serializable()
 class MSTFTDistillLoss(Layer, AdjustableAlphaMixin):
@@ -2819,6 +2795,46 @@ def _make_lpf_kernel(sample_rate, cutoff_hz=2800.0, order=129, window="hamming")
     # reverse for tf.nn.conv1d cross-correlation
     return tf.constant(taps[::-1].reshape(-1, 1, 1), dtype=tf.float32)
 
+# Replace your current call(…, training=None) bodies
+
+@register_keras_serializable()
+class HFSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    def __init__(self, alpha=0.7, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+    def call(self, inputs, training=None):
+        hf, gate = inputs  # (B,T,1), (B,Tg,1)
+        # IMPORTANT: be active when training is True OR None
+        if training is not False:
+            t = tf.minimum(tf.shape(hf)[1], tf.shape(gate)[1])
+            leak = tf.abs(hf[:, :t, :] * tf.stop_gradient(1.0 - gate[:, :t, :]))
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return hf
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
+
+# If you added the mask penalty, change it the same way:
+@register_keras_serializable()
+class MaskSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    def __init__(self, alpha=0.3, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+    def call(self, inputs, training=None):
+        m, gate = inputs
+        if training is not False:
+            t = tf.minimum(tf.shape(m)[1], tf.shape(gate)[1])
+            leak = tf.abs(m[:, :t, :] * tf.stop_gradient(1.0 - gate[:, :t, :]))
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return m
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
+
 @register_keras_serializable()
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
     """
@@ -2845,8 +2861,7 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
         super().build(input_shape)
 
     def call(self, x, training=None):
-        # Only active when training is explicitly True.
-        if training is not True:
+        if training is False:
             return x
         pad = tf.shape(self.kernel)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
@@ -4214,9 +4229,10 @@ def build_realtime_model(offline=None,
         T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{i}")(t) for i, t in enumerate(T_feats)]
         T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
         
-        kd_tensors.append(
-            HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds])
-        )
+        # Already present; keep it
+        kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
+        # Optional extra push directly on the mask (add this if you defined it)
+        kd_tensors.append(MaskSuppressWhenClosed(alpha=0.3, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
 
         # Feature KD
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
@@ -4228,16 +4244,17 @@ def build_realtime_model(offline=None,
 
         # Distill both the raw mask and the actually used mask (smoothed)
         if enable_mask_kd:
+            # Primary: BCE on raw mask logits (sigmoid output) vs teacher gate (downsampled)
             kd_tensors.append(
-                DistillLossBestShift(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, max_shift=8, name="hf_mask_distill")([T_gate_ds, mask_pred])
+                DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_pred])
             )
-            # Distill to the pre-cap smoothed mask to keep gradients alive under the cap
+            # Auxiliary: MSE on the smoothed pre-cap mask
             kd_tensors.append(
                 DistillLossBestShift(alpha=REALTIME_MASK_USED_DISTILL_ALPHA, max_shift=8, name="mask_smooth_distill")([T_gate_ds, mask_smoothed])
             )
-            
+            # Optional: envelope → mask_pred KD (keep weight modest)
             kd_tensors.append(
-                MaskSuppressWhenClosed(alpha=0.3, name="mask_suppress_closed")([mask_smoothed, T_gate_ds])
+                DistillLoss(alpha=0.5 * REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_env_mask_distill")([off_hf_env48_norm, mask_pred])
             )
 
         # Audio KD
