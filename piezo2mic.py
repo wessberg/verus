@@ -701,31 +701,6 @@ class MaskSharpen(tf.keras.layers.Layer):
         return {"power": self.power, **super().get_config()}
 
 
-@register_keras_serializable()
-class HFSuppressByMask(tf.keras.layers.Layer, AdjustableAlphaMixin):
-    """
-    Training-only leak penalty using the STUDENT mask:
-      loss += alpha * mean( |hf| * (1 - stop_grad(mask_audio)) )
-    """
-    def __init__(self, alpha=0.4, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.init_alpha = float(alpha)
-
-    def build(self, input_shape):
-        self.build_alpha(self.init_alpha, name="alpha")
-        super().build(input_shape)
-
-    def call(self, inputs, training=None):
-        hf, mask_audio = inputs
-        if training is not False:
-            w = tf.stop_gradient(1.0 - tf.clip_by_value(mask_audio, 0.0, 1.0))
-            leak = tf.abs(hf) * w
-            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
-        return hf
-
-    def get_config(self):
-        return {"alpha": float(self.init_alpha), **super().get_config()}
-
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
         super().__init__()
@@ -2829,6 +2804,31 @@ class DistillLoss(Layer, AdjustableAlphaMixin):
         return cfg
 
 
+@register_keras_serializable()
+class HFSuppressByMask(tf.keras.layers.Layer, AdjustableAlphaMixin):
+    """
+    Training-only leak penalty using the STUDENT mask:
+      loss += alpha * mean( |hf| * (1 - stop_grad(mask_audio)) )
+    """
+    def __init__(self, alpha=0.4, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.init_alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.build_alpha(self.init_alpha, name="alpha")
+        super().build(input_shape)
+
+    def call(self, inputs, training=None):
+        hf, mask_audio = inputs
+        if training is not False:
+            w = tf.stop_gradient(1.0 - tf.clip_by_value(mask_audio, 0.0, 1.0))
+            leak = tf.abs(hf) * w
+            self.add_loss(self.alpha_var * tf.reduce_mean(leak))
+        return hf
+
+    def get_config(self):
+        return {"alpha": float(self.init_alpha), **super().get_config()}
+    
 @register_keras_serializable()
 class DistillLossBestShift(Layer, AdjustableAlphaMixin):
     """
