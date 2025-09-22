@@ -174,6 +174,18 @@ OFFLINE_GATE_RELEASE_MS     = 4.0
 OFFLINE_GATE_ENV_MS          = 0.35
 OFFLINE_GATE_DEPTH_SMOOTH_MS = 20.0
 
+REALTIME_PICK_NORMALIZATION_KNEE = 0.001
+OFFLINE_PICK_NORMALIZATION_KNEE = REALTIME_PICK_NORMALIZATION_KNEE
+
+REALTIME_PICK_NORMALIZATION_PULSE_MS = 4.0
+OFFLINE_PICK_NORMALIZATION_PULSE_MS = REALTIME_PICK_NORMALIZATION_PULSE_MS
+
+REALTIME_PICK_NORMALIZATION_OUT_EXP = 0.5
+OFFLINE_PICK_NORMALIZATION_OUT_EXP = REALTIME_PICK_NORMALIZATION_OUT_EXP
+
+REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER=1.6
+OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER=REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER
+
 # Finetune mic-target denoise (preamp hiss cleanup)
 FINETUNE_TARGET_DENOISE_ENABLE      = True     # set False to disable
 FINETUNE_TARGET_DENOISE_HOP_MS      = 10.0     # STFT hop
@@ -346,7 +358,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 22
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
@@ -558,23 +570,14 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
 
 @register_keras_serializable()
 class PickNormalizer(tf.keras.layers.Layer):
-    """
-    Per‑onset, causal mask normalizer with constant pick loudness and strict inter‑stroke closure.
-    Self‑contained implementation (no sublayers, no NumPy) so it doesn't trigger cross‑graph
-    initializer captures when Keras traces output specs.
-
-    Pipeline:
-      - env = EMA_asym(m) with fast attack and slower release
-      - norm = clip(m / (env + eps), 0, 1)
-      - pulse = EMA(gate_onset(m), tc=pulse_ms)
-      - out = gain * sqrt(clip(norm * pulse, 0,1))
-    """
     def __init__(self,
                  sample_rate,
                  attack_ms=0.06,
                  release_ms=6.0,
                  pulse_ms=4.0,
                  out_gain=1.0,
+                 out_exp=1.6,   # >1 closes small values; was 0.5 (sqrt)
+                 knee=0.05,     # deadband in 0..0.1 to knock out tiny residuals
                  name=None,
                  **kwargs):
         super().__init__(name=name, **kwargs)
@@ -583,22 +586,15 @@ class PickNormalizer(tf.keras.layers.Layer):
         self.release_ms  = float(release_ms)
         self.pulse_ms    = float(pulse_ms)
         self.out_gain    = float(out_gain)
-
-        # Precompute integer sample counts and FIR lengths as Python ints.
-        self._atk_smpls   = max(1, int(round((self.attack_ms  / 1000.0) * self.sample_rate)))
-        self._rel_smpls   = max(1, int(round((self.release_ms / 1000.0) * self.sample_rate)))
-        self._pulse_smpls = max(1, int(round((self.pulse_ms   / 1000.0) * self.sample_rate)))
-
-        # These match the small kernels you used for the smoothers
-        self._up_scale    = 4.0
-        self._down_scale  = 4.0
-        self._pulse_scale = 4.0
-
-        self._asym_Lmax   = 1024
-        self._pulse_Lmax  = 512
+        self.out_exp     = float(out_exp)
+        self.knee        = float(knee)
+        self._asym_Lmax  = 1024
+        self._pulse_Lmax = 512
+        self._up_scale   = 4.0
+        self._down_scale = 4.0
+        self._pulse_scale= 4.0
 
     def build(self, input_shape):
-        # Single trainable gain
         self.gain = self.add_weight(
             name="picknorm_gain",
             shape=(1,),
@@ -607,16 +603,9 @@ class PickNormalizer(tf.keras.layers.Layer):
         )
         super().build(input_shape)
 
-    def _exp_rev_kernel(self, samples, scale, Lmax, dtype):
-        """
-        Pure-TF causal exponential FIR approx of an EMA.
-        Returns reversed taps (for conv1d/cross-correlation), shape (L,1,1).
-        """
-        # All of these are Python ints → L is static, the tensor taps belongs to the current graph.
-        s = max(1, int(samples))
+    def _exp_rev_kernel(self, tau_smpls, scale, Lmax, dtype):
+        s = max(1, int(tau_smpls))
         L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
-
-        # taps[n] = (1 - a) * a^n, normalized; then reversed for conv1d
         a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
         n = tf.range(L, dtype=dtype)
         taps = (1.0 - a) * tf.pow(a, n)
@@ -626,49 +615,45 @@ class PickNormalizer(tf.keras.layers.Layer):
 
     def _causal_conv1d(self, x, k):
         pad = tf.shape(k)[0] - 1
-        x_pad = tf.pad(x, [[0, 0], [pad, 0], [0, 0]])
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
 
     def _asym_ema(self, x, dtype):
-        """
-        Asymmetric EMA: fast attack, slow release; mix per-sample with rising flag.
-        """
-        kup = self._exp_rev_kernel(self._atk_smpls,   self._up_scale,   self._asym_Lmax, dtype)
-        kdn = self._exp_rev_kernel(self._rel_smpls,   self._down_scale, self._asym_Lmax, dtype)
-
+        atk_smpls = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
+        rel_smpls = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
+        kup = self._exp_rev_kernel(atk_smpls, self._up_scale,   self._asym_Lmax, dtype)
+        kdn = self._exp_rev_kernel(rel_smpls, self._down_scale, self._asym_Lmax, dtype)
         x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
         rising = tf.cast(x > x_prev, dtype)
-
         y_up   = self._causal_conv1d(x, kup)
         y_down = self._causal_conv1d(x, kdn)
         y = rising * y_up + (1.0 - rising) * y_down
         return tf.clip_by_value(y, 0.0, 1.0)
 
     def _pulse_ema(self, x, dtype):
-        """
-        Symmetric short EMA for the onset pulse.
-        """
-        kp = self._exp_rev_kernel(self._pulse_smpls, self._pulse_scale, self._pulse_Lmax, dtype)
+        pulse_smpls = max(1, int(round(self.pulse_ms * self.sample_rate / 1000.0)))
+        kp = self._exp_rev_kernel(pulse_smpls, self._pulse_scale, self._pulse_Lmax, dtype)
         y = self._causal_conv1d(x, kp)
         return tf.clip_by_value(y, 0.0, 1.0)
 
     def call(self, m):
-        # m: (B,T,1) ∈ [0,1]
         m = tf.clip_by_value(m, 0.0, 1.0)
         dtype = m.dtype
-
-        # Per-onset normalization
         env = self._asym_ema(m, dtype)
         env = tf.maximum(env, tf.constant(1e-6, dtype=dtype))
         norm = tf.clip_by_value(m / env, 0.0, 1.0)
-
-        # Onset pulse
-        on = gate_onset(m)  # rising edges
+        on = gate_onset(m)
         pulse = self._pulse_ema(on, dtype)
+        z = tf.clip_by_value(norm * pulse, 0.0, 1.0)
 
-        # Compose and compress
-        y = norm * pulse
-        y = tf.sqrt(tf.clip_by_value(y, 0.0, 1.0) + tf.constant(1e-12, dtype=dtype))
+        # Soft knee deadband to force closure
+        if self.knee > 0.0:
+            k = tf.constant(self.knee, dtype=dtype)
+            z = tf.nn.relu(z - k) / (1.0 - k)
+
+        # Compressive exponent (>1 pushes small values toward 0)
+        z = z + tf.constant(1e-12, dtype=dtype)
+        y = tf.pow(z, tf.constant(self.out_exp, dtype=dtype))
         return y * self.gain
 
     def compute_output_shape(self, input_shape):
@@ -681,8 +666,33 @@ class PickNormalizer(tf.keras.layers.Layer):
             "release_ms": self.release_ms,
             "pulse_ms": self.pulse_ms,
             "out_gain": self.out_gain,
+            "out_exp": self.out_exp,
+            "knee": self.knee,
             **super().get_config()
         }
+
+@register_keras_serializable()
+class MaskSaturatingCompressor(tf.keras.layers.Layer):
+    """
+    Saturating mask compressor in [0,1]:
+      y = 1 - (1 - clip(x,0,1))^p     (p>1 compresses peaks, lifts mids = built-in 'makeup')
+      y = clip(post_gain * y, 0, 1)    (optional extra makeup)
+    """
+    def __init__(self, p=1.6, post_gain=1.0, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.p = float(p)
+        self.post_gain = float(post_gain)
+
+    def call(self, x):
+        z = tf.clip_by_value(x, 0.0, 1.0)
+        p = tf.constant(self.p, dtype=z.dtype)
+        y = 1.0 - tf.pow(1.0 - z, p)
+        if self.post_gain != 1.0:
+            y = tf.clip_by_value(tf.constant(self.post_gain, z.dtype) * y, 0.0, 1.0)
+        return y
+
+    def get_config(self):
+        return {"p": self.p, "post_gain": self.post_gain, **super().get_config()}
 
 @register_keras_serializable()
 class MaskFloor(Layer):
@@ -2885,21 +2895,6 @@ class MaskSuppressWhenClosed(tf.keras.layers.Layer, AdjustableAlphaMixin):
         return {"alpha": float(self.init_alpha), **super().get_config()}
     
 @register_keras_serializable()
-class SqrtClip01(tf.keras.layers.Layer):
-    """
-    y = sqrt(clip(x, 0, 1) + eps). Compressive curve for mask → audio.
-    """
-    def __init__(self, eps=1e-12, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.eps = float(eps)
-    def call(self, x):
-        z = tf.clip_by_value(x, 0.0, 1.0)
-        return tf.sqrt(z + self.eps)
-    def get_config(self):
-        return {"eps": self.eps, **super().get_config()}
-
-
-@register_keras_serializable()
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
     """
     Penalize low-band energy in the student's HF branch: L1(LPF(hf_final)).
@@ -3487,95 +3482,6 @@ class GateInt8Linear(tf.keras.layers.Layer):
         return cfg
 
 @register_keras_serializable()
-class RelativeGate(tf.keras.layers.Layer):
-    """
-    Amplitude-invariant, causal 'safety gate' driven by the piezo:
-      sc   = abs(pre_emphasis(x))
-      ref  = EMA(sc, env_ms)
-      r    = sc / (ref + eps)
-      raw  = clip(r / thr_ratio, 0, 1)
-      gate = AR-smooth(raw) with fast attack, slower release
-    All times in ms; no trainable weights; no external thresholds in dB.
-    """
-    def __init__(self,
-                 sample_rate,
-                 env_ms=6.0,
-                 thr_ratio=1.6,
-                 attack_ms=0.15,
-                 release_ms=8.0,
-                 preemph_alpha=HP_PRE_EMPHASIS_HF,
-                 name=None,
-                 **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.sample_rate   = int(sample_rate)
-        self.env_ms        = float(env_ms)
-        self.thr_ratio     = float(thr_ratio)
-        self.attack_ms     = float(attack_ms)
-        self.release_ms    = float(release_ms)
-        self.preemph_alpha = float(preemph_alpha)
-        # kernel caps (small)
-        self._Lmax_env = 512
-        self._Lmax_ar  = 1024
-        self._scale_env = 2.0
-        self._scale_ar  = 4.0
-
-    def get_config(self):
-        return {
-            "sample_rate": self.sample_rate,
-            "env_ms": self.env_ms,
-            "thr_ratio": self.thr_ratio,
-            "attack_ms": self.attack_ms,
-            "release_ms": self.release_ms,
-            "preemph_alpha": self.preemph_alpha,
-            **super().get_config()
-        }
-
-    def _exp_rev_kernel(self, tau_smpls, scale, Lmax, dtype):
-        s = max(1, int(tau_smpls))
-        L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
-        a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
-        n = tf.range(L, dtype=dtype)
-        taps = (1.0 - a) * tf.pow(a, n)
-        taps = taps / (tf.reduce_sum(taps) + tf.constant(1e-12, dtype=dtype))
-        taps = tf.reverse(taps, axis=[0])
-        return tf.reshape(taps, (L, 1, 1))
-
-    def _causal_conv1d(self, x, k):
-        pad = tf.shape(k)[0] - 1
-        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
-        return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
-
-    def call(self, x):
-        # 1) Sidechain envelope (HP via pre-emphasis)
-        hp = pre_emphasis(x, alpha=self.preemph_alpha)
-        sc = tf.abs(hp) + tf.constant(1e-12, dtype=hp.dtype)
-
-        # 2) Reference EMA for amplitude invariance
-        env_s = max(1, int(round(self.env_ms * self.sample_rate / 1000.0)))
-        k_env = self._exp_rev_kernel(env_s, self._scale_env, self._Lmax_env, sc.dtype)
-        ref = self._causal_conv1d(sc, k_env)
-
-        # 3) Relative open signal (dimensionless)
-        r = sc / (ref + tf.constant(1e-12, dtype=sc.dtype))
-        raw = tf.clip_by_value(r / tf.constant(self.thr_ratio, dtype=sc.dtype), 0.0, 1.0)
-
-        # 4) AR smoothing on 'raw'
-        atk_s = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
-        rel_s = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
-        k_att = self._exp_rev_kernel(atk_s, self._scale_ar, self._Lmax_ar, sc.dtype)
-        k_rel = self._exp_rev_kernel(rel_s, self._scale_ar, self._Lmax_ar, sc.dtype)
-
-        raw_prev = tf.pad(raw, [[0,0],[1,0],[0,0]])[:, :-1, :]
-        rising = tf.cast(raw > raw_prev, sc.dtype)
-        g_att = self._causal_conv1d(raw, k_att)
-        g_rel = self._causal_conv1d(raw, k_rel)
-        gate = rising * g_att + (1.0 - rising) * g_rel
-        return tf.clip_by_value(gate, 0.0, 1.0)
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
-
-@register_keras_serializable()
 def gate_weight_offline(y_true):
     return gate_gain_signal(
         y_true,
@@ -3960,7 +3866,7 @@ def build_offline_model(dynamic_time=False,
 
     # Learned-pick normalizer (teacher-free) when cap is off
     if (offline_gate is None) and use_pick_normalizer:
-        mask_used_for_gating = PickNormalizer(sample_rate=OFFLINE_SAMPLE_RATE, name="offline_picknorm")(mask_pred)
+        mask_used_for_gating = PickNormalizer(sample_rate=OFFLINE_SAMPLE_RATE, name="offline_picknorm", pulse_ms=OFFLINE_PICK_NORMALIZATION_PULSE_MS, out_exp=OFFLINE_PICK_NORMALIZATION_OUT_EXP, knee=OFFLINE_PICK_NORMALIZATION_KNEE)(mask_pred)
     else:
         mask_smoothed = CausalExpSmoother(
             time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="offline_hf_mask_smooth"
@@ -3970,8 +3876,10 @@ def build_offline_model(dynamic_time=False,
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_used_for_gating])
     hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, name="offline_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
+
     if int(hf_time_shift_samples) != 0:
         hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="offline_hf_timeshift")(hf_final)
+
     hf_final_pick = Multiply(name="offline_hf_pick_only")([hf_final, style_time_used])
 
     main_core = Add(name="offline_main_core")([pick_c, finger_c])
@@ -4193,20 +4101,9 @@ def build_realtime_model(offline=None,
 
     # Learned‑pick path: PickNormalizer only if we actually rely on the learned mask for audio gating
     if use_learned_hf_mask and (not cap_mask_with_gate) and use_pick_normalizer:
-        mask_norm = PickNormalizer(sample_rate=REALTIME_SAMPLE_RATE, name="realtime_picknorm")(mask_pred)
-
-        # Amplitude‑invariant safety cap derived from the piezo itself
-        safety_gate = RelativeGate(
-            sample_rate=REALTIME_SAMPLE_RATE,
-            env_ms=6.0,          # reference window for relative level
-            thr_ratio=1.6,       # open when short-term > 1.6 × reference
-            attack_ms=0.15,
-            release_ms=8.0,
-            name="realtime_picknorm_rel_gate"
-        )(inp)
-
-        mask_used_audio = Minimum(name="realtime_picknorm_cap")([mask_norm, safety_gate])
-
+        mask_norm = PickNormalizer(sample_rate=REALTIME_SAMPLE_RATE, name="realtime_picknorm", pulse_ms=REALTIME_PICK_NORMALIZATION_PULSE_MS, out_exp=REALTIME_PICK_NORMALIZATION_OUT_EXP, knee=REALTIME_PICK_NORMALIZATION_KNEE)(mask_pred)
+        
+        mask_used_audio = MaskSaturatingCompressor(p=REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER, name="realtime_mask_compress")(mask_norm)
         mask_for_kd     = mask_norm
         mask_for_mult   = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
         mask_debug_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_audio)
@@ -4231,7 +4128,6 @@ def build_realtime_model(offline=None,
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
-    # Remove follow-limiter; rely on PickNormalizer to control peaks
     hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
                                 cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
                                 order=129,
@@ -4580,7 +4476,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
             use_learned_hf_mask=True,
             enable_mask_kd=False,
             detach_mask_from_audio=True,
-            mask_min_floor=0.02,
+            mask_min_floor=0.0,
             use_pick_normalizer=True,      # NEW: PickNormalizer path
             coloreq_trainable=False
         )
@@ -4596,7 +4492,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
         use_learned_hf_mask=True,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.02,
+        mask_min_floor=0.0,
         use_pick_normalizer=True,         # NEW: PickNormalizer path
         coloreq_trainable=False
     )
@@ -4654,7 +4550,7 @@ def make_realtime_dynamic_with_hf_shift(shift_samples):
         use_learned_hf_mask=False,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.02,
+        mask_min_floor=0.0,
         hf_time_shift_samples=int(shift_samples)
     )
     copy_weights_by_name(rt_dyn_shift, base_dyn, verbose=True)
@@ -4813,7 +4709,7 @@ def make_base_realtime_learned_pick(
         use_learned_hf_mask=True,
         enable_mask_kd=True,
         detach_mask_from_audio=False,
-        mask_min_floor=0.02,
+        mask_min_floor=0.0,
         use_pick_normalizer=False,
         coloreq_trainable=False
     )
@@ -4884,7 +4780,7 @@ def make_base_realtime_learned_pick(
         use_learned_hf_mask=True,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.02,
+        mask_min_floor=0.0,
         use_pick_normalizer=True,
         coloreq_trainable=False
     )
@@ -5036,7 +4932,7 @@ def fine_tune(offline=True, realtime=True):
             use_learned_hf_mask=True,
             enable_mask_kd=False,
             detach_mask_from_audio=True,
-            mask_min_floor=0.02,
+            mask_min_floor=0.0,
             use_pick_normalizer=True,
             coloreq_trainable=False
         )
@@ -5322,6 +5218,95 @@ def build_realtime_debug_model(realtime):
     # Optional fixed gate (baseline)
     add("gate", "realtime_gate")
     return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
+
+@register_keras_serializable()
+class RelativeGate(tf.keras.layers.Layer):
+    """
+    Amplitude-invariant, causal 'safety gate' driven by the piezo:
+      sc   = abs(pre_emphasis(x))
+      ref  = EMA(sc, env_ms)
+      r    = sc / (ref + eps)
+      raw  = clip(r / thr_ratio, 0, 1)
+      gate = AR-smooth(raw) with fast attack, slower release
+    All times in ms; no trainable weights; no external thresholds in dB.
+    """
+    def __init__(self,
+                 sample_rate,
+                 env_ms=6.0,
+                 thr_ratio=1.6,
+                 attack_ms=0.15,
+                 release_ms=8.0,
+                 preemph_alpha=HP_PRE_EMPHASIS_HF,
+                 name=None,
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate   = int(sample_rate)
+        self.env_ms        = float(env_ms)
+        self.thr_ratio     = float(thr_ratio)
+        self.attack_ms     = float(attack_ms)
+        self.release_ms    = float(release_ms)
+        self.preemph_alpha = float(preemph_alpha)
+        # kernel caps (small)
+        self._Lmax_env = 512
+        self._Lmax_ar  = 1024
+        self._scale_env = 2.0
+        self._scale_ar  = 4.0
+
+    def get_config(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "env_ms": self.env_ms,
+            "thr_ratio": self.thr_ratio,
+            "attack_ms": self.attack_ms,
+            "release_ms": self.release_ms,
+            "preemph_alpha": self.preemph_alpha,
+            **super().get_config()
+        }
+
+    def _exp_rev_kernel(self, tau_smpls, scale, Lmax, dtype):
+        s = max(1, int(tau_smpls))
+        L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
+        a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
+        n = tf.range(L, dtype=dtype)
+        taps = (1.0 - a) * tf.pow(a, n)
+        taps = taps / (tf.reduce_sum(taps) + tf.constant(1e-12, dtype=dtype))
+        taps = tf.reverse(taps, axis=[0])
+        return tf.reshape(taps, (L, 1, 1))
+
+    def _causal_conv1d(self, x, k):
+        pad = tf.shape(k)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
+
+    def call(self, x):
+        # 1) Sidechain envelope (HP via pre-emphasis)
+        hp = pre_emphasis(x, alpha=self.preemph_alpha)
+        sc = tf.abs(hp) + tf.constant(1e-12, dtype=hp.dtype)
+
+        # 2) Reference EMA for amplitude invariance
+        env_s = max(1, int(round(self.env_ms * self.sample_rate / 1000.0)))
+        k_env = self._exp_rev_kernel(env_s, self._scale_env, self._Lmax_env, sc.dtype)
+        ref = self._causal_conv1d(sc, k_env)
+
+        # 3) Relative open signal (dimensionless)
+        r = sc / (ref + tf.constant(1e-12, dtype=sc.dtype))
+        raw = tf.clip_by_value(r / tf.constant(self.thr_ratio, dtype=sc.dtype), 0.0, 1.0)
+
+        # 4) AR smoothing on 'raw'
+        atk_s = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
+        rel_s = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
+        k_att = self._exp_rev_kernel(atk_s, self._scale_ar, self._Lmax_ar, sc.dtype)
+        k_rel = self._exp_rev_kernel(rel_s, self._scale_ar, self._Lmax_ar, sc.dtype)
+
+        raw_prev = tf.pad(raw, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(raw > raw_prev, sc.dtype)
+        g_att = self._causal_conv1d(raw, k_att)
+        g_rel = self._causal_conv1d(raw, k_rel)
+        gate = rising * g_att + (1.0 - rising) * g_rel
+        return tf.clip_by_value(gate, 0.0, 1.0)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
 
 def render_isolated_stems(
     debug_model,
@@ -6138,6 +6123,25 @@ def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_o
         print("Loading dynamic model from:", dpath)
         dynamic_model = tf.keras.models.load_model(dpath, compile=False)
     generate_demo(model=dynamic_model, out_dir=demo_out_dir, sample_rate=sample_rate)
+
+def rebuild_learned_pick_dynamic_for_tuning(save_as=None):
+    src_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    src = tf.keras.models.load_model(src_path, compile=False)
+
+    rt_dyn = build_realtime_model(
+        offline=None, dynamic_time=True,
+        cap_mask_with_gate=False,
+        use_learned_hf_mask=True,
+        enable_mask_kd=False,
+        detach_mask_from_audio=True,
+        mask_min_floor=0.0,          # IMPORTANT: allow full closure
+        use_pick_normalizer=True,
+        coloreq_trainable=False
+    )
+    copy_weights_by_name(rt_dyn, src, verbose=True)
+    if save_as:
+        rt_dyn.save(save_as)
+    return rt_dyn
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
