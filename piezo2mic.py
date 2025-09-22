@@ -298,11 +298,11 @@ REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 REALTIME_MASK_RELEASE_MS = REALTIME_GATE_RELEASE_MS
 REALTIME_MASK_SOFTKNEE_K = 10.0
 REALTIME_MASK_SOFTKNEE_T = 0.35
-REALTIME_HF_PEAK_CEILING = 1.0  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_HF_PEAK_CEILING = 0.5  # set to 1.5–2.0 to tame rare spikes; None disables
 
 REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 45     # integer power (>=2) for mask sharpening
+REALTIME_MASK_SHARPEN_P = 40     # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -3.5  # more negative initializes mask closed
 
 # Finetune params
@@ -356,7 +356,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
-REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 8
+REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 18
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
