@@ -689,11 +689,10 @@ class ZeroBias(constraints.Constraint):
 @register_keras_serializable()
 class GateKDMonitor(tf.keras.layers.Layer):
     """
-    Adds gate-matching metrics during training:
-      - gate_bce, gate_l1
-      - gate_iou (binarized at bin_thresh)
-      - onset_prec, onset_rec, onset_f1 (frame-level using gate_onset)
-    Returns the student gate unchanged to allow anchoring via LossTether.
+    Keras 3–compatible no-op monitor.
+    Previously added metrics via Layer.add_metric() inside call(), which is no longer supported.
+    Now it returns the student gate unchanged so the tensor stays in the graph (e.g., for LossTether).
+    If you need gate metrics, expose a pack layer as an extra model output and compute metrics in Model.compile().
     """
     def __init__(self, bin_thresh=0.5, onset_thresh=0.05, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
@@ -701,41 +700,13 @@ class GateKDMonitor(tf.keras.layers.Layer):
         self.onset_thresh = float(onset_thresh)
 
     def call(self, inputs, training=None):
-        y_t, y_s = inputs  # both (B,T,1) in [0,1]
-        t = tf.clip_by_value(y_t, 0.0, 1.0)
-        s = tf.clip_by_value(y_s, 0.0, 1.0)
-        eps = tf.constant(1e-6, tf.float32)
+        # inputs: [teacher_gate, student_gate]; just passthrough the student
+        _, y_s = inputs
+        return tf.identity(y_s)
 
-        # BCE and L1
-        bce = -(t * tf.math.log(s + eps) + (1.0 - t) * tf.math.log(1.0 - s + eps))
-        l1  = tf.abs(t - s)
-        self.add_metric(tf.reduce_mean(bce), name="gate_bce", aggregation="mean")
-        self.add_metric(tf.reduce_mean(l1),  name="gate_l1",  aggregation="mean")
-
-        # IoU (binarized)
-        tb = tf.cast(t >= self.bin_thresh, tf.float32)
-        sb = tf.cast(s >= self.bin_thresh, tf.float32)
-        inter = tf.reduce_sum(tb * sb, axis=[1, 2])
-        union = tf.reduce_sum(tf.clip_by_value(tb + sb, 0.0, 1.0), axis=[1, 2]) + eps
-        iou = inter / union
-        self.add_metric(tf.reduce_mean(iou), name="gate_iou", aggregation="mean")
-
-        # Onset precision/recall/F1 (frame-level)
-        ton = gate_onset(t)
-        son = gate_onset(s)
-        tonb = tf.cast(ton >= self.onset_thresh, tf.float32)
-        sonb = tf.cast(son >= self.onset_thresh, tf.float32)
-        tp = tf.reduce_sum(tonb * sonb, axis=[1, 2])
-        pp = tf.reduce_sum(sonb, axis=[1, 2]) + eps
-        tp_true = tf.reduce_sum(tonb, axis=[1, 2]) + eps
-        prec = tp / pp
-        rec  = tp / tp_true
-        f1 = 2.0 * prec * rec / (prec + rec + eps)
-        self.add_metric(tf.reduce_mean(prec), name="onset_prec", aggregation="mean")
-        self.add_metric(tf.reduce_mean(rec),  name="onset_rec",  aggregation="mean")
-        self.add_metric(tf.reduce_mean(f1),   name="onset_f1",   aggregation="mean")
-
-        return s
+    def compute_output_shape(self, input_shapes):
+        # Same shape as the student gate
+        return input_shapes[1]
 
     def get_config(self):
         return {
@@ -744,21 +715,27 @@ class GateKDMonitor(tf.keras.layers.Layer):
             **super().get_config()
         }
 
+
 @register_keras_serializable()
 class HfLeakMonitor(tf.keras.layers.Layer):
     """
-    Adds hf_leak_l1 metric: mean(|hf| * (1 - gate_teacher)).
-    Returns hf unchanged so it can be anchored in the graph.
+    Keras 3–compatible no-op monitor.
+    Previously added an 'hf_leak_l1' metric via Layer.add_metric() inside call().
+    Now returns hf unchanged to keep the tensor alive in the graph (e.g., for LossTether).
     """
-    def call(self, inputs, training=None):
-        hf, gate_t = inputs
-        t = tf.minimum(tf.shape(hf)[1], tf.shape(gate_t)[1])
-        hf_abs = tf.abs(hf[:, :t, :])
-        g      = tf.clip_by_value(gate_t[:, :t, :], 0.0, 1.0)
-        leak = hf_abs * (1.0 - g)
-        self.add_metric(tf.reduce_mean(leak), name="hf_leak_l1", aggregation="mean")
-        return hf
+    def __init__(self, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
 
+    def call(self, inputs, training=None):
+        hf, _ = inputs
+        return tf.identity(hf)
+
+    def compute_output_shape(self, input_shapes):
+        return input_shapes[0]
+
+    def get_config(self):
+        return {**super().get_config()}
+    
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
         super().__init__()
@@ -6035,85 +6012,6 @@ def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoin
     else:
         return (False, None)
 
-def migrate_add_coloreq_offline():
-    static_path  = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
-    dynamic_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-    if not os.path.exists(dynamic_path):
-        print("Offline dynamic not found; skipping offline migration.")
-        return
-
-    print("[migrate] offline dynamic → coloreq-integrated")
-    old_dyn = tf.keras.models.load_model(dynamic_path, compile=False)
-
-    new_dyn = build_offline_model(dynamic_time=True,
-                                  cap_mask_with_gate=True,
-                                  use_pick_normalizer=False,
-                                  coloreq_trainable=False)
-    copy_weights_by_name(new_dyn, old_dyn, verbose=True)
-    new_dyn.save(dynamic_path)
-    print("✅ Offline dynamic migrated (coloreq added):", dynamic_path)
-
-    if os.path.exists(static_path):
-        print("[migrate] offline static → coloreq-integrated")
-        old_stat = tf.keras.models.load_model(static_path, compile=False)
-        new_stat = build_offline_model(dynamic_time=False,
-                                       cap_mask_with_gate=True,
-                                       use_pick_normalizer=False,
-                                       coloreq_trainable=False)
-        copy_weights_by_name(new_stat, old_stat, verbose=True)
-        new_stat.save(static_path)
-        print("✅ Offline static migrated (coloreq added):", static_path)
-
-def migrate_add_coloreq_realtime():
-    static_path  = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
-    dynamic_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
-    off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-    if not os.path.exists(dynamic_path):
-        print("Realtime dynamic not found; skipping realtime migration.")
-        return
-    if not os.path.exists(off_dyn_path):
-        print("Offline dynamic teacher not found; required for static realtime migration.")
-        return
-
-    # Dynamic (teacher-free)
-    print("[migrate] realtime dynamic → coloreq-integrated")
-    old_dyn = tf.keras.models.load_model(dynamic_path, compile=False)
-    new_dyn = build_realtime_model(offline=None,
-                                   dynamic_time=True,
-                                   cap_mask_with_gate=True,      # keep baseline gating in base dynamic
-                                   use_learned_hf_mask=False,
-                                   enable_mask_kd=False,
-                                   detach_mask_from_audio=True,
-                                   mask_min_floor=0.0,
-                                   use_pick_normalizer=False,
-                                   coloreq_trainable=False)
-    copy_weights_by_name(new_dyn, old_dyn, verbose=True)
-    new_dyn.save(dynamic_path)
-    print("✅ Realtime dynamic migrated (coloreq added):", dynamic_path)
-
-    # Static (with teacher)
-    if os.path.exists(static_path):
-        print("[migrate] realtime static → coloreq-integrated (with teacher)")
-        old_stat = tf.keras.models.load_model(static_path, compile=False)
-        offline_nc = tf.keras.models.load_model(off_dyn_path, compile=False)
-        offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
-        new_stat = build_realtime_model(offline=offline_causal,
-                                        dynamic_time=False,
-                                        cap_mask_with_gate=True,
-                                        use_learned_hf_mask=False,
-                                        enable_mask_kd=False,
-                                        detach_mask_from_audio=True,
-                                        mask_min_floor=0.0,
-                                        use_pick_normalizer=False,
-                                        coloreq_trainable=False)
-        copy_weights_by_name(new_stat, old_stat, verbose=True)
-        new_stat.save(static_path)
-        print("✅ Realtime static migrated (coloreq added):", static_path)
-
-def migrate_add_coloreq_all():
-    migrate_add_coloreq_offline()
-    migrate_add_coloreq_realtime()
-
 def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
     dpath = dynamic_model_filepath
     if not os.path.exists(dpath):
@@ -6302,10 +6200,6 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--make-base-offline-learned-pick":
         print("Converting baseline offline → learned‑pick (mask‑only KD)…")
         make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS, steps_cap=OFFLINE_LEARNED_PICK_MASK_STEPS_CAP, lr=OFFLINE_LEARNED_PICK_MASK_LR)
-    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-coloreq":
-        migrate_add_coloreq_all()
-        print("✅ Migration complete.")
-        sys.exit(0)
     else:
         print("No command given.")
         sys.exit(1)
