@@ -560,15 +560,14 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
 class PickNormalizer(tf.keras.layers.Layer):
     """
     Per‑onset, causal mask normalizer with constant pick loudness and strict inter‑stroke closure.
+    Self‑contained implementation (no sublayers, no NumPy) so it doesn't trigger cross‑graph
+    initializer captures when Keras traces output specs.
+
     Pipeline:
-      - env = EMA_asym(m) with fast attack (e.g., 0.06 ms) and slower release (e.g., 6 ms)
-      - norm = clip(m / (env + eps), 0, 1)    → per-onset normalization
-      - pulse = EMA(gate_onset(m), tc=pulse_ms)  → short pick window, forces closure between hits
+      - env = EMA_asym(m) with fast attack and slower release
+      - norm = clip(m / (env + eps), 0, 1)
+      - pulse = EMA(gate_onset(m), tc=pulse_ms)
       - out = gain * sqrt(clip(norm * pulse, 0,1))
-    Notes:
-      - Keeps the gate shut between strokes (pulse envelope is near-zero there).
-      - Keeps pick amplitude consistent across weak/strong hits (norm).
-      - gain can be tuned later without a new full training run.
     """
     def __init__(self,
                  sample_rate,
@@ -585,42 +584,95 @@ class PickNormalizer(tf.keras.layers.Layer):
         self.pulse_ms    = float(pulse_ms)
         self.out_gain    = float(out_gain)
 
-        # Sub-layers (tracked and serializable)
-        self.env_smooth   = CausalAsymExpSmoother(
-            attack_ms=self.attack_ms,
-            release_ms=self.release_ms,
-            sample_rate=self.sample_rate,
-            up_scale=4.0, down_scale=4.0, Lmax=1024,
-            name=(self.name + "_env") if self.name else None
-        )
-        self.pulse_smooth = CausalExpSmoother(
-            time_const_ms=self.pulse_ms,
-            sample_rate=self.sample_rate,
-            scale=4.0, Lmax=512,
-            name=(self.name + "_pulse") if self.name else None
-        )
-        self.sqrt = SqrtClip01(name=(self.name + "_sqrt") if self.name else None)
+        # Precompute integer sample counts and FIR lengths as Python ints.
+        self._atk_smpls   = max(1, int(round((self.attack_ms  / 1000.0) * self.sample_rate)))
+        self._rel_smpls   = max(1, int(round((self.release_ms / 1000.0) * self.sample_rate)))
+        self._pulse_smpls = max(1, int(round((self.pulse_ms   / 1000.0) * self.sample_rate)))
+
+        # These match the small kernels you used for the smoothers
+        self._up_scale    = 4.0
+        self._down_scale  = 4.0
+        self._pulse_scale = 4.0
+
+        self._asym_Lmax   = 1024
+        self._pulse_Lmax  = 512
 
     def build(self, input_shape):
+        # Single trainable gain
         self.gain = self.add_weight(
             name="picknorm_gain",
             shape=(1,),
             initializer=tf.keras.initializers.Constant(self.out_gain),
-            trainable=True  # you can tune this post-training without touching the rest
+            trainable=True
         )
         super().build(input_shape)
 
+    def _exp_rev_kernel(self, samples, scale, Lmax, dtype):
+        """
+        Pure-TF causal exponential FIR approx of an EMA.
+        Returns reversed taps (for conv1d/cross-correlation), shape (L,1,1).
+        """
+        # All of these are Python ints → L is static, the tensor taps belongs to the current graph.
+        s = max(1, int(samples))
+        L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
+
+        # taps[n] = (1 - a) * a^n, normalized; then reversed for conv1d
+        a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
+        n = tf.range(L, dtype=dtype)
+        taps = (1.0 - a) * tf.pow(a, n)
+        taps = taps / (tf.reduce_sum(taps) + tf.constant(1e-12, dtype=dtype))
+        taps = tf.reverse(taps, axis=[0])
+        return tf.reshape(taps, (L, 1, 1))
+
+    def _causal_conv1d(self, x, k):
+        pad = tf.shape(k)[0] - 1
+        x_pad = tf.pad(x, [[0, 0], [pad, 0], [0, 0]])
+        return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
+
+    def _asym_ema(self, x, dtype):
+        """
+        Asymmetric EMA: fast attack, slow release; mix per-sample with rising flag.
+        """
+        kup = self._exp_rev_kernel(self._atk_smpls,   self._up_scale,   self._asym_Lmax, dtype)
+        kdn = self._exp_rev_kernel(self._rel_smpls,   self._down_scale, self._asym_Lmax, dtype)
+
+        x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(x > x_prev, dtype)
+
+        y_up   = self._causal_conv1d(x, kup)
+        y_down = self._causal_conv1d(x, kdn)
+        y = rising * y_up + (1.0 - rising) * y_down
+        return tf.clip_by_value(y, 0.0, 1.0)
+
+    def _pulse_ema(self, x, dtype):
+        """
+        Symmetric short EMA for the onset pulse.
+        """
+        kp = self._exp_rev_kernel(self._pulse_smpls, self._pulse_scale, self._pulse_Lmax, dtype)
+        y = self._causal_conv1d(x, kp)
+        return tf.clip_by_value(y, 0.0, 1.0)
+
     def call(self, m):
+        # m: (B,T,1) ∈ [0,1]
         m = tf.clip_by_value(m, 0.0, 1.0)
-        env = self.env_smooth(m)
-        env = tf.maximum(env, tf.constant(1e-6, dtype=m.dtype))
+        dtype = m.dtype
+
+        # Per-onset normalization
+        env = self._asym_ema(m, dtype)
+        env = tf.maximum(env, tf.constant(1e-6, dtype=dtype))
         norm = tf.clip_by_value(m / env, 0.0, 1.0)
-        on = gate_onset(m)
-        pulse = self.pulse_smooth(on)
-        pulse = tf.clip_by_value(pulse, 0.0, 1.0)
+
+        # Onset pulse
+        on = gate_onset(m)  # rising edges
+        pulse = self._pulse_ema(on, dtype)
+
+        # Compose and compress
         y = norm * pulse
-        y = self.sqrt(y)
+        y = tf.sqrt(tf.clip_by_value(y, 0.0, 1.0) + tf.constant(1e-12, dtype=dtype))
         return y * self.gain
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
 
     def get_config(self):
         return {
