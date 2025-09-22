@@ -298,7 +298,7 @@ REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 REALTIME_MASK_RELEASE_MS = REALTIME_GATE_RELEASE_MS
 REALTIME_MASK_SOFTKNEE_K = 10.0
 REALTIME_MASK_SOFTKNEE_T = 0.35
-REALTIME_HF_PEAK_CEILING = 3.0  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_HF_PEAK_CEILING = 1.0  # set to 1.5–2.0 to tame rare spikes; None disables
 
 REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
@@ -2818,23 +2818,6 @@ class SoftClip(tf.keras.layers.Layer):
         return {"drive": self.drive, **super().get_config()}
 
 
-def set_realtime_hf_peak_ceiling(model, ceiling):
-    """
-    Override the 'realtime_hf_peak_limiter' ceiling at inference.
-    The layer stores 'ceiling' as a Python attribute (no weights).
-    """
-    try:
-        layer = model.get_layer("realtime_hf_peak_limiter")
-    except Exception:
-        print("[hf-ceiling] Peak limiter layer not found; model may have been built without it.")
-        return False
-    try:
-        layer.ceiling = float(ceiling)
-        print(f"[hf-ceiling] Set peak ceiling to {float(ceiling):.6f}")
-        return True
-    except Exception as e:
-        print(f"[hf-ceiling] Failed to set ceiling: {e}")
-        return False
 
 @register_keras_serializable()
 class AdjustableAlphaMixin:
