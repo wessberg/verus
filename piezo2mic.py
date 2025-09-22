@@ -737,57 +737,7 @@ class ZeroBias(constraints.Constraint):
         return tf.zeros_like(w)
     def get_config(self):
         return {}
-    
-@register_keras_serializable()
-class GateKDMonitor(tf.keras.layers.Layer):
-    """
-    Keras 3–compatible no-op monitor.
-    Previously added metrics via Layer.add_metric() inside call(), which is no longer supported.
-    Now it returns the student gate unchanged so the tensor stays in the graph (e.g., for LossTether).
-    If you need gate metrics, expose a pack layer as an extra model output and compute metrics in Model.compile().
-    """
-    def __init__(self, bin_thresh=0.5, onset_thresh=0.05, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.bin_thresh = float(bin_thresh)
-        self.onset_thresh = float(onset_thresh)
-
-    def call(self, inputs, training=None):
-        # inputs: [teacher_gate, student_gate]; just passthrough the student
-        _, y_s = inputs
-        return tf.identity(y_s)
-
-    def compute_output_shape(self, input_shapes):
-        # Same shape as the student gate
-        return input_shapes[1]
-
-    def get_config(self):
-        return {
-            "bin_thresh": self.bin_thresh,
-            "onset_thresh": self.onset_thresh,
-            **super().get_config()
-        }
-
-
-@register_keras_serializable()
-class HfLeakMonitor(tf.keras.layers.Layer):
-    """
-    Keras 3–compatible no-op monitor.
-    Previously added an 'hf_leak_l1' metric via Layer.add_metric() inside call().
-    Now returns hf unchanged to keep the tensor alive in the graph (e.g., for LossTether).
-    """
-    def __init__(self, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-
-    def call(self, inputs, training=None):
-        hf, _ = inputs
-        return tf.identity(hf)
-
-    def compute_output_shape(self, input_shapes):
-        return input_shapes[0]
-
-    def get_config(self):
-        return {**super().get_config()}
-    
+        
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
         super().__init__()
@@ -3537,6 +3487,95 @@ class GateInt8Linear(tf.keras.layers.Layer):
         return cfg
 
 @register_keras_serializable()
+class RelativeGate(tf.keras.layers.Layer):
+    """
+    Amplitude-invariant, causal 'safety gate' driven by the piezo:
+      sc   = abs(pre_emphasis(x))
+      ref  = EMA(sc, env_ms)
+      r    = sc / (ref + eps)
+      raw  = clip(r / thr_ratio, 0, 1)
+      gate = AR-smooth(raw) with fast attack, slower release
+    All times in ms; no trainable weights; no external thresholds in dB.
+    """
+    def __init__(self,
+                 sample_rate,
+                 env_ms=6.0,
+                 thr_ratio=1.6,
+                 attack_ms=0.15,
+                 release_ms=8.0,
+                 preemph_alpha=HP_PRE_EMPHASIS_HF,
+                 name=None,
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate   = int(sample_rate)
+        self.env_ms        = float(env_ms)
+        self.thr_ratio     = float(thr_ratio)
+        self.attack_ms     = float(attack_ms)
+        self.release_ms    = float(release_ms)
+        self.preemph_alpha = float(preemph_alpha)
+        # kernel caps (small)
+        self._Lmax_env = 512
+        self._Lmax_ar  = 1024
+        self._scale_env = 2.0
+        self._scale_ar  = 4.0
+
+    def get_config(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "env_ms": self.env_ms,
+            "thr_ratio": self.thr_ratio,
+            "attack_ms": self.attack_ms,
+            "release_ms": self.release_ms,
+            "preemph_alpha": self.preemph_alpha,
+            **super().get_config()
+        }
+
+    def _exp_rev_kernel(self, tau_smpls, scale, Lmax, dtype):
+        s = max(1, int(tau_smpls))
+        L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
+        a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
+        n = tf.range(L, dtype=dtype)
+        taps = (1.0 - a) * tf.pow(a, n)
+        taps = taps / (tf.reduce_sum(taps) + tf.constant(1e-12, dtype=dtype))
+        taps = tf.reverse(taps, axis=[0])
+        return tf.reshape(taps, (L, 1, 1))
+
+    def _causal_conv1d(self, x, k):
+        pad = tf.shape(k)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
+
+    def call(self, x):
+        # 1) Sidechain envelope (HP via pre-emphasis)
+        hp = pre_emphasis(x, alpha=self.preemph_alpha)
+        sc = tf.abs(hp) + tf.constant(1e-12, dtype=hp.dtype)
+
+        # 2) Reference EMA for amplitude invariance
+        env_s = max(1, int(round(self.env_ms * self.sample_rate / 1000.0)))
+        k_env = self._exp_rev_kernel(env_s, self._scale_env, self._Lmax_env, sc.dtype)
+        ref = self._causal_conv1d(sc, k_env)
+
+        # 3) Relative open signal (dimensionless)
+        r = sc / (ref + tf.constant(1e-12, dtype=sc.dtype))
+        raw = tf.clip_by_value(r / tf.constant(self.thr_ratio, dtype=sc.dtype), 0.0, 1.0)
+
+        # 4) AR smoothing on 'raw'
+        atk_s = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
+        rel_s = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
+        k_att = self._exp_rev_kernel(atk_s, self._scale_ar, self._Lmax_ar, sc.dtype)
+        k_rel = self._exp_rev_kernel(rel_s, self._scale_ar, self._Lmax_ar, sc.dtype)
+
+        raw_prev = tf.pad(raw, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(raw > raw_prev, sc.dtype)
+        g_att = self._causal_conv1d(raw, k_att)
+        g_rel = self._causal_conv1d(raw, k_rel)
+        gate = rising * g_att + (1.0 - rising) * g_rel
+        return tf.clip_by_value(gate, 0.0, 1.0)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+@register_keras_serializable()
 def gate_weight_offline(y_true):
     return gate_gain_signal(
         y_true,
@@ -4154,9 +4193,21 @@ def build_realtime_model(offline=None,
 
     # Learned‑pick path: PickNormalizer only if we actually rely on the learned mask for audio gating
     if use_learned_hf_mask and (not cap_mask_with_gate) and use_pick_normalizer:
-        # Teacher‑free per‑onset normalization
-        mask_used_audio = PickNormalizer(sample_rate=REALTIME_SAMPLE_RATE, name="realtime_picknorm")(mask_pred)
-        mask_for_kd     = mask_used_audio  # KD compares directly to teacher gate (timing)
+        mask_norm = PickNormalizer(sample_rate=REALTIME_SAMPLE_RATE, name="realtime_picknorm")(mask_pred)
+
+        # Amplitude‑invariant safety cap derived from the piezo itself
+        safety_gate = RelativeGate(
+            sample_rate=REALTIME_SAMPLE_RATE,
+            env_ms=6.0,          # reference window for relative level
+            thr_ratio=1.6,       # open when short-term > 1.6 × reference
+            attack_ms=0.15,
+            release_ms=8.0,
+            name="realtime_picknorm_rel_gate"
+        )(inp)
+
+        mask_used_audio = Minimum(name="realtime_picknorm_cap")([mask_norm, safety_gate])
+
+        mask_for_kd     = mask_norm
         mask_for_mult   = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
         mask_debug_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_audio)
     else:
@@ -4676,9 +4727,7 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
         HFSuppressWhenClosed(alpha=0.7, name="off_lp_hf_suppress")([hf_final, gate_t]),
     ]
 
-    m_gate = GateKDMonitor(name="off_lp_gate_metrics")([gate_t, stu_mask])
-    m_leak = HfLeakMonitor(name="off_lp_hf_leak")([hf_final, gate_t])
-    y_audio_kd = LossTether(name="off_lp_kd_tether")([y_audio] + kd_losses + [m_gate, m_leak])
+    y_audio_kd = LossTether(name="off_lp_kd_tether")([y_audio] + kd_losses)
 
     student_train = tf.keras.Model(
         inputs=off_static_core.inputs, outputs=[y_audio_kd, y_style], name="offline_learned_pick_static_train"
@@ -4779,9 +4828,7 @@ def make_base_realtime_learned_pick(
     hf_final = rt_static_core.get_layer("realtime_hf_scale").output
 
     y_audio, y_style = rt_static_core.outputs
-    m_gate = GateKDMonitor(name="rt_lp_gate_metrics")([gate_t_ds, stu_gate])
-    m_leak = HfLeakMonitor(name="rt_lp_hf_leak")([hf_final, gate_t_ds])
-    y_audio_kd = LossTether(name="rt_lp_kd_metrics_tether")([y_audio, m_gate, m_leak])
+    y_audio_kd = y_audio
 
     rt_static_train = tf.keras.Model(inputs=rt_static_core.inputs, outputs=[y_audio_kd, y_style], name="realtime_learned_pick_static_train")
 
