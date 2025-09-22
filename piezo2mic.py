@@ -4686,6 +4686,11 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
     )
 
     student_train.fit(ds, epochs=int(epochs), steps_per_epoch=int(steps), verbose=1)
+    
+    # 1) Save a clean STATIC, teacher-free model (same graph as training core)
+    static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_STATIC_MODEL_FILENAME)
+    off_static_core.save(static_path)
+    print("✅ Saved base offline learned‑pick (static, teacher‑free):", static_path)
 
     # Export teacher-free dynamic with PickNormalizer path
     off_dyn_export = build_offline_model(dynamic_time=True,
