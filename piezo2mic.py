@@ -298,11 +298,11 @@ REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 REALTIME_MASK_RELEASE_MS = 12.0
 REALTIME_MASK_SOFTKNEE_K = 12.0
 REALTIME_MASK_SOFTKNEE_T = 0.52
-REALTIME_HF_PEAK_CEILING = 1.5  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_HF_PEAK_CEILING = 0.01  # set to 1.5–2.0 to tame rare spikes; None disables
 
 REALTIME_MASK_CLOSE_T   = 0.12   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.78   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 20     # integer power (>=2) for mask sharpening
+REALTIME_MASK_SHARPEN_P = 25     # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
 
 # Finetune params
@@ -5885,24 +5885,24 @@ def render_isolated_stems(
             hf_core = core_of(hf_key)
 
             # Optional: sharpen hf_only using mask^(P)/mask (P>1 ⇒ stronger close between hits)
-            if REALTIME_MASK_SHARPEN_P is not None and float(REALTIME_MASK_SHARPEN_P) > 1.0:
-                # Prefer post-softknee mask if available; else fall back to mask_used
-                mask_key = "mask_audio" if "mask_audio" in outs else ("mask_used" if "mask_used" in outs else None)
-                if mask_key is not None:
-                    m_full = np.asarray(outs[mask_key][0, :, 0], dtype=np.float32)
-                    m_core = _core_crop(m_full, core_start_in_inp, core_end_in_inp)
-                    m_core = np.clip(m_core, 1e-6, 1.0)
+            # if REALTIME_MASK_SHARPEN_P is not None and float(REALTIME_MASK_SHARPEN_P) > 1.0:
+            #     # Prefer post-softknee mask if available; else fall back to mask_used
+            #     mask_key = "mask_audio" if "mask_audio" in outs else ("mask_used" if "mask_used" in outs else None)
+            #     if mask_key is not None:
+            #         m_full = np.asarray(outs[mask_key][0, :, 0], dtype=np.float32)
+            #         m_core = _core_crop(m_full, core_start_in_inp, core_end_in_inp)
+            #         m_core = np.clip(m_core, 1e-6, 1.0)
 
-                    # scale factor = mask^P / mask = mask^(P-1); clamps ensure ≤1 for P>=1
-                    P = float(REALTIME_MASK_SHARPEN_P)
-                    factor = np.power(m_core, max(0.0, P - 1.0))
+            #         # scale factor = mask^P / mask = mask^(P-1); clamps ensure ≤1 for P>=1
+            #         P = float(REALTIME_MASK_SHARPEN_P)
+            #         factor = np.power(m_core, max(0.0, P - 1.0))
 
-                    # If we have pick-only HF, prefer that as base so the style gate stays intact
-                    if "hf_pick" in outs:
-                        hf_pick_full = np.asarray(outs["hf_pick"][0, :, 0], dtype=np.float32)
-                        hf_core = _core_crop(hf_pick_full, core_start_in_inp, core_end_in_inp)
-                    # Apply extra suppression
-                    hf_core = hf_core * factor
+            #         # If we have pick-only HF, prefer that as base so the style gate stays intact
+            #         if "hf_pick" in outs:
+            #             hf_pick_full = np.asarray(outs["hf_pick"][0, :, 0], dtype=np.float32)
+            #             hf_core = _core_crop(hf_pick_full, core_start_in_inp, core_end_in_inp)
+            #         # Apply extra suppression
+            #         hf_core = hf_core * factor
 
             wset["hf"].write(hf_core)
             
