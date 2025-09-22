@@ -282,6 +282,9 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_learned_pick.keras"
 REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_learned_pick_dynamic.keras"
 
+OFFLINE_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline_learned_pick.keras"
+OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_learned_pick_dynamic.keras"
+
 REALTIME_LEARNED_PICK_MASK_EPOCHS    = 10
 REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 2500
 REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
@@ -4693,7 +4696,7 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
                                          name="piezo2mic_offline_learned_pick_dynamic")
     copy_weights_by_name(off_dyn_export, student_train, verbose=True)
 
-    out_dynamic = os.path.join(MODELS_OFFLINE_OUT_DIR, "piezo2mic_baseline_offline_learned_pick_dynamic.keras")
+    out_dynamic = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
     off_dyn_export.save(out_dynamic)
     print("✅ Saved base offline learned‑pick (dynamic, teacher‑free):", out_dynamic)
     return off_dyn_export
