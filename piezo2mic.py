@@ -302,7 +302,7 @@ REALTIME_HF_PEAK_CEILING = 1.5  # set to 1.5–2.0 to tame rare spikes; None dis
 
 REALTIME_MASK_CLOSE_T   = 0.12   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.78   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 8     # integer power (>=2) for mask sharpening
+REALTIME_MASK_SHARPEN_P = 20     # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
 
 # Finetune params
