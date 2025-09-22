@@ -295,15 +295,17 @@ REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 2500
 REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 
 # Learned-pick shaping defaults for realtime
-REALTIME_MASK_RELEASE_MS = 12.0
-REALTIME_MASK_SOFTKNEE_K = 12.0
-REALTIME_MASK_SOFTKNEE_T = 0.52
-REALTIME_HF_PEAK_CEILING = 0.01  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_MASK_RELEASE_MS = 8.0
+REALTIME_MASK_SOFTKNEE_K = 8.0
+REALTIME_MASK_SOFTKNEE_T = 0.62
 
-REALTIME_MASK_CLOSE_T   = 0.12   # dead-zone lower bound (close)
-REALTIME_MASK_OPEN_T    = 0.78   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 25     # integer power (>=2) for mask sharpening
+REALTIME_MASK_CLOSE_T   = 0.35   # dead-zone lower bound (close)
+REALTIME_MASK_OPEN_T    = 0.88   # dead-zone upper bound (open)
+REALTIME_MASK_SHARPEN_P = 8     # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
+REALTIME_HF_FOLLOW_BASE  = 0.05
+REALTIME_HF_FOLLOW_SCALE = 0.35
+REALTIME_HF_FOLLOW_TC_MS = 0.25
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -3117,6 +3119,75 @@ class MaskMarginKD(tf.keras.layers.Layer, AdjustableAlphaMixin):
             **super().get_config()
         }
 
+
+@register_keras_serializable()
+class SqrtClip01(tf.keras.layers.Layer):
+    """
+    y = sqrt(clip(x, 0, 1) + eps). Compressive curve for mask → audio.
+    """
+    def __init__(self, eps=1e-12, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.eps = float(eps)
+    def call(self, x):
+        z = tf.clip_by_value(x, 0.0, 1.0)
+        return tf.sqrt(z + self.eps)
+    def get_config(self):
+        return {"eps": self.eps, **super().get_config()}
+
+@register_keras_serializable()
+class HFMaskFollowLimiter(tf.keras.layers.Layer):
+    """
+    Peak limiter whose ceiling follows the (smoothed) mask:
+      ceiling = base + scale * EMA(mask)
+      y = tanh(x / ceiling) * ceiling
+    Keeps pick hits controlled without lifting the floor.
+    """
+    def __init__(self, base=0.05, scale=0.35,
+                 tc_ms=0.25, sample_rate=REALTIME_SAMPLE_RATE,
+                 Lmax=256, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.base = float(base)
+        self.scale = float(scale)
+        self.tc_ms = float(tc_ms)
+        self.sample_rate = int(sample_rate)
+        self.Lmax = int(Lmax)
+
+    def build(self, input_shape):
+        tau = max(1, int(round(self.tc_ms / 1000.0 * self.sample_rate)))
+        k = _exp_smoothing_kernel(tau, scale=2.0, Lmax=self.Lmax)  # reversed taps for conv1d
+        self.kernel = self.add_weight(
+            name="follow_env_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs: [x_hf, mask_used_audio]
+        x, m = inputs
+        # Smooth the mask a touch for the limiter control
+        pad = tf.shape(self.kernel)[0] - 1
+        m_pad = tf.pad(m, [[0,0], [pad,0], [0,0]])
+        m_env = tf.nn.conv1d(m_pad, filters=self.kernel, stride=1, padding='VALID')
+        m_env = tf.clip_by_value(m_env, 0.0, 1.0)
+
+        base = tf.cast(self.base, x.dtype)
+        scale = tf.cast(self.scale, x.dtype)
+        ceiling = base + scale * m_env
+        ceiling = tf.maximum(ceiling, tf.constant(1e-6, dtype=x.dtype))
+
+        x_norm = x / ceiling
+        y_norm = tf.math.tanh(x_norm)
+        return y_norm * ceiling
+
+    def get_config(self):
+        return {
+            "base": self.base, "scale": self.scale,
+            "tc_ms": self.tc_ms, "sample_rate": self.sample_rate, "Lmax": self.Lmax,
+            **super().get_config()
+        }
+
 @register_keras_serializable()
 class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
     """
@@ -4228,8 +4299,7 @@ def build_realtime_model(offline=None,
                          hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
                          # learned-pick shaping
                          mask_release_ms=REALTIME_MASK_RELEASE_MS,
-                         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-                         hf_peak_ceiling=None):
+                         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T)):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -4473,6 +4543,9 @@ def build_realtime_model(offline=None,
         mask_used_audio = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_audio_floor")(mask_used_audio)
 
     mask_for_mult = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
+    
+    # Compressive curve for audio gating; reduces peak loudness without raising the floor
+    mask_used_audio = SqrtClip01(name="realtime_hf_mask_sqrt")(mask_used_audio)
 
     # HF branch proper
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
@@ -4486,10 +4559,14 @@ def build_realtime_model(offline=None,
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
-        # Optional HF peak limiter (preferred over softclip): unity slope at 0, ceiling=C
-    if hf_peak_ceiling is not None:
-        hf_final = SoftLimiterCeiling(ceiling=float(hf_peak_ceiling),
-                                      name="realtime_hf_peak_limiter")(hf_final)
+    # Follow-limiter: ceiling follows (smoothed) mask to prevent rare “blast” peaks
+    hf_final = HFMaskFollowLimiter(
+        base=REALTIME_HF_FOLLOW_BASE,
+        scale=REALTIME_HF_FOLLOW_SCALE,
+        tc_ms=REALTIME_HF_FOLLOW_TC_MS,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_hf_follow_limit"
+    )([hf_final, mask_used_audio])
 
     hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
                                 cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
@@ -4516,12 +4593,12 @@ def build_realtime_model(offline=None,
         kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
         kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_smoothed, T_gate_ds]))
         kd_tensors.append(
-            MaskMarginKD(alpha=1.5, m_close=0.01, m_open=0.90, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
+            MaskMarginKD(alpha=2.5, m_close=0.01, m_open=0.95, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
         )
         
         # Extra direct supervision on the mask that actually gates audio
         kd_tensors.append(
-            MaskMarginKD(alpha=4.0, m_close=0.01, m_open=0.95, name="mask_audio_margin_kd")(
+            MaskMarginKD(alpha=5.0, m_close=0.01, m_open=0.97, name="mask_audio_margin_kd")(
                 [mask_used_audio, T_gate_ds]
             )
         )
@@ -4874,8 +4951,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
             cap_mask_with_gate=False, use_learned_hf_mask=True,
             enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02,
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
-            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T)
         )
         copy_weights_by_name(realtime_dyn, static_src, verbose=True)
         return realtime_dyn
@@ -4886,8 +4962,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
         cap_mask_with_gate=False, use_learned_hf_mask=True,
         enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
-        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T)
     )
     copy_weights_by_name(realtime_dyn, base_dyn, verbose=True)
     return realtime_dyn
@@ -5075,8 +5150,7 @@ def make_base_realtime_learned_pick(
         detach_mask_from_audio=False,
         mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
-        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
-        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55)
     )
     copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
@@ -5175,8 +5249,7 @@ def make_base_realtime_learned_pick(
         detach_mask_from_audio=True,
         mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
-        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
-        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+        mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55)
     )
     copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -5420,8 +5493,7 @@ def fine_tune(offline=True, realtime=True):
             mask_min_floor=0.05,
             # NEW
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
-            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+            mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T)
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -5468,8 +5540,7 @@ def fine_tune(offline=True, realtime=True):
             # NEW
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
-            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
+            hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -6665,8 +6736,7 @@ def main ():
                     'detach_mask_from_audio': True,
                     'mask_min_floor': 0.0,
                     'mask_release_ms': REALTIME_MASK_RELEASE_MS,
-                    'mask_softknee': (REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-                    'hf_peak_ceiling': REALTIME_HF_PEAK_CEILING
+                    'mask_softknee': (REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T)
                 },
                 use_safe_weight_copy=True
             )
