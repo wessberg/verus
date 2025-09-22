@@ -290,8 +290,8 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 REALTIME_LEARNED_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_learned_pick.keras"
 REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_learned_pick_dynamic.keras"
 
-REALTIME_LEARNED_PICK_MASK_EPOCHS    = 15
-REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 3000
+REALTIME_LEARNED_PICK_MASK_EPOCHS    = 10
+REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 2500
 REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 
 # Learned-pick shaping defaults for realtime
