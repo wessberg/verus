@@ -295,14 +295,14 @@ REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 3000
 REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 
 # Learned-pick shaping defaults for realtime
-REALTIME_MASK_RELEASE_MS = 4.0
+REALTIME_MASK_RELEASE_MS = REALTIME_GATE_RELEASE_MS
 REALTIME_MASK_SOFTKNEE_K = 10.0
 REALTIME_MASK_SOFTKNEE_T = 0.35
-REALTIME_HF_SOFTCLIP_DRIVE = 10.0  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_HF_PEAK_CEILING = 2.0  # set to 1.5–2.0 to tame rare spikes; None disables
 
 REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 8      # integer power (>=2) for mask sharpening
+REALTIME_MASK_SHARPEN_P = 60     # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -3.5  # more negative initializes mask closed
 
 # Finetune params
@@ -2777,6 +2777,26 @@ class GateSoftKnee(tf.keras.layers.Layer):
         return {"k": self.k, "t": self.t, **super().get_config()}
 
 @register_keras_serializable()
+class SoftLimiterCeiling(tf.keras.layers.Layer):
+    """
+    Unity-slope soft peak limiter: y = C * tanh(x / C)
+    - Small-signal region is untouched (slope=1 at 0) so it won't raise the floor.
+    - Large signals smoothly saturate to ±C.
+    """
+    def __init__(self, ceiling=1.0, eps=1e-12, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ceiling = float(ceiling)
+        self.eps = float(eps)
+
+    def call(self, x):
+        c = tf.constant(self.ceiling, dtype=x.dtype)
+        e = tf.constant(self.eps, dtype=x.dtype)
+        return c * tf.math.tanh(x / (c + e))
+
+    def get_config(self):
+        return {**super().get_config(), "ceiling": self.ceiling, "eps": self.eps}
+
+@register_keras_serializable()
 class SoftClip(tf.keras.layers.Layer):
     """
     Very light soft‑clipper: y = tanh(g*x)/tanh(g), with g in [1..4].
@@ -2796,6 +2816,25 @@ class SoftClip(tf.keras.layers.Layer):
 
     def get_config(self):
         return {"drive": self.drive, **super().get_config()}
+
+
+def set_realtime_hf_peak_ceiling(model, ceiling):
+    """
+    Override the 'realtime_hf_peak_limiter' ceiling at inference.
+    The layer stores 'ceiling' as a Python attribute (no weights).
+    """
+    try:
+        layer = model.get_layer("realtime_hf_peak_limiter")
+    except Exception:
+        print("[hf-ceiling] Peak limiter layer not found; model may have been built without it.")
+        return False
+    try:
+        layer.ceiling = float(ceiling)
+        print(f"[hf-ceiling] Set peak ceiling to {float(ceiling):.6f}")
+        return True
+    except Exception as e:
+        print(f"[hf-ceiling] Failed to set ceiling: {e}")
+        return False
 
 @register_keras_serializable()
 class AdjustableAlphaMixin:
@@ -4207,7 +4246,7 @@ def build_realtime_model(offline=None,
                          # learned-pick shaping
                          mask_release_ms=REALTIME_MASK_RELEASE_MS,
                          mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-                         hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE):
+                         hf_peak_ceiling=None):
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -4464,13 +4503,10 @@ def build_realtime_model(offline=None,
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
 
-    # Optional soft‑clip to tame rare spikes after big boosts
-    if hf_softclip_drive is not None and float(hf_softclip_drive) > 0.0:
-        d = float(hf_softclip_drive)
-        hf_scaled = ConstScale(d, name="realtime_hf_softclip_drive")(hf_final)
-        hf_tanh   = Activation("tanh", name="realtime_hf_softclip_tanh")(hf_scaled)
-        norm = 1.0 / float(np.tanh(d))
-        hf_final = ConstScale(norm, name="realtime_hf_softclip_renorm")(hf_tanh)
+        # Optional HF peak limiter (preferred over softclip): unity slope at 0, ceiling=C
+    if hf_peak_ceiling is not None:
+        hf_final = SoftLimiterCeiling(ceiling=float(hf_peak_ceiling),
+                                      name="realtime_hf_peak_limiter")(hf_final)
 
     hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
                                 cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
@@ -4856,7 +4892,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
             enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
+            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
         )
         copy_weights_by_name(realtime_dyn, static_src, verbose=True)
         return realtime_dyn
@@ -4868,7 +4904,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
         enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
+        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
     )
     copy_weights_by_name(realtime_dyn, base_dyn, verbose=True)
     return realtime_dyn
@@ -5057,7 +5093,7 @@ def make_base_realtime_learned_pick(
         mask_min_floor=0.0,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
-        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
+        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
     )
     copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
@@ -5157,7 +5193,7 @@ def make_base_realtime_learned_pick(
         mask_min_floor=0.0,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
-        hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
+        hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
     )
     copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -5402,7 +5438,7 @@ def fine_tune(offline=True, realtime=True):
             # NEW
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
+            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
         )
         # Initialize from baseline realtime dynamic (safe by-name copy)
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
@@ -5449,8 +5485,8 @@ def fine_tune(offline=True, realtime=True):
             # NEW
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-            hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE,
-            hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES
+            hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
+            hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
         )
         copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
 
@@ -5624,7 +5660,6 @@ def _boost_scales(model, sample_rate, use_finetuned=False):
     
     if (resbp_boost_db != 0.0):
         model = boost_hf_scale_in_model(model, resbp_boost_layer_name, gain_db=resbp_boost_db)
-        
 
 def _find_last_layer_with_suffix(model, suffix):
     cand = [l for l in model.layers if l.name.endswith(suffix)]
@@ -6652,7 +6687,7 @@ def main ():
                     'mask_min_floor': 0.0,
                     'mask_release_ms': REALTIME_MASK_RELEASE_MS,
                     'mask_softknee': (REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
-                    'hf_softclip_drive': REALTIME_HF_SOFTCLIP_DRIVE
+                    'hf_peak_ceiling': REALTIME_HF_PEAK_CEILING
                 },
                 use_safe_weight_copy=True
             )
