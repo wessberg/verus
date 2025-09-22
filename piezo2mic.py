@@ -295,15 +295,15 @@ REALTIME_LEARNED_PICK_MASK_STEPS_CAP = 3000
 REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 
 # Learned-pick shaping defaults for realtime
-REALTIME_MASK_RELEASE_MS = REALTIME_GATE_RELEASE_MS
-REALTIME_MASK_SOFTKNEE_K = 10.0
-REALTIME_MASK_SOFTKNEE_T = 0.35
-REALTIME_HF_PEAK_CEILING = 0.5  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_MASK_RELEASE_MS = 12.0
+REALTIME_MASK_SOFTKNEE_K = 12.0
+REALTIME_MASK_SOFTKNEE_T = 0.52
+REALTIME_HF_PEAK_CEILING = 1.5  # set to 1.5–2.0 to tame rare spikes; None disables
 
-REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
-REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 40     # integer power (>=2) for mask sharpening
-REALTIME_MASK_LOGIT_BIAS = -3.5  # more negative initializes mask closed
+REALTIME_MASK_CLOSE_T   = 0.12   # dead-zone lower bound (close)
+REALTIME_MASK_OPEN_T    = 0.78   # dead-zone upper bound (open)
+REALTIME_MASK_SHARPEN_P = 8     # integer power (>=2) for mask sharpening
+REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -1307,13 +1307,13 @@ def _disable_non_mask_kd(model):
 def _boost_mask_kd(model):
     strong = {
         "hf_mask_bce":          5.0,  # teacher gate → mask_pred (BCE)
-        "mask_smooth_distill":  1.2,  # teacher gate → mask_smoothed (shift-aware)
-        "hf_env_mask_distill":  1.2,  # teacher HF env → mask_pred
+        "mask_smooth_distill":  0.6,  # teacher gate → mask_smoothed (shift-aware)
+        "hf_env_mask_distill":  0.6,  # teacher HF env → mask_pred
         "hf_suppress_closed":   1.0,  # penalize HF when teacher gate is closed
         "mask_suppress_closed": 0.8,  # penalize mask open when teacher gate is closed
         # if you add the two KD terms below in build_realtime_model (see patch B),
         # you can set their alphas here as well:
-        "mask_audio_margin_kd": 2.0,  # margin on post-softknee mask_used_audio
+        "mask_audio_margin_kd": 3.5,  # margin on post-softknee mask_used_audio
         "mask_onset_kd":        0.8,  # onset distill
     }
     _set_kd_alphas(model, strong)
@@ -4521,7 +4521,7 @@ def build_realtime_model(offline=None,
         
         # Extra direct supervision on the mask that actually gates audio
         kd_tensors.append(
-            MaskMarginKD(alpha=2.0, m_close=0.02, m_open=0.92, name="mask_audio_margin_kd")(
+            MaskMarginKD(alpha=4.0, m_close=0.01, m_open=0.95, name="mask_audio_margin_kd")(
                 [mask_used_audio, T_gate_ds]
             )
         )
@@ -4872,7 +4872,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
         realtime_dyn = build_realtime_model(
             offline=None, dynamic_time=True,
             cap_mask_with_gate=False, use_learned_hf_mask=True,
-            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
+            enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02,
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
             hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
@@ -4884,7 +4884,7 @@ def _build_realtime_dynamic_learned_pick_for_preview():
     realtime_dyn = build_realtime_model(
         offline=None, dynamic_time=True,
         cap_mask_with_gate=False, use_learned_hf_mask=True,
-        enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.0,
+        enable_mask_kd=False, detach_mask_from_audio=True, mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
         hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
@@ -4996,7 +4996,7 @@ def make_realtime_dynamic_with_hf_shift(shift_samples):
         use_learned_hf_mask=False,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.0,
+        mask_min_floor=0.02,
         hf_time_shift_samples=int(shift_samples)
     )
     copy_weights_by_name(rt_dyn_shift, base_dyn, verbose=True)
@@ -5073,7 +5073,7 @@ def make_base_realtime_learned_pick(
         use_learned_hf_mask=True,
         enable_mask_kd=True,
         detach_mask_from_audio=False,
-        mask_min_floor=0.0,
+        mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
         hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
@@ -5173,7 +5173,7 @@ def make_base_realtime_learned_pick(
         use_learned_hf_mask=True,
         enable_mask_kd=False,
         detach_mask_from_audio=True,
-        mask_min_floor=0.0,
+        mask_min_floor=0.02,
         mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
         hf_peak_ceiling=REALTIME_HF_PEAK_CEILING
@@ -5464,7 +5464,7 @@ def fine_tune(offline=True, realtime=True):
             use_learned_hf_mask=True,
             enable_mask_kd=False,
             detach_mask_from_audio=True,
-            mask_min_floor=0.0,
+            mask_min_floor=0.02,
             # NEW
             mask_release_ms=REALTIME_MASK_RELEASE_MS,
             mask_softknee=(REALTIME_MASK_SOFTKNEE_K, REALTIME_MASK_SOFTKNEE_T),
@@ -5885,24 +5885,24 @@ def render_isolated_stems(
             hf_core = core_of(hf_key)
 
             # Optional: sharpen hf_only using mask^(P)/mask (P>1 ⇒ stronger close between hits)
-            # if REALTIME_MASK_SHARPEN_P is not None and float(REALTIME_MASK_SHARPEN_P) > 1.0:
-            #     # Prefer post-softknee mask if available; else fall back to mask_used
-            #     mask_key = "mask_audio" if "mask_audio" in outs else ("mask_used" if "mask_used" in outs else None)
-            #     if mask_key is not None:
-            #         m_full = np.asarray(outs[mask_key][0, :, 0], dtype=np.float32)
-            #         m_core = _core_crop(m_full, core_start_in_inp, core_end_in_inp)
-            #         m_core = np.clip(m_core, 1e-6, 1.0)
+            if REALTIME_MASK_SHARPEN_P is not None and float(REALTIME_MASK_SHARPEN_P) > 1.0:
+                # Prefer post-softknee mask if available; else fall back to mask_used
+                mask_key = "mask_audio" if "mask_audio" in outs else ("mask_used" if "mask_used" in outs else None)
+                if mask_key is not None:
+                    m_full = np.asarray(outs[mask_key][0, :, 0], dtype=np.float32)
+                    m_core = _core_crop(m_full, core_start_in_inp, core_end_in_inp)
+                    m_core = np.clip(m_core, 1e-6, 1.0)
 
-            #         # scale factor = mask^P / mask = mask^(P-1); clamps ensure ≤1 for P>=1
-            #         P = float(REALTIME_MASK_SHARPEN_P)
-            #         factor = np.power(m_core, max(0.0, P - 1.0))
+                    # scale factor = mask^P / mask = mask^(P-1); clamps ensure ≤1 for P>=1
+                    P = float(REALTIME_MASK_SHARPEN_P)
+                    factor = np.power(m_core, max(0.0, P - 1.0))
 
-            #         # If we have pick-only HF, prefer that as base so the style gate stays intact
-            #         if "hf_pick" in outs:
-            #             hf_pick_full = np.asarray(outs["hf_pick"][0, :, 0], dtype=np.float32)
-            #             hf_core = _core_crop(hf_pick_full, core_start_in_inp, core_end_in_inp)
-            #         # Apply extra suppression
-            #         hf_core = hf_core * factor
+                    # If we have pick-only HF, prefer that as base so the style gate stays intact
+                    if "hf_pick" in outs:
+                        hf_pick_full = np.asarray(outs["hf_pick"][0, :, 0], dtype=np.float32)
+                        hf_core = _core_crop(hf_pick_full, core_start_in_inp, core_end_in_inp)
+                    # Apply extra suppression
+                    hf_core = hf_core * factor
 
             wset["hf"].write(hf_core)
             
@@ -6300,21 +6300,17 @@ def train_shared(
 
     if kind == 'realtime':
         kd_targets = {
-            # audio KD
             "audio_distill":       (REALTIME_DISTILL_ALPHA,              2.0,  0,  80),
             "audio_stft_distill":  (REALTIME_AUDIO_STFT_DISTILL_ALPHA,   0.2,  0,  80),
-            # feature/stem KD
             "feat_distill_0":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
             "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
             "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,    0.2,  0,  80),
             "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA,  0.2,  0,  80),
             "stem_hf_distill":     (REALTIME_STEM_HF_DISTILL_ALPHA,      0.2,  0,  80),
-            "stem_resbp_distill":  (REALTIME_STEM_RESBP_DISTILL_ALPHA,   0.2,  0,  80),  # new
-            # mask/gate KD
+            "stem_resbp_distill":  (REALTIME_STEM_RESBP_DISTILL_ALPHA,   0.2,  0,  80),
             "hf_mask_distill":     (REALTIME_HF_MASK_DISTILL_ALPHA,      1.0,  0,  80),
-            "mask_used_distill":   (REALTIME_MASK_USED_DISTILL_ALPHA,    0.1,  0,  80),
-            # style blend schedule
-            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,           0.3,  0, 100)
+            "mask_smooth_distill": (REALTIME_MASK_USED_DISTILL_ALPHA,    0.2,  0,  80),  # ← name fixed + lower end
+            "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,           0.3,  0, 100),
         }
         cbs.append(KDAlphaScheduler(kd_targets))
 
