@@ -298,11 +298,11 @@ REALTIME_LEARNED_PICK_MASK_LR        = 1e-4
 REALTIME_MASK_RELEASE_MS = 4.0
 REALTIME_MASK_SOFTKNEE_K = 10.0
 REALTIME_MASK_SOFTKNEE_T = 0.35
-REALTIME_HF_SOFTCLIP_DRIVE = 2.0  # set to 1.5–2.0 to tame rare spikes; None disables
+REALTIME_HF_SOFTCLIP_DRIVE = 10.0  # set to 1.5–2.0 to tame rare spikes; None disables
 
 REALTIME_MASK_CLOSE_T   = 0.25   # dead-zone lower bound (close)
 REALTIME_MASK_OPEN_T    = 0.60   # dead-zone upper bound (open)
-REALTIME_MASK_SHARPEN_P = 2      # integer power (>=2) for mask sharpening
+REALTIME_MASK_SHARPEN_P = 8      # integer power (>=2) for mask sharpening
 REALTIME_MASK_LOGIT_BIAS = -3.5  # more negative initializes mask closed
 
 # Finetune params
@@ -1280,6 +1280,43 @@ def mean_hf_metric(y_true, y_pred):
 def stop_grad(x):
     return tf.stop_gradient(x)
 
+
+@register_keras_serializable()
+def _set_kd_alphas(model, alpha_map):
+    for lname, a in alpha_map.items():
+        try:
+            layer = model.get_layer(lname)
+            if hasattr(layer, "set_alpha"):
+                layer.set_alpha(float(a))
+                print(f"[KD] set {lname}.alpha = {a}")
+        except Exception:
+            pass
+
+@register_keras_serializable()
+def _disable_non_mask_kd(model):
+    zero_names = [
+        "audio_distill",
+        "audio_stft_distill",
+        "feat_distill_0", "feat_distill_1",
+        "stem_pick_distill", "stem_finger_distill",
+        "stem_hf_distill", "stem_resbp_distill",
+    ]
+    _set_kd_alphas(model, {n: 0.0 for n in zero_names})
+
+@register_keras_serializable()
+def _boost_mask_kd(model):
+    strong = {
+        "hf_mask_bce":          5.0,  # teacher gate → mask_pred (BCE)
+        "mask_smooth_distill":  1.2,  # teacher gate → mask_smoothed (shift-aware)
+        "hf_env_mask_distill":  1.2,  # teacher HF env → mask_pred
+        "hf_suppress_closed":   1.0,  # penalize HF when teacher gate is closed
+        "mask_suppress_closed": 0.8,  # penalize mask open when teacher gate is closed
+        # if you add the two KD terms below in build_realtime_model (see patch B),
+        # you can set their alphas here as well:
+        "mask_audio_margin_kd": 2.0,  # margin on post-softknee mask_used_audio
+        "mask_onset_kd":        0.8,  # onset distill
+    }
+    _set_kd_alphas(model, strong)
 
 @register_keras_serializable()
 class Abs1D(tf.keras.layers.Layer):
@@ -4463,10 +4500,26 @@ def build_realtime_model(offline=None,
             MaskMarginKD(alpha=1.5, m_close=0.01, m_open=0.90, name="mask_margin_kd")([mask_smoothed, T_gate_ds])
         )
         
+        # Extra direct supervision on the mask that actually gates audio
+        kd_tensors.append(
+            MaskMarginKD(alpha=2.0, m_close=0.02, m_open=0.92, name="mask_audio_margin_kd")(
+                [mask_used_audio, T_gate_ds]
+            )
+        )
+
+        # Onset KD: align rising edges (what counts as a hit)
+        g_on = Lambda(gate_onset, name="off_gate_onset_ds")(T_gate_ds)
+        m_on = Lambda(gate_onset, name="rt_mask_onset")(mask_smoothed)
+        kd_tensors.append(
+            DistillLossBestShift(alpha=0.8, max_shift=6, name="mask_onset_kd")([g_on, m_on])
+        )
+        
         # Penalize HF when the student's mask says "closed"
         kd_tensors.append(
             HFSuppressByMask(alpha=0.4, name="hf_suppress_by_student_mask")([hf_final, mask_used_audio])
         )
+        
+        
 
         for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
             chan = int(T_f_ds.shape[-1])
@@ -5002,7 +5055,7 @@ def make_base_realtime_learned_pick(
         enable_mask_kd=True,
         detach_mask_from_audio=False,
         mask_min_floor=0.0,
-        mask_release_ms=2.0,
+        mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
         hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
@@ -5065,6 +5118,11 @@ def make_base_realtime_learned_pick(
         loss_weights=[1.0, 0.0],  # style BCE disabled; audio loss silenced by sample‑weights=0
         metrics=[["mae"], []]
     )
+    
+    # Make mask learning "pure": disable audio/feature/stem KD
+    _disable_non_mask_kd(rt_static_train)
+    # Make mask KD stronger (open/close and leak penalties)
+    _boost_mask_kd(rt_static_train)
 
     # Optional: gently anneal mask KD strengths (short schedule)
     kd_targets = {
@@ -5097,7 +5155,7 @@ def make_base_realtime_learned_pick(
         enable_mask_kd=False,
         detach_mask_from_audio=True,
         mask_min_floor=0.0,
-        mask_release_ms=2.0,
+        mask_release_ms=REALTIME_MASK_RELEASE_MS,
         mask_softknee=(REALTIME_MASK_SOFTKNEE_K, 0.55),
         hf_softclip_drive=REALTIME_HF_SOFTCLIP_DRIVE
     )
@@ -5804,7 +5862,32 @@ def render_isolated_stems(
                 pred_prob_count += core_len
 
             wset["full"].write(core_of("y_pred"))
-            wset["hf"].write(core_of(hf_key))
+            
+            
+            hf_core = core_of(hf_key)
+
+            # Optional: sharpen hf_only using mask^(P)/mask (P>1 ⇒ stronger close between hits)
+            if REALTIME_MASK_SHARPEN_P is not None and float(REALTIME_MASK_SHARPEN_P) > 1.0:
+                # Prefer post-softknee mask if available; else fall back to mask_used
+                mask_key = "mask_audio" if "mask_audio" in outs else ("mask_used" if "mask_used" in outs else None)
+                if mask_key is not None:
+                    m_full = np.asarray(outs[mask_key][0, :, 0], dtype=np.float32)
+                    m_core = _core_crop(m_full, core_start_in_inp, core_end_in_inp)
+                    m_core = np.clip(m_core, 1e-6, 1.0)
+
+                    # scale factor = mask^P / mask = mask^(P-1); clamps ensure ≤1 for P>=1
+                    P = float(REALTIME_MASK_SHARPEN_P)
+                    factor = np.power(m_core, max(0.0, P - 1.0))
+
+                    # If we have pick-only HF, prefer that as base so the style gate stays intact
+                    if "hf_pick" in outs:
+                        hf_pick_full = np.asarray(outs["hf_pick"][0, :, 0], dtype=np.float32)
+                        hf_core = _core_crop(hf_pick_full, core_start_in_inp, core_end_in_inp)
+                    # Apply extra suppression
+                    hf_core = hf_core * factor
+
+            wset["hf"].write(hf_core)
+            
 
             # Optional branches
             if "ir_only" in outs:
