@@ -2545,10 +2545,12 @@ class CausalExpSmoother(tf.keras.layers.Layer):
     def build(self, input_shape):
         tau_samples = max(1, int(round((self.time_const_ms / 1000.0) * self.sample_rate)))
         k = _exp_smoothing_kernel(tau_samples, scale=self.scale, Lmax=self.Lmax)
+        # IMPORTANT: pass a NumPy value to Constant initializer to avoid cross-graph capture
+        k_init = k.numpy() if tf.is_tensor(k) else np.array(k, dtype=np.float32, copy=False)
         self.kernel = self.add_weight(
             name="exp_smooth_taps",
-            shape=k.shape,
-            initializer=tf.keras.initializers.Constant(k),
+            shape=k_init.shape,
+            initializer=tf.keras.initializers.Constant(k_init),
             trainable=False
         )
         super().build(input_shape)
@@ -2570,7 +2572,8 @@ class CausalExpSmoother(tf.keras.layers.Layer):
             'Lmax': self.Lmax
         })
         return cfg
-    
+
+
 @register_keras_serializable()
 class CausalAsymExpSmoother(tf.keras.layers.Layer):
     """
@@ -2593,21 +2596,24 @@ class CausalAsymExpSmoother(tf.keras.layers.Layer):
         k_up   = _exp_smoothing_kernel(up_smpl,   scale=self.up_scale,   Lmax=self.Lmax)
         k_down = _exp_smoothing_kernel(down_smpl, scale=self.down_scale, Lmax=self.Lmax)
 
+        # IMPORTANT: feed NumPy to Constant initializer
+        k_up_init   = k_up.numpy()   if tf.is_tensor(k_up)   else np.array(k_up,   dtype=np.float32, copy=False)
+        k_down_init = k_down.numpy() if tf.is_tensor(k_down) else np.array(k_down, dtype=np.float32, copy=False)
+
         self.k_up = self.add_weight(
-            name="asym_up_taps", shape=k_up.shape,
-            initializer=tf.keras.initializers.Constant(k_up),
+            name="asym_up_taps", shape=k_up_init.shape,
+            initializer=tf.keras.initializers.Constant(k_up_init),
             trainable=False
         )
         self.k_down = self.add_weight(
-            name="asym_down_taps", shape=k_down.shape,
-            initializer=tf.keras.initializers.Constant(k_down),
+            name="asym_down_taps", shape=k_down_init.shape,
+            initializer=tf.keras.initializers.Constant(k_down_init),
             trainable=False
         )
         super().build(input_shape)
 
     def call(self, x):
         # x: (B,T,1) in [0,1]
-        # Rising flag
         x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
         rising = tf.cast(x > x_prev, x.dtype)
 
@@ -2623,7 +2629,6 @@ class CausalAsymExpSmoother(tf.keras.layers.Layer):
             "up_scale": self.up_scale, "down_scale": self.down_scale, "Lmax": self.Lmax,
             **super().get_config()
         }
-
 @register_keras_serializable()
 class AdjustableAlphaMixin:
     def build_alpha(self, init_alpha, name="alpha"):
