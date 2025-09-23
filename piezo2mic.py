@@ -178,12 +178,12 @@ REALTIME_PICK_NORMALIZATION_KNEE = 0.001
 OFFLINE_PICK_NORMALIZATION_KNEE = 0.02
 
 REALTIME_PICK_NORMALIZATION_PULSE_MS = 4.0
-OFFLINE_PICK_NORMALIZATION_PULSE_MS = 6.0
+OFFLINE_PICK_NORMALIZATION_PULSE_MS = 2.5
 
 REALTIME_PICK_NORMALIZATION_OUT_EXP = 0.7
 OFFLINE_PICK_NORMALIZATION_OUT_EXP = 1.4
 
-REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER=1.6
+REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER=1.2
 OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER=REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER
 
 # Finetune mic-target denoise (preamp hiss cleanup)
@@ -6606,26 +6606,26 @@ def main ():
         #                 frames=96000, start=0)
         # sys.exit(0)
         
-        # # 1) Rebuild with tighter PickNormalizer and gentle compressor
-        # off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
-        #     pulse_ms=6.0,       # shorter pulse at 96k
-        #     out_exp=0.5,        # compress small/mids → less HF wash
-        #     knee=0.001,          # light deadband
-        # )
+        # 1) Rebuild with tighter PickNormalizer and gentle compressor
+        off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
+            pulse_ms=2.0,       # shorter pulse at 96k
+            out_exp=0.8,        # compress small/mids → less HF wash
+            knee=0.02,          # light deadband
+        )
 
-        # # 2) Audition quickly on your demo pair
-        # dbg = build_offline_debug_model(off_dyn_tuned)
-        # src, tgt = all_pairs[DEMO_PAIR_INDEX]
-        # render_isolated_stems(
-        #     debug_model=dbg,
-        #     path_src=src,
-        #     path_tgt=tgt,
-        #     out_dir=os.path.join(DEMOS_OUT_DIR, "offline_learned_pick_tuning"),
-        #     sample_rate=OFFLINE_SAMPLE_RATE,
-        #     sec=LONG_DEMO_SEC,
-        #     offset_sec=LONG_DEMO_OFFSET_SEC
-        # )
-        # sys.exit(0)
+        # 2) Audition quickly on your demo pair
+        dbg = build_offline_debug_model(off_dyn_tuned)
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        render_isolated_stems(
+            debug_model=dbg,
+            path_src=src,
+            path_tgt=tgt,
+            out_dir=os.path.join(DEMOS_OUT_DIR, "offline_learned_pick_tuning"),
+            sample_rate=OFFLINE_SAMPLE_RATE,
+            sec=LONG_DEMO_SEC,
+            offset_sec=LONG_DEMO_OFFSET_SEC
+        )
+        sys.exit(0)
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
         # --learned-pick     → base realtime learned-pick dynamic (if present)
