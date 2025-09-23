@@ -570,14 +570,25 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
 
 @register_keras_serializable()
 class PickNormalizer(tf.keras.layers.Layer):
+    """
+    Per‑onset, causal mask normalizer:
+      - env = asym EMA (fast attack, slow release)
+      - norm = clip(m / (env + eps), 0, 1)
+      - pulse = EMA(gate_onset(m), tc=pulse_ms)
+      - out = gain * pow(clip(norm * pulse, 0,1), out_exp) with optional knee
+
+    Implementation detail:
+      Kernels are computed once in build() (NumPy) and stored as non-trainable
+      weights. call() only runs conv1d → fast and avoids retracing overhead.
+    """
     def __init__(self,
                  sample_rate,
                  attack_ms=0.06,
                  release_ms=6.0,
                  pulse_ms=4.0,
                  out_gain=1.0,
-                 out_exp=1.6,   # >1 closes small values; was 0.5 (sqrt)
-                 knee=0.05,     # deadband in 0..0.1 to knock out tiny residuals
+                 out_exp=1.6,
+                 knee=0.05,
                  name=None,
                  **kwargs):
         super().__init__(name=name, **kwargs)
@@ -588,70 +599,97 @@ class PickNormalizer(tf.keras.layers.Layer):
         self.out_gain    = float(out_gain)
         self.out_exp     = float(out_exp)
         self.knee        = float(knee)
-        self._asym_Lmax  = 1024
-        self._pulse_Lmax = 512
-        self._up_scale   = 4.0
-        self._down_scale = 4.0
-        self._pulse_scale= 4.0
+
+        # FIR design caps/scales
+        self._asym_Lmax   = 1024
+        self._pulse_Lmax  = 512
+        self._up_scale    = 4.0
+        self._down_scale  = 4.0
+        self._pulse_scale = 4.0
+
+        # Will be created in build()
+        self.k_up   = None
+        self.k_down = None
+        self.k_pulse= None
 
     def build(self, input_shape):
+        # Trainable overall gain
         self.gain = self.add_weight(
             name="picknorm_gain",
             shape=(1,),
             initializer=tf.keras.initializers.Constant(self.out_gain),
             trainable=True
         )
+
+        # Helper: reversed EMA taps for conv1d (as NumPy)
+        def _exp_rev_kernel_np(samples, scale, Lmax):
+            s = max(1, int(samples))
+            L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
+            a = np.exp(-1.0 / float(s)).astype(np.float32)
+            n = np.arange(L, dtype=np.float32)
+            taps = (1.0 - a) * (a ** n)
+            taps = taps / max(np.sum(taps, dtype=np.float64), 1e-12)
+            k = taps[::-1].reshape(-1, 1, 1).astype(np.float32)
+            return k
+
+        atk_smpls   = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
+        rel_smpls   = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
+        pulse_smpls = max(1, int(round(self.pulse_ms   * self.sample_rate / 1000.0)))
+
+        k_up_np    = _exp_rev_kernel_np(atk_smpls,   self._up_scale,   self._asym_Lmax)
+        k_down_np  = _exp_rev_kernel_np(rel_smpls,   self._down_scale, self._asym_Lmax)
+        k_pulse_np = _exp_rev_kernel_np(pulse_smpls, self._pulse_scale,self._pulse_Lmax)
+
+        # Store as non-trainable “weights” so they’re placed once and reused
+        self.k_up = self.add_weight(
+            name="asym_up_taps", shape=k_up_np.shape,
+            initializer=tf.keras.initializers.Constant(k_up_np),
+            trainable=False
+        )
+        self.k_down = self.add_weight(
+            name="asym_down_taps", shape=k_down_np.shape,
+            initializer=tf.keras.initializers.Constant(k_down_np),
+            trainable=False
+        )
+        self.k_pulse = self.add_weight(
+            name="pulse_taps", shape=k_pulse_np.shape,
+            initializer=tf.keras.initializers.Constant(k_pulse_np),
+            trainable=False
+        )
         super().build(input_shape)
 
-    def _exp_rev_kernel(self, tau_smpls, scale, Lmax, dtype):
-        s = max(1, int(tau_smpls))
-        L = int(min(max(int(math.ceil(scale * s)), 8), int(Lmax)))
-        a = tf.exp(-1.0 / tf.constant(float(s), dtype=dtype))
-        n = tf.range(L, dtype=dtype)
-        taps = (1.0 - a) * tf.pow(a, n)
-        taps = taps / (tf.reduce_sum(taps) + tf.constant(1e-12, dtype=dtype))
-        taps = tf.reverse(taps, axis=[0])
-        return tf.reshape(taps, (L, 1, 1))
-
-    def _causal_conv1d(self, x, k):
-        pad = tf.shape(k)[0] - 1
+    def _causal_conv1d(self, x, kernel):
+        pad = tf.shape(kernel)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
-        return tf.nn.conv1d(x_pad, filters=k, stride=1, padding='VALID')
-
-    def _asym_ema(self, x, dtype):
-        atk_smpls = max(1, int(round(self.attack_ms  * self.sample_rate / 1000.0)))
-        rel_smpls = max(1, int(round(self.release_ms * self.sample_rate / 1000.0)))
-        kup = self._exp_rev_kernel(atk_smpls, self._up_scale,   self._asym_Lmax, dtype)
-        kdn = self._exp_rev_kernel(rel_smpls, self._down_scale, self._asym_Lmax, dtype)
-        x_prev = tf.pad(x, [[0,0],[1,0],[0,0]])[:, :-1, :]
-        rising = tf.cast(x > x_prev, dtype)
-        y_up   = self._causal_conv1d(x, kup)
-        y_down = self._causal_conv1d(x, kdn)
-        y = rising * y_up + (1.0 - rising) * y_down
-        return tf.clip_by_value(y, 0.0, 1.0)
-
-    def _pulse_ema(self, x, dtype):
-        pulse_smpls = max(1, int(round(self.pulse_ms * self.sample_rate / 1000.0)))
-        kp = self._exp_rev_kernel(pulse_smpls, self._pulse_scale, self._pulse_Lmax, dtype)
-        y = self._causal_conv1d(x, kp)
-        return tf.clip_by_value(y, 0.0, 1.0)
+        return tf.nn.conv1d(x_pad, filters=kernel, stride=1, padding='VALID')
 
     def call(self, m):
+        # m: (B,T,1) in [0,1]
         m = tf.clip_by_value(m, 0.0, 1.0)
         dtype = m.dtype
-        env = self._asym_ema(m, dtype)
+
+        # Asym env
+        x_prev = tf.pad(m, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(m > x_prev, dtype)
+        y_up   = self._causal_conv1d(m, self.k_up)
+        y_down = self._causal_conv1d(m, self.k_down)
+        env = tf.clip_by_value(rising * y_up + (1.0 - rising) * y_down, 0.0, 1.0)
         env = tf.maximum(env, tf.constant(1e-6, dtype=dtype))
+
         norm = tf.clip_by_value(m / env, 0.0, 1.0)
+
+        # Onset pulse
         on = gate_onset(m)
-        pulse = self._pulse_ema(on, dtype)
+        pulse = tf.clip_by_value(self._causal_conv1d(on, self.k_pulse), 0.0, 1.0)
+
         z = tf.clip_by_value(norm * pulse, 0.0, 1.0)
 
-        # Soft knee deadband to force closure
+        # Optional knee (deadband)
         if self.knee > 0.0:
             k = tf.constant(self.knee, dtype=dtype)
             z = tf.nn.relu(z - k) / (1.0 - k)
 
-        # Compressive exponent (>1 pushes small values toward 0)
+        # Compressive exponent (>1 pushes small values to 0; <1 expands)
         z = z + tf.constant(1e-12, dtype=dtype)
         y = tf.pow(z, tf.constant(self.out_exp, dtype=dtype))
         return y * self.gain
@@ -670,7 +708,6 @@ class PickNormalizer(tf.keras.layers.Layer):
             "knee": self.knee,
             **super().get_config()
         }
-
 @register_keras_serializable()
 class MaskSaturatingCompressor(tf.keras.layers.Layer):
     """
