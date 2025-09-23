@@ -4706,7 +4706,7 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
         cap_mask_with_gate=False,
         use_pick_normalizer=True,
         coloreq_trainable=False,
-        mask_min_floor=0.05,
+        mask_min_floor=0.0,
         name="piezo2mic_offline_learned_pick_core"
     )
     copy_weights_by_name(off_static_core, teacher, verbose=True)
@@ -4787,7 +4787,7 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
                                          cap_mask_with_gate=False,
                                          use_pick_normalizer=True,
                                          coloreq_trainable=False,
-                                         mask_min_floor=0.05,
+                                         mask_min_floor=0.0,
                                          name="piezo2mic_offline_learned_pick_dynamic")
     copy_weights_by_name(off_dyn_export, student_train, verbose=True)
 
@@ -5001,7 +5001,7 @@ def fine_tune(offline=True, realtime=True):
             use_learned_hf_mask=True,
             enable_mask_kd=True,
             detach_mask_from_audio=True,
-            mask_min_floor=0.05,
+            mask_min_floor=0.0,
             use_pick_normalizer=False,
             coloreq_trainable=False
         )
