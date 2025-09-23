@@ -306,6 +306,7 @@ OFFLINE_LEARNED_PICK_MASK_STEPS_CAP = 2000
 OFFLINE_LEARNED_PICK_MASK_LR        = 2e-4
 
 # Learned-pick shaping defaults for realtime
+OFFLINE_MASK_LOGIT_BIAS = -5.0
 REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
 
 # Finetune params
@@ -357,7 +358,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 40
+OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
 REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 28
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
@@ -3898,7 +3899,7 @@ def build_offline_model(dynamic_time=False,
 
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits")(m)
+    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits", bias_initializer=tf.keras.initializers.Constant(OFFLINE_MASK_LOGIT_BIAS))(m)
     mask_pred = Activation("sigmoid", name="offline_hf_mask")(m)
 
     if float(mask_min_floor) > 0.0:
@@ -4700,19 +4701,18 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
     teacher = tf.keras.models.load_model(base_off_dyn_path, compile=False)
     teacher.trainable = False
 
-    # Student: teacher-free offline with PickNormalizer path enabled
+    # Student (teacher-free) with learned-pick path enabled, floor matched to your preference
     off_static_core = build_offline_model(
         dynamic_time=False,
         cap_mask_with_gate=False,
         use_pick_normalizer=True,
         coloreq_trainable=False,
-        mask_min_floor=0.0,
+        mask_min_floor=0.0,   # match your tuning
         name="piezo2mic_offline_learned_pick_core"
     )
     copy_weights_by_name(off_static_core, teacher, verbose=True)
 
-    # Wire the teacher gate into the student graph by calling the teacher on the student inputs
-    # (use same 3 inputs: piezo, style_true, style_force)
+    # Teacher gate for KD
     teacher_gate_model = tf.keras.Model(
         inputs=teacher.inputs,
         outputs=teacher.get_layer("offline_gate").output,
@@ -4720,19 +4720,36 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
     )
     gate_t = teacher_gate_model(off_static_core.inputs)  # (B,T,1)
 
-    # Student probes
-    stu_mask = off_static_core.get_layer("offline_picknorm").output     # PickNormalizer output
+    # Probes
+    pn_out   = off_static_core.get_layer("offline_picknorm").output     # PickNormalizer output
+    m_raw    = off_static_core.get_layer("offline_hf_mask").output      # raw mask (sigmoid of logits)
     hf_final = off_static_core.get_layer("offline_hf_scale").output
     y_audio, y_style = off_static_core.outputs
 
-    # KD terms: teacher gate → student mask, onset alignment, and HF leakage suppression
-    kd_losses = [
-        DistillBCE(alpha=2.0, name="off_lp_mask_bce")([gate_t, stu_mask]),
+    # KD losses
+    kd_losses = []
+
+    # A) Distill PickNormalizer output (as before)
+    kd_losses.append(DistillBCE(alpha=2.0, name="off_lp_mask_bce")([gate_t, pn_out]))
+    kd_losses.append(
         DistillLossBestShift(alpha=0.6, max_shift=12, name="off_lp_mask_onset")(
-            [Lambda(gate_onset)(gate_t), Lambda(gate_onset)(stu_mask)]
-        ),
-        HFSuppressWhenClosed(alpha=0.7, name="off_lp_hf_suppress")([hf_final, gate_t]),
-    ]
+            [Lambda(gate_onset, name="off_lp_gate_on_pn")(gate_t),
+             Lambda(gate_onset, name="off_lp_pn_on")(pn_out)]
+        )
+    )
+
+    # B) NEW: Distill raw mask directly (crucial — matches realtime path)
+    kd_losses.append(DistillBCE(alpha=2.0, name="off_lp_mask_raw_bce")([gate_t, m_raw]))
+    kd_losses.append(
+        DistillLossBestShift(alpha=0.6, max_shift=12, name="off_lp_mask_raw_onset")(
+            [Lambda(gate_onset, name="off_lp_gate_on_raw")(gate_t),
+             Lambda(gate_onset, name="off_lp_raw_on")(m_raw)]
+        )
+    )
+    kd_losses.append(MaskSuppressWhenClosed(alpha=0.3, name="off_lp_mask_raw_suppress")([m_raw, gate_t]))
+
+    # C) Suppress HF when teacher gate is closed (as before)
+    kd_losses.append(HFSuppressWhenClosed(alpha=0.7, name="off_lp_hf_suppress")([hf_final, gate_t]))
 
     y_audio_kd = LossTether(name="off_lp_kd_tether")([y_audio] + kd_losses)
 
@@ -4740,13 +4757,12 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
         inputs=off_static_core.inputs, outputs=[y_audio_kd, y_style], name="offline_learned_pick_static_train"
     )
 
-    # Train only the mask head (and optionally the PickNormalizer’s gain)
+    # Train only the mask head (optionally allow PN gain to adapt)
     set_trainable_layers(student_train, enable_mask_head=True, enable_picknorm_gain=False)
 
-    # 96k dataset (no ground-truth style; style BCE disabled by sample weights in the map)
+    # Dataset and training (unchanged)
     assert_has_pairs()
     chunks = build_chunks(pairs_list=all_pairs, seg_len=OFFLINE_SEG_LEN, sample_rate=OFFLINE_SAMPLE_RATE)
-
     sig_x = tf.TensorSpec((OFFLINE_SEG_LEN, 1), tf.float32)
     sig_y = (tf.TensorSpec((OFFLINE_SEG_LEN, 1), tf.float32), tf.TensorSpec((), tf.float32))
     dsP = tf.data.Dataset.from_generator(lambda: segment_generator(OFFLINE_SEG_LEN, chunks, True,  OFFLINE_SAMPLE_RATE),
@@ -4760,29 +4776,20 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
             .prefetch(tf.data.AUTOTUNE)
 
     steps = min(approx_steps_from_chunks(chunks, OFFLINE_SEG_LEN, OFFLINE_SAMPLE_RATE, FINETUNE_BATCH_SIZE),
-                int(steps_cap))
+                int(OFFLINE_LEARNED_PICK_MASK_STEPS_CAP))
 
-    # Keep a very light audio loss to avoid degenerate solutions,
-    # but it’s OK to reduce it to almost-zero if you want strictly mask-only learning.
     loss_offlite = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE,
                                             stft_scales=((1024,256,1024),),
                                             l1_w=0.3, hf_w=2.0, stft_w=0.6, env_w=0.0)
 
-    student_train.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr, clipnorm=1.0),
-        loss=[loss_offlite, "binary_crossentropy"],
-        loss_weights=[1.0, 0.0],
-        metrics=[["mae"], []]
-    )
+    student_train.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=OFFLINE_LEARNED_PICK_MASK_LR, clipnorm=1.0),
+                          loss=[loss_offlite, "binary_crossentropy"],
+                          loss_weights=[1.0, 0.0],
+                          metrics=[["mae"], []])
 
-    student_train.fit(ds, epochs=int(epochs), steps_per_epoch=int(steps), verbose=1)
-    
-    # 1) Save a clean STATIC, teacher-free model (same graph as training core)
-    static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_STATIC_MODEL_FILENAME)
-    off_static_core.save(static_path)
-    print("✅ Saved base offline learned‑pick (static, teacher‑free):", static_path)
+    student_train.fit(ds, epochs=int(OFFLINE_LEARNED_PICK_MASK_EPOCHS), steps_per_epoch=int(steps), verbose=1)
 
-    # Export teacher-free dynamic with PickNormalizer path
+    # Export teacher-free dynamic with the same graph
     off_dyn_export = build_offline_model(dynamic_time=True,
                                          cap_mask_with_gate=False,
                                          use_pick_normalizer=True,
@@ -4794,6 +4801,11 @@ def make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS,
     out_dynamic = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
     off_dyn_export.save(out_dynamic)
     print("✅ Saved base offline learned‑pick (dynamic, teacher‑free):", out_dynamic)
+
+    # Save clean static, too (optional)
+    static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_STATIC_MODEL_FILENAME)
+    off_static_core.save(static_path)
+    print("✅ Saved base offline learned‑pick (static, teacher‑free):", static_path)
     return off_dyn_export
         
 def make_base_realtime_learned_pick(
@@ -6267,7 +6279,7 @@ def build_offline_model_learned_pick_tuning(
     # Mask head (same convs)
     m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_hf_mask_c1")(hf_in)
     m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits")(m)
+    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits", bias_initializer=tf.keras.initializers.Constant(OFFLINE_MASK_LOGIT_BIAS))(m)
     mask_pred = Activation("sigmoid", name="offline_hf_mask")(m)
 
     # Optional small floor BEFORE PickNormalizer; keep at 0.0 unless you really need it
@@ -6389,6 +6401,92 @@ def rebuild_learned_pick_dynamic_for_tuning(save_as=None):
         rt_dyn.save(save_as)
     return rt_dyn
 
+def _has_layer(model, name):
+    try:
+        model.get_layer(name)
+        return True
+    except Exception:
+        return False
+
+def print_offline_lp_status(model):
+    """
+    Print basic integrity info about the offline learned-pick dynamic model.
+    """
+    print("Model name:", model.name)
+    print("Contains offline_picknorm:", _has_layer(model, "offline_picknorm"))
+    # Show PN config if present
+    if _has_layer(model, "offline_picknorm"):
+        pn = model.get_layer("offline_picknorm")
+        cfg = pn.get_config()
+        print("PickNormalizer cfg:",
+              {k: cfg[k] for k in ("attack_ms","release_ms","pulse_ms","out_exp","knee","out_gain") if k in cfg})
+    # Show if a pre-floor exists
+    print("Has pre-floor layer (offline_hf_mask_floor):", _has_layer(model, "offline_hf_mask_floor"))
+    # Show HF and resbp scales for sanity
+    for lname in ("offline_hf_scale", "offline_resbp_scale"):
+        try:
+            w = model.get_layer(lname).get_weights()
+            val = float(w[0][0]) if w and w[0].size == 1 else None
+            print(f"{lname} scalar:", val)
+        except Exception:
+            pass
+
+def probe_offline_lp(model_path, src_wav, frames=96000, start=0):
+    """
+    Load the offline learned-pick dynamic model and print mask statistics on a short region.
+    Also writes small debug WAVs next to the source for quick listening.
+    """
+    import os
+    m = tf.keras.models.load_model(model_path, compile=False)
+    print_offline_lp_status(m)
+
+    dbg = build_offline_debug_model(m)
+
+    # Read mono block at 96k (resample if needed)
+    x2d, _ = sf.read(src_wav, start=start, frames=frames, dtype='float32', always_2d=True)
+    info = sf.info(src_wav); file_sr = info.samplerate
+    x = x2d[:,0]
+    if file_sr != OFFLINE_SAMPLE_RATE:
+        x = resample_to_model_sr(x, file_sr, OFFLINE_SAMPLE_RATE)
+    x = x.astype(np.float32, copy=False)[None, :, None]
+
+    # Force pick to isolate the pick-time behavior
+    style_true  = np.array([[1.0]], dtype=np.float32)
+    style_force = np.array([[1.0]], dtype=np.float32)
+
+    outs = dbg.predict([x, style_true, style_force], verbose=0)
+    # pick a mask tensor: prefer PN output if present
+    mask_name = None
+    for k in ("mask_norm", "mask_used", "hf_mask"):  # mask_used/hf_mask exist in baseline graphs
+        if k in outs:
+            mask_name = k; break
+
+    if mask_name is None:
+        print("No mask tensor found in debug outputs.")
+        return
+
+    msk = outs[mask_name][0, :, 0].astype(np.float32)
+    print(f"Mask '{mask_name}': min={float(msk.min()):.5f} mean={float(msk.mean()):.5f} max={float(msk.max()):.5f}")
+
+    # Also probe HF-pick and resbp stems
+    hf_key = "hf_pick" if ("hf_pick" in outs) else ("hf_scaled" if "hf_scaled" in outs else "hf_gated")
+    hf = outs[hf_key][0, :, 0].astype(np.float32)
+    rb = outs.get("resbp", None)
+    if rb is not None:
+        rb = rb[0, :, 0].astype(np.float32)
+    print(f"HF stem '{hf_key}': min={float(hf.min()):.5f} mean={float(hf.mean()):.5f} max={float(hf.max()):.5f}")
+    if rb is not None:
+        print(f"ResBP stem: min={float(rb.min()):.5f} mean={float(rb.mean()):.5f} max={float(rb.max()):.5f}")
+
+    # Write short WAVs for ears-on verification
+    out_dir = os.path.join(os.path.dirname(src_wav), "_lp_probe")
+    os.makedirs(out_dir, exist_ok=True)
+    sf.write(os.path.join(out_dir, "mask.wav"), msk, OFFLINE_SAMPLE_RATE, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "hf.wav"),   hf,  OFFLINE_SAMPLE_RATE, subtype='FLOAT')
+    if rb is not None:
+        sf.write(os.path.join(out_dir, "resbp.wav"), rb, OFFLINE_SAMPLE_RATE, subtype='FLOAT')
+    print("Wrote probe WAVs to", out_dir)
+
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
         resume, resume_ckpt = cleanup_and_prepare_train(
@@ -6499,11 +6597,17 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
+        
+        # probe_offline_lp(model_path=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME),
+        #                 src_wav=os.path.join(PICK_SRC_DIR, "take1_source.wav"),
+        #                 frames=96000, start=0)
+        # sys.exit(0)
+        
         # # 1) Rebuild with tighter PickNormalizer and gentle compressor
         # off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
-        #     pulse_ms=3.0,       # shorter pulse at 96k
-        #     out_exp=1.8,        # compress small/mids → less HF wash
-        #     knee=0.03,          # light deadband
+        #     pulse_ms=6.0,       # shorter pulse at 96k
+        #     out_exp=0.5,        # compress small/mids → less HF wash
+        #     knee=0.001,          # light deadband
         # )
 
         # # 2) Audition quickly on your demo pair
