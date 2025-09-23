@@ -175,10 +175,10 @@ OFFLINE_GATE_ENV_MS          = 0.35
 OFFLINE_GATE_DEPTH_SMOOTH_MS = 20.0
 
 REALTIME_PICK_NORMALIZATION_KNEE = 0.001
-OFFLINE_PICK_NORMALIZATION_KNEE = 0.01
+OFFLINE_PICK_NORMALIZATION_KNEE = 0.02
 
 REALTIME_PICK_NORMALIZATION_PULSE_MS = 4.0
-OFFLINE_PICK_NORMALIZATION_PULSE_MS = 3.0
+OFFLINE_PICK_NORMALIZATION_PULSE_MS = 6.0
 
 REALTIME_PICK_NORMALIZATION_OUT_EXP = 0.7
 OFFLINE_PICK_NORMALIZATION_OUT_EXP = 1.4
@@ -6298,8 +6298,11 @@ def build_offline_model_learned_pick_tuning(
         name="offline_picknorm"
     )(mask_pred)
 
-    # Use PickNormalizer path directly (no cap)
-    mask_used_for_gating = IdentityLayer(name="offline_hf_mask_used")(mask_norm)
+    mask_used_for_gating = MaskSaturatingCompressor(
+        p=OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER,  # you already set this to match realtime
+        post_gain=1.0,
+        name="offline_mask_compress"
+    )(mask_norm)
 
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_used_for_gating])
     hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, name="offline_hf_highpass")(hf_gated)
