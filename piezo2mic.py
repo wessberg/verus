@@ -6544,16 +6544,20 @@ def train_realtime_picklearn_from_offline():
     return rt_dyn
 
 
-def migrate_picklearn():
+def migrate_picklearn(do_offline=True, do_realtime=True):
     """
     Full migration flow:
       1) Train OFFLINE picklearn heads (sparkle+resonances) from mic.
       2) Distill REALTIME picklearn heads from OFFLINE picklearn.
     """
-    print("🔧 Training OFFLINE picklearn (heads only)…")
-    train_offline_picklearn_from_mic()
-    print("🔧 Training REALTIME picklearn (distillation)…")
-    train_realtime_picklearn_from_offline()
+    
+    if do_offline:
+        print("🔧 Training OFFLINE picklearn (heads only)…")
+        train_offline_picklearn_from_mic()
+    if do_realtime:
+        print("🔧 Training REALTIME picklearn (distillation)…")
+        train_realtime_picklearn_from_offline()
+    
     print("✅ Migration complete. You can now retire old HF/gate/learned‑mask paths.")
 
 
@@ -6755,7 +6759,11 @@ def main ():
         render_hf_shift_sweep_realtime(min_shift=rng[0], max_shift=rng[1])
         sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1] == "--migrate-picklearn":
-        migrate_picklearn()
+        args = set(sys.argv[2:])
+        do_offline   = ("--realtime-only" not in args)
+        do_realtime  = ("--offline-only"  not in args)
+        
+        migrate_picklearn(do_offline=do_offline, do_realtime=do_realtime)
         sys.exit(0)
     else:
         print("No command given.")
