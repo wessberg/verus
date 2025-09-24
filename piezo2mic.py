@@ -175,18 +175,6 @@ OFFLINE_GATE_RELEASE_MS     = 4.0
 OFFLINE_GATE_ENV_MS          = 0.35
 OFFLINE_GATE_DEPTH_SMOOTH_MS = 20.0
 
-REALTIME_PICK_NORMALIZATION_KNEE = 0.001
-OFFLINE_PICK_NORMALIZATION_KNEE = 0.02
-
-REALTIME_PICK_NORMALIZATION_PULSE_MS = 4.0
-OFFLINE_PICK_NORMALIZATION_PULSE_MS = 2.5
-
-REALTIME_PICK_NORMALIZATION_OUT_EXP = 0.7
-OFFLINE_PICK_NORMALIZATION_OUT_EXP = 1.4
-
-REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER=1.2
-OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER=0.6
-
 # Finetune mic-target denoise (preamp hiss cleanup)
 FINETUNE_TARGET_DENOISE_ENABLE      = True     # set False to disable
 FINETUNE_TARGET_DENOISE_HOP_MS      = 10.0     # STFT hop
@@ -285,16 +273,12 @@ RESBP_STRIKE_ENV_MS_REALTIME    = 4.0
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 
-# Learned-pick shaping defaults for realtime
-OFFLINE_MASK_LOGIT_BIAS = -5.0
-REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
-
 # Pick
-OFFLINE_PICK_ENV_FAST_MS = 0.25
+OFFLINE_PICK_ENV_FAST_MS = 0.1
 REALTIME_PICK_ENV_FAST_MS = 0.30
 
-OFFLINE_PICK_ENV_SLOW_MS = 12.0
-REALTIME_PICK_ENV_SLOW_MS = 12.0
+OFFLINE_PICK_ENV_SLOW_MS = 6.0
+REALTIME_PICK_ENV_SLOW_MS = 6.0
 
 OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.08
 REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
@@ -302,11 +286,11 @@ REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
 OFFLINE_PICK_SMOOTH_RELEASE_MS = 6.0
 REALTIME_PICK_SMOOTH_RELEASE_MS = 6.0
 
-OFFLINE_PICK_OUT_GAIN = 1.0
+OFFLINE_PICK_OUT_GAIN = 3.0
 REALTIME_PICK_OUT_GAIN = 1.0
 
-OFFLINE_PICK_KNEE = 0.3
-REALTIME_PICK_KNEE = 0.3
+OFFLINE_PICK_KNEE = 0.5
+REALTIME_PICK_KNEE = 0.5
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -5903,6 +5887,192 @@ def migrate_picklearn(do_offline=True, do_realtime=True):
     print("✅ Migration complete. You can now retire old HF/gate/learned‑mask paths.")
 
 
+
+def _copy_weights_by_name_excluding(dst_model, src_model, exclude_prefixes=None, verbose=False):
+    if exclude_prefixes is None:
+        exclude_prefixes = set()
+    src_layers = {l.name: l for l in src_model.layers}
+    matched = 0
+    skipped = 0
+    for l in dst_model.layers:
+        if any(l.name.startswith(pfx) for pfx in exclude_prefixes):
+            skipped += 1
+            continue
+        ref = src_layers.get(l.name)
+        if ref is None:
+            continue
+        sw = ref.get_weights()
+        dw = l.get_weights()
+        if len(sw) != len(dw):
+            continue
+        ok = True
+        for s, d in zip(sw, dw):
+            if np.shape(s) != np.shape(d):
+                ok = False
+                break
+        if not ok:
+            continue
+        l.set_weights(sw)
+        matched += 1
+    if verbose:
+        print(f"[copy_weights_excl] copied {matched} layer(s), skipped {skipped} by prefix into '{dst_model.name}'")
+    return matched, skipped
+
+def _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True):
+    """
+    kind: 'offline' or 'realtime'
+    mask_overrides: dict with any of:
+      - env_fast_ms, env_slow_ms, knee, smooth_attack_ms, smooth_release_ms, out_gain
+    Rebuilds a new dynamic model with the tweaked CausalPickRatioMask and returns it.
+    """
+    # Temporarily override the module-level constants that builders use
+    global OFFLINE_PICK_ENV_FAST_MS, OFFLINE_PICK_ENV_SLOW_MS, OFFLINE_PICK_KNEE
+    global OFFLINE_PICK_SMOOTH_ATTACK_MS, OFFLINE_PICK_SMOOTH_RELEASE_MS, OFFLINE_PICK_OUT_GAIN
+
+    global REALTIME_PICK_ENV_FAST_MS, REALTIME_PICK_ENV_SLOW_MS, REALTIME_PICK_KNEE
+    global REALTIME_PICK_SMOOTH_ATTACK_MS, REALTIME_PICK_SMOOTH_RELEASE_MS, REALTIME_PICK_OUT_GAIN
+
+    if kind not in ("offline", "realtime"):
+        raise ValueError("kind must be 'offline' or 'realtime'")
+
+    # Snapshot current defaults (so we can restore)
+    if kind == "offline":
+        snap = dict(
+            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
+            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
+            knee=OFFLINE_PICK_KNEE,
+            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
+            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
+            out_gain=OFFLINE_PICK_OUT_GAIN
+        )
+    else:
+        snap = dict(
+            env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
+            env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
+            knee=REALTIME_PICK_KNEE,
+            smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
+            smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
+            out_gain=REALTIME_PICK_OUT_GAIN
+        )
+
+    def _apply(overrides):
+        def pick(d, k, default):
+            return d[k] if k in d and d[k] is not None else default
+        if kind == "offline":
+            # Override module-level constants the builder reads
+            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = float(pick(overrides, "env_fast_ms",       snap["env_fast_ms"]))
+            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = float(pick(overrides, "env_slow_ms",       snap["env_slow_ms"]))
+            globals()["OFFLINE_PICK_KNEE"]              = float(pick(overrides, "knee",              snap["knee"]))
+            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = float(pick(overrides, "smooth_attack_ms",  snap["smooth_attack_ms"]))
+            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = float(pick(overrides, "smooth_release_ms", snap["smooth_release_ms"]))
+            globals()["OFFLINE_PICK_OUT_GAIN"]          = float(pick(overrides, "out_gain",          snap["out_gain"]))
+        else:
+            globals()["REALTIME_PICK_ENV_FAST_MS"]       = float(pick(overrides, "env_fast_ms",       snap["env_fast_ms"]))
+            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = float(pick(overrides, "env_slow_ms",       snap["env_slow_ms"]))
+            globals()["REALTIME_PICK_KNEE"]              = float(pick(overrides, "knee",              snap["knee"]))
+            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = float(pick(overrides, "smooth_attack_ms",  snap["smooth_attack_ms"]))
+            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = float(pick(overrides, "smooth_release_ms", snap["smooth_release_ms"]))
+            globals()["REALTIME_PICK_OUT_GAIN"]          = float(pick(overrides, "out_gain",          snap["out_gain"]))
+
+    def _restore():
+        if kind == "offline":
+            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = snap["env_fast_ms"]
+            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = snap["env_slow_ms"]
+            globals()["OFFLINE_PICK_KNEE"]              = snap["knee"]
+            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = snap["smooth_attack_ms"]
+            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = snap["smooth_release_ms"]
+            globals()["OFFLINE_PICK_OUT_GAIN"]          = snap["out_gain"]
+        else:
+            globals()["REALTIME_PICK_ENV_FAST_MS"]       = snap["env_fast_ms"]
+            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = snap["env_slow_ms"]
+            globals()["REALTIME_PICK_KNEE"]              = snap["knee"]
+            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = snap["smooth_attack_ms"]
+            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = snap["smooth_release_ms"]
+            globals()["REALTIME_PICK_OUT_GAIN"]          = snap["out_gain"]
+
+    # Apply overrides → build a fresh dynamic model that bakes them into the mask's FIR lengths
+    _apply(mask_overrides or {})
+    try:
+        if kind == "offline":
+            new_dyn = build_offline_model(dynamic_time=bool(dynamic_time))
+        else:
+            # Teacher-free realtime dynamic (same graph as deployed)
+            new_dyn = build_realtime_model(offline=None, dynamic_time=bool(dynamic_time))
+    finally:
+        # Always restore globals so your training code remains unaffected
+        _restore()
+
+    return new_dyn
+
+def build_mask_tweaked_dynamic(kind="realtime", mask_overrides=None, use_finetuned=False, verbose=True):
+    """
+    - Loads the latest trained dynamic model for 'kind'
+    - Rebuilds a new dynamic model with tweaked mask parameters
+    - Copies all other weights by name, skipping the mask layer
+    Returns the tweaked dynamic model (ready for predict/stems).
+    """
+    if mask_overrides is None:
+        mask_overrides = {}
+    # Load baseline to source weights
+    dyn_path = _select_stems_model_path(kind, use_finetuned=bool(use_finetuned))
+    if dyn_path is None or not os.path.exists(dyn_path):
+        raise FileNotFoundError(f"No dynamic model found for kind='{kind}'. Train or export models first.")
+    src_dyn = tf.keras.models.load_model(dyn_path, compile=False)
+
+    # Build new dynamic with overridden mask config
+    tweaked = _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True)
+
+    # Copy weights for all layers except the mask (its kernel shapes likely changed)
+    mask_name = "offline_pick_mask" if kind == "offline" else "realtime_pick_mask"
+    _copy_weights_by_name_excluding(
+        dst_model=tweaked, src_model=src_dyn,
+        exclude_prefixes={mask_name},
+        verbose=bool(verbose)
+    )
+
+    if verbose:
+        print(f"[mask-tweak] Built tweaked dynamic ({kind}) with overrides={mask_overrides}")
+    return tweaked
+
+def quick_mask_tweak_stems(kind="realtime",
+                           mask_overrides=None,
+                           out_dir=None,
+                           use_finetuned=False,
+                           sec=LONG_DEMO_SEC,
+                           offset_sec=LONG_DEMO_OFFSET_SEC):
+    """
+    Convenience: build tweaked model and render stems on the demo pair.
+    """
+    if mask_overrides is None:
+        mask_overrides = {}
+    assert_has_pairs()
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    sample_rate = OFFLINE_SAMPLE_RATE if kind == "offline" else REALTIME_SAMPLE_RATE
+
+    if out_dir is None:
+        tag = "_".join(f"{k}={mask_overrides[k]}" for k in sorted(mask_overrides.keys()))
+        out_dir = os.path.join(DEMOS_OUT_DIR, "mask_tweak", kind, tag.replace(" ", ""))
+
+    tweaked = build_mask_tweaked_dynamic(kind=kind,
+                                         mask_overrides=mask_overrides,
+                                         use_finetuned=bool(use_finetuned),
+                                         verbose=True)
+
+    # Build a debug model exposing stems and render
+    dbg = build_offline_debug_model(tweaked) if kind == "offline" else build_realtime_debug_model(tweaked)
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"[mask-tweak] Rendering stems to: {out_dir}")
+    render_isolated_stems(
+        debug_model=dbg,
+        path_src=src, path_tgt=tgt,
+        out_dir=out_dir,
+        sample_rate=sample_rate,
+        sec=float(sec), offset_sec=float(offset_sec),
+        use_finetuned=bool(use_finetuned)
+    )
+    return tweaked, out_dir
+
+
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
         resume, resume_ckpt = cleanup_and_prepare_train(
@@ -5991,6 +6161,18 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
+        
+        mask_overrides = dict(
+            knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
+            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
+            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
+            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
+            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
+            out_gain=OFFLINE_PICK_OUT_GAIN
+        )
+        quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
+        sys.exit(0)
+        
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
         # --both             → baseline + finetuned
