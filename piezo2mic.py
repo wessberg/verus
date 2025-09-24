@@ -248,7 +248,7 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 10.0
 REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -277,19 +277,19 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 OFFLINE_PICK_ENV_FAST_MS = 0.1
 REALTIME_PICK_ENV_FAST_MS = 0.30
 
-OFFLINE_PICK_ENV_SLOW_MS = 6.0
+OFFLINE_PICK_ENV_SLOW_MS = 60.0
 REALTIME_PICK_ENV_SLOW_MS = 6.0
 
 OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.08
 REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
 
-OFFLINE_PICK_SMOOTH_RELEASE_MS = 6.0
+OFFLINE_PICK_SMOOTH_RELEASE_MS = 60.0
 REALTIME_PICK_SMOOTH_RELEASE_MS = 6.0
 
-OFFLINE_PICK_OUT_GAIN = 3.0
-REALTIME_PICK_OUT_GAIN = 1.0
+OFFLINE_PICK_OUT_GAIN = 10.0
+REALTIME_PICK_OUT_GAIN = 5.0
 
-OFFLINE_PICK_KNEE = 0.5
+OFFLINE_PICK_KNEE = 10.5
 REALTIME_PICK_KNEE = 0.5
 
 # Finetune params
@@ -370,11 +370,11 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
-REALTIME_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
 
-FINETUNE_OFFLINE_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
-FINETUNE_REALTIME_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -401,11 +401,11 @@ SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
 DEMO_SEC        = 10
-DEMO_OFFSET_SEC = 600
+DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
 LONG_DEMO_SEC        = 10
-LONG_DEMO_OFFSET_SEC = 600
+LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
@@ -741,7 +741,7 @@ class LearnedModalBank(tf.keras.layers.Layer):
         }
 
 
-def _pick_sparkle(prefix, hf_in, mask, filters=16):
+def _pick_attack(prefix, hf_in, mask, filters=16):
     """
     Tiny causal HF synthesis gated by the analytic pick mask.
     """
@@ -749,7 +749,7 @@ def _pick_sparkle(prefix, hf_in, mask, filters=16):
     x = causal_sep_conv(x, filters, 7, 1, name=f"{prefix}_picklearn_c1", activation="relu")
     x = causal_sep_conv(x, filters, 7, 2, name=f"{prefix}_picklearn_c2", activation="relu")
     x = Conv1D(1, 1, padding="same", name=f"{prefix}_picklearn_out")(x)
-    return IrScale(init=1.0, name=f"{prefix}_picklearn_sparkle_scale")(x)
+    return IrScale(init=1.0, name=f"{prefix}_picklearn_pickattack_scale")(x)
 
 
 def _reson_learn_offline(inp, mask):
@@ -3873,11 +3873,6 @@ def build_offline_model(dynamic_time=False,
                                   lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
                                   name="piezo2mic_offline_picklearn",
                                   coloreq_trainable=False):
-    """
-    NEW base OFFLINE: main_core + pick_scale * (sparkle + learned resonances).
-    No old HF gate/mask, no old fixed ResBP in the mix.
-    Names of backbone layers match the old base to copy weights by name.
-    """
     T   = None if dynamic_time else OFFLINE_SEG_LEN
     inp = Input(shape=(T,1), name="offline_piezo_input")
 
@@ -3938,16 +3933,16 @@ def build_offline_model(dynamic_time=False,
                              prefix="offline"
             )
 
-    # Pick branch: sparkle + learned resonances, pick‑only by style
+    # Pick branch: pick attack + pick resonances, pick‑only by style
     hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
-    sparkle  = _pick_sparkle("offline", hf_in, mask)
+    pickattack  = _pick_attack("offline", hf_in, mask)
     pickreso = _reson_learn_offline(inp, mask)
-    pick_pred= Add(name="offline_picklearn_pred_raw")([sparkle, pickreso])
-    pick_pred= Multiply(name="offline_picklearn_pred")([pick_pred, style_time])
+    
+    # Style-gate each sub-branch so they are only present in pick style
+    pickattack_g  = Multiply(name="offline_pickattack_gated")([pickattack,  style_time])
+    pickreso_g = Multiply(name="offline_pickreso_gated")([pickreso, style_time])
 
-    pick_scale = IrScale(init=1.0, name="offline_pick_scale")(pick_pred)
-
-    out = Add(name="offline_mix_core_plus_pick")([main_core, pick_scale])
+    out = Add(name="offline_mix_core_plus_pick")([main_core, pickattack_g, pickreso_g])
 
     out = add_coloreq(out, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
@@ -3960,10 +3955,6 @@ def build_realtime_model(offline=None,
                                    dynamic_time=False,
                                    name="piezo2mic_realtime_picklearn",
                                    coloreq_trainable=False):
-    """
-    NEW base REALTIME: y = y_main + IR + pick_scale * (sparkle + learned resonances).
-    No old HF stem in the mix.
-    """
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -4061,15 +4052,16 @@ def build_realtime_model(offline=None,
                              prefix="realtime"
             )
 
-    # Learned pick: sparkle + learned resonances
+    # Learned pick: pick attack + pick resonances
     hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-    sparkle  = _pick_sparkle("realtime", hf_in, mask)
+    pickattack  = _pick_attack("realtime", hf_in, mask)
     pickreso = _reson_learn_realtime(inp, mask)
-    pick_pred= Add(name="realtime_picklearn_pred_raw")([sparkle, pickreso])
-    pick_pred= Multiply(name="realtime_picklearn_pred")([pick_pred, style_scalar_b3])
-    pick_scale = IrScale(init=1.0, name="realtime_pick_scale")(pick_pred)
+    
+    # Gate both by style
+    pickattack_g  = Multiply(name="realtime_pickattack_gated")([pickattack,  style_scalar_b3])
+    pickreso_g = Multiply(name="realtime_pickreso_gated")([pickreso, style_scalar_b3])
 
-    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pick_scale])
+    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pickattack_g, pickreso_g])
 
     y_final = add_coloreq(y_final, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
@@ -4645,7 +4637,7 @@ def set_trainable_layers(model,
     """
     Freeze everything, then selectively unfreeze groups:
       - enable_film:    Dense layers generating FiLM params (name contains 'film_dense')
-      - enable_scales:  All IrScale except coloreq (sparkle_scale, pick_scale, ir_scale, resbp_scale, etc.)
+      - enable_scales:  All IrScale except coloreq (pickattack_scale, pickreso_scale, ir_scale, etc.)
       - enable_coloreq: Only coloreq IrScale bands (name starts with '*_coloreq_g_')
       - enable_mask_head: hf mask tiny conv stack (offline_*_hf_mask_* and realtime_* equivalents)
       - enable_heads:   final pick/finger heads (Conv1D layers named '*_final_pick'/'*_final_finger')
@@ -4766,33 +4758,33 @@ def _boost_scales(model, sample_rate, use_finetuned=False):
     Only applies when the *_BOOST_DB values exceed 0.0.
     """
 
-    pick_scale_layer_name = "offline_pick_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pick_scale"
-    ir_scale_layer_name = "realtime_ir_scale"
+    pickattack_scale_layer_name = "offline_pickattack_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pickattack_scale"
     pickreso_boost_layer_name = "offline_pickreso_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pickreso_scale"
+    ir_scale_layer_name = "realtime_ir_scale"
 
-    pick_boost_db = 0.0
-    ir_boost_db = 0.0
+    pickattack_boost_db = 0.0
     pickreso_boost_db = 0.0
+    ir_boost_db = 0.0
 
     if use_finetuned:
         if sample_rate == OFFLINE_SAMPLE_RATE:
-            pick_boost_db = FINETUNE_OFFLINE_PICK_BOOST_DB
+            pickattack_boost_db = FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB
             pickreso_boost_db = FINETUNE_OFFLINE_PICK_RESO_BOOST_DB
         elif sample_rate == REALTIME_SAMPLE_RATE:
-            pick_boost_db = FINETUNE_REALTIME_PICK_BOOST_DB
+            pickattack_boost_db = FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB
             ir_boost_db = FINETUNE_REALTIME_IR_BOOST_DB
             pickreso_boost_db = FINETUNE_REALTIME_PICK_RESO_BOOST_DB
     else:
         if (sample_rate == OFFLINE_SAMPLE_RATE):
-            pick_boost_db = OFFLINE_PICK_BOOST_DB
+            pickattack_boost_db = OFFLINE_PICK_ATTACK_BOOST_DB
             pickreso_boost_db = OFFLINE_PICK_RESO_BOOST_DB
         elif (sample_rate == REALTIME_SAMPLE_RATE):
-            pick_boost_db = REALTIME_PICK_BOOST_DB
+            pickattack_boost_db = REALTIME_PICK_ATTACK_BOOST_DB
             ir_boost_db = REALTIME_IR_BOOST_DB
             pickreso_boost_db = REALTIME_PICK_RESO_BOOST_DB
     
-    if pick_boost_db != 0.0:
-        model = boost_scale_in_model(model, pick_scale_layer_name, pick_boost_db)
+    if pickattack_boost_db != 0.0:
+        model = boost_scale_in_model(model, pickattack_scale_layer_name, pickattack_boost_db)
         
     if (ir_boost_db != 0.0):
         model = boost_scale_in_model(model, ir_scale_layer_name, gain_db=ir_boost_db)
@@ -4814,9 +4806,8 @@ def build_offline_debug_model(model):
     add("main_pick",    "offline_pick_contrib")
     add("main_finger",  "offline_finger_contrib")
     add("picklearn",    "offline_picklearn_pred")
-    add("pick_scale",  "offline_pick_scale")
     add("pickreso",     "offline_pickreso_scale")
-    add("sparkle",      "offline_picklearn_sparkle")  # NEW
+    add("pickattack",   "offline_pickattack_scale")
     add("style_pred",   "offline_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
@@ -4831,9 +4822,8 @@ def build_realtime_debug_model(model):
     add("main_finger",  "realtime_finger_contrib")
     add("ir_only",      "realtime_ir_matchlen")
     add("picklearn",    "realtime_picklearn_pred")
-    add("pick_scale",  "realtime_pick_scale")
     add("pickreso",     "realtime_pickreso_scale")
-    add("sparkle",      "realtime_picklearn_sparkle")  # NEW
+    add("pickattack",    "realtime_pickattack_scale")  # NEW
     add("style_pred",   "realtime_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
 
@@ -5019,18 +5009,18 @@ def render_isolated_stems(debug_model,
             pick_only  = core_of("main_pick")   if "main_pick"   in outs else np.zeros_like(y_full)
             fing_only  = core_of("main_finger") if "main_finger" in outs else np.zeros_like(y_full)
             picklearn  = core_of("picklearn")   if "picklearn"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
-            pick_amt   = core_of("pick_scale") if "pick_scale" in outs else picklearn               # post IrScale = in the real mix
+            pickattack  = core_of("pickattack")  if "pickattack"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
+            pickreso  = core_of("pickreso")  if "pickreso"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
             ir_only    = core_of("ir_only")     if "ir_only"     in outs else np.zeros_like(y_full)
 
-            # Correct sum-check: offline = main_core + pick_scale; realtime adds IR
-            sum_est = main_c + pick_amt + ir_only
+            sum_est = main_c + pickattack + pickreso + ir_only
 
             # Diagnostics
             print(f"[stems:{pass_key}] "
                 f"RMS full={_rms(y_full):.6f}  main={_rms(main_c):.6f}  "
                 f"pick={_rms(pick_only):.6f}  fing={_rms(fing_only):.6f}  "
-                f"picklearn(pre)={_rms(picklearn):.6f}  pick_scale={_rms(pick_amt):.6f}  "
-                f"ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
+                f"picklearn(pre)={_rms(picklearn):.6f}  pick_attack={_rms(pickattack):.6f}  "
+                f"pick_reso={_rms(pickreso):.6f}  ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
 
             # Writes
             wset["full"].write(y_full)
@@ -5038,12 +5028,12 @@ def render_isolated_stems(debug_model,
             wset["pick"].write(pick_only)
             wset["fing"].write(fing_only)
 
-            # Optional: write sparkle if you added it to debug model
-            if "sparkle" in outs:
-                if wset.get("sparkle") is None:
-                    fn = "stem_sparkle_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
-                    wset["sparkle"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["sparkle"].write(core_of("sparkle"))
+            # Optional: write pickattack if you added it to debug model
+            if "pickattack" in outs:
+                if wset.get("pickattack") is None:
+                    fn = "stem_pickattack_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["pickattack"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["pickattack"].write(core_of("pickattack"))
 
             if "picklearn" in outs:
                 if wset["picklearn"] is None:
@@ -5702,7 +5692,7 @@ def _make_realtime_dual_ds(batch_size):
 
 def train_offline_picklearn_from_mic():
     """
-    Train only the OFFLINE pick branches (sparkle + learned resonances) vs mic target.
+    Train only the OFFLINE pick branches (pick attack + pick reso) vs mic target.
     """
     base_off_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
     if not os.path.exists(base_off_path):
@@ -5712,7 +5702,7 @@ def train_offline_picklearn_from_mic():
     stu = build_offline_model(dynamic_time=False)
     copy_weights_by_name(stu, base_off, verbose=True)
 
-    _freeze_only_prefixes(stu, prefixes=("offline_picklearn_", "offline_pickreso_", "offline_pick_scale"))
+    _freeze_only_prefixes(stu, prefixes=("offline_picklearn_", "offline_pickreso_", "offline_pickattack_"))
 
     ds, steps = _make_offline_mixed_ds(FINETUNE_BATCH_SIZE)
 
@@ -5783,10 +5773,9 @@ def train_realtime_picklearn_from_offline():
     rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
     copy_weights_by_name(rt, rt_src, verbose=True)
 
-    # IMPORTANT: enable only picklearn/pickreso stacks + pick_scale in the STUDENT before wrapping
     _freeze_only_prefixes(
         rt,
-        prefixes=("realtime_picklearn_", "realtime_pickreso_", "realtime_pick_scale")
+        prefixes=("realtime_picklearn_", "realtime_pickreso_", "realtime_pickattack_")
     )
 
     # Wrapper inputs (fresh keras.Inputs so both student and teacher sit in one graph)
@@ -5800,10 +5789,7 @@ def train_realtime_picklearn_from_offline():
     y_audio, y_style = rt([rt_inp, off_inp, style_true_in, style_force_in])
 
     # Teacher picklearn stem at 96k (select best available node), then decimate-by-2 to 48k
-    if any(l.name == "offline_picklearn_pred" for l in off_causal.layers):
-        pick_t_node = off_causal.get_layer("offline_picklearn_pred").output
-    else:
-        pick_t_node = off_causal.get_layer("offline_pick_scale").output
+    pick_t_node = off_causal.get_layer("offline_picklearn_pred").output
 
     teacher_pick = tf.keras.models.Model(
         inputs=off_causal.inputs,
@@ -5873,7 +5859,7 @@ def train_realtime_picklearn_from_offline():
 def migrate_picklearn(do_offline=True, do_realtime=True):
     """
     Full migration flow:
-      1) Train OFFLINE picklearn heads (sparkle+resonances) from mic.
+      1) Train OFFLINE picklearn heads (pick attack + pick resonances) from mic.
       2) Distill REALTIME picklearn heads from OFFLINE picklearn.
     """
     
@@ -5885,7 +5871,6 @@ def migrate_picklearn(do_offline=True, do_realtime=True):
         train_realtime_picklearn_from_offline()
     
     print("✅ Migration complete. You can now retire old HF/gate/learned‑mask paths.")
-
 
 
 def _copy_weights_by_name_excluding(dst_model, src_model, exclude_prefixes=None, verbose=False):
@@ -5908,71 +5893,56 @@ def _copy_weights_by_name_excluding(dst_model, src_model, exclude_prefixes=None,
         ok = True
         for s, d in zip(sw, dw):
             if np.shape(s) != np.shape(d):
-                ok = False
-                break
+                ok = False; break
         if not ok:
             continue
         l.set_weights(sw)
         matched += 1
     if verbose:
-        print(f"[copy_weights_excl] copied {matched} layer(s), skipped {skipped} by prefix into '{dst_model.name}'")
+        print(f"[copy_weights_excl] copied {matched}, skipped {skipped}")
     return matched, skipped
 
 def _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True):
-    """
-    kind: 'offline' or 'realtime'
-    mask_overrides: dict with any of:
-      - env_fast_ms, env_slow_ms, knee, smooth_attack_ms, smooth_release_ms, out_gain
-    Rebuilds a new dynamic model with the tweaked CausalPickRatioMask and returns it.
-    """
-    # Temporarily override the module-level constants that builders use
+    # kind ∈ {"offline","realtime"}
     global OFFLINE_PICK_ENV_FAST_MS, OFFLINE_PICK_ENV_SLOW_MS, OFFLINE_PICK_KNEE
     global OFFLINE_PICK_SMOOTH_ATTACK_MS, OFFLINE_PICK_SMOOTH_RELEASE_MS, OFFLINE_PICK_OUT_GAIN
-
     global REALTIME_PICK_ENV_FAST_MS, REALTIME_PICK_ENV_SLOW_MS, REALTIME_PICK_KNEE
     global REALTIME_PICK_SMOOTH_ATTACK_MS, REALTIME_PICK_SMOOTH_RELEASE_MS, REALTIME_PICK_OUT_GAIN
 
     if kind not in ("offline", "realtime"):
         raise ValueError("kind must be 'offline' or 'realtime'")
 
-    # Snapshot current defaults (so we can restore)
     if kind == "offline":
-        snap = dict(
-            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
-            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
-            knee=OFFLINE_PICK_KNEE,
-            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
-            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
-            out_gain=OFFLINE_PICK_OUT_GAIN
-        )
+        snap = dict(env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
+                    env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
+                    knee=OFFLINE_PICK_KNEE,
+                    smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
+                    smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
+                    out_gain=OFFLINE_PICK_OUT_GAIN)
     else:
-        snap = dict(
-            env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
-            env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
-            knee=REALTIME_PICK_KNEE,
-            smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
-            smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
-            out_gain=REALTIME_PICK_OUT_GAIN
-        )
+        snap = dict(env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
+                    env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
+                    knee=REALTIME_PICK_KNEE,
+                    smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
+                    smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
+                    out_gain=REALTIME_PICK_OUT_GAIN)
 
-    def _apply(overrides):
-        def pick(d, k, default):
-            return d[k] if k in d and d[k] is not None else default
+    def _apply(d):
+        def get(k): return d[k] if (d is not None and k in d and d[k] is not None) else snap[k]
         if kind == "offline":
-            # Override module-level constants the builder reads
-            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = float(pick(overrides, "env_fast_ms",       snap["env_fast_ms"]))
-            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = float(pick(overrides, "env_slow_ms",       snap["env_slow_ms"]))
-            globals()["OFFLINE_PICK_KNEE"]              = float(pick(overrides, "knee",              snap["knee"]))
-            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = float(pick(overrides, "smooth_attack_ms",  snap["smooth_attack_ms"]))
-            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = float(pick(overrides, "smooth_release_ms", snap["smooth_release_ms"]))
-            globals()["OFFLINE_PICK_OUT_GAIN"]          = float(pick(overrides, "out_gain",          snap["out_gain"]))
+            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = float(get("env_fast_ms"))
+            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = float(get("env_slow_ms"))
+            globals()["OFFLINE_PICK_KNEE"]              = float(get("knee"))
+            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = float(get("smooth_attack_ms"))
+            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = float(get("smooth_release_ms"))
+            globals()["OFFLINE_PICK_OUT_GAIN"]          = float(get("out_gain"))
         else:
-            globals()["REALTIME_PICK_ENV_FAST_MS"]       = float(pick(overrides, "env_fast_ms",       snap["env_fast_ms"]))
-            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = float(pick(overrides, "env_slow_ms",       snap["env_slow_ms"]))
-            globals()["REALTIME_PICK_KNEE"]              = float(pick(overrides, "knee",              snap["knee"]))
-            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = float(pick(overrides, "smooth_attack_ms",  snap["smooth_attack_ms"]))
-            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = float(pick(overrides, "smooth_release_ms", snap["smooth_release_ms"]))
-            globals()["REALTIME_PICK_OUT_GAIN"]          = float(pick(overrides, "out_gain",          snap["out_gain"]))
+            globals()["REALTIME_PICK_ENV_FAST_MS"]       = float(get("env_fast_ms"))
+            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = float(get("env_slow_ms"))
+            globals()["REALTIME_PICK_KNEE"]              = float(get("knee"))
+            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = float(get("smooth_attack_ms"))
+            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = float(get("smooth_release_ms"))
+            globals()["REALTIME_PICK_OUT_GAIN"]          = float(get("out_gain"))
 
     def _restore():
         if kind == "offline":
@@ -5990,48 +5960,28 @@ def _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True):
             globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = snap["smooth_release_ms"]
             globals()["REALTIME_PICK_OUT_GAIN"]          = snap["out_gain"]
 
-    # Apply overrides → build a fresh dynamic model that bakes them into the mask's FIR lengths
     _apply(mask_overrides or {})
     try:
         if kind == "offline":
             new_dyn = build_offline_model(dynamic_time=bool(dynamic_time))
         else:
-            # Teacher-free realtime dynamic (same graph as deployed)
             new_dyn = build_realtime_model(offline=None, dynamic_time=bool(dynamic_time))
     finally:
-        # Always restore globals so your training code remains unaffected
         _restore()
-
     return new_dyn
 
 def build_mask_tweaked_dynamic(kind="realtime", mask_overrides=None, use_finetuned=False, verbose=True):
-    """
-    - Loads the latest trained dynamic model for 'kind'
-    - Rebuilds a new dynamic model with tweaked mask parameters
-    - Copies all other weights by name, skipping the mask layer
-    Returns the tweaked dynamic model (ready for predict/stems).
-    """
-    if mask_overrides is None:
-        mask_overrides = {}
-    # Load baseline to source weights
-    dyn_path = _select_stems_model_path(kind, use_finetuned=bool(use_finetuned))
-    if dyn_path is None or not os.path.exists(dyn_path):
-        raise FileNotFoundError(f"No dynamic model found for kind='{kind}'. Train or export models first.")
-    src_dyn = tf.keras.models.load_model(dyn_path, compile=False)
-
-    # Build new dynamic with overridden mask config
+    dpath = _select_stems_model_path(kind, use_finetuned=bool(use_finetuned))
+    if dpath is None or not os.path.exists(dpath):
+        raise FileNotFoundError("Trained dynamic model not found; train/export first.")
+    src_dyn = tf.keras.models.load_model(dpath, compile=False)
     tweaked = _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True)
-
-    # Copy weights for all layers except the mask (its kernel shapes likely changed)
     mask_name = "offline_pick_mask" if kind == "offline" else "realtime_pick_mask"
-    _copy_weights_by_name_excluding(
-        dst_model=tweaked, src_model=src_dyn,
-        exclude_prefixes={mask_name},
-        verbose=bool(verbose)
-    )
-
+    _copy_weights_by_name_excluding(tweaked, src_dyn, exclude_prefixes={mask_name}, verbose=bool(verbose))
     if verbose:
-        print(f"[mask-tweak] Built tweaked dynamic ({kind}) with overrides={mask_overrides}")
+        l = tweaked.get_layer(mask_name)
+        print(f"[mask] knee={getattr(l, 'knee', None)} fastL={int(l.k_fast.shape[0])} slowL={int(l.k_slow.shape[0])} "
+              f"attL={int(l.k_att.shape[0])} relL={int(l.k_rel.shape[0])}")
     return tweaked
 
 def quick_mask_tweak_stems(kind="realtime",
@@ -6162,16 +6112,16 @@ def main ():
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
         
-        mask_overrides = dict(
-            knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
-            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
-            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
-            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
-            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
-            out_gain=OFFLINE_PICK_OUT_GAIN
-        )
-        quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
-        sys.exit(0)
+        # mask_overrides = dict(
+        #     knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
+        #     env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
+        #     env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
+        #     smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
+        #     smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
+        #     out_gain=OFFLINE_PICK_OUT_GAIN
+        # )
+        # quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
+        # sys.exit(0)
         
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
