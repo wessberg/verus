@@ -260,11 +260,11 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
-REALTIME_PICK_RESO_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
-FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 100.0
-FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
+FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
@@ -288,6 +288,25 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 # Learned-pick shaping defaults for realtime
 OFFLINE_MASK_LOGIT_BIAS = -5.0
 REALTIME_MASK_LOGIT_BIAS = -5.0  # more negative initializes mask closed
+
+# Pick
+OFFLINE_PICK_ENV_FAST_MS = 0.25
+REALTIME_PICK_ENV_FAST_MS = 0.30
+
+OFFLINE_PICK_ENV_SLOW_MS = 12.0
+REALTIME_PICK_ENV_SLOW_MS = 12.0
+
+OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.08
+REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
+
+OFFLINE_PICK_SMOOTH_RELEASE_MS = 6.0
+REALTIME_PICK_SMOOTH_RELEASE_MS = 6.0
+
+OFFLINE_PICK_OUT_GAIN = 1.0
+REALTIME_PICK_OUT_GAIN = 1.0
+
+OFFLINE_PICK_KNEE = 0.3
+REALTIME_PICK_KNEE = 0.3
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -356,8 +375,8 @@ REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
-REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
-FINETUNE_REALTIME_IR_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 1.5
+REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+FINETUNE_REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
 
 REALTIME_LP_ORDER   = 257 
 
@@ -367,11 +386,11 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 32
-REALTIME_PICK_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 32
+OFFLINE_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+REALTIME_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
 
-FINETUNE_OFFLINE_PICK_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
-FINETUNE_REALTIME_PICK_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
+FINETUNE_OFFLINE_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+FINETUNE_REALTIME_PICK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -679,18 +698,17 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
             **super().get_config()
         }
 
-
-def _pick_mask_engine(inp, sample_rate, prefix):
+def _pick_mask_engine(inp, sample_rate, prefix, hp_order=129, env_fast_ms=0.30, env_slow_ms=12.0, knee=0.1, smooth_attack_ms=0.08, smooth_release_ms=6.0, out_gain=1.0):
     return CausalPickRatioMask(
         sample_rate=sample_rate,
         hp_cut_hz=hp_cutoff_for_sr(sample_rate),
-        hp_order=129,
-        env_fast_ms=0.30 if int(sample_rate)==REALTIME_SAMPLE_RATE else 0.25,
-        env_slow_ms=12.0,
-        knee=0.1,
-        smooth_attack_ms=0.08,
-        smooth_release_ms=6.0,
-        out_gain=1.0,
+        hp_order=hp_order,
+        env_fast_ms=env_fast_ms,
+        env_slow_ms=env_slow_ms,
+        knee=knee,
+        smooth_attack_ms=smooth_attack_ms,
+        smooth_release_ms=smooth_release_ms,
+        out_gain=out_gain,
         name=f"{prefix}_pick_mask"
     )(inp)
 
@@ -747,55 +765,55 @@ def _pick_sparkle(prefix, hf_in, mask, filters=16):
     x = causal_sep_conv(x, filters, 7, 1, name=f"{prefix}_picklearn_c1", activation="relu")
     x = causal_sep_conv(x, filters, 7, 2, name=f"{prefix}_picklearn_c2", activation="relu")
     x = Conv1D(1, 1, padding="same", name=f"{prefix}_picklearn_out")(x)
-    return IrScale(init=1.0, name=f"{prefix}_picklearn_hf_scale")(x)
+    return IrScale(init=1.0, name=f"{prefix}_picklearn_sparkle_scale")(x)
 
 
 def _reson_learn_offline(inp, mask):
     sr = OFFLINE_SAMPLE_RATE
-    onset = Lambda(gate_onset, name="offline_reslearn_onset")(mask)
+    onset = Lambda(gate_onset, name="offline_pickreso_onset")(mask)
     strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_OFFLINE, sample_rate=sr, Lmax=4096,
-                               name="offline_reslearn_onset_pulse")(onset)
+                               name="offline_pickreso_onset_pulse")(onset)
     ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE),
                       high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_OFFLINE),
                       order=OFFLINE_PICK_RESO_BP_ORDER, sample_rate=sr,
-                      name="offline_reslearn_ctrl_bp")(inp)
+                      name="offline_pickreso_ctrl_bp")(inp)
     amp = CausalExpSmoother(time_const_ms=4.0, sample_rate=sr, Lmax=1024,
-                            name="offline_reslearn_ctrl_env")(Abs1D()(ana))
-    amp = Lambda(clip_01x4, name="offline_reslearn_ctrl_gain")(amp)
-    exc = Multiply(name="offline_reslearn_excite")([strike, amp])
+                            name="offline_pickreso_ctrl_env")(Abs1D()(ana))
+    amp = Lambda(clip_01x4, name="offline_pickreso_ctrl_gain")(amp)
+    exc = Multiply(name="offline_pickreso_excite")([strike, amp])
     modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
                              decays_ms =RESBP_MODAL_DECAYS_MS_OFFLINE,
                              length    =RESBP_MODAL_LEN_OFFLINE,
                              sample_rate=sr,
-                             name="offline_reslearn_modal")(exc)
-    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="offline_reslearn_mix")(modes)
+                             name="offline_pickreso_modal")(exc)
+    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="offline_pickreso_mix")(modes)
     mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE), order=65,
-                       name="offline_reslearn_post_hp")(mixed)
-    return IrScale(init=1.0, name="offline_reslearn_scale")(mixed)
+                       name="offline_pickreso_post_hp")(mixed)
+    return IrScale(init=1.0, name="offline_pickreso_scale")(mixed)
 
 
 def _reson_learn_realtime(inp, mask):
     sr = REALTIME_SAMPLE_RATE
-    onset = Lambda(gate_onset, name="realtime_reslearn_onset")(mask)
+    onset = Lambda(gate_onset, name="realtime_pickreso_onset")(mask)
     strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_REALTIME, sample_rate=sr, Lmax=512,
-                               name="realtime_reslearn_onset_pulse")(onset)
+                               name="realtime_pickreso_onset_pulse")(onset)
     ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME),
                       high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_REALTIME),
                       order=REALTIME_PICK_RESO_BP_ORDER, sample_rate=sr,
-                      name="realtime_reslearn_ctrl_bp")(inp)
+                      name="realtime_pickreso_ctrl_bp")(inp)
     amp = CausalExpSmoother(time_const_ms=3.0, sample_rate=sr, Lmax=256,
-                            name="realtime_reslearn_ctrl_env")(Abs1D()(ana))
-    amp = Lambda(clip_01x4, name="realtime_reslearn_ctrl_gain")(amp)
-    exc = Multiply(name="realtime_reslearn_excite")([strike, amp])
+                            name="realtime_pickreso_ctrl_env")(Abs1D()(ana))
+    amp = Lambda(clip_01x4, name="realtime_pickreso_ctrl_gain")(amp)
+    exc = Multiply(name="realtime_pickreso_excite")([strike, amp])
     modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
                              decays_ms =RESBP_MODAL_DECAYS_MS_REALTIME,
                              length    =RESBP_MODAL_LEN_REALTIME,
                              sample_rate=sr,
-                             name="realtime_reslearn_modal")(exc)
-    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_reslearn_mix")(modes)
+                             name="realtime_pickreso_modal")(exc)
+    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_pickreso_mix")(modes)
     mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65,
-                       name="realtime_reslearn_post_hp")(mixed)
-    return IrScale(init=1.0, name="realtime_reslearn_scale")(mixed)
+                       name="realtime_pickreso_post_hp")(mixed)
+    return IrScale(init=1.0, name="realtime_pickreso_scale")(mixed)
 
 
 
@@ -1771,28 +1789,28 @@ def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE,
     """
     Realtime learned-resonance LC for stems:
       LC_total = LC_onset_pulse + (L_modal - 1)
-    Onset: CausalExpSmoother(name starts with 'realtime_reslearn_onset_pulse' or legacy 'realtime_resbp_onset_pulse')
-    Modal: ModalBank or LearnedModalBank layer named '*_reslearn_modal' (or legacy '*_resbp_modalbank')
+    Onset: CausalExpSmoother(name starts with 'realtime_pickreso_onset_pulse' or legacy 'realtime_resbp_onset_pulse')
+    Modal: ModalBank or LearnedModalBank layer named '*_pickreso_modal' (or legacy '*_resbp_modalbank')
     """
     sr = int(sample_rate)
 
     # Find pulse smoother
-    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_reslearn_onset_pulse")
+    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_pickreso_onset_pulse")
     if not env_layers:
         env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_pulse")
     L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
 
     # Find modal bank (either ModalBank or LearnedModalBank)
     mb = None
-    for cls, prefix in [(ModalBank, "realtime_reslearn_modal"),
-                        (LearnedModalBank, "realtime_reslearn_modal"),
+    for cls, prefix in [(ModalBank, "realtime_pickreso_modal"),
+                        (LearnedModalBank, "realtime_pickreso_modal"),
                         (ModalBank, "realtime_resbp_modalbank")]:
         layers = _find_layers(model, cls, name_prefix=prefix)
         if layers:
             mb = layers[0]
             break
     if mb is None:
-        raise ValueError("compute_resbp_left_context_realtime: missing reslearn/resbp modal bank.")
+        raise ValueError("compute_resbp_left_context_realtime: missing pickreso/resbp modal bank.")
 
     try:
         L_modal = int(mb.length)
@@ -1803,9 +1821,9 @@ def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE,
 
     if verbose:
         def as_ms(s): return 1000.0 * float(s) / float(sr)
-        print(f"[reslearn] env LC = {L_env - 1} ({as_ms(L_env - 1):.3f} ms)")
-        print(f"[reslearn] modal LC = {L_modal - 1} ({as_ms(L_modal - 1):.3f} ms)")
-        print(f"[reslearn] TOTAL LC = {LC_total} ({as_ms(LC_total):.3f} ms)")
+        print(f"[pickreso] env LC = {L_env - 1} ({as_ms(L_env - 1):.3f} ms)")
+        print(f"[pickreso] modal LC = {L_modal - 1} ({as_ms(L_modal - 1):.3f} ms)")
+        print(f"[pickreso] TOTAL LC = {LC_total} ({as_ms(LC_total):.3f} ms)")
     return {
         "resbp_signal_left_ctx_samples": int(LC_total),
         "resbp_signal_left_ctx_ms":      1000.0 * float(LC_total) / float(sr),
@@ -3872,7 +3890,7 @@ def build_offline_model(dynamic_time=False,
                                   name="piezo2mic_offline_picklearn",
                                   coloreq_trainable=False):
     """
-    NEW base OFFLINE: main_core + pick_amount * (sparkle + learned resonances).
+    NEW base OFFLINE: main_core + pick_scale * (sparkle + learned resonances).
     No old HF gate/mask, no old fixed ResBP in the mix.
     Names of backbone layers match the old base to copy weights by name.
     """
@@ -3925,18 +3943,27 @@ def build_offline_model(dynamic_time=False,
     main_core   = Add(name="offline_main_core")([pick_c, finger_c])
 
     # Analytic pick mask
-    mask = _pick_mask_engine(inp, OFFLINE_SAMPLE_RATE, prefix="offline")
+    mask = _pick_mask_engine(inp,
+                             sample_rate=OFFLINE_SAMPLE_RATE,
+                             out_gain=OFFLINE_PICK_OUT_GAIN,
+                             env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
+                             env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
+                             smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
+                             smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
+                             knee=OFFLINE_PICK_KNEE,
+                             prefix="offline"
+            )
 
     # Pick branch: sparkle + learned resonances, pick‑only by style
     hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
     sparkle  = _pick_sparkle("offline", hf_in, mask)
-    reslearn = _reson_learn_offline(inp, mask)
-    pick_pred= Add(name="offline_picklearn_pred_raw")([sparkle, reslearn])
+    pickreso = _reson_learn_offline(inp, mask)
+    pick_pred= Add(name="offline_picklearn_pred_raw")([sparkle, pickreso])
     pick_pred= Multiply(name="offline_picklearn_pred")([pick_pred, style_time])
 
-    pick_amount = IrScale(init=1.0, name="offline_pick_amount")(pick_pred)
+    pick_scale = IrScale(init=1.0, name="offline_pick_scale")(pick_pred)
 
-    out = Add(name="offline_mix_core_plus_pick")([main_core, pick_amount])
+    out = Add(name="offline_mix_core_plus_pick")([main_core, pick_scale])
 
     out = add_coloreq(out, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
@@ -3950,7 +3977,7 @@ def build_realtime_model(offline=None,
                                    name="piezo2mic_realtime_picklearn",
                                    coloreq_trainable=False):
     """
-    NEW base REALTIME: y = y_main + IR + pick_amount * (sparkle + learned resonances).
+    NEW base REALTIME: y = y_main + IR + pick_scale * (sparkle + learned resonances).
     No old HF stem in the mix.
     """
     T   = None if dynamic_time else REALTIME_SEG_LEN
@@ -4039,17 +4066,26 @@ def build_realtime_model(offline=None,
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
     # Analytic pick mask
-    mask = _pick_mask_engine(inp, REALTIME_SAMPLE_RATE, prefix="realtime")
+    mask = _pick_mask_engine(inp,
+                             sample_rate=REALTIME_SAMPLE_RATE,
+                             out_gain=REALTIME_PICK_OUT_GAIN,
+                             env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
+                             env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
+                             smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
+                             smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
+                             knee=REALTIME_PICK_KNEE,
+                             prefix="realtime"
+            )
 
     # Learned pick: sparkle + learned resonances
     hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
     sparkle  = _pick_sparkle("realtime", hf_in, mask)
-    reslearn = _reson_learn_realtime(inp, mask)
-    pick_pred= Add(name="realtime_picklearn_pred_raw")([sparkle, reslearn])
+    pickreso = _reson_learn_realtime(inp, mask)
+    pick_pred= Add(name="realtime_picklearn_pred_raw")([sparkle, pickreso])
     pick_pred= Multiply(name="realtime_picklearn_pred")([pick_pred, style_scalar_b3])
-    pick_amount = IrScale(init=1.0, name="realtime_pick_amount")(pick_pred)
+    pick_scale = IrScale(init=1.0, name="realtime_pick_scale")(pick_pred)
 
-    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pick_amount])
+    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pick_scale])
 
     y_final = add_coloreq(y_final, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
@@ -4621,18 +4657,16 @@ def set_trainable_layers(model,
                          enable_mask_head=False,
                          enable_heads=False,
                          enable_style_head=False,
-                         enable_style_blend=False,
-                         enable_picknorm_gain=False):
+                         enable_style_blend=False):
     """
     Freeze everything, then selectively unfreeze groups:
       - enable_film:    Dense layers generating FiLM params (name contains 'film_dense')
-      - enable_scales:  All IrScale except coloreq (hf_scale, ir_scale, resbp_scale, etc.)
+      - enable_scales:  All IrScale except coloreq (sparkle_scale, pick_scale, ir_scale, resbp_scale, etc.)
       - enable_coloreq: Only coloreq IrScale bands (name starts with '*_coloreq_g_')
       - enable_mask_head: hf mask tiny conv stack (offline_*_hf_mask_* and realtime_* equivalents)
       - enable_heads:   final pick/finger heads (Conv1D layers named '*_final_pick'/'*_final_finger')
       - enable_style_head: style classifier tower (conv/gap/logit/prob)
       - enable_style_blend: realtime_style_blend scalar (if present)
-      - enable_picknorm_gain: PickNormalizer layer (realtime_picknorm/offline_picknorm)
     Works for both offline_* and realtime_* prefixes.
     """
     # 1) Freeze all
@@ -4726,17 +4760,6 @@ def set_trainable_layers(model,
         except Exception:
             pass
 
-    # 9) PickNormalizer quick gain tweak (optional for learned‑pick iteration)
-    if enable_picknorm_gain:
-        for lname in ["realtime_picknorm","offline_picknorm"]:
-            try:
-                layer = model.get_layer(lname)
-                # Make the layer trainable (enables its gain weight)
-                layer.trainable = True
-                trainable_names.append(layer.name)
-            except Exception:
-                pass
-
     print(f"[trainable] enabled: {sorted(set(trainable_names))}")
     return model
 
@@ -4759,9 +4782,9 @@ def _boost_scales(model, sample_rate, use_finetuned=False):
     Only applies when the *_BOOST_DB values exceed 0.0.
     """
 
-    pick_amount_layer_name = "offline_pick_amount" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pick_amount"
+    pick_scale_layer_name = "offline_pick_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pick_scale"
     ir_scale_layer_name = "realtime_ir_scale"
-    pickreso_boost_layer_name = "offline_reslearn_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_reslearn_scale"
+    pickreso_boost_layer_name = "offline_pickreso_scale" if sample_rate == OFFLINE_SAMPLE_RATE else "realtime_pickreso_scale"
 
     pick_boost_db = 0.0
     ir_boost_db = 0.0
@@ -4785,7 +4808,7 @@ def _boost_scales(model, sample_rate, use_finetuned=False):
             pickreso_boost_db = REALTIME_PICK_RESO_BOOST_DB
     
     if pick_boost_db != 0.0:
-        model = boost_scale_in_model(model, pick_amount_layer_name, pick_boost_db)
+        model = boost_scale_in_model(model, pick_scale_layer_name, pick_boost_db)
         
     if (ir_boost_db != 0.0):
         model = boost_scale_in_model(model, ir_scale_layer_name, gain_db=ir_boost_db)
@@ -4797,7 +4820,6 @@ def _find_last_layer_with_suffix(model, suffix):
     cand = [l for l in model.layers if l.name.endswith(suffix)]
     return cand[-1] if cand else None
 
-@register_keras_serializable()
 def build_offline_debug_model(model):
     outs = {}
     def add(name, lname):
@@ -4808,12 +4830,12 @@ def build_offline_debug_model(model):
     add("main_pick",    "offline_pick_contrib")
     add("main_finger",  "offline_finger_contrib")
     add("picklearn",    "offline_picklearn_pred")
-    add("pick_amount",  "offline_pick_amount")
-    add("reslearn",     "offline_reslearn_scale")
+    add("pick_scale",  "offline_pick_scale")
+    add("pickreso",     "offline_pickreso_scale")
+    add("sparkle",      "offline_picklearn_sparkle")  # NEW
     add("style_pred",   "offline_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
-@register_keras_serializable()
 def build_realtime_debug_model(model):
     outs = {}
     def add(name, lname):
@@ -4825,10 +4847,26 @@ def build_realtime_debug_model(model):
     add("main_finger",  "realtime_finger_contrib")
     add("ir_only",      "realtime_ir_matchlen")
     add("picklearn",    "realtime_picklearn_pred")
-    add("pick_amount",  "realtime_pick_amount")
-    add("reslearn",     "realtime_reslearn_scale")
+    add("pick_scale",  "realtime_pick_scale")
+    add("pickreso",     "realtime_pickreso_scale")
+    add("sparkle",      "realtime_picklearn_sparkle")  # NEW
     add("style_pred",   "realtime_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
+
+def _rms(x):
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0: return 0.0
+    return float(np.sqrt(np.mean(x*x) + 1e-12))
+
+def _corr(a, b):
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    n = min(a.size, b.size)
+    if n < 8: return 0.0
+    a = a[:n]; b = b[:n]
+    den = np.sqrt((np.sum(a*a)+1e-12) * (np.sum(b*b)+1e-12))
+    if den <= 0: return 0.0
+    return float(np.sum(a*b) / den)
 
 def render_isolated_stems(debug_model,
                           path_src,
@@ -4844,7 +4882,7 @@ def render_isolated_stems(debug_model,
     Streaming stems renderer that:
       - feeds model inputs by NAME, not by position (robust to saved input order),
       - uses float32 scalars for style_true/style_force,
-      - writes full prediction and isolated stems (pick, finger, picklearn, reslearn, optional IR).
+      - writes full prediction and isolated stems (pick, finger, picklearn, pickreso, optional IR).
 
     The 'forced' passes explicitly set the style inputs:
       - pred:          style_force=0 → use the model's own predicted style
@@ -4900,14 +4938,17 @@ def render_isolated_stems(debug_model,
         else:
             w["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-        # Stems/open-on-demand
-        w["picklearn"] = None
+        w["main_core"] = sf.SoundFile(os.path.join(out_dir, "stem_main_core_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                    mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         w["pick"] = sf.SoundFile(os.path.join(out_dir, "stem_pick_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                                mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         w["fing"] = sf.SoundFile(os.path.join(out_dir, "stem_finger_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                                mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["picklearn"] = None
         w["ir"] = None
-        w["reslearn"] = None
+        w["pickreso"] = None
+        w["sumcheck"] = sf.SoundFile(os.path.join(out_dir, "pred_full_sumcheck" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                    mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         return w
 
     # Forced variants: make sure scalars are float32
@@ -4987,7 +5028,60 @@ def render_isolated_stems(debug_model,
                 return arr[core_start_in_inp:core_end_in_inp]
 
             wset = pass_writers[pass_key]
+            
+            # Collect cores (time-cropped)
+            y_full     = core_of("y_pred")
+            main_c     = core_of("main_core")   if "main_core"   in outs else np.zeros_like(y_full)
+            pick_only  = core_of("main_pick")   if "main_pick"   in outs else np.zeros_like(y_full)
+            fing_only  = core_of("main_finger") if "main_finger" in outs else np.zeros_like(y_full)
+            picklearn  = core_of("picklearn")   if "picklearn"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
+            pick_amt   = core_of("pick_scale") if "pick_scale" in outs else picklearn               # post IrScale = in the real mix
+            ir_only    = core_of("ir_only")     if "ir_only"     in outs else np.zeros_like(y_full)
 
+            # Correct sum-check: offline = main_core + pick_scale; realtime adds IR
+            sum_est = main_c + pick_amt + ir_only
+
+            # Diagnostics
+            print(f"[stems:{pass_key}] "
+                f"RMS full={_rms(y_full):.6f}  main={_rms(main_c):.6f}  "
+                f"pick={_rms(pick_only):.6f}  fing={_rms(fing_only):.6f}  "
+                f"picklearn(pre)={_rms(picklearn):.6f}  pick_scale={_rms(pick_amt):.6f}  "
+                f"ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
+
+            # Writes
+            wset["full"].write(y_full)
+            wset["main_core"].write(main_c)
+            wset["pick"].write(pick_only)
+            wset["fing"].write(fing_only)
+
+            # Optional: write sparkle if you added it to debug model
+            if "sparkle" in outs:
+                if wset.get("sparkle") is None:
+                    fn = "stem_sparkle_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["sparkle"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["sparkle"].write(core_of("sparkle"))
+
+            if "picklearn" in outs:
+                if wset["picklearn"] is None:
+                    fn = "stem_picklearn_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["picklearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["picklearn"].write(picklearn)
+
+            if "ir_only" in outs:
+                if wset["ir"] is None:
+                    fn = "stem_ir_lowpass" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["ir"].write(ir_only)
+
+            if "pickreso" in outs:
+                if wset["pickreso"] is None:
+                    fn = "stem_pickreso_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["pickreso"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["pickreso"].write(core_of("pickreso"))
+
+            # Sum-check write (now correct)
+            wset["sumcheck"].write(sum_est)
+            
             # Accumulate predicted style only for the 'pred' pass
             if pass_key == "pred" and "style_pred" in outs:
                 sp = float(np.asarray(outs["style_pred"])[0, 0])
@@ -5012,11 +5106,11 @@ def render_isolated_stems(debug_model,
                 wset["ir"].write(core_of("ir_only"))
 
             # Learned resonance stem (optional)
-            if "reslearn" in outs:
-                if wset["reslearn"] is None:
-                    fn = "stem_reslearn_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
-                    wset["reslearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["reslearn"].write(core_of("reslearn"))
+            if "pickreso" in outs:
+                if wset["pickreso"] is None:
+                    fn = "stem_pickreso_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
+                    wset["pickreso"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["pickreso"].write(core_of("pickreso"))
 
             # Pick/finger stems from main_core decomposition (if available)
             if "main_core" in outs:
@@ -5634,7 +5728,7 @@ def train_offline_picklearn_from_mic():
     stu = build_offline_model(dynamic_time=False)
     copy_weights_by_name(stu, base_off, verbose=True)
 
-    _freeze_only_prefixes(stu, prefixes=("offline_picklearn_", "offline_reslearn_", "offline_pick_amount"))
+    _freeze_only_prefixes(stu, prefixes=("offline_picklearn_", "offline_pickreso_", "offline_pick_scale"))
 
     ds, steps = _make_offline_mixed_ds(FINETUNE_BATCH_SIZE)
 
@@ -5705,10 +5799,10 @@ def train_realtime_picklearn_from_offline():
     rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
     copy_weights_by_name(rt, rt_src, verbose=True)
 
-    # IMPORTANT: enable only picklearn/reslearn stacks + pick_amount in the STUDENT before wrapping
+    # IMPORTANT: enable only picklearn/pickreso stacks + pick_scale in the STUDENT before wrapping
     _freeze_only_prefixes(
         rt,
-        prefixes=("realtime_picklearn_", "realtime_reslearn_", "realtime_pick_amount")
+        prefixes=("realtime_picklearn_", "realtime_pickreso_", "realtime_pick_scale")
     )
 
     # Wrapper inputs (fresh keras.Inputs so both student and teacher sit in one graph)
@@ -5725,7 +5819,7 @@ def train_realtime_picklearn_from_offline():
     if any(l.name == "offline_picklearn_pred" for l in off_causal.layers):
         pick_t_node = off_causal.get_layer("offline_picklearn_pred").output
     else:
-        pick_t_node = off_causal.get_layer("offline_pick_amount").output
+        pick_t_node = off_causal.get_layer("offline_pick_scale").output
 
     teacher_pick = tf.keras.models.Model(
         inputs=off_causal.inputs,
@@ -5897,37 +5991,8 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
-        
-        # probe_offline_lp(model_path=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME),
-        #                 src_wav=os.path.join(PICK_SRC_DIR, "take1_source.wav"),
-        #                 frames=96000, start=0)
-        # sys.exit(0)
-        
-        # 1) Rebuild with tighter PickNormalizer and gentle compressor
-        # off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
-        #     pulse_ms=2.5,       # shorter pulse at 96k
-        #     out_exp=0.5,        # compress small/mids → less HF wash
-        #     knee=0.0,          # light deadband,
-        #     mask_saturation=0.1
-            
-        # )
-
-        # # 2) Audition quickly on your demo pair
-        # dbg = build_offline_debug_model(off_dyn_tuned)
-        # src, tgt = all_pairs[DEMO_PAIR_INDEX]
-        # render_isolated_stems(
-        #     debug_model=dbg,
-        #     path_src=src,
-        #     path_tgt=tgt,
-        #     out_dir=os.path.join(DEMOS_OUT_DIR, "offline_learned_pick_tuning"),
-        #     sample_rate=OFFLINE_SAMPLE_RATE,
-        #     sec=LONG_DEMO_SEC,
-        #     offset_sec=LONG_DEMO_OFFSET_SEC
-        # )
-        # sys.exit(0)
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
-        # --learned-pick     → base realtime learned-pick dynamic (if present)
         # --both             → baseline + finetuned
         # --all              → baseline + finetuned + learned-pick
         # --offline-only / --realtime-only limits branches
