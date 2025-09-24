@@ -391,13 +391,13 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 10
+DEMO_SEC        = 60
 DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 0
+DEMO_PAIR_INDEX = 1
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 60
 LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 0
+LONG_DEMO_PAIR_INDEX = 1
 
 PICK_SRC_DIR   = "./input/pick/source"
 PICK_TGT_DIR   = "./input/pick/target"
@@ -4918,7 +4918,31 @@ def make_base_realtime_learned_pick(
     print("✅ Saved base realtime learned‑pick (STATIC with teacher):", out_static)
     return rt_dyn_export
 
+def _load_base_offline_learned_pick_dynamic_or_die():
+    """
+    Load the base offline learned-pick dynamic model. Error with instructions if missing.
+    """
+    path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(path):
+        print("ERROR: base offline learned-pick dynamic not found:", path)
+        print("Run: python piezo2mic.py --make-base-offline-learned-pick")
+        sys.exit(1)
+    return tf.keras.models.load_model(path, compile=False)
+
+def _load_base_realtime_learned_pick_dynamic_or_die():
+    """
+    Load the base realtime learned-pick dynamic model. Error with instructions if missing.
+    """
+    path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(path):
+        print("ERROR: base realtime learned-pick dynamic not found:", path)
+        print("Run: python piezo2mic.py --train-realtime (which also creates learned-pick) or")
+        print("     python piezo2mic.py --make-base-realtime-learned-pick")
+        sys.exit(1)
+    return tf.keras.models.load_model(path, compile=False)
+
 def fine_tune(offline=True, realtime=True):
+    # IO
     src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
     tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     if not os.path.exists(src) or not os.path.exists(tgt):
@@ -4935,28 +4959,33 @@ def fine_tune(offline=True, realtime=True):
         sr_rt=REALTIME_SAMPLE_RATE, sr_off=OFFLINE_SAMPLE_RATE
     )
 
-    # Losses
-    loss_offlite = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE, stft_scales=((1024,256,1024),), l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
-    loss_rt_lite = FinetuneCombinedLossLite(sample_rate=REALTIME_SAMPLE_RATE, stft_scales=((1024,256,1024),), l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
+    # Lightweight fine-tune losses
+    loss_offlite = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE,
+                                            stft_scales=((1024,256,1024),),
+                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
+    loss_rt_lite = FinetuneCombinedLossLite(sample_rate=REALTIME_SAMPLE_RATE,
+                                            stft_scales=((1024,256,1024),),
+                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
 
     off_dyn_export = None
     rt_dyn_export  = None
 
     if offline:
-        print("\n🔧 Finetuning OFFLINE (coloreq + film + scales only)…")
-        base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(base_off_dyn_path):
-            print("ERROR: baseline offline dynamic model not found:", base_off_dyn_path); sys.exit(1)
-        base_off_dyn = tf.keras.models.load_model(base_off_dyn_path, compile=False)
+        print("\n🔧 Finetuning OFFLINE learned-pick (coloreq + film + scales only)…")
+        # Require the base offline learned-pick dynamic (student init)
+        base_off_lp_dyn = _load_base_offline_learned_pick_dynamic_or_die()
 
-        # Static training graph with COLOREQ inside, default frozen
-        off_static_train = build_offline_model(dynamic_time=False,
-                                               cap_mask_with_gate=True,
-                                               use_pick_normalizer=False,
-                                               coloreq_trainable=False)
-        copy_weights_by_name(off_static_train, base_off_dyn, verbose=True)
+        # Build the OFFLINE learned-pick training graph (identical to runtime graph)
+        off_static_train = build_offline_model(
+            dynamic_time=False,
+            cap_mask_with_gate=False,   # learned-pick graph
+            use_pick_normalizer=True,
+            coloreq_trainable=False,
+            mask_min_floor=0.0
+        )
+        copy_weights_by_name(off_static_train, base_off_lp_dyn, verbose=True)
 
-        # Unfreeze coloreq + film + scales
+        # Unfreeze only FiLM + IrScale (except coloreq) + coloreq band scales
         off_static_train = set_trainable_layers(
             off_static_train,
             enable_film=True,
@@ -4964,62 +4993,71 @@ def fine_tune(offline=True, realtime=True):
             enable_coloreq=True
         )
 
-        dsO = make_mixed_ds_from_arrays_offline(cached["x96"], cached["y96"],
-                                                batch_size=FINETUNE_BATCH_SIZE,
-                                                seg_len=OFFLINE_SEG_LEN
+        # Dataset
+        dsO = make_mixed_ds_from_arrays_offline(
+            cached["x96"], cached["y96"],
+            batch_size=FINETUNE_BATCH_SIZE,
+            seg_len=OFFLINE_SEG_LEN
         ).map(add_sw_offline_finetune_nf
         ).map(add_shared_random_gain_offline(db_lo=-30.0, db_hi=+18.0)
         ).prefetch(tf.data.AUTOTUNE)
 
-        steps_off = approx_steps_from_length(len(cached["x96"]), OFFLINE_SEG_LEN, FINETUNE_BATCH_SIZE, cap=FINETUNE_OFFLINE_STEPS_CAP)
+        steps_off = approx_steps_from_length(
+            len(cached["x96"]), OFFLINE_SEG_LEN, FINETUNE_BATCH_SIZE, cap=FINETUNE_OFFLINE_STEPS_CAP
+        )
+
         off_static_train.compile(optimizer=tf.keras.optimizers.Adam(FINETUNE_OFFLINE_LR),
                                  loss=[loss_offlite, "binary_crossentropy"],
-                                 loss_weights=[1.0, 0.0], metrics=[["mae"], []])
+                                 loss_weights=[1.0, 0.0],
+                                 metrics=[["mae"], []])
         off_static_train.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
 
-        # Export dynamic (same graph, coloreq in place)
-        off_dyn_export = build_offline_model(dynamic_time=True,
-                                             cap_mask_with_gate=True,
-                                             use_pick_normalizer=False,
-                                             coloreq_trainable=False)
+        # Export OFFLINE dynamic with the same learned-pick graph (1:1)
+        off_dyn_export = build_offline_model(
+            dynamic_time=True,
+            cap_mask_with_gate=False,
+            use_pick_normalizer=True,
+            coloreq_trainable=False,
+            mask_min_floor=0.0
+        )
         copy_weights_by_name(off_dyn_export, off_static_train, verbose=True)
 
         ft_offline_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
         off_dyn_export.save(ft_offline_dyn_path)
-        print("✅ Saved finetuned offline model (dynamic):", ft_offline_dyn_path)
+        print("✅ Saved finetuned offline model (dynamic, learned-pick):", ft_offline_dyn_path)
 
         ft_offline_static_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
         off_static_train.save(ft_offline_static_path)
-        print("✅ Saved finetuned offline model (static):", ft_offline_static_path)
+        print("✅ Saved finetuned offline model (static, learned-pick):", ft_offline_static_path)
 
     if realtime:
-        print("\n🔧 Finetuning REALTIME (coloreq + film + scales only)…")
+        print("\n🔧 Finetuning REALTIME learned-pick (coloreq + film + scales only)…")
+
+        # Teacher must be the baseline offline dynamic model (has 'offline_gate' for KD heads)
         base_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
         if not os.path.exists(base_off_dyn_path):
-            print("ERROR: baseline offline dynamic model not found for teacher:", base_off_dyn_path); sys.exit(1)
+            print("ERROR: baseline offline dynamic model (teacher) not found:", base_off_dyn_path); sys.exit(1)
         offline_nc = tf.keras.models.load_model(base_off_dyn_path, compile=False)
         offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
 
-        base_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
-        if not os.path.exists(base_rt_dyn_path):
-            print("ERROR: baseline realtime dynamic model not found:", base_rt_dyn_path); sys.exit(1)
-        base_rt_dyn = tf.keras.models.load_model(base_rt_dyn_path, compile=False)
+        # Student init: base realtime learned-pick dynamic
+        base_rt_lp_dyn = _load_base_realtime_learned_pick_dynamic_or_die()
 
-        # Static training student with teacher and coloreq frozen by default
+        # Build the REALTIME learned-pick training graph (teacher attached for KD)
         rt_static_train = build_realtime_model(
             offline=offline_causal,
             dynamic_time=False,
-            cap_mask_with_gate=True,         # preserve baseline gating in base finetune
+            cap_mask_with_gate=False,       # learned-pick graph (no fixed gate)
             use_learned_hf_mask=True,
-            enable_mask_kd=True,
+            enable_mask_kd=False,           # do not KD the mask in finetune
             detach_mask_from_audio=True,
             mask_min_floor=0.0,
-            use_pick_normalizer=False,
+            use_pick_normalizer=True,       # PickNormalizer path ON
             coloreq_trainable=False
         )
-        copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
+        copy_weights_by_name(rt_static_train, base_rt_lp_dyn, verbose=True)
 
-        # Unfreeze coloreq + film + scales only
+        # Unfreeze only FiLM + IrScale + coloreq
         rt_static_train = set_trainable_layers(
             rt_static_train,
             enable_film=True,
@@ -5027,15 +5065,18 @@ def fine_tune(offline=True, realtime=True):
             enable_coloreq=True
         )
 
-        dsRT_dual = make_mixed_ds_from_arrays_realtime_dual(cached["x48"], cached["x96"], cached["y48"],
-                                                            batch_size=FINETUNE_BATCH_SIZE,
-                                                            seg_len_rt=REALTIME_SEG_LEN
-        ).map(add_sw_realtime_dual_nf
+        # Dataset (teacher 96k + student 48k)
+        dsRT_dual = make_mixed_ds_from_arrays_realtime_dual(
+            cached["x48"], cached["x96"], cached["y48"],
+            batch_size=FINETUNE_BATCH_SIZE,
+            seg_len_rt=REALTIME_SEG_LEN
+        ).map(add_sw_realtime_dual_nf         # force predicted style, disable style BCE
         ).map(add_shared_random_gain_dual(db_lo=-30.0, db_hi=+18.0)
         ).prefetch(tf.data.AUTOTUNE)
 
-        steps_rt = approx_steps_from_length(len(cached["x48"]), REALTIME_SEG_LEN,
-                                            FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP)
+        steps_rt = approx_steps_from_length(
+            len(cached["x48"]), REALTIME_SEG_LEN, FINETUNE_BATCH_SIZE, cap=FINETUNE_REALTIME_STEPS_CAP
+        )
 
         rt_static_train.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=FINETUNE_REALTIME_LR, clipnorm=1.0),
                                 loss=[loss_rt_lite, "binary_crossentropy"],
@@ -5045,9 +5086,9 @@ def fine_tune(offline=True, realtime=True):
 
         ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
         rt_static_train.save(ft_rt_static_path)
-        print("✅ Saved finetuned realtime model (static WITH teacher):", ft_rt_static_path)
+        print("✅ Saved finetuned realtime model (static WITH teacher, learned-pick graph):", ft_rt_static_path)
 
-        # Export DYNAMIC (teacher‑free). Keep cap OFF + PickNormalizer ON (best runtime)
+        # Export REALTIME dynamic (teacher-free) with the same learned-pick graph (1:1)
         rt_dyn_export = build_realtime_model(
             offline=None,
             dynamic_time=True,
@@ -5063,7 +5104,7 @@ def fine_tune(offline=True, realtime=True):
 
         ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
         rt_dyn_export.save(ft_rt_dyn_path)
-        print("✅ Saved finetuned realtime model (dynamic, teacher‑free):", ft_rt_dyn_path)
+        print("✅ Saved finetuned realtime model (dynamic, teacher‑free, learned‑pick):", ft_rt_dyn_path)
 
     return off_dyn_export, rt_dyn_export
 
