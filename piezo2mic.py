@@ -123,10 +123,11 @@ tf.random.set_seed(SEED)
 DISABLE_SCALE_BOOSTS = False
 
 EPOCHS      = 40
-FINETUNE_EPOCHS = 3
+OFFLINE_FINETUNE_EPOCHS = 10
+REALTIME_FINETUNE_EPOCHS = 3
 
-FINETUNE_OFFLINE_STEPS_CAP       = 250
-FINETUNE_REALTIME_STEPS_CAP      = FINETUNE_OFFLINE_STEPS_CAP * 10
+FINETUNE_OFFLINE_STEPS_CAP       = 1000
+FINETUNE_REALTIME_STEPS_CAP      = 2500
 
 # Audio sample‐rates
 OFFLINE_SAMPLE_RATE = 96000
@@ -5010,7 +5011,7 @@ def fine_tune(offline=True, realtime=True):
                                  loss=[loss_offlite, "binary_crossentropy"],
                                  loss_weights=[1.0, 0.0],
                                  metrics=[["mae"], []])
-        off_static_train.fit(dsO, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
+        off_static_train.fit(dsO, epochs=OFFLINE_FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
 
         # Export OFFLINE dynamic with the same learned-pick graph (1:1)
         off_dyn_export = build_offline_model(
@@ -5082,7 +5083,7 @@ def fine_tune(offline=True, realtime=True):
                                 loss=[loss_rt_lite, "binary_crossentropy"],
                                 loss_weights=[1.0, 0.0],
                                 metrics=[["mae"], []])
-        rt_static_train.fit(dsRT_dual, epochs=FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
+        rt_static_train.fit(dsRT_dual, epochs=REALTIME_FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
 
         ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
         rt_static_train.save(ft_rt_static_path)
