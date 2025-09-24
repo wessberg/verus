@@ -270,7 +270,7 @@ OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
 REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 20.0
 
 FINETUNE_OFFLINE_RESBP_BOOST_DB    = -1000.0 if DISABLE_SCALE_BOOSTS else 100.0
-FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 60.0
+FINETUNE_REALTIME_RESBP_BOOST_DB   = -1000.0 if DISABLE_SCALE_BOOSTS else 40.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
@@ -315,6 +315,13 @@ FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
 FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_realtime_dynamic.keras"
 FINETUNE_OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_offline.keras"
 FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.keras"
+
+
+# New filenames for converted base models (analytic pick)
+OFFLINE_ANALYTIC_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline_analytic_pick.keras"
+OFFLINE_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_analytic_pick_dynamic.keras"
+REALTIME_ANALYTIC_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_analytic_pick.keras"
+REALTIME_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_analytic_pick_dynamic.keras"
 
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
@@ -363,7 +370,7 @@ OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 32
 REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 32
 
 FINETUNE_OFFLINE_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
-FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 4
+FINETUNE_REALTIME_HF_BOOST_DB = -1000.0 if DISABLE_SCALE_BOOSTS else 24
 
 REALTIME_HF_TIME_SHIFT_SAMPLES = -1
 OFFLINE_HF_TIME_SHIFT_SAMPLES  = 0
@@ -392,13 +399,13 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 60
-DEMO_OFFSET_SEC = 0
-DEMO_PAIR_INDEX = 1
+DEMO_SEC        = 10
+DEMO_OFFSET_SEC = 600
+DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 60
-LONG_DEMO_OFFSET_SEC = 0
-LONG_DEMO_PAIR_INDEX = 1
+LONG_DEMO_SEC        = 10
+LONG_DEMO_OFFSET_SEC = 600
+LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
 PICK_TGT_DIR   = "./input/pick/target"
@@ -572,6 +579,134 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
     if verbose:
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
+
+@register_keras_serializable()
+class CausalPickRatioMask(tf.keras.layers.Layer):
+    """
+    Analytic, causal, volume-invariant pick mask:
+      - env_hi = EMA(|HPF(x)|, tau=env_fast_ms)
+      - env_lo = EMA(|x|,      tau=env_slow_ms)
+      - r = env_hi / (env_lo + eps)
+      - mask_raw = r / (r + knee) in [0,1]  (soft-ratio)
+      - optional asym smoothing (fast attack, slow release)
+    All ops are conv1d + elementwise; fully TFLite-friendly.
+
+    Parameters tuned conservatively; override in builders if needed.
+    """
+    def __init__(self,
+                 sample_rate,
+                 hp_cut_hz=3500.0,
+                 hp_order=129,
+                 env_fast_ms=0.30,     # short for pick sparkle
+                 env_slow_ms=12.0,     # slow for divisive normalization
+                 knee=0.20,            # soft-knee of r/(r+knee)
+                 smooth_attack_ms=0.10,
+                 smooth_release_ms=6.0,
+                 out_gain=1.0,         # optional scalar makeup (kept 1.0)
+                 name=None,
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate      = int(sample_rate)
+        self.hp_cut_hz        = float(hp_cut_hz)
+        self.hp_order         = int(hp_order)
+        self.env_fast_ms      = float(env_fast_ms)
+        self.env_slow_ms      = float(env_slow_ms)
+        self.knee             = float(knee)
+        self.smooth_attack_ms = float(smooth_attack_ms)
+        self.smooth_release_ms= float(smooth_release_ms)
+        self.out_gain         = float(out_gain)
+
+        # Non-trainable kernels will be created in build()
+        self.k_hp    = None
+        self.k_fast  = None
+        self.k_slow  = None
+        self.k_att   = None
+        self.k_rel   = None
+
+    def build(self, input_shape):
+        # High-pass for the "sparkle" band
+        k_hp = _get_minphase_hp_kernel(self.sample_rate, self.hp_cut_hz, self.hp_order)
+        self.k_hp = self.add_weight(
+            name="pick_hp_taps", shape=k_hp.shape,
+            initializer=tf.keras.initializers.Constant(k_hp),
+            trainable=False
+        )
+        # Fast/slow EMAs for envelopes
+        def ema_kernel(ms, scale, Lmax):
+            s = max(1, int(round((float(ms) / 1000.0) * float(self.sample_rate))))
+            return _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
+        k_fast = ema_kernel(self.env_fast_ms, scale=3.0, Lmax=1024)
+        k_slow = ema_kernel(self.env_slow_ms, scale=3.0, Lmax=4096)
+        self.k_fast = self.add_weight(
+            name="pick_env_fast", shape=k_fast.shape,
+            initializer=tf.keras.initializers.Constant(k_fast), trainable=False
+        )
+        self.k_slow = self.add_weight(
+            name="pick_env_slow", shape=k_slow.shape,
+            initializer=tf.keras.initializers.Constant(k_slow), trainable=False
+        )
+        # Asymmetric smoothing on mask
+        k_att = ema_kernel(self.smooth_attack_ms, scale=4.0, Lmax=2048)
+        k_rel = ema_kernel(self.smooth_release_ms, scale=4.0, Lmax=2048)
+        self.k_att = self.add_weight(
+            name="pick_smooth_attack", shape=k_att.shape,
+            initializer=tf.keras.initializers.Constant(k_att), trainable=False
+        )
+        self.k_rel = self.add_weight(
+            name="pick_smooth_release", shape=k_rel.shape,
+            initializer=tf.keras.initializers.Constant(k_rel), trainable=False
+        )
+        # Optional global gain
+        self.gain = self.add_weight(
+            name="pick_mask_gain", shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.out_gain),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (B,T,1)
+        # High-band envelope
+        hp     = _causal_conv1d(x, self.k_hp)
+        env_hi = _causal_conv1d(tf.abs(hp), self.k_fast)
+        # Broadband envelope
+        env_lo = _causal_conv1d(tf.abs(x),  self.k_slow)
+
+        eps = tf.constant(1e-8, dtype=x.dtype)
+        r   = env_hi / (env_lo + eps)
+
+        # Soft ratio knee → [0,1]
+        k   = tf.constant(self.knee, dtype=x.dtype)
+        mask_raw = r / (r + tf.maximum(k, eps))
+        mask_raw = tf.clip_by_value(mask_raw, 0.0, 1.0)
+
+        # Asymmetric smoothing (attack/release)
+        prev = tf.pad(mask_raw, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(mask_raw > prev, x.dtype)
+        att = _causal_conv1d(mask_raw, self.k_att)
+        rel = _causal_conv1d(mask_raw, self.k_rel)
+        m   = rising * att + (1.0 - rising) * rel
+
+        m = tf.clip_by_value(m * self.gain, 0.0, 1.0)
+        return m
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "sample_rate": self.sample_rate,
+            "hp_cut_hz": self.hp_cut_hz,
+            "hp_order": self.hp_order,
+            "env_fast_ms": self.env_fast_ms,
+            "env_slow_ms": self.env_slow_ms,
+            "knee": self.knee,
+            "smooth_attack_ms": self.smooth_attack_ms,
+            "smooth_release_ms": self.smooth_release_ms,
+            "out_gain": self.out_gain
+        })
+        return cfg
 
 @register_keras_serializable()
 class PickNormalizer(tf.keras.layers.Layer):
@@ -3809,24 +3944,44 @@ def build_offline_model_causal(offline_src, dynamic_time=True):
     for l in offline_causal.layers:
         l.trainable = False
     return offline_causal
+def _add_pick_engine_mask(inp, sample_rate, prefix):
+    """
+    Helper to add the analytic pick mask into the graph.
+    Returns the mask tensor named f"{prefix}_pick_engine_mask".
+    """
+    # Defaults chosen to match your HF cutoff and behavior
+    hp_cut = hp_cutoff_for_sr(sample_rate)  # ~2.5 kHz
+    pe = CausalPickRatioMask(
+        sample_rate=sample_rate,
+        hp_cut_hz=hp_cut,
+        hp_order=129,
+        env_fast_ms=0.30 if sample_rate == REALTIME_SAMPLE_RATE else 0.25,
+        env_slow_ms=12.0,
+        knee=0.20,
+        smooth_attack_ms=0.08,
+        smooth_release_ms=6.0,
+        out_gain=1.0,
+        name=f"{prefix}_pick_engine_mask"
+    )
+    return pe(inp)
+
 
 @register_keras_serializable()
 def build_offline_model(dynamic_time=False,
-                        lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
-                        name="piezo2mic_offline",
-                        cap_mask_with_gate=True,
-                        hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES,
-                        mask_min_floor=0.0,
-                        # NEW
-                        use_pick_normalizer=False,
-                        coloreq_trainable=False):
+                                      lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
+                                      name="piezo2mic_offline_analytic_pick",
+                                      coloreq_trainable=False):
+    """
+    Offline model using analytic pick engine instead of fixed gate / learned mask.
+    Only the gating/excitation path is changed; all other layers/names match baseline.
+    """
     T   = None if dynamic_time else OFFLINE_SEG_LEN
     inp = Input(shape=(T,1), name="offline_piezo_input")
 
     style_true_in  = Input(shape=(1,), name="offline_style_true_input")
     style_force_in = Input(shape=(1,), name="offline_style_force_input")
 
-    # Style head
+    # Style head (unchanged)
     cls         = Conv1D(16,3, padding="same", activation="relu", name="offline_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="offline_style_gap")(cls)
     style_logit = Dense(1, name="offline_style_logit")(cls)
@@ -3840,6 +3995,7 @@ def build_offline_model(dynamic_time=False,
     style_time_used = TileStyle(name="offline_style_time_used")([style_used_scalar, inp])
     style_embed     = Dense(OFFLINE_EMBED_DIM, activation="linear", name="offline_style_embed")(style_used_scalar)
 
+    # Main stack (unchanged)
     x = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_init_pw")(inp)
     for i in range(OFFLINE_PRE_BLOCKS):
         x = gated_sep_block(x, OFFLINE_FILTERS, OFFLINE_PRE_KERNEL, 1, prefix=f"offline_pre_{i}", lookahead=lookahead_samples)
@@ -3865,29 +4021,14 @@ def build_offline_model(dynamic_time=False,
     main_pick   = Conv1D(1,1,padding="same",name="offline_final_pick")(x)
     main_finger = Conv1D(1,1,padding="same",name="offline_final_finger")(x)
 
-    inv_style  = InvertStyle(name="offline_invert_style")(style_time_used)
-    pick_c     = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
-    finger_c   = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
+    inv_style = InvertStyle(name="offline_invert_style")(style_time_used)
+    pick_c    = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
+    finger_c  = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
 
-    offline_gate = None
-    if cap_mask_with_gate:
-        offline_gate = Gate(
-            sample_rate=OFFLINE_SAMPLE_RATE,
-            threshold_db=OFFLINE_GATE_THRESHOLD_DB,
-            ratio=OFFLINE_GATE_RATIO,
-            attack_ms=OFFLINE_GATE_ATTACK_MS,
-            hold_ms=OFFLINE_GATE_HOLD_MS,
-            release_ms=OFFLINE_GATE_RELEASE_MS,
-            cutoff_hz=OFFLINE_GATE_HP_SIDECHAIN_LOW_CUT_HZ,
-            depth_smooth_ms=OFFLINE_GATE_DEPTH_SMOOTH_MS,
-            env_ms=OFFLINE_GATE_ENV_MS,
-            hp_order=OFFLINE_HF_HP_ORDER,
-            env_lmax=None,
-            depth_lmax=None,
-            name="offline_gate"
-        )(inp)
+    # Analytic pick mask replaces fixed gate / learned mask
+    mask_used_for_gating = _add_pick_engine_mask(inp, OFFLINE_SAMPLE_RATE, prefix="offline")
 
-    # HF branch
+    # HF branch (unchanged except gating source)
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
     hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
     hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=lookahead_samples)
@@ -3898,45 +4039,25 @@ def build_offline_model(dynamic_time=False,
     hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
     hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
 
-    m = SeparableConv1D(8, 5, dilation_rate=1, padding="same", activation="relu", name="offline_hf_mask_c1")(hf_in)
-    m = SeparableConv1D(8, 5, dilation_rate=2, padding="same", activation="relu", name="offline_hf_mask_c2")(m)
-    m = SeparableConv1D(1, 3, dilation_rate=1, padding="same", name="offline_hf_mask_logits", bias_initializer=tf.keras.initializers.Constant(OFFLINE_MASK_LOGIT_BIAS))(m)
-    mask_pred = Activation("sigmoid", name="offline_hf_mask")(m)
-
-    if float(mask_min_floor) > 0.0:
-        mask_pred = MaskFloor(eps=float(mask_min_floor), name="offline_hf_mask_floor")(mask_pred)
-
-    # Learned-pick normalizer (teacher-free) when cap is off
-    if (offline_gate is None) and use_pick_normalizer:
-        mask_used_for_gating = PickNormalizer(sample_rate=OFFLINE_SAMPLE_RATE, name="offline_picknorm", pulse_ms=OFFLINE_PICK_NORMALIZATION_PULSE_MS, out_exp=OFFLINE_PICK_NORMALIZATION_OUT_EXP, knee=OFFLINE_PICK_NORMALIZATION_KNEE)(mask_pred)
-    else:
-        mask_smoothed = CausalExpSmoother(
-            time_const_ms=0.08, sample_rate=OFFLINE_SAMPLE_RATE, Lmax=64, name="offline_hf_mask_smooth"
-        )(mask_pred)
-        mask_used_for_gating = Minimum(name="offline_hf_mask_used")([mask_smoothed, offline_gate]) if offline_gate is not None else IdentityLayer(name="offline_hf_mask_used")(mask_smoothed)
-
     hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_used_for_gating])
     hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, name="offline_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
-
-    if int(hf_time_shift_samples) != 0:
-        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="offline_hf_timeshift")(hf_final)
-
+    if int(OFFLINE_HF_TIME_SHIFT_SAMPLES) != 0:
+        hf_final = TimeShift1D(shift=int(OFFLINE_HF_TIME_SHIFT_SAMPLES), name="offline_hf_timeshift")(hf_final)
     hf_final_pick = Multiply(name="offline_hf_pick_only")([hf_final, style_time_used])
 
-    main_core = Add(name="offline_main_core")([pick_c, finger_c])
-
-    gate_for_resbp = mask_used_for_gating if (offline_gate is None) else offline_gate
+    # ResBP branch: use the same mask as a gate/excitation proxy
     offline_resbp = _add_resbp_branch_offline(
         inp=inp,
         style_embed=style_embed,
         style_time_used=style_time_used,
-        gate=gate_for_resbp
+        gate=mask_used_for_gating
     )
 
+    main_core = Add(name="offline_main_core")([pick_c, finger_c])
     out = Add(name="offline_mix_main")([main_core, hf_final_pick, offline_resbp])
 
-    # COLOREQ inside the base graph (frozen by default)
+    # coloreq (inside graph, frozen by default)
     out = add_coloreq(out,
                       bands=COLOREQ_BANDS_OFFLINE_BODY,
                       sample_rate=OFFLINE_SAMPLE_RATE,
@@ -3946,18 +4067,15 @@ def build_offline_model(dynamic_time=False,
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
+
 @register_keras_serializable()
 def build_realtime_model(offline=None,
-                         dynamic_time=False,
-                         cap_mask_with_gate=True,
-                         use_learned_hf_mask=True,
-                         enable_mask_kd=True,
-                         detach_mask_from_audio=True,
-                         mask_min_floor=0.0,
-                         hf_time_shift_samples=REALTIME_HF_TIME_SHIFT_SAMPLES,
-                         # NEW
-                         use_pick_normalizer=True,
-                         coloreq_trainable=False):
+                                       dynamic_time=False,
+                                       name="piezo2mic_realtime_analytic_pick",
+                                       coloreq_trainable=False):
+    """
+    Realtime model using analytic pick engine. Teacher/KD optional (pass offline=None to keep it teacher-free).
+    """
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3974,59 +4092,18 @@ def build_realtime_model(offline=None,
     style_logit = Dense(1, name="realtime_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
 
-    kd_tensors = []
     style_pred_source = style_prob
-    BC = ZeroBias()
-
-    # Teacher bundle (optional)
-    T_feats = []
-    T_gate = None
-    offline_audio = None
-    offline_style_prob = None
-    off_pick = None
-    off_finger = None
-    off_hf_scaled = None
-    off_resbp_scaled = None
-
     if offline is not None:
         teacher = offline
         teacher.trainable = False
-
-        feat_names = REALTIME_OFFLINE_FEAT_LAYERS or []
-        feat_outs  = [teacher.get_layer(n).output for n in feat_names]
-
-        gate_out = teacher.get_layer("offline_gate").output
         audio_out, style_prob_out = teacher.outputs
-        pick_out   = teacher.get_layer("offline_final_pick").output
-        finger_out = teacher.get_layer("offline_final_finger").output
-        hf_scaled  = teacher.get_layer("offline_hf_scale").output
-        resbp_scaled = teacher.get_layer("offline_resbp_scale").output
-
         teacher_combo = tf.keras.Model(
-            inputs=teacher.inputs,
-            outputs=feat_outs + [gate_out, audio_out, style_prob_out, pick_out, finger_out, hf_scaled, resbp_scaled],
-            name="offline_teacher_combo"
+            inputs=teacher.inputs, outputs=[audio_out, style_prob_out],
+            name="offline_teacher_min"
         )
         combo = teacher_combo([offline_inp, style_true_in, style_force_in])
-
-        idx = 0
-        if feat_names:
-            T_feats = combo[idx: idx + len(feat_names)]; idx += len(feat_names)
-        T_gate             = combo[idx]; idx += 1
-        offline_audio      = combo[idx]; idx += 1
-        offline_style_prob = combo[idx]; idx += 1
-        off_pick           = combo[idx]; idx += 1
-        off_finger         = combo[idx]; idx += 1
-        off_hf_scaled      = combo[idx]; idx += 1
-        off_resbp_scaled   = combo[idx]
-
-        style_prob_3d         = Reshape((1, 1), name="realtime_style_prob_3d")(style_prob)
-        offline_style_prob_3d = Reshape((1, 1), name="offline_style_prob_3d")(offline_style_prob)
-        kd_tensors.append(
-            DistillLoss(alpha=REALTIME_STYLE_DISTILL_ALPHA, name="style_prob_distill")(
-                [offline_style_prob_3d, style_prob_3d]
-            )
-        )
+        offline_audio      = combo[0]
+        offline_style_prob = combo[1]
         style_pred_source = BlendScalar(
             init_alpha=REALTIME_STYLE_BLEND_INIT,
             trainable=REALTIME_STYLE_BLEND_TRAINABLE,
@@ -4039,21 +4116,19 @@ def build_realtime_model(offline=None,
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
     style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
-    style_embed = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
+    style_embed     = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
     # Main stack
+    BC = ZeroBias()
     x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
     for i in range(REALTIME_PRE_BLOCKS):
         x = glu_sep_block(x, REALTIME_FILTERS, REALTIME_PRE_KERNEL, 1,
                           prefix=f"realtime_pre_{i}", lookahead=0,
                           residual_scale=0.35, bias_constraint=BC)
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}",
-                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-                       beta_scale=REALTIME_FILM_BETA_SCALE,
-                       gamma_mag=REALTIME_FILM_GAMMA_MAG,
-                       beta_mag=REALTIME_FILM_BETA_MAG)
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
+                       gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
 
-    realtime_feats = []
     for i, d in enumerate(REALTIME_DILATIONS):
         res = x
         pad_left, pad_right = compute_pads(kernel=REALTIME_KERNEL_SIZE, dilation=d, lookahead_samples=0)
@@ -4066,16 +4141,9 @@ def build_realtime_model(offline=None,
         x_block = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(x_block)
         x_block = ConstScale(0.35, name=f"realtime_res_scale_{i}")(x_block)
         x = Add(name=f"realtime_res_add_{i}")([x_block, res])
-
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
-                       gamma_scale=REALTIME_FILM_GAMMA_SCALE,
-                       beta_scale=REALTIME_FILM_BETA_SCALE,
-                       gamma_mag=REALTIME_FILM_GAMMA_MAG,
-                       beta_mag=REALTIME_FILM_BETA_MAG)
-
-        offline_feat_name = f"offline_dil_{i}_film_apply"
-        if REALTIME_OFFLINE_FEAT_LAYERS and offline_feat_name in REALTIME_OFFLINE_FEAT_LAYERS:
-            realtime_feats.append(x)
+                       gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
+                       gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
 
     out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
     out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
@@ -4084,7 +4152,7 @@ def build_realtime_model(offline=None,
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_realtime = Add(name="realtime_main")([pick_c, finger_c])
 
-    # IR branch
+    # IR branch (unchanged)
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -4111,127 +4179,39 @@ def build_realtime_model(offline=None,
     )(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
-    # Mask head
+    # Analytic pick mask
+    mask_used_for_gating = _add_pick_engine_mask(inp, REALTIME_SAMPLE_RATE, prefix="realtime")
+
+    # HF branch with analytic mask
     hf_in  = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-    m = causal_sep_conv(hf_in, 8, 5, 1, name="realtime_hf_mask_c1", activation="relu", bias_constraint=BC)
-    m = causal_sep_conv(m,    8, 5, 2, name="realtime_hf_mask_c2", activation="relu", bias_constraint=BC)
-    m = causal_sep_conv(m,    1, 3, 1, name="realtime_hf_mask_logits", bias_constraint=BC,
-                        bias_initializer=tf.keras.initializers.Constant(REALTIME_MASK_LOGIT_BIAS))
-    mask_pred = Activation("sigmoid", name="realtime_hf_mask")(m)
-    if float(mask_min_floor) > 0.0:
-        mask_pred = MaskFloor(eps=float(mask_min_floor), name="realtime_hf_mask_floor")(mask_pred)
-
-    # Optional fixed gate cap
-    realtime_gate = None
-    if cap_mask_with_gate:
-        realtime_gate = GateInt8Linear(
-            sample_rate=REALTIME_SAMPLE_RATE,
-            threshold_db=REALTIME_GATE_THRESHOLD_DB,
-            ratio=REALTIME_GATE_RATIO,
-            attack_ms=REALTIME_GATE_ATTACK_MS,
-            hold_ms=REALTIME_GATE_HOLD_MS,
-            release_ms=REALTIME_GATE_RELEASE_MS,
-            cutoff_hz=REALTIME_GATE_HP_SIDECHAIN_LOW_CUT_HZ,
-            hp_order=REALTIME_HF_HP_ORDER,
-            env_ms=REALTIME_GATE_ENV_MS,
-            depth_smooth_ms=REALTIME_GATE_DEPTH_SMOOTH_MS,
-            env_lmax=REALTIME_GATE_ENV_LMAX,
-            depth_lmax=REALTIME_GATE_DEPTH_LMAX,
-            min_gain_db=-60.0,
-            name="realtime_gate"
-        )(inp)
-
-    # Learned‑pick path: PickNormalizer only if we actually rely on the learned mask for audio gating
-    if use_learned_hf_mask and (not cap_mask_with_gate) and use_pick_normalizer:
-        mask_norm = PickNormalizer(sample_rate=REALTIME_SAMPLE_RATE, name="realtime_picknorm", pulse_ms=REALTIME_PICK_NORMALIZATION_PULSE_MS, out_exp=REALTIME_PICK_NORMALIZATION_OUT_EXP, knee=REALTIME_PICK_NORMALIZATION_KNEE)(mask_pred)
-        
-        mask_used_audio = MaskSaturatingCompressor(p=REALTIME_PICK_NORMALIZATION_MASK_SATURATION_POWER, name="realtime_mask_compress")(mask_norm)
-        mask_for_kd     = mask_norm
-        mask_for_mult   = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
-        mask_debug_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_audio)
-    else:
-        # Baseline (or learned head capped by fixed gate)
-        mask_smoothed = CausalExpSmoother(time_const_ms=0.08, sample_rate=REALTIME_SAMPLE_RATE, Lmax=128, name="realtime_hf_mask_smooth")(mask_pred)
-        mask_used_inner = Minimum(name="realtime_hf_mask_used_min")([mask_smoothed, realtime_gate]) if realtime_gate is not None else IdentityLayer(name="realtime_hf_mask_used_id")(mask_smoothed)
-        # No extra shaping on baseline path
-        mask_used_audio = mask_used_inner
-        mask_for_kd     = mask_smoothed
-        mask_for_mult   = Lambda(stop_grad, name="realtime_hf_mask_stopgrad")(mask_used_audio) if detach_mask_from_audio else mask_used_audio
-        mask_debug_used = IdentityLayer(name="realtime_hf_mask_used")(mask_used_audio)
-
-    # HF branch proper
     hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
     hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0, residual_scale=0.35, bias_constraint=BC)
     hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0, residual_scale=0.35, bias_constraint=BC)
     hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0, residual_scale=0.35, bias_constraint=BC)
     hf = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_hf_out")(hf)
 
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_for_mult])
+    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used_for_gating])
     hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
     hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
-
     hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
                                 cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
                                 order=129,
                                 sample_rate=REALTIME_SAMPLE_RATE,
                                 name="realtime_hf_lowband_penalty")(hf_final)
-
-    if int(hf_time_shift_samples) != 0:
-        hf_final = TimeShift1D(shift=int(hf_time_shift_samples), name="realtime_hf_timeshift")(hf_final)
+    if int(REALTIME_HF_TIME_SHIFT_SAMPLES) != 0:
+        hf_final = TimeShift1D(shift=int(REALTIME_HF_TIME_SHIFT_SAMPLES), name="realtime_hf_timeshift")(hf_final)
     hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
 
-    # Mix
+    # Sum
     y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final_pick])
 
-    # Resonance stem gates from the same mask gate used for HF
-    gate_for_resbp = mask_debug_used if (realtime_gate is None) else realtime_gate
-    realtime_resbp = _add_resbp_branch_realtime(inp=inp, gate=gate_for_resbp, style_time_used=style_scalar_b3, bias_constraint=BC)
+    # ResBP branch: driven by the same mask gate
+    realtime_resbp = _add_resbp_branch_realtime(
+        inp=inp, gate=mask_used_for_gating, style_time_used=style_scalar_b3, bias_constraint=BC
+    )
     y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
 
-        # KD wiring
-    if offline is not None:
-        T_gate_ds  = FIRDecimateBy2(name="offline_gate_ds2")(T_gate)
-
-        # Always-on KD (audio/features/stems)
-        kd_tensors.append(HFSuppressWhenClosed(alpha=0.7, name="hf_suppress_closed")([hf_final, T_gate_ds]))
-
-        T_feats_ds = [FIRDecimateBy2(name=f"offline_feat_ds2_{i}")(t) for i, t in enumerate(T_feats)]
-        for i, (T_f_ds, S_f) in enumerate(zip(T_feats_ds, realtime_feats)):
-            chan = int(T_f_ds.shape[-1])
-            proj = Conv1D(chan, 1, padding="same", name=f"realtime_proj_feat_{i}")(S_f)
-            kd_tensors.append(DistillLoss(alpha=REALTIME_FEAT_DISTILL_ALPHA, name=f"feat_distill_{i}")([T_f_ds, proj]))
-
-        offline_audio_ds = FIRDecimateBy2(name="offline_audio_ds2")(offline_audio)
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_DISTILL_ALPHA, max_shift=8, name="audio_distill")([offline_audio_ds, y_realtime]))
-        kd_tensors.append(MSTFTDistillLoss(alpha=REALTIME_AUDIO_STFT_DISTILL_ALPHA, name="audio_stft_distill")([offline_audio_ds, y_realtime]))
-
-        off_pick_ds   = FIRDecimateBy2(name="offline_pick_ds2")(off_pick)
-        off_finger_ds = FIRDecimateBy2(name="offline_finger_ds2")(off_finger)
-        off_hf_ds     = FIRDecimateBy2(name="offline_hf_ds2")(off_hf_scaled)
-        off_hf_ds_hp48 = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="offline_hf_ds_hp48")(off_hf_ds)
-        off_hf_ds_hp48_pick = Multiply(name="offline_hf_ds_hp48_pick_only")([off_hf_ds_hp48, style_scalar_b3])
-
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_PICK_DISTILL_ALPHA,   max_shift=8, name="stem_pick_distill")([off_pick_ds,   out_pick]))
-        kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_FINGER_DISTILL_ALPHA, max_shift=8, name="stem_finger_distill")([off_finger_ds, out_finger]))
-        kd_tensors.append(DistillLoss(alpha=REALTIME_STEM_HF_DISTILL_ALPHA, name="stem_hf_distill")([off_hf_ds_hp48_pick, hf_final_pick]))
-
-        if realtime_resbp is not None and off_resbp_scaled is not None:
-            off_resbp_ds = FIRDecimateBy2(name="offline_resbp_ds2")(off_resbp_scaled)
-            kd_tensors.append(DistillLossBestShift(alpha=REALTIME_STEM_RESBP_DISTILL_ALPHA, max_shift=8, name="stem_resbp_distill")([off_resbp_ds, realtime_resbp]))
-
-        # Mask-specific KD only if requested
-        if enable_mask_kd:
-            kd_tensors.append(MaskSuppressWhenClosed(alpha=0.5, name="mask_suppress_closed")([mask_for_kd, T_gate_ds]))
-            kd_tensors.append(DistillBCE(alpha=REALTIME_HF_MASK_DISTILL_ALPHA, name="hf_mask_bce")([T_gate_ds, mask_for_kd]))
-            g_on = Lambda(gate_onset, name="off_gate_onset_ds")(T_gate_ds)
-            m_on = Lambda(gate_onset, name="rt_mask_onset")(mask_for_kd)
-            kd_tensors.append(DistillLossBestShift(alpha=0.8, max_shift=6, name="mask_onset_kd")([g_on, m_on]))
-            kd_tensors.append(HFSuppressByMask(alpha=0.4, name="hf_suppress_by_student_mask")([hf_final, mask_for_kd]))
-
-    if kd_tensors:
-        y_realtime = LossTether(name="realtime_kd_tether")([y_realtime] + kd_tensors)
-
-    # COLOREQ inside the base graph (frozen by default)
+    # coloreq
     y_realtime = add_coloreq(y_realtime,
                              bands=COLOREQ_BANDS_REALTIME_BODY,
                              sample_rate=REALTIME_SAMPLE_RATE,
@@ -4242,8 +4222,39 @@ def build_realtime_model(offline=None,
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
+    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_realtime, style_prob], name=name)
 
-    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_realtime, style_prob], name="piezo2mic_realtime")
+
+def convert_base_models_to_analytic_pick():
+    """
+    Load baseline base models (dynamic), build analytic-pick variants, copy weights by name, and save.
+    This does NOT retrain anything and takes seconds.
+    """
+    # Offline
+    off_src_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(off_src_path):
+        print("ERROR: baseline offline dynamic not found:", off_src_path)
+        sys.exit(1)
+    off_src = tf.keras.models.load_model(off_src_path, compile=False)
+
+    off_dyn = build_offline_model(dynamic_time=True)
+    copy_weights_by_name(off_dyn, off_src, verbose=True)
+    out_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME)
+    off_dyn.save(out_off_dyn_path)
+    print("✅ Saved OFFLINE analytic-pick dynamic:", out_off_dyn_path)
+
+    # Realtime
+    rt_src_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(rt_src_path):
+        print("ERROR: baseline realtime dynamic not found:", rt_src_path)
+        sys.exit(1)
+    rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
+    rt_dyn = build_realtime_model(offline=None, dynamic_time=True)
+    copy_weights_by_name(rt_dyn, rt_src, verbose=True)
+    out_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME)
+    rt_dyn.save(out_rt_dyn_path)
+    print("✅ Saved REALTIME analytic-pick dynamic:", out_rt_dyn_path)
+
 
 def approx_steps_from_chunks(chunks, seg_len, model_sample_rate, batch_size):
     """
@@ -5296,49 +5307,57 @@ def _find_last_layer_with_suffix(model, suffix):
     cand = [l for l in model.layers if l.name.endswith(suffix)]
     return cand[-1] if cand else None
 
-@register_keras_serializable()
-def build_offline_debug_model(offline):
+def build_offline_debug_model(model):
+    """
+    Override the previous debug builder so it also exposes the analytic pick mask (if present).
+    """
     outs = {
-        "hf_pre":     offline.get_layer("offline_hf_out").output,
-        "hf_gated":   offline.get_layer("offline_hf_mult_gate").output,
-        "hf_hp":      offline.get_layer("offline_hf_highpass").output,
-        "hf_scaled":  offline.get_layer("offline_hf_scale").output,
-        "hf_pick":    offline.get_layer("offline_hf_pick_only").output,  # pick-only HF
-        "pick_c":     offline.get_layer("offline_pick_contrib").output,
-        "finger_c":   offline.get_layer("offline_finger_contrib").output,
-        "y_pred":     offline.get_layer("offline_mix_main").output,
-        "style_pred": offline.get_layer("offline_style_prob").output,
+        "hf_pre":     model.get_layer("offline_hf_out").output,
+        "hf_gated":   model.get_layer("offline_hf_mult_gate").output,
+        "hf_hp":      model.get_layer("offline_hf_highpass").output,
+        "hf_scaled":  model.get_layer("offline_hf_scale").output,
+        "hf_pick":    model.get_layer("offline_hf_pick_only").output,
+        "pick_c":     model.get_layer("offline_pick_contrib").output,
+        "finger_c":   model.get_layer("offline_finger_contrib").output,
+        "y_pred":     model.get_layer("offline_mix_main").output,
+        "style_pred": model.get_layer("offline_style_prob").output,
     }
-    # Optional: the fixed gate may not exist (cap_mask_with_gate=False)
-    try: outs["gate"] = offline.get_layer("offline_gate").output
+    # Optional resbp
+    try: outs["resbp"] = model.get_layer("offline_resbp_scale").output
     except Exception: pass
-    # Optional stems
-    try: outs["resbp"] = offline.get_layer("offline_resbp_scale").output
-    except Exception: pass
-    # Optional mask tensors
-    for name in ["offline_hf_mask", "offline_hf_mask_smooth", "offline_hf_mask_used"]:
+    # Optional fixed gate (baseline models)
+    for lname in ["offline_gate"]:
+        try: outs["gate"] = model.get_layer(lname).output
+        except Exception: pass
+    # Masks: learned, PN, or analytic engine
+    name_map = [
+        ("mask_pred",  "offline_hf_mask"),
+        ("mask_norm",  "offline_picknorm"),
+        ("mask_used",  "offline_hf_mask_used"),
+        ("mask_engine","offline_pick_engine_mask"),
+    ]
+    for key, lname in name_map:
         try:
-            outs[name.replace("offline_", "")] = offline.get_layer(name).output
+            outs[key] = model.get_layer(lname).output
         except Exception:
             pass
-    # Optional last FiLM params
-    g_last = _find_last_layer_with_suffix(offline, "_film_gamma_expand")
-    b_last = _find_last_layer_with_suffix(offline, "_film_beta_expand")
+    # Last FiLM params (optional)
+    g_last = _find_last_layer_with_suffix(model, "_film_gamma_expand")
+    b_last = _find_last_layer_with_suffix(model, "_film_beta_expand")
     if g_last is not None: outs["film_gamma_last"] = g_last.output
     if b_last is not None: outs["film_beta_last"]  = b_last.output
 
-    return tf.keras.Model(inputs=offline.inputs, outputs=outs, name="offline_debug_model")
+    return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
 
-def build_realtime_debug_model(realtime):
+def build_realtime_debug_model(model):
     """
-    Build a debug model that exposes final audio and key stems/masks.
-    Works for both baseline (fixed gate) and learned-pick (PickNormalizer) graphs.
+    Override previous realtime debug builder to add analytic mask if present.
     """
     def _get_first(names):
         for n in names:
             try:
-                return realtime.get_layer(n).output
+                return model.get_layer(n).output
             except Exception:
                 pass
         return None
@@ -5351,7 +5370,7 @@ def build_realtime_debug_model(realtime):
 
     def add(key, lname):
         try:
-            outs[key] = realtime.get_layer(lname).output
+            outs[key] = model.get_layer(lname).output
         except Exception:
             pass
 
@@ -5362,13 +5381,11 @@ def build_realtime_debug_model(realtime):
     add("hf_scaled","realtime_hf_scale")
     add("hf_pick",  "realtime_hf_pick_only")
 
-    # Mask probes:
-    # - mask_pred: raw sigmoid of mask head
-    # - mask_norm: PickNormalizer output (learned-pick path)
-    # - mask_used: baseline smoothed or capped-by-gate mask (fallback)
-    add("mask_pred", "realtime_hf_mask")
-    add("mask_norm", "realtime_picknorm")     # present when PickNormalizer path exists
-    add("mask_used", "realtime_hf_mask_used") # present on baseline/capped graphs
+    # Masks (all variants)
+    add("mask_pred",   "realtime_hf_mask")
+    add("mask_norm",   "realtime_picknorm")
+    add("mask_used",   "realtime_hf_mask_used")
+    add("mask_engine", "realtime_pick_engine_mask")
 
     # Stems and style
     add("pick_c",     "realtime_pick_contrib")
@@ -5379,10 +5396,10 @@ def build_realtime_debug_model(realtime):
     ir = _get_first(["realtime_ir_matchlen", "realtime_ir_interp", "realtime_ir_lowpass", "realtime_ir_upsample"])
     if ir is not None:
         outs["ir_only"] = ir
+    add("gate", "realtime_gate")  # baseline fixed gate (if any)
 
-    # Optional fixed gate (baseline)
-    add("gate", "realtime_gate")
-    return tf.keras.Model(inputs=realtime.inputs, outputs=outs, name="realtime_debug_model")
+    return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
+
 
 def render_isolated_stems(
     debug_model,
@@ -6247,7 +6264,9 @@ def build_offline_model_learned_pick_tuning(
     picknorm_pulse_ms=OFFLINE_PICK_NORMALIZATION_PULSE_MS,
     picknorm_out_exp=OFFLINE_PICK_NORMALIZATION_OUT_EXP,
     picknorm_knee=OFFLINE_PICK_NORMALIZATION_KNEE,
+    picknorm_mask_saturation=OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER,
     picknorm_out_gain=1.0,
+    
     # Optional small floor BEFORE PickNormalizer (usually keep 0.0)
     pre_picknorm_mask_floor=0.0,
     # Other toggles
@@ -6341,7 +6360,7 @@ def build_offline_model_learned_pick_tuning(
     )(mask_pred)
 
     mask_used_for_gating = MaskSaturatingCompressor(
-        p=OFFLINE_PICK_NORMALIZATION_MASK_SATURATION_POWER,  # you already set this to match realtime
+        p=picknorm_mask_saturation,  # you already set this to match realtime
         post_gain=1.0,
         name="offline_mask_compress"
     )(mask_norm)
@@ -6387,6 +6406,7 @@ def rebuild_offline_learned_pick_dynamic_for_tuning(
     out_gain=1.0,
     attack_ms=0.06,
     release_ms=6.0,
+    mask_saturation=0.6,
     # Others
     pre_picknorm_mask_floor=0.0,
     hf_time_shift_samples=OFFLINE_HF_TIME_SHIFT_SAMPLES
@@ -6413,8 +6433,10 @@ def rebuild_offline_learned_pick_dynamic_for_tuning(
         picknorm_release_ms=release_ms,
         picknorm_pulse_ms=pulse_ms,
         picknorm_out_exp=out_exp,
+        picknorm_mask_saturation=mask_saturation,
         picknorm_knee=knee,
         picknorm_out_gain=out_gain,
+        
         pre_picknorm_mask_floor=pre_picknorm_mask_floor,
         hf_time_shift_samples=hf_time_shift_samples,
         coloreq_trainable=False
@@ -6649,25 +6671,27 @@ def main ():
         # sys.exit(0)
         
         # 1) Rebuild with tighter PickNormalizer and gentle compressor
-        # off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
-        #     pulse_ms=2.5,       # shorter pulse at 96k
-        #     out_exp=1.8,        # compress small/mids → less HF wash
-        #     knee=0.02,          # light deadband
-        # )
+        off_dyn_tuned = rebuild_offline_learned_pick_dynamic_for_tuning(
+            pulse_ms=2.5,       # shorter pulse at 96k
+            out_exp=0.5,        # compress small/mids → less HF wash
+            knee=0.0,          # light deadband,
+            mask_saturation=0.1
+            
+        )
 
-        # # 2) Audition quickly on your demo pair
-        # dbg = build_offline_debug_model(off_dyn_tuned)
-        # src, tgt = all_pairs[DEMO_PAIR_INDEX]
-        # render_isolated_stems(
-        #     debug_model=dbg,
-        #     path_src=src,
-        #     path_tgt=tgt,
-        #     out_dir=os.path.join(DEMOS_OUT_DIR, "offline_learned_pick_tuning"),
-        #     sample_rate=OFFLINE_SAMPLE_RATE,
-        #     sec=LONG_DEMO_SEC,
-        #     offset_sec=LONG_DEMO_OFFSET_SEC
-        # )
-        # sys.exit(0)
+        # 2) Audition quickly on your demo pair
+        dbg = build_offline_debug_model(off_dyn_tuned)
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        render_isolated_stems(
+            debug_model=dbg,
+            path_src=src,
+            path_tgt=tgt,
+            out_dir=os.path.join(DEMOS_OUT_DIR, "offline_learned_pick_tuning"),
+            sample_rate=OFFLINE_SAMPLE_RATE,
+            sec=LONG_DEMO_SEC,
+            offset_sec=LONG_DEMO_OFFSET_SEC
+        )
+        sys.exit(0)
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
         # --learned-pick     → base realtime learned-pick dynamic (if present)
@@ -6727,12 +6751,8 @@ def main ():
             rng = (int(a), int(b))
         render_hf_shift_sweep_realtime(min_shift=rng[0], max_shift=rng[1])
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--make-base-realtime-learned-pick":
-        print("Converting baseline realtime → learned‑pick (mask‑only KD)…")
-        make_base_realtime_learned_pick(epochs=REALTIME_LEARNED_PICK_MASK_EPOCHS, steps_cap=REALTIME_LEARNED_PICK_MASK_STEPS_CAP, lr=REALTIME_LEARNED_PICK_MASK_LR)
-    elif len(sys.argv)>1 and sys.argv[1]=="--make-base-offline-learned-pick":
-        print("Converting baseline offline → learned‑pick (mask‑only KD)…")
-        make_base_offline_learned_pick(epochs=OFFLINE_LEARNED_PICK_MASK_EPOCHS, steps_cap=OFFLINE_LEARNED_PICK_MASK_STEPS_CAP, lr=OFFLINE_LEARNED_PICK_MASK_LR)
+    elif len(sys.argv)>1 and sys.argv[1]=="--convert-analytic-pick":
+        convert_base_models_to_analytic_pick()
     else:
         print("No command given.")
         sys.exit(1)
