@@ -605,12 +605,6 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
 
 @register_keras_serializable()
 class CausalPickRatioMask(tf.keras.layers.Layer):
-    """
-    Analytic, causal, volume‑invariant pick mask:
-      env_hi = EMA(|HPF(x)|, short), env_lo = EMA(|x|, long), r = env_hi/(env_lo+eps)
-      mask = r/(r+knee), then asym. smoothing (fast att, slow rel).
-    All kernels are non‑trainable; ops are conv1d/abs/add/mul/clip.
-    """
     def __init__(self,
                  sample_rate,
                  hp_cut_hz=3500.0,
@@ -636,8 +630,12 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         k_hp = _get_minphase_hp_kernel(self.sample_rate, self.hp_cut_hz, self.hp_order)
-        self.k_hp = self.add_weight("pick_hp_taps", shape=k_hp.shape,
-                                    initializer=tf.keras.initializers.Constant(k_hp), trainable=False)
+        self.k_hp = self.add_weight(
+            name="pick_hp_taps",
+            shape=k_hp.shape,
+            initializer=tf.keras.initializers.Constant(k_hp),
+            trainable=False
+        )
 
         def _ema(ms, scale, Lmax):
             s = max(1, int(round((float(ms)/1000.0)*self.sample_rate)))
@@ -648,16 +646,36 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
         k_att  = _ema(self.smooth_attack_ms, scale=4.0, Lmax=2048)
         k_rel  = _ema(self.smooth_release_ms, scale=4.0, Lmax=2048)
 
-        self.k_fast = self.add_weight("pick_env_fast", shape=k_fast.shape,
-                                      initializer=tf.keras.initializers.Constant(k_fast), trainable=False)
-        self.k_slow = self.add_weight("pick_env_slow", shape=k_slow.shape,
-                                      initializer=tf.keras.initializers.Constant(k_slow), trainable=False)
-        self.k_att  = self.add_weight("pick_smooth_attack", shape=k_att.shape,
-                                      initializer=tf.keras.initializers.Constant(k_att), trainable=False)
-        self.k_rel  = self.add_weight("pick_smooth_release", shape=k_rel.shape,
-                                      initializer=tf.keras.initializers.Constant(k_rel), trainable=False)
-        self.gain   = self.add_weight("pick_mask_gain", shape=(1,),
-                                      initializer=tf.keras.initializers.Constant(self.out_gain), trainable=False)
+        self.k_fast = self.add_weight(
+            name="pick_env_fast",
+            shape=k_fast.shape,
+            initializer=tf.keras.initializers.Constant(k_fast),
+            trainable=False
+        )
+        self.k_slow = self.add_weight(
+            name="pick_env_slow",
+            shape=k_slow.shape,
+            initializer=tf.keras.initializers.Constant(k_slow),
+            trainable=False
+        )
+        self.k_att  = self.add_weight(
+            name="pick_smooth_attack",
+            shape=k_att.shape,
+            initializer=tf.keras.initializers.Constant(k_att),
+            trainable=False
+        )
+        self.k_rel  = self.add_weight(
+            name="pick_smooth_release",
+            shape=k_rel.shape,
+            initializer=tf.keras.initializers.Constant(k_rel),
+            trainable=False
+        )
+        self.gain   = self.add_weight(
+            name="pick_mask_gain",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant(self.out_gain),
+            trainable=False
+        )
         super().build(input_shape)
 
     def call(self, x):
