@@ -6456,6 +6456,18 @@ def train_offline_picklearn_from_mic():
     print("✅ Saved OFFLINE picklearn (static):", stat_path)
     return dyn
 
+def _get_input_tensor_by_name(model, name):
+    # Prefer InputLayer lookup
+    try:
+        return model.get_layer(name).input
+    except Exception:
+        # Fallback: match against model.inputs stripping ':0'
+        for t in model.inputs:
+            base = t.name.split(':')[0].split('/')[-1]
+            if base == name:
+                return t
+        raise ValueError(f"Input '{name}' not found in model '{model.name}'. "
+                         f"Available inputs: {[t.name for t in model.inputs]}")
 
 def train_realtime_picklearn_from_offline():
     """
@@ -6485,11 +6497,14 @@ def train_realtime_picklearn_from_offline():
     copy_weights_by_name(rt, rt_src, verbose=True)
 
     # Teacher picklearn stem at 96k, then ds2 to 48k
-    off_inp = rt.get_layer("realtime_offline_piezo_input").input if any(i.name=="realtime_offline_piezo_input" for i in rt.inputs) else None
-    style_true_in  = rt.get_layer("realtime_style_true_input").input
-    style_force_in = rt.get_layer("realtime_style_force_input").input
+    off_inp       = _get_input_tensor_by_name(rt, "realtime_offline_piezo_input")
+    style_true_in = _get_input_tensor_by_name(rt, "realtime_style_true_input")
+    style_force_in= _get_input_tensor_by_name(rt, "realtime_style_force_input")
 
-    pick_t = off_causal.get_layer("offline_picklearn_pred").output if any(l.name=="offline_picklearn_pred" for l in off_causal.layers) else off_causal.get_layer("offline_pick_amount").output
+    pick_t = (off_causal.get_layer("offline_picklearn_pred").output
+              if any(l.name == "offline_picklearn_pred" for l in off_causal.layers)
+              else off_causal.get_layer("offline_pick_amount").output)
+
     teacher_pick = tf.keras.Model(inputs=off_causal.inputs, outputs=pick_t, name="offline_picklearn_teacher")
 
     pick_t96 = teacher_pick([off_inp, style_true_in, style_force_in])  # (B,T96,1)
