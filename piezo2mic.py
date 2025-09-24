@@ -6472,21 +6472,24 @@ def _get_input_tensor_by_name(model, name):
 def train_realtime_picklearn_from_offline():
     """
     Distill REALTIME pick branches from the OFFLINE picklearn stem (96k→48k).
+    Uses a wrapper graph so student and teacher are called with the same fresh Inputs.
     """
     off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
     if not os.path.exists(off_dyn_path):
         print("ERROR: offline picklearn dynamic not found. Run --migrate-picklearn first."); sys.exit(1)
     off_nc = tf.keras.models.load_model(off_dyn_path, compile=False)
 
-    # Make a causalized teacher clone (0 lookahead) of the picklearn graph
+    # Causalized teacher clone (0 right-lookahead) of the picklearn graph
     def build_offline_picklearn_causal(src):
         m = build_offline_model(dynamic_time=True, lookahead_samples=0, name="piezo2mic_offline_picklearn_causal")
         copy_weights_by_name(m, src, verbose=True)
-        for l in m.layers: l.trainable = False
+        for l in m.layers:
+            l.trainable = False
         return m
+
     off_causal = build_offline_picklearn_causal(off_nc)
 
-    # Build realtime picklearn with teacher plugged (for KD)
+    # Student realtime (static) with teacher plugged (used only to initialize weights)
     rt = build_realtime_model(offline=off_causal, dynamic_time=False)
 
     # Copy backbone weights from baseline realtime
@@ -6496,42 +6499,73 @@ def train_realtime_picklearn_from_offline():
     rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
     copy_weights_by_name(rt, rt_src, verbose=True)
 
-    # Teacher picklearn stem at 96k, then ds2 to 48k
-    off_inp       = _get_input_tensor_by_name(rt, "realtime_offline_piezo_input")
-    style_true_in = _get_input_tensor_by_name(rt, "realtime_style_true_input")
-    style_force_in= _get_input_tensor_by_name(rt, "realtime_style_force_input")
+    # Build the KD wrapper inputs (fresh keras.Inputs)
+    factor = OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE  # expect 2
+    rt_inp        = tf.keras.layers.Input(shape=(REALTIME_SEG_LEN, 1), name="realtime_piezo_input")
+    off_inp       = tf.keras.layers.Input(shape=(REALTIME_SEG_LEN * factor, 1), name="realtime_offline_piezo_input")
+    style_true_in = tf.keras.layers.Input(shape=(1,), name="realtime_style_true_input")
+    style_force_in= tf.keras.layers.Input(shape=(1,), name="realtime_style_force_input")
 
-    pick_t = (off_causal.get_layer("offline_picklearn_pred").output
-              if any(l.name == "offline_picklearn_pred" for l in off_causal.layers)
-              else off_causal.get_layer("offline_pick_amount").output)
+    # Route through the student model on these fresh inputs
+    y_audio, y_style = rt([rt_inp, off_inp, style_true_in, style_force_in])
 
-    teacher_pick = tf.keras.Model(inputs=off_causal.inputs, outputs=pick_t, name="offline_picklearn_teacher")
+    # Teacher picklearn stem (at 96k), then decimate-by-2 to 48k
+    if any(l.name == "offline_picklearn_pred" for l in off_causal.layers):
+        pick_t = off_causal.get_layer("offline_picklearn_pred").output
+    else:
+        pick_t = off_causal.get_layer("offline_pick_amount").output
 
-    pick_t96 = teacher_pick([off_inp, style_true_in, style_force_in])  # (B,T96,1)
+    teacher_pick = tf.keras.models.Model(
+        inputs=off_causal.inputs,
+        outputs=pick_t,
+        name="offline_picklearn_teacher"
+    )
+    pick_t96 = teacher_pick([off_inp, style_true_in, style_force_in])  # (B, T96, 1)
     pick_t48 = FIRDecimateBy2(name="rt_picklearn_teacher_ds2")(pick_t96)
 
-    pick_s = rt.get_layer("realtime_picklearn_pred").output
+    # Student picklearn output (build a stub submodel to expose the internal layer wrt the new inputs)
+    rt_pick_stub = tf.keras.models.Model(
+        inputs=rt.inputs,
+        outputs=rt.get_layer("realtime_picklearn_pred").output,
+        name="realtime_pick_stub"
+    )
+    pick_s = rt_pick_stub([rt_inp, off_inp, style_true_in, style_force_in])
 
+    # KD losses (training-only via add_loss)
     kd_terms = []
     kd_terms.append(DistillLossBestShift(alpha=1.0, max_shift=8, name="rt_picklearn_l2")([pick_t48, pick_s]))
     kd_terms.append(MSTFTDistillLoss(alpha=0.6, name="rt_picklearn_stft")([pick_t48, pick_s]))
 
-    y_audio, y_style = rt.outputs
+    # Tether to keep KD tensors reachable
     y_audio_kd = LossTether(name="rt_picklearn_kd_tether")([y_audio] + kd_terms)
-    rt_train = tf.keras.Model(inputs=rt.inputs, outputs=[y_audio_kd, y_style], name="realtime_picklearn_train")
 
+    # Final training model (wrapper)
+    rt_train = tf.keras.models.Model(
+        inputs=[rt_inp, off_inp, style_true_in, style_force_in],
+        outputs=[y_audio_kd, y_style],
+        name="realtime_picklearn_train"
+    )
+
+    # Train only the picklearn heads
     _freeze_only_prefixes(rt_train, prefixes=("realtime_picklearn_", "realtime_reslearn_", "realtime_pick_amount"))
 
+    # Dataset and training (unchanged)
     ds, steps = _make_realtime_dual_ds(FINETUNE_BATCH_SIZE)
 
-    loss_dummy = FinetuneCombinedLossLite(sample_rate=REALTIME_SAMPLE_RATE,
-                                          stft_scales=((1024,256,1024),),
-                                          l1_w=0.0, hf_w=0.0, stft_w=0.0, env_w=0.0)
+    loss_dummy = FinetuneCombinedLossLite(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        stft_scales=((1024,256,1024),),
+        l1_w=0.0, hf_w=0.0, stft_w=0.0, env_w=0.0
+    )
 
-    rt_train.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=PICKLEARN_REALTIME_LR, clipnorm=1.0),
-                     loss=[loss_dummy, "binary_crossentropy"], loss_weights=[0.0, 0.0])
+    rt_train.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=PICKLEARN_REALTIME_LR, clipnorm=1.0),
+        loss=[loss_dummy, "binary_crossentropy"],
+        loss_weights=[0.0, 0.0]
+    )
     rt_train.fit(ds, epochs=int(PICKLEARN_REALTIME_EPOCHS), steps_per_epoch=int(steps), verbose=1)
 
+    # Export teacher-free realtime dynamic
     rt_dyn = build_realtime_model(offline=None, dynamic_time=True)
     copy_weights_by_name(rt_dyn, rt_train, verbose=True)
     dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME)
