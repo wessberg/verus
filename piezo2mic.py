@@ -317,11 +317,33 @@ FINETUNE_OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_offline.keras"
 FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.keras"
 
 
-# New filenames for converted base models (analytic pick)
-OFFLINE_ANALYTIC_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_offline_analytic_pick.keras"
-OFFLINE_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_offline_analytic_pick_dynamic.keras"
-REALTIME_ANALYTIC_PICK_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime_analytic_pick.keras"
-REALTIME_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_analytic_pick_dynamic.keras"
+
+
+
+
+
+
+# Filenames for new base models
+OFFLINE_PICKLEARN_STATIC_MODEL_FILENAME   = "piezo2mic_offline_picklearn.keras"
+OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME  = "piezo2mic_offline_picklearn_dynamic.keras"
+REALTIME_PICKLEARN_STATIC_MODEL_FILENAME  = "piezo2mic_realtime_picklearn.keras"
+REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME = "piezo2mic_realtime_picklearn_dynamic.keras"
+
+# Training caps/params for the small pick heads (fast)
+PICKLEARN_OFFLINE_EPOCHS     = 10
+PICKLEARN_OFFLINE_STEPS_CAP  = 1800
+PICKLEARN_OFFLINE_LR         = 2e-4
+
+PICKLEARN_REALTIME_EPOCHS    = 10
+PICKLEARN_REALTIME_STEPS_CAP = 2200
+PICKLEARN_REALTIME_LR        = 1e-4
+
+
+
+
+
+
+
 
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
@@ -580,29 +602,25 @@ def copy_weights_by_name(dst_model, src_model, verbose=False):
         print(f"[copy_weights_by_name] copied {matched} layer(s) by name into '{dst_model.name}'")
     return matched
 
+
 @register_keras_serializable()
 class CausalPickRatioMask(tf.keras.layers.Layer):
     """
-    Analytic, causal, volume-invariant pick mask:
-      - env_hi = EMA(|HPF(x)|, tau=env_fast_ms)
-      - env_lo = EMA(|x|,      tau=env_slow_ms)
-      - r = env_hi / (env_lo + eps)
-      - mask_raw = r / (r + knee) in [0,1]  (soft-ratio)
-      - optional asym smoothing (fast attack, slow release)
-    All ops are conv1d + elementwise; fully TFLite-friendly.
-
-    Parameters tuned conservatively; override in builders if needed.
+    Analytic, causal, volume‑invariant pick mask:
+      env_hi = EMA(|HPF(x)|, short), env_lo = EMA(|x|, long), r = env_hi/(env_lo+eps)
+      mask = r/(r+knee), then asym. smoothing (fast att, slow rel).
+    All kernels are non‑trainable; ops are conv1d/abs/add/mul/clip.
     """
     def __init__(self,
                  sample_rate,
                  hp_cut_hz=3500.0,
                  hp_order=129,
-                 env_fast_ms=0.30,     # short for pick sparkle
-                 env_slow_ms=12.0,     # slow for divisive normalization
-                 knee=0.20,            # soft-knee of r/(r+knee)
-                 smooth_attack_ms=0.10,
+                 env_fast_ms=0.30,
+                 env_slow_ms=12.0,
+                 knee=0.20,
+                 smooth_attack_ms=0.08,
                  smooth_release_ms=6.0,
-                 out_gain=1.0,         # optional scalar makeup (kept 1.0)
+                 out_gain=1.0,
                  name=None,
                  **kwargs):
         super().__init__(name=name, **kwargs)
@@ -616,86 +634,50 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
         self.smooth_release_ms= float(smooth_release_ms)
         self.out_gain         = float(out_gain)
 
-        # Non-trainable kernels will be created in build()
-        self.k_hp    = None
-        self.k_fast  = None
-        self.k_slow  = None
-        self.k_att   = None
-        self.k_rel   = None
-
     def build(self, input_shape):
-        # High-pass for the "sparkle" band
         k_hp = _get_minphase_hp_kernel(self.sample_rate, self.hp_cut_hz, self.hp_order)
-        self.k_hp = self.add_weight(
-            name="pick_hp_taps", shape=k_hp.shape,
-            initializer=tf.keras.initializers.Constant(k_hp),
-            trainable=False
-        )
-        # Fast/slow EMAs for envelopes
-        def ema_kernel(ms, scale, Lmax):
-            s = max(1, int(round((float(ms) / 1000.0) * float(self.sample_rate))))
+        self.k_hp = self.add_weight("pick_hp_taps", shape=k_hp.shape,
+                                    initializer=tf.keras.initializers.Constant(k_hp), trainable=False)
+
+        def _ema(ms, scale, Lmax):
+            s = max(1, int(round((float(ms)/1000.0)*self.sample_rate)))
             return _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
-        k_fast = ema_kernel(self.env_fast_ms, scale=3.0, Lmax=1024)
-        k_slow = ema_kernel(self.env_slow_ms, scale=3.0, Lmax=4096)
-        self.k_fast = self.add_weight(
-            name="pick_env_fast", shape=k_fast.shape,
-            initializer=tf.keras.initializers.Constant(k_fast), trainable=False
-        )
-        self.k_slow = self.add_weight(
-            name="pick_env_slow", shape=k_slow.shape,
-            initializer=tf.keras.initializers.Constant(k_slow), trainable=False
-        )
-        # Asymmetric smoothing on mask
-        k_att = ema_kernel(self.smooth_attack_ms, scale=4.0, Lmax=2048)
-        k_rel = ema_kernel(self.smooth_release_ms, scale=4.0, Lmax=2048)
-        self.k_att = self.add_weight(
-            name="pick_smooth_attack", shape=k_att.shape,
-            initializer=tf.keras.initializers.Constant(k_att), trainable=False
-        )
-        self.k_rel = self.add_weight(
-            name="pick_smooth_release", shape=k_rel.shape,
-            initializer=tf.keras.initializers.Constant(k_rel), trainable=False
-        )
-        # Optional global gain
-        self.gain = self.add_weight(
-            name="pick_mask_gain", shape=(1,),
-            initializer=tf.keras.initializers.Constant(self.out_gain),
-            trainable=False
-        )
+
+        k_fast = _ema(self.env_fast_ms, scale=3.0, Lmax=1024)
+        k_slow = _ema(self.env_slow_ms, scale=3.0, Lmax=4096)
+        k_att  = _ema(self.smooth_attack_ms, scale=4.0, Lmax=2048)
+        k_rel  = _ema(self.smooth_release_ms, scale=4.0, Lmax=2048)
+
+        self.k_fast = self.add_weight("pick_env_fast", shape=k_fast.shape,
+                                      initializer=tf.keras.initializers.Constant(k_fast), trainable=False)
+        self.k_slow = self.add_weight("pick_env_slow", shape=k_slow.shape,
+                                      initializer=tf.keras.initializers.Constant(k_slow), trainable=False)
+        self.k_att  = self.add_weight("pick_smooth_attack", shape=k_att.shape,
+                                      initializer=tf.keras.initializers.Constant(k_att), trainable=False)
+        self.k_rel  = self.add_weight("pick_smooth_release", shape=k_rel.shape,
+                                      initializer=tf.keras.initializers.Constant(k_rel), trainable=False)
+        self.gain   = self.add_weight("pick_mask_gain", shape=(1,),
+                                      initializer=tf.keras.initializers.Constant(self.out_gain), trainable=False)
         super().build(input_shape)
 
     def call(self, x):
-        # x: (B,T,1)
-        # High-band envelope
         hp     = _causal_conv1d(x, self.k_hp)
         env_hi = _causal_conv1d(tf.abs(hp), self.k_fast)
-        # Broadband envelope
         env_lo = _causal_conv1d(tf.abs(x),  self.k_slow)
-
         eps = tf.constant(1e-8, dtype=x.dtype)
         r   = env_hi / (env_lo + eps)
-
-        # Soft ratio knee → [0,1]
         k   = tf.constant(self.knee, dtype=x.dtype)
-        mask_raw = r / (r + tf.maximum(k, eps))
-        mask_raw = tf.clip_by_value(mask_raw, 0.0, 1.0)
+        m0  = tf.clip_by_value(r / (r + tf.maximum(k, eps)), 0.0, 1.0)
 
-        # Asymmetric smoothing (attack/release)
-        prev = tf.pad(mask_raw, [[0,0],[1,0],[0,0]])[:, :-1, :]
-        rising = tf.cast(mask_raw > prev, x.dtype)
-        att = _causal_conv1d(mask_raw, self.k_att)
-        rel = _causal_conv1d(mask_raw, self.k_rel)
-        m   = rising * att + (1.0 - rising) * rel
-
-        m = tf.clip_by_value(m * self.gain, 0.0, 1.0)
-        return m
-
-    def compute_output_shape(self, input_shape):
-        return input_shape
+        prev = tf.pad(m0, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(m0 > prev, x.dtype)
+        att = _causal_conv1d(m0, self.k_att)
+        rel = _causal_conv1d(m0, self.k_rel)
+        m = rising * att + (1.0 - rising) * rel
+        return tf.clip_by_value(m * self.gain, 0.0, 1.0)
 
     def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
+        return {
             "sample_rate": self.sample_rate,
             "hp_cut_hz": self.hp_cut_hz,
             "hp_order": self.hp_order,
@@ -704,9 +686,130 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
             "knee": self.knee,
             "smooth_attack_ms": self.smooth_attack_ms,
             "smooth_release_ms": self.smooth_release_ms,
-            "out_gain": self.out_gain
-        })
-        return cfg
+            "out_gain": self.out_gain,
+            **super().get_config()
+        }
+
+
+def _pick_mask_engine(inp, sample_rate, prefix):
+    return CausalPickRatioMask(
+        sample_rate=sample_rate,
+        hp_cut_hz=hp_cutoff_for_sr(sample_rate),
+        hp_order=129,
+        env_fast_ms=0.30 if int(sample_rate)==REALTIME_SAMPLE_RATE else 0.25,
+        env_slow_ms=12.0,
+        knee=0.20,
+        smooth_attack_ms=0.08,
+        smooth_release_ms=6.0,
+        out_gain=1.0,
+        name=f"{prefix}_pick_mask"
+    )(inp)
+
+
+@register_keras_serializable()
+class LearnedModalBank(tf.keras.layers.Layer):
+    """
+    Trainable version of ModalBank; initialized from your fixed modal kernels.
+    """
+    def __init__(self, centers_hz, decays_ms, length, sample_rate, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.centers_hz = [float(x) for x in centers_hz]
+        self.decays_ms  = [float(x) for x in decays_ms]
+        self.length     = int(length)
+        self.sample_rate= int(sample_rate)
+
+    def build(self, input_shape):
+        K = _make_modal_kernels(self.centers_hz, self.decays_ms, self.length, self.sample_rate)
+        self.kernel = self.add_weight(
+            name="modal_kernels_trainable",
+            shape=K.shape,
+            initializer=tf.keras.initializers.Constant(K),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        shp = tf.shape(x); b = shp[0]; t = shp[1]; c = tf.reduce_prod(shp[2:])
+        assert_op = tf.debugging.assert_equal(c, 1, message="LearnedModalBank expects 1 channel.")
+        with tf.control_dependencies([assert_op]):
+            x3 = tf.reshape(x, [b, t, c])
+        pad = self.length - 1
+        x_pad = tf.pad(x3, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], input_shape[1], len(self.centers_hz))
+
+    def get_config(self):
+        return {
+            "centers_hz": self.centers_hz,
+            "decays_ms":  self.decays_ms,
+            "length":     self.length,
+            "sample_rate":self.sample_rate,
+            **super().get_config()
+        }
+
+
+def _pick_sparkle(prefix, hf_in, mask, filters=16):
+    """
+    Tiny causal HF synthesis gated by the analytic pick mask.
+    """
+    x = Multiply(name=f"{prefix}_picklearn_gate")([hf_in, mask])
+    x = causal_sep_conv(x, filters, 7, 1, name=f"{prefix}_picklearn_c1", activation="relu")
+    x = causal_sep_conv(x, filters, 7, 2, name=f"{prefix}_picklearn_c2", activation="relu")
+    x = Conv1D(1, 1, padding="same", name=f"{prefix}_picklearn_out")(x)
+    return IrScale(init=1.0, name=f"{prefix}_picklearn_hf_scale")(x)
+
+
+def _reson_learn_offline(inp, mask):
+    sr = OFFLINE_SAMPLE_RATE
+    onset = Lambda(gate_onset, name="offline_reslearn_onset")(mask)
+    strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_OFFLINE, sample_rate=sr, Lmax=4096,
+                               name="offline_reslearn_onset_pulse")(onset)
+    ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE),
+                      high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_OFFLINE),
+                      order=OFFLINE_RESBP_BP_ORDER, sample_rate=sr,
+                      name="offline_reslearn_ctrl_bp")(inp)
+    amp = CausalExpSmoother(time_const_ms=4.0, sample_rate=sr, Lmax=1024,
+                            name="offline_reslearn_ctrl_env")(Abs1D()(ana))
+    amp = Lambda(clip_01x4, name="offline_reslearn_ctrl_gain")(amp)
+    exc = Multiply(name="offline_reslearn_excite")([strike, amp])
+    modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
+                             decays_ms =RESBP_MODAL_DECAYS_MS_OFFLINE,
+                             length    =RESBP_MODAL_LEN_OFFLINE,
+                             sample_rate=sr,
+                             name="offline_reslearn_modal")(exc)
+    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="offline_reslearn_mix")(modes)
+    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE), order=65,
+                       name="offline_reslearn_post_hp")(mixed)
+    return IrScale(init=1.0, name="offline_reslearn_scale")(mixed)
+
+
+def _reson_learn_realtime(inp, mask):
+    sr = REALTIME_SAMPLE_RATE
+    onset = Lambda(gate_onset, name="realtime_reslearn_onset")(mask)
+    strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_REALTIME, sample_rate=sr, Lmax=512,
+                               name="realtime_reslearn_onset_pulse")(onset)
+    ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME),
+                      high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_REALTIME),
+                      order=REALTIME_RESBP_BP_ORDER, sample_rate=sr,
+                      name="realtime_reslearn_ctrl_bp")(inp)
+    amp = CausalExpSmoother(time_const_ms=3.0, sample_rate=sr, Lmax=256,
+                            name="realtime_reslearn_ctrl_env")(Abs1D()(ana))
+    amp = Lambda(clip_01x4, name="realtime_reslearn_ctrl_gain")(amp)
+    exc = Multiply(name="realtime_reslearn_excite")([strike, amp])
+    modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
+                             decays_ms =RESBP_MODAL_DECAYS_MS_REALTIME,
+                             length    =RESBP_MODAL_LEN_REALTIME,
+                             sample_rate=sr,
+                             name="realtime_reslearn_modal")(exc)
+    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_reslearn_mix")(modes)
+    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65,
+                       name="realtime_reslearn_post_hp")(mixed)
+    return IrScale(init=1.0, name="realtime_reslearn_scale")(mixed)
+
+
+
 
 @register_keras_serializable()
 class PickNormalizer(tf.keras.layers.Layer):
@@ -3944,36 +4047,16 @@ def build_offline_model_causal(offline_src, dynamic_time=True):
     for l in offline_causal.layers:
         l.trainable = False
     return offline_causal
-def _add_pick_engine_mask(inp, sample_rate, prefix):
-    """
-    Helper to add the analytic pick mask into the graph.
-    Returns the mask tensor named f"{prefix}_pick_engine_mask".
-    """
-    # Defaults chosen to match your HF cutoff and behavior
-    hp_cut = hp_cutoff_for_sr(sample_rate)  # ~2.5 kHz
-    pe = CausalPickRatioMask(
-        sample_rate=sample_rate,
-        hp_cut_hz=hp_cut,
-        hp_order=129,
-        env_fast_ms=0.30 if sample_rate == REALTIME_SAMPLE_RATE else 0.25,
-        env_slow_ms=12.0,
-        knee=0.20,
-        smooth_attack_ms=0.08,
-        smooth_release_ms=6.0,
-        out_gain=1.0,
-        name=f"{prefix}_pick_engine_mask"
-    )
-    return pe(inp)
-
 
 @register_keras_serializable()
 def build_offline_model(dynamic_time=False,
-                                      lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
-                                      name="piezo2mic_offline_analytic_pick",
-                                      coloreq_trainable=False):
+                                  lookahead_samples=OFFLINE_LOOKAHEAD_SAMPLES,
+                                  name="piezo2mic_offline_picklearn",
+                                  coloreq_trainable=False):
     """
-    Offline model using analytic pick engine instead of fixed gate / learned mask.
-    Only the gating/excitation path is changed; all other layers/names match baseline.
+    NEW base OFFLINE: main_core + pick_amount * (sparkle + learned resonances).
+    No old HF gate/mask, no old fixed ResBP in the mix.
+    Names of backbone layers match the old base to copy weights by name.
     """
     T   = None if dynamic_time else OFFLINE_SEG_LEN
     inp = Input(shape=(T,1), name="offline_piezo_input")
@@ -3981,7 +4064,6 @@ def build_offline_model(dynamic_time=False,
     style_true_in  = Input(shape=(1,), name="offline_style_true_input")
     style_force_in = Input(shape=(1,), name="offline_style_force_input")
 
-    # Style head (unchanged)
     cls         = Conv1D(16,3, padding="same", activation="relu", name="offline_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="offline_style_gap")(cls)
     style_logit = Dense(1, name="offline_style_logit")(cls)
@@ -3992,10 +4074,9 @@ def build_offline_model(dynamic_time=False,
         Multiply(name="offline_style_pred_part")([one_minus_force, style_prob]),
         Multiply(name="offline_style_true_part")([style_force_in, style_true_in]),
     ])
-    style_time_used = TileStyle(name="offline_style_time_used")([style_used_scalar, inp])
-    style_embed     = Dense(OFFLINE_EMBED_DIM, activation="linear", name="offline_style_embed")(style_used_scalar)
+    style_time = TileStyle(name="offline_style_time_used")([style_used_scalar, inp])
+    style_embed= Dense(OFFLINE_EMBED_DIM, activation="linear", name="offline_style_embed")(style_used_scalar)
 
-    # Main stack (unchanged)
     x = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_init_pw")(inp)
     for i in range(OFFLINE_PRE_BLOCKS):
         x = gated_sep_block(x, OFFLINE_FILTERS, OFFLINE_PRE_KERNEL, 1, prefix=f"offline_pre_{i}", lookahead=lookahead_samples)
@@ -4020,61 +4101,39 @@ def build_offline_model(dynamic_time=False,
 
     main_pick   = Conv1D(1,1,padding="same",name="offline_final_pick")(x)
     main_finger = Conv1D(1,1,padding="same",name="offline_final_finger")(x)
+    inv_style   = InvertStyle(name="offline_invert_style")(style_time)
+    pick_c      = Multiply(name="offline_pick_contrib")([style_time, main_pick])
+    finger_c    = Multiply(name="offline_finger_contrib")([inv_style,   main_finger])
+    main_core   = Add(name="offline_main_core")([pick_c, finger_c])
 
-    inv_style = InvertStyle(name="offline_invert_style")(style_time_used)
-    pick_c    = Multiply(name="offline_pick_contrib")([style_time_used, main_pick])
-    finger_c  = Multiply(name="offline_finger_contrib")([inv_style,     main_finger])
+    # Analytic pick mask
+    mask = _pick_mask_engine(inp, OFFLINE_SAMPLE_RATE, prefix="offline")
 
-    # Analytic pick mask replaces fixed gate / learned mask
-    mask_used_for_gating = _add_pick_engine_mask(inp, OFFLINE_SAMPLE_RATE, prefix="offline")
+    # Pick branch: sparkle + learned resonances, pick‑only by style
+    hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
+    sparkle  = _pick_sparkle("offline", hf_in, mask)
+    reslearn = _reson_learn_offline(inp, mask)
+    pick_pred= Add(name="offline_picklearn_pred_raw")([sparkle, reslearn])
+    pick_pred= Multiply(name="offline_picklearn_pred")([pick_pred, style_time])
 
-    # HF branch (unchanged except gating source)
-    hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
-    hf    = Conv1D(OFFLINE_FILTERS, 1, padding="same", name="offline_hf_init")(hf_in)
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b0", lookahead=lookahead_samples)
-    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b0")
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=5, dilation=1, prefix="offline_hf_b1", lookahead=lookahead_samples)
-    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b1")
-    hf    = gated_sep_block(hf, OFFLINE_FILTERS, kernel=3, dilation=1, prefix="offline_hf_b2", lookahead=lookahead_samples)
-    hf    = film_apply(hf, style_embed, OFFLINE_FILTERS, prefix="offline_hf_b2")
-    hf    = Conv1D(1,1,padding="same", name="offline_hf_out")(hf)
+    pick_amount = IrScale(init=1.0, name="offline_pick_amount")(pick_pred)
 
-    hf_gated = Multiply(name="offline_hf_mult_gate")([hf, mask_used_for_gating])
-    hf_hp    = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE, cutoff_hz=OFFLINE_HP_CUTOFF_HZ, order=OFFLINE_HF_HP_ORDER, name="offline_hf_highpass")(hf_gated)
-    hf_final = IrScale(init=8.0, name="offline_hf_scale")(hf_hp)
-    if int(OFFLINE_HF_TIME_SHIFT_SAMPLES) != 0:
-        hf_final = TimeShift1D(shift=int(OFFLINE_HF_TIME_SHIFT_SAMPLES), name="offline_hf_timeshift")(hf_final)
-    hf_final_pick = Multiply(name="offline_hf_pick_only")([hf_final, style_time_used])
+    out = Add(name="offline_mix_core_plus_pick")([main_core, pick_amount])
 
-    # ResBP branch: use the same mask as a gate/excitation proxy
-    offline_resbp = _add_resbp_branch_offline(
-        inp=inp,
-        style_embed=style_embed,
-        style_time_used=style_time_used,
-        gate=mask_used_for_gating
-    )
-
-    main_core = Add(name="offline_main_core")([pick_c, finger_c])
-    out = Add(name="offline_mix_main")([main_core, hf_final_pick, offline_resbp])
-
-    # coloreq (inside graph, frozen by default)
-    out = add_coloreq(out,
-                      bands=COLOREQ_BANDS_OFFLINE_BODY,
-                      sample_rate=OFFLINE_SAMPLE_RATE,
-                      name_prefix="offline_coloreq",
-                      order=97,
-                      trainable_scales=bool(coloreq_trainable))
+    out = add_coloreq(out, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
+                      name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
 
 @register_keras_serializable()
 def build_realtime_model(offline=None,
-                                       dynamic_time=False,
-                                       name="piezo2mic_realtime_analytic_pick",
-                                       coloreq_trainable=False):
+                                   dynamic_time=False,
+                                   name="piezo2mic_realtime_picklearn",
+                                   coloreq_trainable=False):
     """
-    Realtime model using analytic pick engine. Teacher/KD optional (pass offline=None to keep it teacher-free).
+    NEW base REALTIME: y = y_main + IR + pick_amount * (sparkle + learned resonances).
+    No old HF stem in the mix.
     """
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
@@ -4086,7 +4145,6 @@ def build_realtime_model(offline=None,
     style_true_in  = Input(shape=(1,), name="realtime_style_true_input")
     style_force_in = Input(shape=(1,), name="realtime_style_force_input")
 
-    # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
     style_logit = Dense(1, name="realtime_style_logit")(cls)
@@ -4094,21 +4152,15 @@ def build_realtime_model(offline=None,
 
     style_pred_source = style_prob
     if offline is not None:
-        teacher = offline
-        teacher.trainable = False
+        teacher = offline; teacher.trainable = False
         audio_out, style_prob_out = teacher.outputs
-        teacher_combo = tf.keras.Model(
-            inputs=teacher.inputs, outputs=[audio_out, style_prob_out],
-            name="offline_teacher_min"
-        )
+        teacher_combo = tf.keras.Model(inputs=teacher.inputs, outputs=[audio_out, style_prob_out],
+                                       name="offline_teacher_min_picklearn")
         combo = teacher_combo([offline_inp, style_true_in, style_force_in])
-        offline_audio      = combo[0]
         offline_style_prob = combo[1]
-        style_pred_source = BlendScalar(
-            init_alpha=REALTIME_STYLE_BLEND_INIT,
-            trainable=REALTIME_STYLE_BLEND_TRAINABLE,
-            name="realtime_style_blend"
-        )([style_prob, offline_style_prob])
+        style_pred_source = BlendScalar(init_alpha=REALTIME_STYLE_BLEND_INIT,
+                                        trainable=REALTIME_STYLE_BLEND_TRAINABLE,
+                                        name="realtime_style_blend")([style_prob, offline_style_prob])
 
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
     style_used_scalar = Add(name="realtime_style_used_scalar")([
@@ -4118,7 +4170,6 @@ def build_realtime_model(offline=None,
     style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
     style_embed     = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
-    # Main stack
     BC = ZeroBias()
     x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
     for i in range(REALTIME_PRE_BLOCKS):
@@ -4137,10 +4188,10 @@ def build_realtime_model(offline=None,
                             bias_constraint=BC, name=f"realtime_sep_{i}")(x)
         c  = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
         g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
-        x_block = Multiply(name=f"realtime_gate_mul_{i}")([c, Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
-        x_block = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(x_block)
-        x_block = ConstScale(0.35, name=f"realtime_res_scale_{i}")(x_block)
-        x = Add(name=f"realtime_res_add_{i}")([x_block, res])
+        xb = Multiply(name=f"realtime_gate_mul_{i}")([c, Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
+        xb = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(xb)
+        xb = ConstScale(0.35, name=f"realtime_res_scale_{i}")(xb)
+        x = Add(name=f"realtime_res_add_{i}")([xb, res])
         x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
                        gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
                        gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
@@ -4150,110 +4201,45 @@ def build_realtime_model(offline=None,
     inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
     pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
-    y_realtime = Add(name="realtime_main")([pick_c, finger_c])
+    y_main     = Add(name="realtime_main")([pick_c, finger_c])
 
     # IR branch (unchanged)
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
         ir = ZeroPadding1D((pad, 0), name=f"realtime_ir_pad_{i}")(ir)
-        ir = SeparableConv1D(
-            filters=1,
-            kernel_size=REALTIME_IR_KERNEL,
-            dilation_rate=d,
-            padding="valid",
-            depthwise_regularizer=regularizers.l2(1e-4),
-            pointwise_regularizer=regularizers.l2(1e-4),
-            depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
-            pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
-            bias_constraint=BC,
-            name=f"realtime_ir_sep_{i}"
-        )(ir)
+        ir = SeparableConv1D(filters=1, kernel_size=REALTIME_IR_KERNEL, dilation_rate=d, padding="valid",
+                             depthwise_regularizer=regularizers.l2(1e-4),
+                             pointwise_regularizer=regularizers.l2(1e-4),
+                             depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+                             pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+                             bias_constraint=BC, name=f"realtime_ir_sep_{i}")(ir)
     ir = IrScale(init=0.6, name="realtime_ir_scale")(ir)
-    ir = FIRInterpByN(
-        factor=REALTIME_IR_DOWNSAMPLE_FACTOR,
-        num_taps=max(193, REALTIME_LP_ORDER),
-        cutoff=0.45/REALTIME_IR_DOWNSAMPLE_FACTOR,
-        window=('kaiser', 9.0),
-        name="realtime_ir_interp"
-    )(ir)
+    ir = FIRInterpByN(factor=REALTIME_IR_DOWNSAMPLE_FACTOR, num_taps=max(193, REALTIME_LP_ORDER),
+                      cutoff=0.45/REALTIME_IR_DOWNSAMPLE_FACTOR, window=('kaiser', 9.0),
+                      name="realtime_ir_interp")(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
     # Analytic pick mask
-    mask_used_for_gating = _add_pick_engine_mask(inp, REALTIME_SAMPLE_RATE, prefix="realtime")
+    mask = _pick_mask_engine(inp, REALTIME_SAMPLE_RATE, prefix="realtime")
 
-    # HF branch with analytic mask
-    hf_in  = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-    hf = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name="realtime_hf_init")(hf_in)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b0", lookahead=0, residual_scale=0.35, bias_constraint=BC)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=5, dilation=1, prefix="realtime_hf_b1", lookahead=0, residual_scale=0.35, bias_constraint=BC)
-    hf = glu_sep_block(hf, REALTIME_FILTERS, kernel=3, dilation=1, prefix="realtime_hf_b2", lookahead=0, residual_scale=0.35, bias_constraint=BC)
-    hf = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_hf_out")(hf)
+    # Learned pick: sparkle + learned resonances
+    hf_in    = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
+    sparkle  = _pick_sparkle("realtime", hf_in, mask)
+    reslearn = _reson_learn_realtime(inp, mask)
+    pick_pred= Add(name="realtime_picklearn_pred_raw")([sparkle, reslearn])
+    pick_pred= Multiply(name="realtime_picklearn_pred")([pick_pred, style_scalar_b3])
+    pick_amount = IrScale(init=1.0, name="realtime_pick_amount")(pick_pred)
 
-    hf_gated = Multiply(name="realtime_hf_mult_gate")([hf, mask_used_for_gating])
-    hf_hp    = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE, cutoff_hz=REALTIME_HP_CUTOFF_HZ, order=REALTIME_HF_HP_ORDER, name="realtime_hf_highpass")(hf_gated)
-    hf_final = IrScale(init=8.0, name="realtime_hf_scale")(hf_hp)
-    hf_final = HFLowbandPenalty(alpha=REALTIME_HF_LOWBAND_PENALTY_ALPHA,
-                                cutoff_hz=REALTIME_HF_LOWBAND_PENALTY_CUTOFF_HZ,
-                                order=129,
-                                sample_rate=REALTIME_SAMPLE_RATE,
-                                name="realtime_hf_lowband_penalty")(hf_final)
-    if int(REALTIME_HF_TIME_SHIFT_SAMPLES) != 0:
-        hf_final = TimeShift1D(shift=int(REALTIME_HF_TIME_SHIFT_SAMPLES), name="realtime_hf_timeshift")(hf_final)
-    hf_final_pick = Multiply(name="realtime_hf_pick_only")([hf_final, style_scalar_b3])
+    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pick_amount])
 
-    # Sum
-    y_realtime = Add(name="realtime_with_ir")([y_realtime, ir, hf_final_pick])
-
-    # ResBP branch: driven by the same mask gate
-    realtime_resbp = _add_resbp_branch_realtime(
-        inp=inp, gate=mask_used_for_gating, style_time_used=style_scalar_b3, bias_constraint=BC
-    )
-    y_realtime = Add(name="realtime_with_ir_resbp")([y_realtime, realtime_resbp])
-
-    # coloreq
-    y_realtime = add_coloreq(y_realtime,
-                             bands=COLOREQ_BANDS_REALTIME_BODY,
-                             sample_rate=REALTIME_SAMPLE_RATE,
-                             name_prefix="realtime_coloreq",
-                             order=65,
-                             trainable_scales=bool(coloreq_trainable))
+    y_final = add_coloreq(y_final, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
+                          name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
-    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_realtime, style_prob], name=name)
-
-
-def convert_base_models_to_analytic_pick():
-    """
-    Load baseline base models (dynamic), build analytic-pick variants, copy weights by name, and save.
-    This does NOT retrain anything and takes seconds.
-    """
-    # Offline
-    off_src_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-    if not os.path.exists(off_src_path):
-        print("ERROR: baseline offline dynamic not found:", off_src_path)
-        sys.exit(1)
-    off_src = tf.keras.models.load_model(off_src_path, compile=False)
-
-    off_dyn = build_offline_model(dynamic_time=True)
-    copy_weights_by_name(off_dyn, off_src, verbose=True)
-    out_off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME)
-    off_dyn.save(out_off_dyn_path)
-    print("✅ Saved OFFLINE analytic-pick dynamic:", out_off_dyn_path)
-
-    # Realtime
-    rt_src_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
-    if not os.path.exists(rt_src_path):
-        print("ERROR: baseline realtime dynamic not found:", rt_src_path)
-        sys.exit(1)
-    rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
-    rt_dyn = build_realtime_model(offline=None, dynamic_time=True)
-    copy_weights_by_name(rt_dyn, rt_src, verbose=True)
-    out_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_ANALYTIC_PICK_DYNAMIC_MODEL_FILENAME)
-    rt_dyn.save(out_rt_dyn_path)
-    print("✅ Saved REALTIME analytic-pick dynamic:", out_rt_dyn_path)
+    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_final, style_prob], name=name)
 
 
 def approx_steps_from_chunks(chunks, seg_len, model_sample_rate, batch_size):
@@ -5307,116 +5293,55 @@ def _find_last_layer_with_suffix(model, suffix):
     cand = [l for l in model.layers if l.name.endswith(suffix)]
     return cand[-1] if cand else None
 
+@register_keras_serializable()
 def build_offline_debug_model(model):
     """
-    Override the previous debug builder so it also exposes the analytic pick mask (if present).
+    Expose new picklearn tensors; keep main_core and final mix for stems.
     """
-    outs = {
-        "hf_pre":     model.get_layer("offline_hf_out").output,
-        "hf_gated":   model.get_layer("offline_hf_mult_gate").output,
-        "hf_hp":      model.get_layer("offline_hf_highpass").output,
-        "hf_scaled":  model.get_layer("offline_hf_scale").output,
-        "hf_pick":    model.get_layer("offline_hf_pick_only").output,
-        "pick_c":     model.get_layer("offline_pick_contrib").output,
-        "finger_c":   model.get_layer("offline_finger_contrib").output,
-        "y_pred":     model.get_layer("offline_mix_main").output,
-        "style_pred": model.get_layer("offline_style_prob").output,
-    }
-    # Optional resbp
-    try: outs["resbp"] = model.get_layer("offline_resbp_scale").output
-    except Exception: pass
-    # Optional fixed gate (baseline models)
-    for lname in ["offline_gate"]:
-        try: outs["gate"] = model.get_layer(lname).output
+    outs = {}
+    def add(name, lname):
+        try: outs[name] = model.get_layer(lname).output
         except Exception: pass
-    # Masks: learned, PN, or analytic engine
-    name_map = [
-        ("mask_pred",  "offline_hf_mask"),
-        ("mask_norm",  "offline_picknorm"),
-        ("mask_used",  "offline_hf_mask_used"),
-        ("mask_engine","offline_pick_engine_mask"),
-    ]
-    for key, lname in name_map:
-        try:
-            outs[key] = model.get_layer(lname).output
-        except Exception:
-            pass
-    # Last FiLM params (optional)
-    g_last = _find_last_layer_with_suffix(model, "_film_gamma_expand")
-    b_last = _find_last_layer_with_suffix(model, "_film_beta_expand")
-    if g_last is not None: outs["film_gamma_last"] = g_last.output
-    if b_last is not None: outs["film_beta_last"]  = b_last.output
-
+    add("y_pred",     "offline_mix_core_plus_pick")
+    add("main_core",  "offline_main_core")
+    add("picklearn",  "offline_picklearn_pred")
+    add("pick_amount","offline_pick_amount")
+    add("reslearn",   "offline_reslearn_scale")
+    add("style_pred", "offline_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
-
+@register_keras_serializable()
 def build_realtime_debug_model(model):
-    """
-    Override previous realtime debug builder to add analytic mask if present.
-    """
-    def _get_first(names):
-        for n in names:
-            try:
-                return model.get_layer(n).output
-            except Exception:
-                pass
-        return None
-
-    y_pred = _get_first(["realtime_with_ir_resbp", "realtime_with_ir", "realtime_main"])
-    if y_pred is None:
-        raise RuntimeError("Could not find a final audio tensor in the realtime model.")
-
-    outs = {"y_pred": y_pred}
-
-    def add(key, lname):
-        try:
-            outs[key] = model.get_layer(lname).output
-        except Exception:
-            pass
-
-    # HF probes
-    add("hf_pre",   "realtime_hf_out")
-    add("hf_gated", "realtime_hf_mult_gate")
-    add("hf_hp",    "realtime_hf_highpass")
-    add("hf_scaled","realtime_hf_scale")
-    add("hf_pick",  "realtime_hf_pick_only")
-
-    # Masks (all variants)
-    add("mask_pred",   "realtime_hf_mask")
-    add("mask_norm",   "realtime_picknorm")
-    add("mask_used",   "realtime_hf_mask_used")
-    add("mask_engine", "realtime_pick_engine_mask")
-
-    # Stems and style
-    add("pick_c",     "realtime_pick_contrib")
-    add("finger_c",   "realtime_finger_contrib")
-    add("resbp",      "realtime_resbp_scale")
-    add("style_pred", "realtime_style_prob")
-
-    ir = _get_first(["realtime_ir_matchlen", "realtime_ir_interp", "realtime_ir_lowpass", "realtime_ir_upsample"])
-    if ir is not None:
-        outs["ir_only"] = ir
-    add("gate", "realtime_gate")  # baseline fixed gate (if any)
-
+    outs = {}
+    def add(name, lname):
+        try: outs[name] = model.get_layer(lname).output
+        except Exception: pass
+    add("y_pred",      "realtime_with_picklearn")
+    add("main_core",   "realtime_main")
+    add("ir_only",     "realtime_ir_matchlen")
+    add("picklearn",   "realtime_picklearn_pred")
+    add("pick_amount", "realtime_pick_amount")
+    add("reslearn",    "realtime_reslearn_scale")
+    add("style_pred",  "realtime_style_prob")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
 
-
-def render_isolated_stems(
-    debug_model,
-    path_src,
-    path_tgt,
-    out_dir,
-    sample_rate,
-    sec=LONG_DEMO_SEC,
-    offset_sec=LONG_DEMO_OFFSET_SEC,
-    block_sec=12.0,
-    resample_margin_ms=50.0,
-    use_finetuned=False
-):
+def render_isolated_stems(debug_model,
+                          path_src,
+                          path_tgt,
+                          out_dir,
+                          sample_rate,
+                          sec=LONG_DEMO_SEC,
+                          offset_sec=LONG_DEMO_OFFSET_SEC,
+                          block_sec=12.0,
+                          resample_margin_ms=50.0,
+                          use_finetuned=False):
+    """
+    Override: identical streaming core, but when 'picklearn' exists we render it as stem_picklearn_only.wav
+    and skip legacy HF stems.
+    """
     os.makedirs(out_dir, exist_ok=True)
     _boost_scales(model=debug_model, sample_rate=sample_rate, use_finetuned=use_finetuned)
 
-    # Style inference hint from filename
     if "pick" in path_src:
         style_true_flag = 1.0
     elif "finger" in path_src:
@@ -5437,17 +5362,10 @@ def render_isolated_stems(
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
 
-    forced_variants = [
-        ("pred",   np.zeros((1, 1), dtype=np.float32), np.zeros((1, 1), dtype=np.float32)),  # predicted style
-        ("forced_pick",   np.array([[1.0]], dtype=np.float32), np.ones((1, 1), dtype=np.float32)),
-        ("forced_finger", np.array([[0.0]], dtype=np.float32), np.ones((1, 1), dtype=np.float32)),
-    ]
-
-    def open_writers_for_pass(pass_key):
+    def open_writers(pass_key):
         is_pred = (pass_key == "pred")
         suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"
         w = {}
-
         if is_pred:
             w["src"]  = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
             w["tgt"]  = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
@@ -5455,32 +5373,26 @@ def render_isolated_stems(
         else:
             w["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
-        name_hf = "stem_hf_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"
-        w["hf"] = sf.SoundFile(os.path.join(out_dir, name_hf), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-
-        # Optional branches
-        w["ir"] = None
-        w["resbp"] = None
-
-        # Optional: write mask signals if present
-        w["mask_norm"] = None
-        w["mask_used"] = None
-
-        # Stems
+        # If picklearn exists, we write its stem; else we try legacy hf stems
+        w["picklearn"] = None
         w["pick"] = sf.SoundFile(os.path.join(out_dir, "stem_pick_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
                                  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         w["fing"] = sf.SoundFile(os.path.join(out_dir, "stem_finger_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
                                  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["ir"] = None
+        w["reslearn"] = None
         return w
 
-    pass_writers = {k: open_writers_for_pass(k) for k, _, _ in forced_variants}
+    forced_variants = [
+        ("pred",         np.zeros((1,1), np.float32), np.zeros((1,1), np.float32)),
+        ("forced_pick",  np.array([[1.0]], np.float32), np.ones((1,1), np.float32)),
+        ("forced_finger",np.array([[0.0]], np.float32), np.ones((1,1), np.float32)),
+    ]
+    pass_writers = {k: open_writers(k) for k,_,_ in forced_variants}
 
     produced_model = 0
     pred_prob_sum = 0.0
     pred_prob_count = 0
-
-    def _core_crop(arr, a, b):
-        return arr[a:b]
 
     while produced_model < want_total_model:
         core_model = min(block_core_model, want_total_model - produced_model)
@@ -5497,34 +5409,30 @@ def render_isolated_stems(
         read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
         read_b = min(END_FRAME, core_start_file + core_file_len + right_ctx_file + resample_margin_file)
         n_read = max(0, read_b - read_a)
-        if n_read <= 0:
-            break
+        if n_read <= 0: break
 
         x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
         y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        x_file = x_blk_2d[:, 0] * g_norm
-        y_file = y_blk_2d[:, 0] * g_norm
+        x_file = x_blk_2d[:,0] * g_norm
+        y_file = y_blk_2d[:,0] * g_norm
 
         if file_sr != sample_rate:
             x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
             y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
         else:
-            x_resamp = x_file
-            y_resamp = y_file
+            x_resamp = x_file; y_resamp = y_file
 
         left_off_file  = (core_start_file - left_ctx_file) - read_a
         left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
         inp_start = max(0, min(left_off_model, len(x_resamp)))
         inp_end   = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
         x_inp     = x_resamp[inp_start:inp_end]
-        if x_inp.size <= 0:
-            break
+        if x_inp.size <= 0: break
 
         core_start_in_inp = min(left_this, len(x_inp))
         core_end_in_inp   = min(core_start_in_inp + core_model, len(x_inp))
         core_len          = max(0, core_end_in_inp - core_start_in_inp)
-        if core_len <= 0:
-            break
+        if core_len <= 0: break
 
         x_b = x_inp[None, :, None].astype(np.float32)
 
@@ -5533,52 +5441,49 @@ def render_isolated_stems(
             if isinstance(outs, (list, tuple)):
                 raise RuntimeError("Expected dict outputs from debug_model; got list/tuple.")
 
-            # Pick which HF tensor to write (prefer pick-only)
-            hf_key = "hf_pick" if "hf_pick" in outs else ("hf_scaled" if "hf_scaled" in outs else ("hf_gated" if "hf_gated" in outs else "hf_pre"))
-
             def core_of(key):
                 arr = np.asarray(outs[key][0, :, 0], dtype=np.float32)
-                return _core_crop(arr, core_start_in_inp, core_end_in_inp)
+                return arr[core_start_in_inp:core_end_in_inp]
 
             wset = pass_writers[pass_key]
 
             if pass_key == "pred" and "style_pred" in outs:
-                sp = float(np.asarray(outs["style_pred"])[0, 0])
-                pred_prob_sum += sp * float(core_len)
-                pred_prob_count += core_len
+                sp = float(np.asarray(outs["style_pred"])[0, 0]); pred_prob_sum += sp * float(core_len); pred_prob_count += core_len
 
-            # Full and HF-only
+            # Full
             wset["full"].write(core_of("y_pred"))
-            wset["hf"].write(core_of(hf_key))
 
-            # Optional branches
+            # picklearn stem if present
+            if "picklearn" in outs:
+                if wset["picklearn"] is None:
+                    fn = "stem_picklearn_only" + ("" if pass_key=="pred" else f"_{pass_key.split('_',1)[1]}") + ".wav"
+                    wset["picklearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["picklearn"].write(core_of("picklearn"))
+
+            # IR (optional)
             if "ir_only" in outs:
                 if wset["ir"] is None:
-                    fn = "stem_ir_lowpass.wav" if pass_key == "pred" else f"stem_ir_lowpass_{pass_key.replace('forced_', 'forced_')}.wav"
+                    fn = "stem_ir_lowpass" + ("" if pass_key=="pred" else f"_{pass_key.split('_',1)[1]}") + ".wav"
                     wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["ir"].write(core_of("ir_only"))
 
-            if "resbp" in outs:
-                if wset["resbp"] is None:
-                    fn = "stem_resbp_only.wav" if pass_key == "pred" else f"stem_resbp_only_{pass_key.replace('forced_', 'forced_')}.wav"
-                    wset["resbp"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["resbp"].write(core_of("resbp"))
+            # Learned resonances (optional)
+            if "reslearn" in outs:
+                if wset["reslearn"] is None:
+                    fn = "stem_reslearn_only" + ("" if pass_key=="pred" else f"_{pass_key.split('_',1)[1]}") + ".wav"
+                    wset["reslearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                wset["reslearn"].write(core_of("reslearn"))
 
-            # Masks: prefer mask_norm (PickNormalizer), else mask_used (baseline)
-            if "mask_norm" in outs:
-                if wset["mask_norm"] is None:
-                    fn = "stem_mask_norm.wav" if pass_key == "pred" else f"stem_mask_norm_{pass_key.replace('forced_', 'forced_')}.wav"
-                    wset["mask_norm"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["mask_norm"].write(core_of("mask_norm"))
-            elif "mask_used" in outs:
-                if wset["mask_used"] is None:
-                    fn = "stem_mask_used.wav" if pass_key == "pred" else f"stem_mask_used_{pass_key.replace('forced_', 'forced_')}.wav"
-                    wset["mask_used"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["mask_used"].write(core_of("mask_used"))
-
-            # Pick/finger stems
-            wset["pick"].write(core_of("pick_c"))
-            wset["fing"].write(core_of("finger_c"))
+            # Stems
+            if "main_core" in outs:
+                main_core = core_of("main_core")
+                # Decompose pick/finger only if present; else write main_core as stems
+                try:
+                    pick_only = core_of("main_core") * 0.0  # placeholder; kept for interface
+                except Exception:
+                    pick_only = main_core
+                wset["pick"].write(pick_only)
+                wset["fing"].write(main_core - pick_only)
 
         core_start_global = inp_start + core_start_in_inp
         core_end_global   = inp_start + core_end_in_inp
@@ -5591,8 +5496,7 @@ def render_isolated_stems(
     for wset in pass_writers.values():
         for w in list(wset.values()):
             try:
-                if w is not None:
-                    w.close()
+                if w is not None: w.close()
             except Exception:
                 pass
 
@@ -5603,203 +5507,59 @@ def render_isolated_stems(
     else:
         print(f"✅ Stems saved to {out_dir}.")
 
+
 def run_render_stems_offline(use_finetuned=False):
     """
-    Render offline stems from either baseline or fine-tuned dynamic model.
+    Prefer OFFLINE picklearn model when present.
     """
-    src = None
-    tgt = None
     sample_rate = OFFLINE_SAMPLE_RATE
+    if not all_pairs:
+        print("ERROR: No baseline training pairs found."); sys.exit(1)
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
-    # Always prefer the finetune pair when --finetuned is requested, even if model is missing.
-    out_dir = STEMS_FINETUNE_OFFLINE_OUT_DIR if use_finetuned else STEMS_OFFLINE_OUT_DIR
-
-    if use_finetuned:
-        candidate = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
-        # Choose finetune src/tgt if they exist; else fall back to baseline pair
-        src_ft = os.path.join(FINETUNE_SRC_DIR, "source.wav")
-        tgt_ft = os.path.join(FINETUNE_SRC_DIR, "target.wav")
-        if os.path.exists(src_ft) and os.path.exists(tgt_ft):
-            src, tgt = src_ft, tgt_ft
-        else:
-            if not all_pairs:
-                print("ERROR: No baseline training pairs found and finetune source/target missing.")
-                sys.exit(1)
-            src, tgt = all_pairs[DEMO_PAIR_INDEX]
-
-        if os.path.exists(candidate):
-            print("[stems/offline] Loading finetuned dynamic model:", candidate)
-            offline_dyn = tf.keras.models.load_model(candidate, compile=False)
-        else:
-            print("[stems/offline] Finetuned dynamic model not found; building a preview model for tuning.")
-            offline_dyn = _build_offline_dynamic_for_preview()
+    # Prefer picklearn dynamic
+    pick_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    if os.path.exists(pick_path):
+        offline_dyn = tf.keras.models.load_model(pick_path, compile=False)
     else:
-        # Baseline flow (as before)
+        # Fallback to baseline dynamic
         dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-        if os.path.exists(dyn_path):
-            print("[stems/offline] Loading baseline dynamic model:", dyn_path)
-            offline_dyn = tf.keras.models.load_model(dyn_path, compile=False)
-        else:
-            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR, "*.keras")))
-            if ckpts:
-                print("Loading latest checkpoint:", ckpts[-1])
-                static = tf.keras.models.load_model(ckpts[-1], compile=False)
-                offline_dyn = build_offline_model(dynamic_time=True)
-                offline_dyn.set_weights(static.get_weights())
-            else:
-                static = build_offline_model(dynamic_time=False)
-                offline_dyn = build_offline_model(dynamic_time=True)
-                offline_dyn.set_weights(static.get_weights())
-        # Baseline demo pair if not set already
-        if src is None or tgt is None:
-            assert_has_pairs()
-            src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        if not os.path.exists(dyn_path):
+            print("[stems/offline] No offline models found."); sys.exit(1)
+        offline_dyn = tf.keras.models.load_model(dyn_path, compile=False)
 
     dbg = build_offline_debug_model(offline_dyn)
-    render_isolated_stems(
-        debug_model=dbg,
-        path_src=src,
-        path_tgt=tgt,
-        out_dir=out_dir,
-        sample_rate=sample_rate,
-        sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC,
-        use_finetuned=use_finetuned
-    )
+    render_isolated_stems(dbg, path_src=src, path_tgt=tgt,
+                          out_dir=(STEMS_FINETUNE_OFFLINE_OUT_DIR if use_finetuned else STEMS_OFFLINE_OUT_DIR),
+                          sample_rate=sample_rate,
+                          sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC,
+                          use_finetuned=use_finetuned)
 
-def run_render_stems_realtime_learned_pick():
-    """
-    Render stems from the base realtime learned-pick dynamic model (teacher-free, no fixed gate).
-    """
-    src = None
-    tgt = None
-    sample_rate = REALTIME_SAMPLE_RATE
-    out_dir = STEMS_REALTIME_LEARNED_OUT_DIR
-
-    # Choose a pair (prefer baseline training pair for consistency)
-    if not all_pairs:
-        print("ERROR: No baseline training pairs found.")
-        sys.exit(1)
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
-
-    # Load learned-pick dynamic or build a preview
-    cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
-    if os.path.exists(cand):
-        print("[stems/realtime/learned] Loading learned-pick dynamic model:", cand)
-        realtime_dyn = tf.keras.models.load_model(cand, compile=False)
-    else:
-        print("[stems/realtime/learned] Learned-pick dynamic not found; building preview.")
-        realtime_dyn = _build_realtime_dynamic_learned_pick_for_preview()
-
-    dbg = build_realtime_debug_model(realtime_dyn)
-    render_isolated_stems(
-        debug_model=dbg,
-        path_src=src,
-        path_tgt=tgt,
-        out_dir=out_dir,
-        sample_rate=sample_rate,
-        sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC,
-        use_finetuned=False
-    )
-    
-def run_render_stems_offline_learned_pick():
-    """
-    Render stems from the base offline learned-pick dynamic model (no fixed gate).
-    """
-    src = None
-    tgt = None
-    sample_rate = OFFLINE_SAMPLE_RATE
-    out_dir = STEMS_OFFLINE_LEARNED_OUT_DIR
-
-    # Choose a pair (prefer baseline training pair for consistency)
-    if not all_pairs:
-        print("ERROR: No baseline training pairs found.")
-        sys.exit(1)
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
-
-    # Load learned-pick dynamic or build a preview
-    cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_LEARNED_PICK_DYNAMIC_MODEL_FILENAME)
-    if os.path.exists(cand):
-        print("[stems/offline/learned] Loading learned-pick dynamic model:", cand)
-        offline_dyn = tf.keras.models.load_model(cand, compile=False)
-    else:
-        print("[stems/offline/learned] Learned-pick dynamic not found; building preview.")
-        offline_dyn = _build_offline_dynamic_learned_pick_for_preview()
-
-    dbg = build_offline_debug_model(offline_dyn)
-    render_isolated_stems(
-        debug_model=dbg,
-        path_src=src,
-        path_tgt=tgt,
-        out_dir=out_dir,
-        sample_rate=sample_rate,
-        sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC,
-        use_finetuned=False
-    )
 
 def run_render_stems_realtime(use_finetuned=False):
-    src = None
-    tgt = None
+    """
+    Prefer REALTIME picklearn model when present.
+    """
     sample_rate = REALTIME_SAMPLE_RATE
+    if not all_pairs:
+        print("ERROR: No baseline training pairs found."); sys.exit(1)
+    src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
-    # Always prefer the finetune pair when --finetuned is requested, even if model is missing.
-    out_dir = STEMS_FINETUNE_REALTIME_OUT_DIR if use_finetuned else STEMS_REALTIME_OUT_DIR
-
-    if use_finetuned:
-        candidate = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        # Choose finetune src/tgt if they exist; else fall back to baseline pair
-        src_ft = os.path.join(FINETUNE_SRC_DIR, "source.wav")
-        tgt_ft = os.path.join(FINETUNE_SRC_DIR, "target.wav")
-        if os.path.exists(src_ft) and os.path.exists(tgt_ft):
-            src, tgt = src_ft, tgt_ft
-        else:
-            if not all_pairs:
-                print("ERROR: No baseline training pairs found and finetune source/target missing.")
-                sys.exit(1)
-            src, tgt = all_pairs[DEMO_PAIR_INDEX]
-
-        if os.path.exists(candidate):
-            print("[stems/realtime] Loading finetuned dynamic model:", candidate)
-            realtime_dyn = tf.keras.models.load_model(candidate, compile=False)
-        else:
-            print("[stems/realtime] Finetuned dynamic model not found; building a preview model for tuning.")
-            realtime_dyn = _build_realtime_dynamic_for_preview()
+    pick_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    if os.path.exists(pick_path):
+        realtime_dyn = tf.keras.models.load_model(pick_path, compile=False)
     else:
-        # Baseline flow (as before)
         dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
-        if os.path.exists(dyn_path):
-            print("[stems/realtime] Loading baseline dynamic model:", dyn_path)
-            realtime_dyn = tf.keras.models.load_model(dyn_path, compile=False)
-        else:
-            ckpts = sorted(glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras")))
-            if ckpts:
-                print("Loading latest checkpoint:", ckpts[-1])
-                static = tf.keras.models.load_model(ckpts[-1], compile=False)
-                realtime_dyn = build_realtime_model(dynamic_time=True)
-                copy_weights_by_name(realtime_dyn, static)
-            else:
-                static = build_realtime_model(dynamic_time=False)
-                realtime_dyn = build_realtime_model(dynamic_time=True)
-                copy_weights_by_name(realtime_dyn, static)
-        # Baseline demo pair if not set already
-        if src is None or tgt is None:
-            assert_has_pairs()
-            src, tgt = all_pairs[DEMO_PAIR_INDEX]
+        if not os.path.exists(dyn_path):
+            print("[stems/realtime] No realtime models found."); sys.exit(1)
+        realtime_dyn = tf.keras.models.load_model(dyn_path, compile=False)
 
     dbg = build_realtime_debug_model(realtime_dyn)
-    
-    render_isolated_stems(
-        debug_model=dbg,
-        path_src=src,
-        path_tgt=tgt,
-        out_dir=out_dir,
-        sample_rate=sample_rate,
-        sec=LONG_DEMO_SEC,
-        offset_sec=LONG_DEMO_OFFSET_SEC,
-        use_finetuned=use_finetuned
-    )
+    render_isolated_stems(dbg, path_src=src, path_tgt=tgt,
+                          out_dir=(STEMS_FINETUNE_REALTIME_OUT_DIR if use_finetuned else STEMS_REALTIME_OUT_DIR),
+                          sample_rate=sample_rate,
+                          sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC,
+                          use_finetuned=use_finetuned)
 
 def train_shared(
     kind,
@@ -6230,13 +5990,25 @@ def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoin
     else:
         return (False, None)
 
-def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_out_dir, demo_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
-    dpath = dynamic_model_filepath
+def prepare_and_generate_demo(sample_rate, dynamic_model_filepath, checkpoint_out_dir,
+                              demo_out_dir, build_model_fn, build_model_fn_args_dynamic={},
+                              use_safe_weight_copy=False):
+    """
+    Override: prefer picklearn dynamics when the requested baseline is passed.
+    """
+    prefer = None
+    if int(sample_rate) == OFFLINE_SAMPLE_RATE:
+        cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(cand): prefer = cand
+    elif int(sample_rate) == REALTIME_SAMPLE_RATE:
+        cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+        if os.path.exists(cand): prefer = cand
+
+    dpath = prefer if prefer is not None else dynamic_model_filepath
     if not os.path.exists(dpath):
         checkpoints = sorted(glob.glob(os.path.join(checkpoint_out_dir, "*.keras")))
         if checkpoints:
             dpath = checkpoints[-1]
-            print("Loading model from checkpoint:", dpath)
             static_model = tf.keras.models.load_model(dpath, compile=False)
             dynamic_model = build_model_fn(**build_model_fn_args_dynamic, dynamic_time=True)
             if use_safe_weight_copy:
@@ -6244,13 +6016,11 @@ def prepare_and_generate_demo (sample_rate, dynamic_model_filepath, checkpoint_o
             else:
                 dynamic_model.set_weights(static_model.get_weights())
         else:
-            dpath = None
-        if dpath is None:
-            print("Dynamic model not found. run: python piezo2mic.py --train-offline and/or python piezo2mic.py --train-realtime")
+            print("Dynamic model not found. Train models first.")
             sys.exit(1)
     else:
-        print("Loading dynamic model from:", dpath)
         dynamic_model = tf.keras.models.load_model(dpath, compile=False)
+
     generate_demo(model=dynamic_model, out_dir=demo_out_dir, sample_rate=sample_rate)
     
 @register_keras_serializable()
@@ -6553,6 +6323,206 @@ def probe_offline_lp(model_path, src_wav, frames=96000, start=0):
     if rb is not None:
         sf.write(os.path.join(out_dir, "resbp.wav"), rb, OFFLINE_SAMPLE_RATE, subtype='FLOAT')
     print("Wrote probe WAVs to", out_dir)
+    
+    
+
+def _freeze_only_prefixes(model, prefixes):
+    names = []
+    for l in model.layers:
+        train = any(l.name.startswith(p) for p in prefixes)
+        l.trainable = train
+        if train:
+            names.append(l.name)
+    print("[trainable] enabled:", names)
+
+
+def _make_offline_mixed_ds(batch_size):
+    assert_has_pairs()
+    chunks = build_chunks(pairs_list=all_pairs, seg_len=OFFLINE_SEG_LEN, sample_rate=OFFLINE_SAMPLE_RATE)
+
+    sig_x = tf.TensorSpec((OFFLINE_SEG_LEN, 1), tf.float32)
+    sig_y = (tf.TensorSpec((OFFLINE_SEG_LEN, 1), tf.float32), tf.TensorSpec((), tf.float32))
+
+    def gen_pick():
+        g = segment_generator(OFFLINE_SEG_LEN, chunks, True, OFFLINE_SAMPLE_RATE)
+        for x, y in g:
+            yield x, y
+    def gen_finger():
+        g = segment_generator(OFFLINE_SEG_LEN, chunks, False, OFFLINE_SAMPLE_RATE)
+        for x, y in g:
+            yield x, y
+
+    dsP = tf.data.Dataset.from_generator(gen_pick, output_signature=(sig_x, sig_y))
+    dsF = tf.data.Dataset.from_generator(gen_finger, output_signature=(sig_x, sig_y))
+
+    ds = tf.data.Dataset.sample_from_datasets([dsP, dsF], weights=[0.5, 0.5], seed=SEED)\
+         .shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True)\
+         .batch(batch_size)\
+         .map(add_sw_offline_finetune_nf)\
+         .map(add_shared_random_gain_offline(-30.0, +18.0))\
+         .prefetch(tf.data.AUTOTUNE)
+
+    steps = min(approx_steps_from_chunks(chunks, OFFLINE_SEG_LEN, OFFLINE_SAMPLE_RATE, batch_size),
+                int(PICKLEARN_OFFLINE_STEPS_CAP))
+    return ds, steps
+
+
+def _make_realtime_dual_ds(batch_size):
+    assert_has_pairs()
+    chunks_all = build_chunks(pairs_list=all_pairs, seg_len=REALTIME_SEG_LEN, sample_rate=REALTIME_SAMPLE_RATE)
+
+    sig_x = (
+        tf.TensorSpec((REALTIME_SEG_LEN, 1), tf.float32),
+        tf.TensorSpec((REALTIME_SEG_LEN * (OFFLINE_SAMPLE_RATE//REALTIME_SAMPLE_RATE), 1), tf.float32)
+    )
+    sig_y = (tf.TensorSpec((REALTIME_SEG_LEN, 1), tf.float32), tf.TensorSpec((), tf.float32))
+
+    def gen_pick():
+        g = segment_generator_dual(REALTIME_SEG_LEN, chunks_all, True, REALTIME_SAMPLE_RATE, OFFLINE_SAMPLE_RATE)
+        for xy, y in g:
+            yield xy, y
+    def gen_finger():
+        g = segment_generator_dual(REALTIME_SEG_LEN, chunks_all, False, REALTIME_SAMPLE_RATE, OFFLINE_SAMPLE_RATE)
+        for xy, y in g:
+            yield xy, y
+
+    dsP = tf.data.Dataset.from_generator(gen_pick, output_signature=(sig_x, sig_y))
+    dsF = tf.data.Dataset.from_generator(gen_finger, output_signature=(sig_x, sig_y))
+
+    ds = tf.data.Dataset.sample_from_datasets([dsP, dsF], weights=[0.5, 0.5], seed=SEED)\
+         .shuffle(SHUFFLE_BUF, seed=SEED, reshuffle_each_iteration=True)\
+         .batch(batch_size)\
+         .map(add_sw_realtime_dual_kd_only)\
+         .map(add_shared_random_gain_dual(-30.0, +18.0))\
+         .prefetch(tf.data.AUTOTUNE)
+
+    steps_pk = approx_steps_from_chunks(chunks_all, REALTIME_SEG_LEN, REALTIME_SAMPLE_RATE, batch_size)
+    steps_fg = steps_pk
+    steps = min(max(1, steps_pk + steps_fg), int(PICKLEARN_REALTIME_STEPS_CAP))
+    return ds, steps
+
+
+def train_offline_picklearn_from_mic():
+    """
+    Train only the OFFLINE pick branches (sparkle + learned resonances) vs mic target.
+    """
+    base_off_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(base_off_path):
+        print("ERROR: baseline offline dynamic not found:", base_off_path); sys.exit(1)
+    base_off = tf.keras.models.load_model(base_off_path, compile=False)
+
+    stu = build_offline_model(dynamic_time=False)
+    copy_weights_by_name(stu, base_off, verbose=True)
+
+    _freeze_only_prefixes(stu, prefixes=("offline_picklearn_", "offline_reslearn_", "offline_pick_amount"))
+
+    ds, steps = _make_offline_mixed_ds(FINETUNE_BATCH_SIZE)
+
+    loss = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE,
+                                    stft_scales=((1024,256,1024),),
+                                    l1_w=0.4, hf_w=2.2, stft_w=0.8, env_w=0.0)
+
+    stu.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=PICKLEARN_OFFLINE_LR, clipnorm=1.0),
+                loss=[loss, "binary_crossentropy"], loss_weights=[1.0, 0.0],
+                metrics=[["mae"], []])
+    stu.fit(ds, epochs=int(PICKLEARN_OFFLINE_EPOCHS), steps_per_epoch=int(steps), verbose=1)
+
+    dyn = build_offline_model(dynamic_time=True)
+    copy_weights_by_name(dyn, stu, verbose=True)
+    dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    dyn.save(dyn_path)
+    print("✅ Saved OFFLINE picklearn (dynamic):", dyn_path)
+
+    stat_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_STATIC_MODEL_FILENAME)
+    stu.save(stat_path)
+    print("✅ Saved OFFLINE picklearn (static):", stat_path)
+    return dyn
+
+
+def train_realtime_picklearn_from_offline():
+    """
+    Distill REALTIME pick branches from the OFFLINE picklearn stem (96k→48k).
+    """
+    off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(off_dyn_path):
+        print("ERROR: offline picklearn dynamic not found. Run --migrate-picklearn first."); sys.exit(1)
+    off_nc = tf.keras.models.load_model(off_dyn_path, compile=False)
+
+    # Make a causalized teacher clone (0 lookahead) of the picklearn graph
+    def build_offline_picklearn_causal(src):
+        m = build_offline_model(dynamic_time=True, lookahead_samples=0, name="piezo2mic_offline_picklearn_causal")
+        copy_weights_by_name(m, src, verbose=True)
+        for l in m.layers: l.trainable = False
+        return m
+    off_causal = build_offline_picklearn_causal(off_nc)
+
+    # Build realtime picklearn with teacher plugged (for KD)
+    rt = build_realtime_model(offline=off_causal, dynamic_time=False)
+
+    # Copy backbone weights from baseline realtime
+    rt_src_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(rt_src_path):
+        print("ERROR: baseline realtime dynamic not found:", rt_src_path); sys.exit(1)
+    rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
+    copy_weights_by_name(rt, rt_src, verbose=True)
+
+    # Teacher picklearn stem at 96k, then ds2 to 48k
+    off_inp = rt.get_layer("realtime_offline_piezo_input").input if any(i.name=="realtime_offline_piezo_input" for i in rt.inputs) else None
+    style_true_in  = rt.get_layer("realtime_style_true_input").input
+    style_force_in = rt.get_layer("realtime_style_force_input").input
+
+    pick_t = off_causal.get_layer("offline_picklearn_pred").output if any(l.name=="offline_picklearn_pred" for l in off_causal.layers) else off_causal.get_layer("offline_pick_amount").output
+    teacher_pick = tf.keras.Model(inputs=off_causal.inputs, outputs=pick_t, name="offline_picklearn_teacher")
+
+    pick_t96 = teacher_pick([off_inp, style_true_in, style_force_in])  # (B,T96,1)
+    pick_t48 = FIRDecimateBy2(name="rt_picklearn_teacher_ds2")(pick_t96)
+
+    pick_s = rt.get_layer("realtime_picklearn_pred").output
+
+    kd_terms = []
+    kd_terms.append(DistillLossBestShift(alpha=1.0, max_shift=8, name="rt_picklearn_l2")([pick_t48, pick_s]))
+    kd_terms.append(MSTFTDistillLoss(alpha=0.6, name="rt_picklearn_stft")([pick_t48, pick_s]))
+
+    y_audio, y_style = rt.outputs
+    y_audio_kd = LossTether(name="rt_picklearn_kd_tether")([y_audio] + kd_terms)
+    rt_train = tf.keras.Model(inputs=rt.inputs, outputs=[y_audio_kd, y_style], name="realtime_picklearn_train")
+
+    _freeze_only_prefixes(rt_train, prefixes=("realtime_picklearn_", "realtime_reslearn_", "realtime_pick_amount"))
+
+    ds, steps = _make_realtime_dual_ds(FINETUNE_BATCH_SIZE)
+
+    loss_dummy = FinetuneCombinedLossLite(sample_rate=REALTIME_SAMPLE_RATE,
+                                          stft_scales=((1024,256,1024),),
+                                          l1_w=0.0, hf_w=0.0, stft_w=0.0, env_w=0.0)
+
+    rt_train.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=PICKLEARN_REALTIME_LR, clipnorm=1.0),
+                     loss=[loss_dummy, "binary_crossentropy"], loss_weights=[0.0, 0.0])
+    rt_train.fit(ds, epochs=int(PICKLEARN_REALTIME_EPOCHS), steps_per_epoch=int(steps), verbose=1)
+
+    rt_dyn = build_realtime_model(offline=None, dynamic_time=True)
+    copy_weights_by_name(rt_dyn, rt_train, verbose=True)
+    dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    rt_dyn.save(dyn_path)
+    print("✅ Saved REALTIME picklearn (dynamic):", dyn_path)
+
+    stat_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_STATIC_MODEL_FILENAME)
+    rt_train.save(stat_path)
+    print("✅ Saved REALTIME picklearn (static):", stat_path)
+    return rt_dyn
+
+
+def migrate_picklearn():
+    """
+    Full migration flow:
+      1) Train OFFLINE picklearn heads (sparkle+resonances) from mic.
+      2) Distill REALTIME picklearn heads from OFFLINE picklearn.
+    """
+    print("🔧 Training OFFLINE picklearn (heads only)…")
+    train_offline_picklearn_from_mic()
+    print("🔧 Training REALTIME picklearn (distillation)…")
+    train_realtime_picklearn_from_offline()
+    print("✅ Migration complete. You can now retire old HF/gate/learned‑mask paths.")
+
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -6751,8 +6721,9 @@ def main ():
             rng = (int(a), int(b))
         render_hf_shift_sweep_realtime(min_shift=rng[0], max_shift=rng[1])
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--convert-analytic-pick":
-        convert_base_models_to_analytic_pick()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--migrate-picklearn":
+        migrate_picklearn()
+        sys.exit(0)
     else:
         print("No command given.")
         sys.exit(1)
