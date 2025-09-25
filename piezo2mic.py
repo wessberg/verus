@@ -296,11 +296,11 @@ REALTIME_PICK_KNEE = 0.5
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
 PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
 PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 129
-PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 3.0
+PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
 PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
 PICK_RESO_LOWBAND_PENALTY_ORDER     = 129
-PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.0
+PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.5
 
 # Also do this from the main mix path, to prevent build-up in ultra low frequencies
 ULTRALOW_MAIN_CUTOFF_HZ            = 40.0
@@ -766,10 +766,12 @@ def _pick_attack(prefix,
                  penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
                  penalty_sample_rate=REALTIME_SAMPLE_RATE):
     """
-    Tiny causal HF synthesis gated by the analytic pick mask, then style-gated.
+    Tiny causal HF synthesis gated by the analytic pick mask, then style-gated,
+    then a runtime HPF safety-net, then final scale.
+
     Returns:
-      - y:    style-gated branch that goes to the mix (IrScale named '{prefix}_pickattack_scale')
-      - patt: penalty anchor (HFLowbandPenalty attached to y; training-only add_loss)
+      - y:    post-style, post-HPF, post-scale stem named '{prefix}_pickattack_scale'
+      - patt: training-only lowband penalty attached to the post-scale stem
     """
     # Mask-gated input for the tiny CNN
     x = Multiply(name=f"{prefix}_picklearn_gate")([hf_in, mask])
@@ -777,20 +779,25 @@ def _pick_attack(prefix,
     x = causal_sep_conv(x, filters, 7, 2, name=f"{prefix}_picklearn_c2", activation="relu")
     x = Conv1D(1, 1, padding="same", name=f"{prefix}_picklearn_out")(x)
 
-    # Style-gated branch (this is what you want to hear in stems)
+    # Style gating
     xg = Multiply(name=f"{prefix}_pickattack_gated")([x, style_time])
 
-    # Final scale after style gate — this is the post-style-gated stem
-    y = IrScale(init=1.0, name=f"{prefix}_pickattack_scale")(xg)
+    # Runtime HPF safety-net (cut below penalty_cutoff_hz)
+    xh = HFHighpass(sample_rate=penalty_sample_rate,
+                    cutoff_hz=penalty_cutoff_hz,
+                    order=penalty_order,
+                    name=f"{prefix}_pickattack_post_hp")(xg)
 
-    # Attach training-only lowband penalty to the same (post-gated) signal
+    # Final scale (stems are POST-HPF as requested)
+    y = IrScale(init=1.0, name=f"{prefix}_pickattack_scale")(xh)
+
+    # Training-only lowband penalty on the post-scale signal
     patt = HFLowbandPenalty(alpha=penalty_alpha,
                             cutoff_hz=penalty_cutoff_hz,
                             order=penalty_order,
                             sample_rate=penalty_sample_rate,
                             name=f"{prefix}_pickattack_lowband_penalty")(y)
     return y, patt
-
 
 def _reson_learn_offline(inp, mask, style_time):
     sr = OFFLINE_SAMPLE_RATE
@@ -805,29 +812,33 @@ def _reson_learn_offline(inp, mask, style_time):
                             name="offline_pickreso_ctrl_env")(Abs1D()(ana))
     amp = Lambda(clip_01x4, name="offline_pickreso_ctrl_gain")(amp)
     exc = Multiply(name="offline_pickreso_excite")([strike, amp])
+
     modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
                              decays_ms =RESBP_MODAL_DECAYS_MS_OFFLINE,
                              length    =RESBP_MODAL_LEN_OFFLINE,
                              sample_rate=sr,
                              name="offline_pickreso_modal")(exc)
     mixed = Conv1D(1, 1, use_bias=True, padding="same", name="offline_pickreso_mix")(modes)
-    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE), order=65,
-                       name="offline_pickreso_post_hp")(mixed)
 
-    # Style-gate the resonance branch here
+    # Style-gate first
     xg = Multiply(name="offline_pickreso_gated")([mixed, style_time])
 
-    # Final scale after style gate — this is the post-style-gated stem
-    y = IrScale(init=1.0, name="offline_pickreso_scale")(xg)
+    # Then runtime HPF safety-net at the requested cutoff
+    xh = HFHighpass(sample_rate=sr,
+                    cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+                    order=PICK_RESO_LOWBAND_PENALTY_ORDER,
+                    name="offline_pickreso_post_hp")(xg)
 
-    # Training-only lowband penalty on the post-gated stem
+    # Final scale (POST-HPF)
+    y = IrScale(init=1.0, name="offline_pickreso_scale")(xh)
+
+    # Training-only lowband penalty on the post-scale stem
     patt = HFLowbandPenalty(alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
                             cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                             order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                             sample_rate=OFFLINE_SAMPLE_RATE,
                             name="offline_pickreso_lowband_penalty")(y)
     return y, patt
-
 
 def _reson_learn_realtime(inp, mask, style_time):
     sr = REALTIME_SAMPLE_RATE
@@ -842,29 +853,33 @@ def _reson_learn_realtime(inp, mask, style_time):
                             name="realtime_pickreso_ctrl_env")(Abs1D()(ana))
     amp = Lambda(clip_01x4, name="realtime_pickreso_ctrl_gain")(amp)
     exc = Multiply(name="realtime_pickreso_excite")([strike, amp])
+
     modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
                              decays_ms =RESBP_MODAL_DECAYS_MS_REALTIME,
                              length    =RESBP_MODAL_LEN_REALTIME,
                              sample_rate=sr,
                              name="realtime_pickreso_modal")(exc)
     mixed = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_pickreso_mix")(modes)
-    mixed = HFHighpass(sample_rate=sr, cutoff_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME), order=65,
-                       name="realtime_pickreso_post_hp")(mixed)
 
-    # Style-gate the resonance branch here
+    # Style-gate first
     xg = Multiply(name="realtime_pickreso_gated")([mixed, style_time])
 
-    # Final scale after style gate — this is the post-style-gated stem
-    y = IrScale(init=1.0, name="realtime_pickreso_scale")(xg)
+    # Then runtime HPF safety-net at the requested cutoff
+    xh = HFHighpass(sample_rate=sr,
+                    cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+                    order=PICK_RESO_LOWBAND_PENALTY_ORDER,
+                    name="realtime_pickreso_post_hp")(xg)
 
-    # Training-only lowband penalty on the post-gated stem
+    # Final scale (POST-HPF)
+    y = IrScale(init=1.0, name="realtime_pickreso_scale")(xh)
+
+    # Training-only lowband penalty on the post-scale stem
     patt = HFLowbandPenalty(alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
                             cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                             order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                             sample_rate=REALTIME_SAMPLE_RATE,
                             name="realtime_pickreso_lowband_penalty")(y)
     return y, patt
-
 
 @register_keras_serializable()
 class PickNormalizer(tf.keras.layers.Layer):
@@ -1947,6 +1962,15 @@ def compute_main_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, 
     R_main = _sum_sep_rf_for_prefix(model, r'^realtime_sep_\d+$')
     R_pre  = _sum_sep_rf_for_prefix(model, r'^realtime_pre_\d+_sep$')
     LC_main = int((R_main - 1) + (R_pre - 1))
+
+    hp_layers = _find_layers(model, HFHighpass, name_prefix="realtime_with_picklearn")
+    if hp_layers:
+        L_hp = int(hp_layers[0].taps.shape[0])
+        LC_main += (L_hp - 1)
+        if verbose:
+            ms = 1000.0 * (L_hp - 1) / float(sample_rate)
+            print(f"[main] +HPF LC = {L_hp - 1} samples ({ms:.3f} ms)")
+
     if verbose:
         ms = 1000.0 * LC_main / float(sample_rate)
         print(f"[main] LC = {LC_main} samples ({ms:.2f} ms)")
@@ -4058,7 +4082,7 @@ def build_offline_model(dynamic_time=False,
     # HF pre-emphasis for pickattack head
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
 
-    # Style‑gated pick stems (return stem + penalty anchor)
+    # Style‑gated pick stems (now POST-HPF inside the heads)
     pickattack, pa_pen = _pick_attack(
         "offline", hf_in, mask, style_time,
         filters=16,
@@ -4069,18 +4093,21 @@ def build_offline_model(dynamic_time=False,
     )
     pickreso, pr_pen = _reson_learn_offline(inp, mask, style_time)
 
-    # Mix the style‑gated stems (no additional gating needed)
-    out = Add(name="offline_mix_core_plus_pick")([main_core, pickattack, pickreso])
+    # Mix, then main HPF safety-net
+    out_sum = Add(name="offline_mix_core_plus_pick_prehp")([main_core, pickattack, pickreso])
+    out_hp  = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE,
+                         cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                         order=ULTRALOW_MAIN_ORDER,
+                         name="offline_mix_core_plus_pick")(out_sum)
 
-    # Tie penalty nodes so add_loss is kept
-    out = LossTether(name="offline_pick_lowband_penalties")([out, pa_pen, pr_pen])
+    # Tie penalty nodes so add_loss is kept (attach to post-HPF signal)
+    out_hp = LossTether(name="offline_pick_lowband_penalties")([out_hp, pa_pen, pr_pen])
 
-    out = add_coloreq(out, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
+    # Final tone shaping (cannot re-introduce subsonics; first band starts at 80 Hz)
+    out = add_coloreq(out_hp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
 
-
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
-
 
 @register_keras_serializable()
 def build_realtime_model(offline=None,
@@ -4155,7 +4182,7 @@ def build_realtime_model(offline=None,
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_main     = Add(name="realtime_main")([pick_c, finger_c])
 
-    # IR branch (unchanged)
+    # IR branch
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -4172,7 +4199,7 @@ def build_realtime_model(offline=None,
                       name="realtime_ir_interp")(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
-        # Analytic pick mask
+    # Analytic pick mask
     mask = _pick_mask_engine(inp,
                              sample_rate=REALTIME_SAMPLE_RATE,
                              out_gain=REALTIME_PICK_OUT_GAIN,
@@ -4185,7 +4212,7 @@ def build_realtime_model(offline=None,
 
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
 
-    # Style‑gated pick stems (return stem + penalty anchor)
+    # Post-HPF stems inside the heads
     pickattack, pa_pen = _pick_attack(
         "realtime", hf_in, mask, style_scalar_b3,
         filters=16,
@@ -4196,12 +4223,18 @@ def build_realtime_model(offline=None,
     )
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
-    y_final = Add(name="realtime_with_picklearn")([y_main, ir, pickattack, pickreso])
+    # Sum then main HPF safety-net; keep debug name pointing to POST-HPF node
+    y_pre  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
+    y_hp   = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
+                        cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                        order=ULTRALOW_MAIN_ORDER,
+                        name="realtime_with_picklearn")(y_pre)
 
-    # Tie penalty nodes so add_loss is kept
-    y_final = LossTether(name="realtime_pick_lowband_penalties")([y_final, pa_pen, pr_pen])
+    # Tie in penalties (post-HPF)
+    y_hp = LossTether(name="realtime_pick_lowband_penalties")([y_hp, pa_pen, pr_pen])
 
-    y_final = add_coloreq(y_final, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
+    # Color EQ last
+    y_final = add_coloreq(y_hp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
 
     inputs_list = [inp, style_true_in, style_force_in]
