@@ -286,11 +286,23 @@ REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
 OFFLINE_PICK_SMOOTH_RELEASE_MS = 24.0
 REALTIME_PICK_SMOOTH_RELEASE_MS = 12.0
 
-OFFLINE_PICK_OUT_GAIN = 6.0
-REALTIME_PICK_OUT_GAIN = 5.0
+OFFLINE_PICK_OUT_GAIN = 10.0
+REALTIME_PICK_OUT_GAIN = 10.0
 
-OFFLINE_PICK_KNEE = 8.5
-REALTIME_PICK_KNEE = 8.5
+OFFLINE_PICK_KNEE_DB = 12.0
+REALTIME_PICK_KNEE_DB = 12.0
+
+OFFLINE_PICK_THRESHOLD_DB = 0.0
+REALTIME_PICK_THRESHOLD_DB = 0.0
+
+OFFLINE_PICK_POST_COMP_P = 1.6
+REALTIME_PICK_POST_COMP_P = 1.6
+
+OFFLINE_PICK_POST_COMP_GAIN = 1.15
+REALTIME_PICK_POST_COMP_GAIN = 1.15
+
+OFFLINE_PICK_FLOOR = 0.02
+REALTIME_PICK_FLOOR = 0.02
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
@@ -385,7 +397,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 28.0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 28.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -697,20 +709,233 @@ class CausalPickRatioMask(tf.keras.layers.Layer):
             **super().get_config()
         }
 
-def _pick_mask_engine(inp, sample_rate, prefix, hp_order=129, env_fast_ms=0.30, env_slow_ms=12.0, knee=0.1, smooth_attack_ms=0.08, smooth_release_ms=6.0, out_gain=1.0):
-    return CausalPickRatioMask(
+@register_keras_serializable()
+class CausalPickDBMask(tf.keras.layers.Layer):
+    """
+    Causal pick detector in dB domain with soft-knee logistic mapping.
+
+    Pipeline:
+      x → HPF → |.| → fast EMA = env_hi
+      ref = (|HPF(x)| slow EMA)  if ref_is_hp else (|x| slow EMA)
+      R_db = 20*log10(env_hi+eps) - 20*log10(ref+eps)
+      m0   = sigmoid(slope * (R_db - thr_db)), where slope ~ ln(9)/knee_db (so ±knee/2 spans ~10%-90%)
+      asym attack/release smoothing on m0
+      optional post compression: y = 1 - (1 - m)^p with makeup
+      optional floor: y = floor + (1 - floor) * y
+
+    Notes:
+      - thr_db around 0 dB means mask ≈ 0.5 when HF and ref are equal.
+      - knee_db controls softness; 8–14 dB tends to sound natural.
+      - ref_is_hp=True measures contrast of fast HF vs slower HF (recommended).
+        If False, ref is broadband slow env (more conservative).
+    """
+    def __init__(self,
+                 sample_rate,
+                 hp_cut_hz=3500.0,
+                 hp_order=129,
+                 env_fast_ms=0.25,
+                 env_slow_ms=10.0,
+                 thr_db=0.0,
+                 knee_db=12.0,
+                 smooth_attack_ms=0.06,
+                 smooth_release_ms=6.0,
+                 ref_is_hp=True,
+                 post_comp_p=1.6,
+                 post_comp_gain=1.15,
+                 floor=0.02,
+                 out_gain=1.0,
+                 name=None,
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate       = int(sample_rate)
+        self.hp_cut_hz         = float(hp_cut_hz)
+        self.hp_order          = int(hp_order)
+        self.env_fast_ms       = float(env_fast_ms)
+        self.env_slow_ms       = float(env_slow_ms)
+        self.thr_db            = float(thr_db)
+        self.knee_db           = float(knee_db)
+        self.smooth_attack_ms  = float(smooth_attack_ms)
+        self.smooth_release_ms = float(smooth_release_ms)
+        self.ref_is_hp         = bool(ref_is_hp)
+        self.post_comp_p       = float(post_comp_p)
+        self.post_comp_gain    = float(post_comp_gain)
+        self.floor             = float(floor)
+        self.out_gain          = float(out_gain)
+
+    def build(self, input_shape):
+        # HPF taps
+        k_hp = _get_minphase_hp_kernel(self.sample_rate, self.hp_cut_hz, self.hp_order)
+        self.k_hp = self.add_weight(
+            name="dbmask_hp_taps", shape=k_hp.shape,
+            initializer=tf.keras.initializers.Constant(k_hp), trainable=False
+        )
+
+        # EMA taps (reversed for conv1d)
+        def ema_ms(ms, scale, Lmax):
+            smpls = max(1, int(round((float(ms)/1000.0) * self.sample_rate)))
+            return _exp_smoothing_kernel(smpls, scale=scale, Lmax=Lmax)
+
+        k_fast = ema_ms(self.env_fast_ms, scale=3.0, Lmax=1024)
+        k_slow = ema_ms(self.env_slow_ms, scale=3.0, Lmax=4096)
+        k_att  = ema_ms(self.smooth_attack_ms,  scale=4.0, Lmax=2048)
+        k_rel  = ema_ms(self.smooth_release_ms, scale=4.0, Lmax=2048)
+
+        self.k_fast = self.add_weight(
+            name="dbmask_env_fast", shape=k_fast.shape,
+            initializer=tf.keras.initializers.Constant(k_fast), trainable=False
+        )
+        self.k_slow = self.add_weight(
+            name="dbmask_env_slow", shape=k_slow.shape,
+            initializer=tf.keras.initializers.Constant(k_slow), trainable=False
+        )
+        self.k_att  = self.add_weight(
+            name="dbmask_att", shape=k_att.shape,
+            initializer=tf.keras.initializers.Constant(k_att), trainable=False
+        )
+        self.k_rel  = self.add_weight(
+            name="dbmask_rel", shape=k_rel.shape,
+            initializer=tf.keras.initializers.Constant(k_rel), trainable=False
+        )
+
+        # Precompute sigmoid slope so that ±knee/2 → ~0.1/0.9
+        # slope ≈ ln(9)/knee_db
+        slope_val = float(np.log(9.0) / max(self.knee_db, 1e-3))
+        self.slope = self.add_weight(
+            name="dbmask_sigmoid_slope", shape=(1,),
+            initializer=tf.keras.initializers.Constant([slope_val]), trainable=False
+        )
+        self.thr_db_w = self.add_weight(
+            name="dbmask_thr_db", shape=(1,),
+            initializer=tf.keras.initializers.Constant([self.thr_db]), trainable=False
+        )
+
+        # Output gain as a weight so you can tweak via set_weights if needed
+        self.gain = self.add_weight(
+            name="dbmask_out_gain", shape=(1,),
+            initializer=tf.keras.initializers.Constant([self.out_gain]), trainable=False
+        )
+
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (B,T,1)
+        eps = tf.constant(1e-8, dtype=x.dtype)
+
+        # Sidechain: HPF → abs
+        hp     = _causal_conv1d(x, self.k_hp)
+        abs_hp = tf.abs(hp)
+
+        # Envelopes
+        env_hi = _causal_conv1d(abs_hp, self.k_fast)
+        if self.ref_is_hp:
+            env_lo = _causal_conv1d(abs_hp, self.k_slow)
+        else:
+            env_lo = _causal_conv1d(tf.abs(x), self.k_slow)
+
+        # Contrast in dB
+        # R_db = 20 * log10(env_hi+eps) - 20*log10(env_lo+eps)
+        ln10 = tf.math.log(tf.constant(10.0, dtype=x.dtype))
+        r_db = (20.0 / ln10) * (tf.math.log(env_hi + eps) - tf.math.log(env_lo + eps))
+
+        # Soft-knee logistic around thr_db with slope tied to knee_db
+        z  = (r_db - self.thr_db_w[0]) * self.slope[0]
+        m0 = tf.math.sigmoid(z)
+
+        # Asym attack/release smoothing
+        prev   = tf.pad(m0, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        rising = tf.cast(m0 > prev, x.dtype)
+        m_att  = _causal_conv1d(m0, self.k_att)
+        m_rel  = _causal_conv1d(m0, self.k_rel)
+        m1     = tf.clip_by_value(rising * m_att + (1.0 - rising) * m_rel, 0.0, 1.0)
+
+        # Optional post compression (saturating), then floor and final gain
+        if self.post_comp_p != 1.0:
+            p = tf.constant(self.post_comp_p, dtype=x.dtype)
+            y = 1.0 - tf.pow(1.0 - m1, p)
+            if self.post_comp_gain != 1.0:
+                y = tf.clip_by_value(tf.constant(self.post_comp_gain, dtype=x.dtype) * y, 0.0, 1.0)
+        else:
+            y = m1
+
+        if self.floor > 0.0:
+            fl = tf.constant(self.floor, dtype=x.dtype)
+            y = fl + (1.0 - fl) * y
+
+        return tf.clip_by_value(y * self.gain[0], 0.0, 1.0)
+
+    def get_config(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "hp_cut_hz": self.hp_cut_hz,
+            "hp_order": self.hp_order,
+            "env_fast_ms": self.env_fast_ms,
+            "env_slow_ms": self.env_slow_ms,
+            "thr_db": self.thr_db,
+            "knee_db": self.knee_db,
+            "smooth_attack_ms": self.smooth_attack_ms,
+            "smooth_release_ms": self.smooth_release_ms,
+            "ref_is_hp": self.ref_is_hp,
+            "post_comp_p": self.post_comp_p,
+            "post_comp_gain": self.post_comp_gain,
+            "floor": self.floor,
+            "out_gain": self.out_gain,
+            **super().get_config()
+        }
+
+
+@register_keras_serializable()
+def _pick_mask_engine(inp,
+                         sample_rate,
+                         prefix,
+                         hp_order=129,
+                         env_fast_ms=0.25,
+                         env_slow_ms=10.0,
+                         thr_db=0.0,
+                         knee_db=12.0,
+                         smooth_attack_ms=0.06,
+                         smooth_release_ms=6.0,
+                         ref_is_hp=True,
+                         post_comp_p=1.6,
+                         post_comp_gain=1.15,
+                         floor=0.02,
+                         out_gain=1.0):
+    """
+    Replacement for _pick_mask_engine using dB-domain detector + soft-knee + post compression.
+    """
+    return CausalPickDBMask(
         sample_rate=sample_rate,
         hp_cut_hz=hp_cutoff_for_sr(sample_rate),
         hp_order=hp_order,
         env_fast_ms=env_fast_ms,
         env_slow_ms=env_slow_ms,
-        knee=knee,
+        thr_db=thr_db,
+        knee_db=knee_db,
         smooth_attack_ms=smooth_attack_ms,
         smooth_release_ms=smooth_release_ms,
+        ref_is_hp=bool(ref_is_hp),
+        post_comp_p=post_comp_p,
+        post_comp_gain=post_comp_gain,
+        floor=floor,
         out_gain=out_gain,
-        name=f"{prefix}_pick_mask"
+        name=f"{prefix}_pick_mask_db"
     )(inp)
 
+@register_keras_serializable()
+class SoftClip1D(tf.keras.layers.Layer):
+    """
+    Per-sample soft clip: y = tanh(drive * x) / tanh(drive) * limit
+    Use limit<=1 to bound, drive>0 controls hardness.
+    """
+    def __init__(self, drive=2.0, limit=0.98, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.drive = float(drive)
+        self.limit = float(limit)
+    def call(self, x):
+        d = tf.constant(self.drive, dtype=x.dtype)
+        lim = tf.constant(self.limit, dtype=x.dtype)
+        return lim * tf.math.tanh(d * x) / tf.math.tanh(d)
+    def get_config(self):
+        return {"drive": self.drive, "limit": self.limit, **super().get_config()}
 
 @register_keras_serializable()
 class LearnedModalBank(tf.keras.layers.Layer):
@@ -781,6 +1006,8 @@ def _pick_attack(prefix,
 
     # Style gating
     xg = Multiply(name=f"{prefix}_pickattack_gated")([x, style_time])
+    
+    xg = SoftClip1D(drive=2.0, limit=0.98, name=f"{prefix}_pickattack_softclip")(xg)
 
     # Runtime HPF safety-net (cut below penalty_cutoff_hz)
     xh = HFHighpass(sample_rate=penalty_sample_rate,
@@ -828,6 +1055,8 @@ def _reson_learn_offline(inp, mask, style_time):
                     cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="offline_pickreso_post_hp")(xg)
+    
+    xh = SoftClip1D(drive=OFFLINE_PICK_POST_COMP_P, limit=0.98, name="offline_pickattack_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="offline_pickreso_scale")(xh)
@@ -869,6 +1098,8 @@ def _reson_learn_realtime(inp, mask, style_time):
                     cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="realtime_pickreso_post_hp")(xg)
+    
+    xh = SoftClip1D(drive=REALTIME_PICK_POST_COMP_P, limit=0.98, name="realtime_pickattack_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="realtime_pickreso_scale")(xh)
@@ -4125,13 +4356,19 @@ def build_offline_model(dynamic_time=False,
 
     # Analytic pick mask
     mask = _pick_mask_engine(inp,
-                             sample_rate=OFFLINE_SAMPLE_RATE,
+                             thr_db=OFFLINE_PICK_THRESHOLD_DB,
+                             knee_db=OFFLINE_PICK_KNEE_DB,
+                             ref_is_hp=True,
+                             post_comp_p=OFFLINE_PICK_POST_COMP_P,
+                             post_comp_gain=OFFLINE_PICK_POST_COMP_GAIN,
+                             floor=OFFLINE_PICK_FLOOR,
                              out_gain=OFFLINE_PICK_OUT_GAIN,
                              env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
                              env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
+                             hp_order=OFFLINE_HF_HP_ORDER,
+                             sample_rate=OFFLINE_SAMPLE_RATE,
                              smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
                              smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
-                             knee=OFFLINE_PICK_KNEE,
                              prefix="offline")
 
     # HF pre-emphasis for pickattack head
@@ -4255,13 +4492,19 @@ def build_realtime_model(offline=None,
 
     # Analytic pick mask
     mask = _pick_mask_engine(inp,
-                             sample_rate=REALTIME_SAMPLE_RATE,
+                             thr_db=REALTIME_PICK_THRESHOLD_DB,
+                             knee_db=REALTIME_PICK_KNEE_DB,
+                             ref_is_hp=True,
+                             post_comp_p=REALTIME_PICK_POST_COMP_P,
+                             post_comp_gain=REALTIME_PICK_POST_COMP_GAIN,
+                             floor=REALTIME_PICK_FLOOR,
                              out_gain=REALTIME_PICK_OUT_GAIN,
                              env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
                              env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
+                             hp_order=REALTIME_HF_HP_ORDER,
+                             sample_rate=REALTIME_SAMPLE_RATE,
                              smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
                              smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
-                             knee=REALTIME_PICK_KNEE,
                              prefix="realtime")
 
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
@@ -6167,151 +6410,225 @@ def migrate_picklearn(do_offline=True, do_realtime=True):
     print("✅ Migration complete. You can now retire old HF/gate/learned‑mask paths.")
 
 
-def _copy_weights_by_name_excluding(dst_model, src_model, exclude_prefixes=None, verbose=False):
-    if exclude_prefixes is None:
-        exclude_prefixes = set()
-    src_layers = {l.name: l for l in src_model.layers}
-    matched = 0
-    skipped = 0
-    for l in dst_model.layers:
-        if any(l.name.startswith(pfx) for pfx in exclude_prefixes):
-            skipped += 1
+def _find_first_present_layer_name(model, candidate_names):
+    for name in candidate_names:
+        try:
+            _ = model.get_layer(name)
+            return name
+        except Exception:
             continue
-        ref = src_layers.get(l.name)
-        if ref is None:
-            continue
-        sw = ref.get_weights()
-        dw = l.get_weights()
-        if len(sw) != len(dw):
-            continue
-        ok = True
-        for s, d in zip(sw, dw):
-            if np.shape(s) != np.shape(d):
-                ok = False; break
-        if not ok:
-            continue
-        l.set_weights(sw)
-        matched += 1
-    if verbose:
-        print(f"[copy_weights_excl] copied {matched}, skipped {skipped}")
-    return matched, skipped
+    return None
 
-def _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True):
-    # kind ∈ {"offline","realtime"}
-    global OFFLINE_PICK_ENV_FAST_MS, OFFLINE_PICK_ENV_SLOW_MS, OFFLINE_PICK_KNEE
-    global OFFLINE_PICK_SMOOTH_ATTACK_MS, OFFLINE_PICK_SMOOTH_RELEASE_MS, OFFLINE_PICK_OUT_GAIN
-    global REALTIME_PICK_ENV_FAST_MS, REALTIME_PICK_ENV_SLOW_MS, REALTIME_PICK_KNEE
-    global REALTIME_PICK_SMOOTH_ATTACK_MS, REALTIME_PICK_SMOOTH_RELEASE_MS, REALTIME_PICK_OUT_GAIN
 
-    if kind not in ("offline", "realtime"):
-        raise ValueError("kind must be 'offline' or 'realtime'")
+def _ema_kernel_fixed_len(tau_samples, L):
+    """
+    Build a normalized exponential (EMA) kernel of fixed length L for the given time-constant (samples).
+    Reversed for tf.nn.conv1d cross-correlation.
+    """
+    s = max(1, int(tau_samples))
+    L = max(1, int(L))
+    a = np.exp(-1.0 / float(s)).astype(np.float32)
+    n = np.arange(L, dtype=np.float32)
+    taps = (1.0 - a) * (a ** n)
+    taps = taps / max(np.sum(taps, dtype=np.float64), 1e-12)
+    return taps[::-1].reshape(-1, 1, 1).astype(np.float32)
 
-    if kind == "offline":
-        snap = dict(env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,
-                    env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
-                    knee=OFFLINE_PICK_KNEE,
-                    smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,
-                    smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
-                    out_gain=OFFLINE_PICK_OUT_GAIN)
-    else:
-        snap = dict(env_fast_ms=REALTIME_PICK_ENV_FAST_MS,
-                    env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
-                    knee=REALTIME_PICK_KNEE,
-                    smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,
-                    smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
-                    out_gain=REALTIME_PICK_OUT_GAIN)
 
-    def _apply(d):
-        def get(k): return d[k] if (d is not None and k in d and d[k] is not None) else snap[k]
-        if kind == "offline":
-            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = float(get("env_fast_ms"))
-            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = float(get("env_slow_ms"))
-            globals()["OFFLINE_PICK_KNEE"]              = float(get("knee"))
-            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = float(get("smooth_attack_ms"))
-            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = float(get("smooth_release_ms"))
-            globals()["OFFLINE_PICK_OUT_GAIN"]          = float(get("out_gain"))
-        else:
-            globals()["REALTIME_PICK_ENV_FAST_MS"]       = float(get("env_fast_ms"))
-            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = float(get("env_slow_ms"))
-            globals()["REALTIME_PICK_KNEE"]              = float(get("knee"))
-            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = float(get("smooth_attack_ms"))
-            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = float(get("smooth_release_ms"))
-            globals()["REALTIME_PICK_OUT_GAIN"]          = float(get("out_gain"))
+def _recompute_hp_kernel_fixed_len(sample_rate, cutoff_hz, L, window="hamming"):
+    """
+    Recompute a causal min-phase HPF kernel with fixed length L for the new cutoff.
+    Returns reversed taps for tf.nn.conv1d (cross-correlation).
+    """
+    sr = int(sample_rate)
+    L = int(L)
+    # SciPy firwin expects numtaps=L
+    taps_lin = firwin(L, cutoff=float(cutoff_hz) / (sr / 2.0), window=window, pass_zero=False).astype(np.float32)
+    taps_min = minimum_phase(taps_lin, method="homomorphic").astype(np.float32)
+    k = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)
+    return k
 
-    def _restore():
-        if kind == "offline":
-            globals()["OFFLINE_PICK_ENV_FAST_MS"]       = snap["env_fast_ms"]
-            globals()["OFFLINE_PICK_ENV_SLOW_MS"]       = snap["env_slow_ms"]
-            globals()["OFFLINE_PICK_KNEE"]              = snap["knee"]
-            globals()["OFFLINE_PICK_SMOOTH_ATTACK_MS"]  = snap["smooth_attack_ms"]
-            globals()["OFFLINE_PICK_SMOOTH_RELEASE_MS"] = snap["smooth_release_ms"]
-            globals()["OFFLINE_PICK_OUT_GAIN"]          = snap["out_gain"]
-        else:
-            globals()["REALTIME_PICK_ENV_FAST_MS"]       = snap["env_fast_ms"]
-            globals()["REALTIME_PICK_ENV_SLOW_MS"]       = snap["env_slow_ms"]
-            globals()["REALTIME_PICK_KNEE"]              = snap["knee"]
-            globals()["REALTIME_PICK_SMOOTH_ATTACK_MS"]  = snap["smooth_attack_ms"]
-            globals()["REALTIME_PICK_SMOOTH_RELEASE_MS"] = snap["smooth_release_ms"]
-            globals()["REALTIME_PICK_OUT_GAIN"]          = snap["out_gain"]
 
-    _apply(mask_overrides or {})
+def set_dbmask_params_inplace(model,
+                              layer_name,
+                              thr_db=None,
+                              knee_db=None,
+                              out_gain=None,
+                              post_comp_p=None,
+                              post_comp_gain=None,
+                              floor=None,
+                              ref_is_hp=None,
+                              eps_rel=None,
+                              eps_abs=None,
+                              env_fast_ms=None,
+                              env_slow_ms=None,
+                              smooth_attack_ms=None,
+                              smooth_release_ms=None,
+                              hp_cut_hz=None):
+    """
+    In-place param tweak for CausalPickDBMask.
+    Also supports re-synthesizing EMA and HPF kernels at the SAME length (no rebuild needed).
+
+    Unsupported in place: hp_order (changes weight shape).
+    """
     try:
-        if kind == "offline":
-            new_dyn = build_offline_model(dynamic_time=bool(dynamic_time))
-        else:
-            new_dyn = build_realtime_model(offline=None, dynamic_time=bool(dynamic_time))
-    finally:
-        _restore()
-    return new_dyn
+        l = model.get_layer(layer_name)
+    except Exception as e:
+        raise ValueError(f"Layer '{layer_name}' not found in model {model.name}") from e
 
-def build_mask_tweaked_dynamic(kind="realtime", mask_overrides=None, use_finetuned=False, verbose=True):
-    dpath = _select_stems_model_path(kind, use_finetuned=bool(use_finetuned))
-    if dpath is None or not os.path.exists(dpath):
-        raise FileNotFoundError("Trained dynamic model not found; train/export first.")
-    src_dyn = tf.keras.models.load_model(dpath, compile=False)
-    tweaked = _build_model_with_mask_overrides(kind, mask_overrides, dynamic_time=True)
-    mask_name = "offline_pick_mask" if kind == "offline" else "realtime_pick_mask"
-    _copy_weights_by_name_excluding(tweaked, src_dyn, exclude_prefixes={mask_name}, verbose=bool(verbose))
-    if verbose:
-        l = tweaked.get_layer(mask_name)
-        print(f"[mask] knee={getattr(l, 'knee', None)} fastL={int(l.k_fast.shape[0])} slowL={int(l.k_slow.shape[0])} "
-              f"attL={int(l.k_att.shape[0])} relL={int(l.k_rel.shape[0])}")
-    return tweaked
+    # Small scalar weights/attributes
+    if thr_db is not None and hasattr(l, "thr_db_w"):
+        l.thr_db_w.assign([float(thr_db)])
+        l.thr_db = float(thr_db)
+    if knee_db is not None and hasattr(l, "slope"):
+        s = float(np.log(9.0) / max(1e-3, float(knee_db)))
+        l.slope.assign([s])
+        l.knee_db = float(knee_db)
+    if out_gain is not None and hasattr(l, "gain"):
+        l.gain.assign([float(out_gain)])
+        l.out_gain = float(out_gain)
+
+    if post_comp_p is not None:
+        l.post_comp_p = float(post_comp_p)
+    if post_comp_gain is not None:
+        l.post_comp_gain = float(post_comp_gain)
+    if floor is not None:
+        l.floor = float(floor)
+    if ref_is_hp is not None:
+        l.ref_is_hp = bool(ref_is_hp)
+    if eps_rel is not None:
+        l.eps_rel = float(eps_rel)
+    if eps_abs is not None:
+        l.eps_abs = float(eps_abs)
+
+    # Re-synthesize EMA kernels at fixed length (fast/slow/attack/release)
+    sr = int(getattr(l, "sample_rate", REALTIME_SAMPLE_RATE))
+
+    def to_samples(ms):
+        return max(1, int(round((float(ms) / 1000.0) * sr)))
+
+    # env_fast
+    if env_fast_ms is not None and hasattr(l, "k_fast"):
+        Lf = int(l.k_fast.shape[0])
+        kf = _ema_kernel_fixed_len(to_samples(env_fast_ms), Lf)
+        l.k_fast.assign(kf)
+        l.env_fast_ms = float(env_fast_ms)
+
+    # env_slow
+    if env_slow_ms is not None and hasattr(l, "k_slow"):
+        Ls = int(l.k_slow.shape[0])
+        ks = _ema_kernel_fixed_len(to_samples(env_slow_ms), Ls)
+        l.k_slow.assign(ks)
+        l.env_slow_ms = float(env_slow_ms)
+
+    # smooth attack
+    if smooth_attack_ms is not None and hasattr(l, "k_att"):
+        La = int(l.k_att.shape[0])
+        ka = _ema_kernel_fixed_len(to_samples(smooth_attack_ms), La)
+        l.k_att.assign(ka)
+        l.smooth_attack_ms = float(smooth_attack_ms)
+
+    # smooth release
+    if smooth_release_ms is not None and hasattr(l, "k_rel"):
+        Lr = int(l.k_rel.shape[0])
+        kr = _ema_kernel_fixed_len(to_samples(smooth_release_ms), Lr)
+        l.k_rel.assign(kr)
+        l.smooth_release_ms = float(smooth_release_ms)
+
+    # HPF cutoff retune at fixed length
+    if hp_cut_hz is not None and hasattr(l, "k_hp"):
+        Lh = int(l.k_hp.shape[0])
+        kh = _recompute_hp_kernel_fixed_len(sr, float(hp_cut_hz), Lh, window="hamming")
+        l.k_hp.assign(kh)
+        l.hp_cut_hz = float(hp_cut_hz)
+
 
 def quick_mask_tweak_stems(kind="realtime",
                            mask_overrides=None,
                            out_dir=None,
                            use_finetuned=False,
-                           sec=LONG_DEMO_SEC,
-                           offset_sec=LONG_DEMO_OFFSET_SEC):
+                           sec=10,
+                           offset_sec=0.0):
     """
-    Convenience: build tweaked model and render stems on the demo pair.
+    Quick audition for the new dB pick mask (CausalPickDBMask) only.
+
+    Supported in-place params (no rebuild):
+      - thr_db, knee_db, post_comp_p, post_comp_gain, floor, out_gain, ref_is_hp, eps_rel, eps_abs
+      - env_fast_ms, env_slow_ms, smooth_attack_ms, smooth_release_ms (EMA taps retuned at same length)
+      - hp_cut_hz (HPF retuned at same length)
+
+    Not supported in-place:
+      - hp_order (would change weight shape) → rebuild the model if you must change it.
+
+    Returns: (tweaked_model, out_dir)
     """
     if mask_overrides is None:
         mask_overrides = {}
+
+    # Load the newest dynamic model for the requested kind
+    dpath = _select_stems_model_path(kind, use_finetuned=bool(use_finetuned))
+    if dpath is None or not os.path.exists(dpath):
+        raise FileNotFoundError("Trained dynamic model not found; train/export first.")
+
+    tweaked = tf.keras.models.load_model(dpath, compile=False)
+
+    # Find the DB mask layer
+    prefix = "offline" if kind == "offline" else "realtime"
+    candidate_db = f"{prefix}_pick_mask_db"
+    mask_layer_name = _find_first_present_layer_name(tweaked, (candidate_db,))
+    if mask_layer_name is None:
+        raise RuntimeError(f"No dB pick mask layer '{candidate_db}' found in model '{tweaked.name}'. "
+                           f"Ensure your model uses CausalPickDBMask.")
+
+    # Apply in-place overrides
+    set_dbmask_params_inplace(
+        tweaked, mask_layer_name,
+        thr_db=mask_overrides.get("thr_db", None),
+        knee_db=mask_overrides.get("knee_db", None),
+        out_gain=mask_overrides.get("out_gain", None),
+        post_comp_p=mask_overrides.get("post_comp_p", None),
+        post_comp_gain=mask_overrides.get("post_comp_gain", None),
+        floor=mask_overrides.get("floor", None),
+        ref_is_hp=mask_overrides.get("ref_is_hp", None),
+        eps_rel=mask_overrides.get("eps_rel", None),
+        eps_abs=mask_overrides.get("eps_abs", None),
+        env_fast_ms=mask_overrides.get("env_fast_ms", None),
+        env_slow_ms=mask_overrides.get("env_slow_ms", None),
+        smooth_attack_ms=mask_overrides.get("smooth_attack_ms", None),
+        smooth_release_ms=mask_overrides.get("smooth_release_ms", None),
+        hp_cut_hz=mask_overrides.get("hp_cut_hz", None)
+    )
+
+    # Debug model (shares variables with 'tweaked')
+    dbg = build_offline_debug_model(tweaked) if kind == "offline" else build_realtime_debug_model(tweaked)
+
+    # Choose demo pair
     assert_has_pairs()
     src, tgt = all_pairs[DEMO_PAIR_INDEX]
     sample_rate = OFFLINE_SAMPLE_RATE if kind == "offline" else REALTIME_SAMPLE_RATE
 
+    # Output directory
     if out_dir is None:
-        tag = "_".join(f"{k}={mask_overrides[k]}" for k in sorted(mask_overrides.keys()))
-        out_dir = os.path.join(DEMOS_OUT_DIR, "mask_tweak", kind, tag.replace(" ", ""))
+        keys_sorted = sorted(mask_overrides.keys())
+        tag_parts = []
+        for k in keys_sorted:
+            try:
+                tag_parts.append(f"{k}={mask_overrides[k]}")
+            except Exception:
+                tag_parts.append(str(k))
+        tag = "_".join(tag_parts).replace(" ", "")
+        out_dir = os.path.join(DEMOS_OUT_DIR, "mask_tweak_db", kind, tag if tag else "default")
 
-    tweaked = build_mask_tweaked_dynamic(kind=kind,
-                                         mask_overrides=mask_overrides,
-                                         use_finetuned=bool(use_finetuned),
-                                         verbose=True)
-
-    # Build a debug model exposing stems and render
-    dbg = build_offline_debug_model(tweaked) if kind == "offline" else build_realtime_debug_model(tweaked)
     os.makedirs(out_dir, exist_ok=True)
-    print(f"[mask-tweak] Rendering stems to: {out_dir}")
+    print(f"[mask-tweak-db] Rendering stems to: {out_dir}")
+
     render_isolated_stems(
         debug_model=dbg,
-        path_src=src, path_tgt=tgt,
+        path_src=src,
+        path_tgt=tgt,
         out_dir=out_dir,
         sample_rate=sample_rate,
-        sec=float(sec), offset_sec=float(offset_sec),
+        sec=float(sec),
+        offset_sec=float(offset_sec),
         use_finetuned=bool(use_finetuned)
     )
     return tweaked, out_dir
@@ -6385,7 +6702,6 @@ def _metrics_for_core(outs_dict, y_target_core=None):
 
     return m
 
-
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
         resume, resume_ckpt = cleanup_and_prepare_train(
@@ -6412,7 +6728,6 @@ def main ():
         args = set(sys.argv[2:])
         do_offline   = ("--realtime-only" not in args)
         do_realtime  = ("--offline-only"  not in args)
-        do_rt_learned = ("--learned-pick" in args)
 
         # Offline baseline
         if do_offline:
@@ -6474,16 +6789,19 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
+        
         # Realtime mask sweep example
-        mask_overrides = dict(
-            knee=REALTIME_PICK_KNEE,              # default 0.30 (your constants), try 0.2
-            env_fast_ms=REALTIME_PICK_ENV_FAST_MS,       # was ~0.30
-            env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,       # was ~12.0
-            smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
-            smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
-            out_gain=REALTIME_PICK_OUT_GAIN
+        quick_mask_tweak_stems(
+            kind="offline",
+            mask_overrides=dict(
+                thr_db=OFFLINE_PICK_THRESHOLD_DB, knee_db=OFFLINE_PICK_KNEE_DB,
+                env_fast_ms=OFFLINE_PICK_ENV_FAST_MS, env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
+                smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS, smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
+                post_comp_p=OFFLINE_PICK_POST_COMP_P, post_comp_gain=OFFLINE_PICK_POST_COMP_GAIN,
+                floor=OFFLINE_PICK_FLOOR, out_gain=OFFLINE_PICK_OUT_GAIN
+            ),
+            sec=6, offset_sec=0.0
         )
-        quick_mask_tweak_stems(kind="realtime", mask_overrides=mask_overrides)
         sys.exit(0)
         
         # Flags (can be combined):
