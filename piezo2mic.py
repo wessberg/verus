@@ -1891,58 +1891,6 @@ def approx_steps_from_length(total_samples, seg_len, batch_size, hop=None, cap=N
         steps = min(steps, int(cap))
     return steps
 
-def compute_resbp_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
-    """
-    Realtime learned-resonance LC for stems:
-      LC_total = LC_onset_pulse + (L_modal - 1)
-    Onset: CausalExpSmoother(name starts with 'realtime_pickreso_onset_pulse' or legacy 'realtime_resbp_onset_pulse')
-    Modal: ModalBank or LearnedModalBank layer named '*_pickreso_modal' (or legacy '*_resbp_modalbank')
-    """
-    sr = int(sample_rate)
-
-    # Find pulse smoother
-    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_pickreso_onset_pulse")
-    if not env_layers:
-        env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_resbp_onset_pulse")
-    L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
-
-    # Find modal bank (either ModalBank or LearnedModalBank)
-    mb = None
-    for cls, prefix in [(ModalBank, "realtime_pickreso_modal"),
-                        (LearnedModalBank, "realtime_pickreso_modal"),
-                        (ModalBank, "realtime_resbp_modalbank")]:
-        layers = _find_layers(model, cls, name_prefix=prefix)
-        if layers:
-            mb = layers[0]
-            break
-    if mb is None:
-        raise ValueError("compute_resbp_left_context_realtime: missing pickreso/resbp modal bank.")
-
-    try:
-        L_modal = int(mb.length)
-    except Exception:
-        L_modal = int(mb.kernel.shape[0])
-
-    LC_total = (L_env - 1) + (L_modal - 1)
-
-    if verbose:
-        def as_ms(s): return 1000.0 * float(s) / float(sr)
-        print(f"[pickreso] env LC = {L_env - 1} ({as_ms(L_env - 1):.3f} ms)")
-        print(f"[pickreso] modal LC = {L_modal - 1} ({as_ms(L_modal - 1):.3f} ms)")
-        print(f"[pickreso] TOTAL LC = {LC_total} ({as_ms(LC_total):.3f} ms)")
-    return {
-        "resbp_signal_left_ctx_samples": int(LC_total),
-        "resbp_signal_left_ctx_ms":      1000.0 * float(LC_total) / float(sr),
-        "resbp_gain_left_ctx_samples":   int(LC_total),
-        "resbp_gain_left_ctx_ms":        1000.0 * float(LC_total) / float(sr),
-        "resbp_left_ctx_samples":        int(LC_total),
-        "resbp_left_ctx_ms":             1000.0 * float(LC_total) / float(sr),
-        "downsample_taps":               [],
-        "lowrate_rf_samples":            1,
-        "bandpass_taps":                 0,
-        "upsample_factor":               1,
-    }
-
 def compute_ir_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
     sr = int(sample_rate)
     ds8_layers = _find_layers(model, RealtimeIrDownsampleFIR, name_prefix="realtime_ir_downsample")
@@ -1976,22 +1924,129 @@ def compute_main_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, 
         print(f"[main] LC = {LC_main} samples ({ms:.2f} ms)")
     return LC_main
 
-def compute_hf_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
-    return 0
+
+
+
+
+
+
+
+
+
+
+
+
+def compute_pickattack_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Left context for the realtime pickattack head:
+      LC = LC(pre-emph) + RF(tiny CNN) + LC(post-HPF in head)
+
+    - pre-emph layer 'realtime_hf_pre_emph' adds 1 sample (x[n-1]) if present.
+    - tiny CNN = separable convs 'realtime_picklearn_c1' and 'realtime_picklearn_c2'
+      RF increment = sum((k-1)*d).
+    - post-HPF safety-net 'realtime_pickattack_post_hp' contributes (L-1).
+    """
+    sr = int(sample_rate)
+
+    # Pre-emphasis: present → 1 sample, else 0
+    lc_pre = 1 if any(l.name == "realtime_hf_pre_emph" for l in model.layers) else 0
+
+    # Tiny CNN RF (two SeparableConv1D: c1, c2)
+    R_pa = _sum_sep_rf_for_prefix(model, r'^realtime_picklearn_c[12]$')  # returns 1 + sum((k-1)*d)
+    lc_cnn = max(0, int(R_pa) - 1)
+
+    # Post-HPF inside the head
+    hp_layers = _find_layers(model, HFHighpass, name_prefix="realtime_pickattack_post_hp")
+    L_hp = int(hp_layers[0].taps.shape[0]) if hp_layers else 1
+    lc_hp = L_hp - 1
+
+    LC = lc_pre + lc_cnn + lc_hp
+    if verbose:
+        ms = 1000.0 * float(LC) / float(sr)
+        print(f"[pickattack] LC = pre={lc_pre}, cnn={lc_cnn}, hpf={lc_hp} → {LC} samples ({ms:.3f} ms)")
+    return int(LC)
+
+
+def compute_pickreso_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Left context for the learned resonance (pickreso) stem:
+      LC = (L_onset_pulse - 1) + (L_modal - 1)
+
+    - onset pulse layer: CausalExpSmoother named 'realtime_pickreso_onset_pulse'
+    - modal bank: LearnedModalBank or ModalBank named 'realtime_pickreso_modal'
+    If the branch is absent, returns 0.
+    """
+    sr = int(sample_rate)
+
+    # Onset pulse smoother
+    env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_pickreso_onset_pulse")
+    L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
+
+    # Modal bank (prefer LearnedModalBank; fallback to ModalBank)
+    mb_layers = _find_layers(model, LearnedModalBank, name_prefix="realtime_pickreso_modal")
+    if not mb_layers:
+        mb_layers = _find_layers(model, ModalBank, name_prefix="realtime_pickreso_modal")
+
+    if not mb_layers:
+        LC = max(0, L_env - 1)
+        if verbose:
+            ms = 1000.0 * float(LC) / float(sr)
+            print(f"[pickreso] branch not present; LC={LC} samples ({ms:.3f} ms)")
+        return int(LC)
+
+    mb = mb_layers[0]
+    # length is a config property (available even if not built); kernel.shape[0] is also fine post-build
+    try:
+        L_modal = int(getattr(mb, "length"))
+    except Exception:
+        L_modal = int(mb.kernel.shape[0])
+
+    LC = (L_env - 1) + (L_modal - 1)
+    if verbose:
+        ms = 1000.0 * float(LC) / float(sr)
+        print(f"[pickreso] env={L_env - 1}, modal={L_modal - 1} → {LC} samples ({ms:.3f} ms)")
+    return int(LC)
+
 
 def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
+    """
+    Max left context across realtime branches that feed the final sum:
+      - main (pre + dilated stack [+ optional main HPF safety-net])
+      - IR branch (ds FIR + lowrate RF + interp FIR)
+      - pickattack head (pre-emph + tiny CNN + head HPF)
+      - pickreso head (onset pulse + modal length)
+      - coloreq bandpasses (if present)
+    Returns (left_ctx_samples, right_ctx_samples). Right = 0 (purely causal).
+    """
     lc_main = compute_main_left_context_realtime(model, sample_rate, verbose=False)
     lc_ir   = compute_ir_left_context_realtime(model, sample_rate, verbose=False)
-    rbp     = compute_resbp_left_context_realtime(model, sample_rate, verbose=False)
-    lc_rbp  = int(rbp["resbp_left_ctx_samples"])
-    lc_hf   = compute_hf_left_context_realtime(model, sample_rate, verbose=False)
-    lc_col  = compute_coloreq_left_context_realtime(model, sample_rate, verbose=False)  # NEW
+    lc_reso = compute_pickreso_left_context_realtime(model, sample_rate, verbose=False)
+    lc_patt = compute_pickattack_left_context_realtime(model, sample_rate, verbose=False)
+    lc_col  = compute_coloreq_left_context_realtime(model, sample_rate, verbose=False)
 
-    left_ctx = max(lc_main, lc_ir, lc_rbp, lc_hf, lc_col)
+    left_ctx = max(lc_main, lc_ir, lc_reso, lc_patt, lc_col)
+
     if verbose:
-        def as_ms(s): return 1000.0 * float(s) / float(sample_rate)
-        print(f"[streaming] realtime left ctx (samples): main={lc_main}, ir={lc_ir}, resbp={lc_rbp}, hf={lc_hf}, coloreq_ft={lc_col} → max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
+        def as_ms(samples):
+            return 1000.0 * float(samples) / float(sample_rate)
+        print("[streaming] realtime LC (samples): "
+              f"main={lc_main}, ir={lc_ir}, pickattack={lc_patt}, pickreso={lc_reso}, coloreq={lc_col} "
+              f"→ max={left_ctx} ({as_ms(left_ctx):.2f} ms)")
+
     return int(left_ctx), 0
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @register_keras_serializable()
 def add_coloreq(x, bands, sample_rate, name_prefix, order=65, trainable_scales=False):
