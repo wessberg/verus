@@ -248,7 +248,7 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 10.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -291,6 +291,21 @@ REALTIME_PICK_OUT_GAIN = 5.0
 
 OFFLINE_PICK_KNEE = 10.5
 REALTIME_PICK_KNEE = 0.5
+
+# If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
+# So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
+PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
+PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 129
+PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.0
+
+PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
+PICK_RESO_LOWBAND_PENALTY_ORDER     = 129
+PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.0
+
+# Also do this from the main mix path, to prevent build-up in ultra low frequencies
+ULTRALOW_MAIN_CUTOFF_HZ            = 40.0
+ULTRALOW_MAIN_ORDER        = 129
+ULTRALOW_MAIN_WEIGHT               = 0.15  # keep modest; adjust by ear/plots
 
 # Finetune params
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
@@ -359,8 +374,8 @@ REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
 
-REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
-FINETUNE_REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+FINETUNE_REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 REALTIME_LP_ORDER   = 257 
 
@@ -370,11 +385,11 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 20.0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
-FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
-FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0
+FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -1147,6 +1162,8 @@ class FinetuneCombinedLossLite(tf.keras.losses.Loss):
     """
     Lightweight loss for strict finetune:
       L = l1_w * L1 + hf_w * HF(preemph) + stft_w * 1-scale MR-STFT + env_w * RMS-env
+          + ulb_w * L1( LPF_{<ulb_cut}(y_pred - y_true) )
+
     Single STFT scale by default to keep it very cheap.
     """
     def __init__(self,
@@ -1154,6 +1171,9 @@ class FinetuneCombinedLossLite(tf.keras.losses.Loss):
                  stft_scales=((1024, 256, 1024),),  # single scale by default
                  l1_w=1.0, hf_w=2.0, stft_w=1.0, env_w=0.0,
                  onset_gain=HF_ONSET_GAIN,
+                 ulb_w=0.0,
+                 ulb_cut_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                 ulb_order=None,
                  name="finetune_combined_loss_lite",
                  **kwargs):
         super().__init__(name=name, **kwargs)
@@ -1165,12 +1185,26 @@ class FinetuneCombinedLossLite(tf.keras.losses.Loss):
         self.env_w = float(env_w)
         self.onset_gain = float(onset_gain)
 
+        # ULB term
+        self.ulb_w     = float(ulb_w)
+        self.ulb_cut_hz= float(ulb_cut_hz)
+        if ulb_order is None:
+            self.ulb_order = int(ULTRALOW_MAIN_ORDER)
+        else:
+            self.ulb_order = int(ulb_order)
+
         # Precompute Hann windows (shape (1,1,win)) as constants
         self._wins = []
         for _, _, win in self.stft_scales:
             w = tf.signal.hann_window(win, periodic=True)
             w = tf.reshape(w, (1, 1, win))
             self._wins.append(tf.constant(w, dtype=tf.float32))
+
+        # LPF kernel for ultra-lowband error (as a constant)
+        self._ulb_kernel = _make_lpf_kernel(self.sample_rate,
+                                            cutoff_hz=self.ulb_cut_hz,
+                                            order=self.ulb_order,
+                                            window="hamming")
 
     def get_config(self):
         cfg = super().get_config()
@@ -1182,6 +1216,9 @@ class FinetuneCombinedLossLite(tf.keras.losses.Loss):
             "stft_w": self.stft_w,
             "env_w": self.env_w,
             "onset_gain": self.onset_gain,
+            "ulb_w": self.ulb_w,
+            "ulb_cut_hz": self.ulb_cut_hz,
+            "ulb_order": self.ulb_order
         })
         return cfg
 
@@ -1212,14 +1249,30 @@ class FinetuneCombinedLossLite(tf.keras.losses.Loss):
         loss = tf.add_n(losses) / float(len(losses))
         return loss[:, None, None]
 
+    def _ulb(self, y_true, y_pred):
+        if self.ulb_w == 0.0:
+            # Shape-compatible zero so downstream weighting is clean
+            return tf.zeros_like(y_true)
+        err = y_pred - y_true
+        k = self._ulb_kernel  # (L,1,1), already reversed for conv1d
+        pad = tf.shape(k)[0] - 1
+        err_pad = tf.pad(err, [[0,0],[pad,0],[0,0]])
+        lp_err = tf.nn.conv1d(err_pad, filters=k, stride=1, padding='VALID')
+        return tf.abs(lp_err)
+
     def call(self, y_true, y_pred):
         gate_env = gate_weight_dynamic(y_true, self.sample_rate)  # (B,T,1) in [0,1]
-        # Gate the L1 to de-emphasize background noise
         td = waveform_l1_loss(y_true, y_pred) * (0.2 + 0.8 * gate_env)
         hf = hf_loss(y_true, y_pred) * (1.0 + self.onset_gain * gate_env)
         spec = self._mrstft(y_true, y_pred, gate_env) if self.stft_scales else 0.0
         env = rms_env_loss(y_true, y_pred) if self.env_w != 0.0 else 0.0
-        return (self.l1_w * td + self.hf_w * hf + self.stft_w * spec + self.env_w * env)
+        ulb = self._ulb(y_true, y_pred)
+
+        return (self.l1_w  * td
+              + self.hf_w  * hf
+              + self.stft_w* spec
+              + self.env_w * env
+              + self.ulb_w * ulb)
 
 @register_keras_serializable()
 class LogMelLoss(Loss):
@@ -1479,6 +1532,10 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
 
     d2   = second_diff_l1_onset(y_true, y_pred, onset_env=gate_env)
     bl   = resonance_band_loss(y_true, y_pred, sample_rate)
+    
+    ulb = lowband_error_penalty(y_true, y_pred, sample_rate,
+                                cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                                order=ULTRALOW_MAIN_ORDER)
 
     return (L1_WEIGHT       * td
           + HF_WEIGHT       * hf
@@ -1487,7 +1544,8 @@ def combined_loss(y_true, y_pred, sample_rate, extra_small_cplx=False):
           + RMS_ENV_WEIGHT  * env
           + COMPLEX_STFT_WEIGHT * cplx
           + D2_WEIGHT       * d2
-          + RESBP_BAND_LOSS_WEIGHT * bl)
+          + RESBP_BAND_LOSS_WEIGHT * bl
+          + ULTRALOW_MAIN_WEIGHT   * ulb)
 
 # Replace mean_hf_metric with this version
 @register_keras_serializable()
@@ -3174,6 +3232,22 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
             'window': self.window
         })
         return cfg
+    
+@register_keras_serializable()
+def lowband_error_penalty(y_true, y_pred, sample_rate,
+                          cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                          order=129,
+                          window="hamming"):
+    """
+    Training loss term: L1 of LPF(y_pred - y_true) below cutoff_hz.
+    Returns (B,T,1) so it’s compatible with per-sample weighting.
+    """
+    err = y_pred - y_true
+    k = _make_lpf_kernel(int(sample_rate), float(cutoff_hz), int(order), window=window)  # (L,1,1) reversed
+    pad = tf.shape(k)[0] - 1
+    err_pad = tf.pad(err, [[0,0],[pad,0],[0,0]])
+    lp_err = tf.nn.conv1d(err_pad, filters=k, stride=1, padding='VALID')
+    return tf.abs(lp_err)
 
 @register_keras_serializable()
 class TileStyle(Layer):
@@ -3942,10 +4016,35 @@ def build_offline_model(dynamic_time=False,
     pickattack_g  = Multiply(name="offline_pickattack_gated")([pickattack,  style_time])
     pickreso_g = Multiply(name="offline_pickreso_gated")([pickreso, style_time])
 
+    # Training-only lowband penalties (no grad to style)
+    style_time_sg = Lambda(stop_grad, name="offline_style_time_sg")(style_time)
+
+    pa_penalty_in = Multiply(name="offline_pickattack_penalty_gate")([pickattack, style_time_sg])
+    pa_penalty = HFLowbandPenalty(
+        alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
+        cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
+        order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        name="offline_pickattack_lowband_penalty"
+    )(pa_penalty_in)
+
+    pr_penalty_in = Multiply(name="offline_pickreso_penalty_gate")([pickreso, style_time_sg])
+    pr_penalty = HFLowbandPenalty(
+        alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
+        cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+        order=PICK_RESO_LOWBAND_PENALTY_ORDER,
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        name="offline_pickreso_lowband_penalty"
+    )(pr_penalty_in)
+
     out = Add(name="offline_mix_core_plus_pick")([main_core, pickattack_g, pickreso_g])
+
+    # Tie penalties into the graph without changing audio
+    out = LossTether(name="offline_pick_lowband_penalties")([out, pa_penalty, pr_penalty])
 
     out = add_coloreq(out, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
+
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
 
@@ -4057,11 +4156,35 @@ def build_realtime_model(offline=None,
     pickattack  = _pick_attack("realtime", hf_in, mask)
     pickreso = _reson_learn_realtime(inp, mask)
     
-    # Gate both by style
+        # Gate both by style
     pickattack_g  = Multiply(name="realtime_pickattack_gated")([pickattack,  style_scalar_b3])
     pickreso_g = Multiply(name="realtime_pickreso_gated")([pickreso, style_scalar_b3])
 
+    # Training-only lowband penalties (no grad to style)
+    style_b3_sg = Lambda(stop_grad, name="realtime_style_scalar_b3_sg")(style_scalar_b3)
+
+    pa_penalty_in = Multiply(name="realtime_pickattack_penalty_gate")([pickattack, style_b3_sg])
+    pa_penalty = HFLowbandPenalty(
+        alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
+        cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
+        order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_pickattack_lowband_penalty"
+    )(pa_penalty_in)
+
+    pr_penalty_in = Multiply(name="realtime_pickreso_penalty_gate")([pickreso, style_b3_sg])
+    pr_penalty = HFLowbandPenalty(
+        alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
+        cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+        order=PICK_RESO_LOWBAND_PENALTY_ORDER,
+        sample_rate=REALTIME_SAMPLE_RATE,
+        name="realtime_pickreso_lowband_penalty"
+    )(pr_penalty_in)
+
     y_final = Add(name="realtime_with_picklearn")([y_main, ir, pickattack_g, pickreso_g])
+
+    # Tie penalties into the graph without changing audio
+    y_final = LossTether(name="realtime_pick_lowband_penalties")([y_final, pa_penalty, pr_penalty])
 
     y_final = add_coloreq(y_final, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
@@ -4480,10 +4603,14 @@ def fine_tune(offline=True, realtime=True):
     # Lightweight fine-tune losses
     loss_offlite = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE,
                                             stft_scales=((1024,256,1024),),
-                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
+                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0,ulb_w=0.20,
+                                            ulb_cut_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                                            ulb_order=ULTRALOW_MAIN_ORDER)
     loss_rt_lite = FinetuneCombinedLossLite(sample_rate=REALTIME_SAMPLE_RATE,
                                             stft_scales=((1024,256,1024),),
-                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0)
+                                            l1_w=0.6, hf_w=2.0, stft_w=0.8, env_w=0.0,
+                                            ulb_cut_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+                                            ulb_order=ULTRALOW_MAIN_ORDER)
 
     off_dyn_export = None
     rt_dyn_export  = None
@@ -5704,9 +5831,14 @@ def train_offline_picklearn_from_mic():
 
     ds, steps = _make_offline_mixed_ds(FINETUNE_BATCH_SIZE)
 
-    loss = FinetuneCombinedLossLite(sample_rate=OFFLINE_SAMPLE_RATE,
-                                    stft_scales=((1024,256,1024),),
-                                    l1_w=0.4, hf_w=2.5, stft_w=0.8, env_w=0.0)
+    loss = FinetuneCombinedLossLite(
+        sample_rate=OFFLINE_SAMPLE_RATE,
+        stft_scales=((1024,256,1024),),
+        l1_w=0.4, hf_w=2.5, stft_w=0.8, env_w=0.0,
+        ulb_w=0.20,
+        ulb_cut_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+        ulb_order=ULTRALOW_MAIN_ORDER
+    )
 
     stu.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=PICKLEARN_OFFLINE_LR, clipnorm=1.0),
                 loss=[loss, "binary_crossentropy"], loss_weights=[1.0, 0.0],
@@ -5839,7 +5971,9 @@ def train_realtime_picklearn_from_offline():
     loss_dummy = FinetuneCombinedLossLite(
         sample_rate=REALTIME_SAMPLE_RATE,
         stft_scales=((1024, 256, 1024),),
-        l1_w=0.0, hf_w=0.0, stft_w=0.0, env_w=0.0
+        l1_w=0.0, hf_w=0.0, stft_w=0.0, env_w=0.0,
+        ulb_cut_hz=ULTRALOW_MAIN_CUTOFF_HZ,
+        ulb_order=ULTRALOW_MAIN_ORDER
     )
 
     rt_train.compile(
