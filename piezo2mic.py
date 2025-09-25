@@ -248,8 +248,8 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -275,34 +275,34 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 
 # Pick
 OFFLINE_PICK_ENV_FAST_MS = 0.1
-REALTIME_PICK_ENV_FAST_MS = 0.30
+REALTIME_PICK_ENV_FAST_MS = 0.1
 
-OFFLINE_PICK_ENV_SLOW_MS = 24.0
-REALTIME_PICK_ENV_SLOW_MS = 12.0
+OFFLINE_PICK_ENV_SLOW_MS = 72.0
+REALTIME_PICK_ENV_SLOW_MS = 72.0
 
-OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.10
-REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
+OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.1
+REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.1
 
 OFFLINE_PICK_SMOOTH_RELEASE_MS = 24.0
-REALTIME_PICK_SMOOTH_RELEASE_MS = 12.0
+REALTIME_PICK_SMOOTH_RELEASE_MS = 24.0
 
-OFFLINE_PICK_OUT_GAIN = 10.0
-REALTIME_PICK_OUT_GAIN = 10.0
+OFFLINE_PICK_OUT_GAIN = 38.0
+REALTIME_PICK_OUT_GAIN = 38.0
 
-OFFLINE_PICK_KNEE_DB = 12.0
-REALTIME_PICK_KNEE_DB = 12.0
+OFFLINE_PICK_KNEE_DB = 6.0
+REALTIME_PICK_KNEE_DB = 6.0
 
-OFFLINE_PICK_THRESHOLD_DB = 0.0
-REALTIME_PICK_THRESHOLD_DB = 0.0
+OFFLINE_PICK_THRESHOLD_DB = 26.0
+REALTIME_PICK_THRESHOLD_DB = 26.0
 
-OFFLINE_PICK_POST_COMP_P = 1.6
-REALTIME_PICK_POST_COMP_P = 1.6
+OFFLINE_PICK_POST_COMP_P = 5.0
+REALTIME_PICK_POST_COMP_P = 5.0
 
-OFFLINE_PICK_POST_COMP_GAIN = 1.15
-REALTIME_PICK_POST_COMP_GAIN = 1.15
+OFFLINE_PICK_POST_COMP_GAIN = 1.0
+REALTIME_PICK_POST_COMP_GAIN = 1.0
 
-OFFLINE_PICK_FLOOR = 0.02
-REALTIME_PICK_FLOOR = 0.02
+OFFLINE_PICK_FLOOR = 0.0
+REALTIME_PICK_FLOOR = 0.00
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
@@ -357,7 +357,7 @@ PICKLEARN_REALTIME_LR        = 1e-4
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
 
-FINETUNE_DEMO_SEC = 10
+FINETUNE_DEMO_SEC = 4
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -397,8 +397,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 28.0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -427,11 +427,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 10
+DEMO_SEC        = 4
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 4
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -5279,7 +5279,7 @@ def build_offline_debug_model(model):
     add("pickreso",     "offline_pickreso_scale")
     add("pickattack",   "offline_pickattack_scale")
     add("style_pred",   "offline_style_prob"),
-    add("mask",         "offline_pick_mask")
+    add("mask",         "offline_pick_mask_db")
     add("style_time",   "offline_style_time_used")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
@@ -5300,7 +5300,7 @@ def build_realtime_debug_model(model):
     add("pickreso",     "realtime_pickreso_scale")
     add("pickattack",   "realtime_pickattack_scale")
     add("style_pred",   "realtime_style_prob"),
-    add("mask",         "realtime_pick_mask")
+    add("mask",         "realtime_pick_mask_db")
     add("style_time",   "realtime_style_scalar_broadcast")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
 
@@ -5422,7 +5422,7 @@ def render_isolated_stems(debug_model,
 
     while produced_model < want_total_model:
         core_model = min(block_core_model, want_total_model - produced_model)
-        left_this  = left_ctx_model if produced_model > 0 else 0
+        left_this = left_ctx_model
         right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
 
         core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
@@ -6789,19 +6789,23 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
-        
+
         # Realtime mask sweep example
         quick_mask_tweak_stems(
-            kind="offline",
-            mask_overrides=dict(
-                thr_db=OFFLINE_PICK_THRESHOLD_DB, knee_db=OFFLINE_PICK_KNEE_DB,
-                env_fast_ms=OFFLINE_PICK_ENV_FAST_MS, env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,
-                smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS, smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,
-                post_comp_p=OFFLINE_PICK_POST_COMP_P, post_comp_gain=OFFLINE_PICK_POST_COMP_GAIN,
-                floor=OFFLINE_PICK_FLOOR, out_gain=OFFLINE_PICK_OUT_GAIN
-            ),
-            sec=6, offset_sec=0.0
-        )
+                kind="realtime",
+                mask_overrides=dict(
+                    thr_db=REALTIME_PICK_THRESHOLD_DB, knee_db=REALTIME_PICK_KNEE_DB,
+                    env_fast_ms=REALTIME_PICK_ENV_FAST_MS, env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,
+                    smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS, smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,
+                    post_comp_p=REALTIME_PICK_POST_COMP_P, post_comp_gain=REALTIME_PICK_POST_COMP_GAIN,
+                    floor=REALTIME_PICK_FLOOR, out_gain=REALTIME_PICK_OUT_GAIN,
+                ),
+                sec=6, offset_sec=0.0
+            )    
+                
+        
+               
+        
         sys.exit(0)
         
         # Flags (can be combined):
