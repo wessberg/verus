@@ -277,20 +277,20 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 OFFLINE_PICK_ENV_FAST_MS = 0.1
 REALTIME_PICK_ENV_FAST_MS = 0.30
 
-OFFLINE_PICK_ENV_SLOW_MS = 60.0
-REALTIME_PICK_ENV_SLOW_MS = 6.0
+OFFLINE_PICK_ENV_SLOW_MS = 12.0
+REALTIME_PICK_ENV_SLOW_MS = 12.0
 
 OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.08
 REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
 
-OFFLINE_PICK_SMOOTH_RELEASE_MS = 60.0
-REALTIME_PICK_SMOOTH_RELEASE_MS = 6.0
+OFFLINE_PICK_SMOOTH_RELEASE_MS = 12.0
+REALTIME_PICK_SMOOTH_RELEASE_MS = 12.0
 
 OFFLINE_PICK_OUT_GAIN = 10.0
 REALTIME_PICK_OUT_GAIN = 5.0
 
-OFFLINE_PICK_KNEE = 10.5
-REALTIME_PICK_KNEE = 0.5
+OFFLINE_PICK_KNEE = 2.5
+REALTIME_PICK_KNEE = 2.5
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
@@ -4148,18 +4148,17 @@ def build_offline_model(dynamic_time=False,
     )
     pickreso, pr_pen = _reson_learn_offline(inp, mask, style_time)
 
-    # Mix, then main HPF safety-net
+    # Mix (no bus HPF)
     out_sum = Add(name="offline_mix_core_plus_pick_prehp")([main_core, pickattack, pickreso])
-    out_hp  = HFHighpass(sample_rate=OFFLINE_SAMPLE_RATE,
-                         cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
-                         order=ULTRALOW_MAIN_ORDER,
-                         name="offline_mix_core_plus_pick")(out_sum)
 
-    # Tie penalty nodes so add_loss is kept (attach to post-HPF signal)
-    out_hp = LossTether(name="offline_pick_lowband_penalties")([out_hp, pa_pen, pr_pen])
+    # Keep the same published node name but make it a no-op (preserves debug/stems)
+    out_nohp = IdentityLayer(name="offline_mix_core_plus_pick")(out_sum)
+
+    # Tie penalty nodes so add_loss is kept (attach to post-no-op signal)
+    out_nohp = LossTether(name="offline_pick_lowband_penalties")([out_nohp, pa_pen, pr_pen])
 
     # Final tone shaping (cannot re-introduce subsonics; first band starts at 80 Hz)
-    out = add_coloreq(out_hp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
+    out = add_coloreq(out_nohp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
 
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in], outputs=[out, style_prob], name=name)
@@ -4278,18 +4277,17 @@ def build_realtime_model(offline=None,
     )
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
-    # Sum then main HPF safety-net; keep debug name pointing to POST-HPF node
+        # Sum (no bus HPF)
     y_pre  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
-    y_hp   = HFHighpass(sample_rate=REALTIME_SAMPLE_RATE,
-                        cutoff_hz=ULTRALOW_MAIN_CUTOFF_HZ,
-                        order=ULTRALOW_MAIN_ORDER,
-                        name="realtime_with_picklearn")(y_pre)
 
-    # Tie in penalties (post-HPF)
-    y_hp = LossTether(name="realtime_pick_lowband_penalties")([y_hp, pa_pen, pr_pen])
+    # Keep the same published node name but make it a no-op (preserves debug/stems)
+    y_nohp = IdentityLayer(name="realtime_with_picklearn")(y_pre)
+
+    # Tie in penalties (post-no-op)
+    y_nohp = LossTether(name="realtime_pick_lowband_penalties")([y_nohp, pa_pen, pr_pen])
 
     # Color EQ last
-    y_final = add_coloreq(y_hp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
+    y_final = add_coloreq(y_nohp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
 
     inputs_list = [inp, style_true_in, style_force_in]
@@ -5037,7 +5035,9 @@ def build_offline_debug_model(model):
     # Style-gated pick stems
     add("pickreso",     "offline_pickreso_scale")
     add("pickattack",   "offline_pickattack_scale")
-    add("style_pred",   "offline_style_prob")
+    add("style_pred",   "offline_style_prob"),
+    add("mask",         "offline_pick_mask")
+    add("style_time",   "offline_style_time_used")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
 
@@ -5056,7 +5056,9 @@ def build_realtime_debug_model(model):
     # Style-gated pick stems
     add("pickreso",     "realtime_pickreso_scale")
     add("pickattack",   "realtime_pickattack_scale")
-    add("style_pred",   "realtime_style_prob")
+    add("style_pred",   "realtime_style_prob"),
+    add("mask",         "realtime_pick_mask")
+    add("style_time",   "realtime_style_scalar_broadcast")
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
 
 def _rms(x):
@@ -5244,8 +5246,56 @@ def render_isolated_stems(debug_model,
             pickattack  = core_of("pickattack")  if "pickattack"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
             pickreso  = core_of("pickreso")  if "pickreso"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
             ir_only    = core_of("ir_only")     if "ir_only"     in outs else np.zeros_like(y_full)
+            mask_core  = core_of("mask") if "mask" in outs else np.zeros_like(y_full)
 
             sum_est = main_c + pickattack + pickreso + ir_only
+            
+            
+            
+            
+            
+            # After computing y_full, main_c, pickattack, pickreso, pick_only, fing_only, mask_core if available:
+            core_outs = {
+                "y_pred": y_full,
+                "main_core": main_c,
+                "pickattack": pickattack,
+                "pickreso": pickreso,
+                "main_pick": pick_only,
+                "main_finger": fing_only,
+                "mask": mask_core
+            }
+
+            # Target core for overshoot proxy (only available in pred pass since we read y_resamp)
+            y_target_core = None
+            if pass_key == "pred":
+                core_start_global = inp_start + core_start_in_inp
+                core_end_global   = inp_start + core_end_in_inp
+                y_target_core = y_resamp[core_start_global:core_end_global]
+
+            m = _metrics_for_core(core_outs, y_target_core=y_target_core)
+            # Persist metrics once per pass (append or write)
+            metrics_fn = os.path.join(out_dir, f"metrics_{pass_key}.json")
+            try:
+                import json
+                with open(metrics_fn, "a") as f:
+                    f.write(json.dumps(m) + "\n")
+            except Exception:
+                pass
+
+            # Also print a compact crest/mask overview:
+            if pass_key == "pred":
+                print(f"[crest] full={m.get('crest_full',0):.2f} main={m.get('crest_main',0):.2f} "
+                    f"pAtt={m.get('crest_pickattack',0):.2f} pRes={m.get('crest_pick_reso',0):.2f} "
+                    f"mask_duty@0.2={m.get('mask_duty20',0):.2f} overshoot_q99={m.get('overshoot_q99_ratio',0):.2f} "
+                    f"sum_err_rms={m.get('rms_sum_err',0):.6f}")
+            
+            
+            
+            
+            
+            
+            
+            
 
             # Diagnostics
             print(f"[stems:{pass_key}] "
@@ -6266,6 +6316,75 @@ def quick_mask_tweak_stems(kind="realtime",
     )
     return tweaked, out_dir
 
+def _crest(x):
+    x = np.asarray(x, dtype=np.float32)
+    if x.size == 0: return 0.0
+    rms = np.sqrt(np.mean(x*x) + 1e-12)
+    peak = np.max(np.abs(x))
+    return float(peak / (rms + 1e-12))
+
+def _quantiles(x, qs=(0.5, 0.9, 0.99, 0.999)):
+    x = np.abs(np.asarray(x, dtype=np.float32))
+    return {f"q{int(q*1000):03d}": float(np.quantile(x, q)) for q in qs}
+
+def _duty_cycle(m, thr=0.2):
+    m = np.asarray(m, dtype=np.float32)
+    if m.size == 0: return 0.0
+    return float(np.mean((m > float(thr)).astype(np.float32)))
+
+def _sum_rms(x):
+    return float(np.sqrt(np.mean(np.asarray(x, dtype=np.float32)**2) + 1e-12))
+
+def _metrics_for_core(outs_dict, y_target_core=None):
+    # outs must contain keys: y_pred, main_core, pickattack, pickreso, main_pick, main_finger
+    y   = outs_dict.get("y_pred",    None)
+    main= outs_dict.get("main_core", None)
+    patt= outs_dict.get("pickattack",None)
+    pres= outs_dict.get("pickreso",  None)
+    mp  = outs_dict.get("main_pick", None)
+    mf  = outs_dict.get("main_finger", None)
+    msk = outs_dict.get("mask",      None)
+
+    m = {}
+    # RMS and crest
+    for k, sig in [("full", y), ("main", main), ("pickattack", patt), ("pick_reso", pres),
+                   ("pick", mp), ("fing", mf)]:
+        if sig is not None:
+            m[f"rms_{k}"]   = _sum_rms(sig)
+            m[f"crest_{k}"] = _crest(sig)
+            m.update({f"{k}_{q}":v for q,v in _quantiles(sig).items()})
+
+    # Sum-check error
+    if y is not None and main is not None:
+        est = np.zeros_like(y)
+        if patt is not None: est = est + patt
+        if pres is not None: est = est + pres
+        est = est + main
+        m["rms_sum_err"] = _sum_rms(y - est)
+
+    # Mask stats
+    if msk is not None:
+        m["mask_mean"]  = float(np.mean(msk))
+        m["mask_duty20"] = _duty_cycle(msk, thr=0.2)
+        m["mask_duty50"] = _duty_cycle(msk, thr=0.5)
+        m.update({f"mask_{q}": v for q, v in _quantiles(msk).items()})
+
+    # Pick/finger correlation
+    if mp is not None and mf is not None:
+        m["corr_pick_fing"] = _corr(mp, mf)
+
+    # Optional: overshoot vs target (HF-ish proxy)
+    if (y_target_core is not None) and (patt is not None):
+        yt = np.asarray(y_target_core, dtype=np.float32)
+        pa = np.asarray(patt,         dtype=np.float32)
+        eps = 1e-6
+        # Compare 99th percentile magnitudes normalized by RMS
+        q_patt = np.quantile(np.abs(pa), 0.99)
+        q_tgt  = np.quantile(np.abs(yt), 0.99)
+        m["overshoot_q99_ratio"] = float(q_patt / (q_tgt + eps))
+
+    return m
+
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -6355,17 +6474,17 @@ def main ():
             generate_fine_tune_demo(realtime_dyn, REALTIME_SAMPLE_RATE, subdir_name="realtime")
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
-        
-        # mask_overrides = dict(
-        #     knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
-        #     env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
-        #     env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
-        #     smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
-        #     smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
-        #     out_gain=OFFLINE_PICK_OUT_GAIN
-        # )
-        # quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
-        # sys.exit(0)
+        # Realtime mask sweep example
+        mask_overrides = dict(
+            knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
+            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
+            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
+            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
+            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
+            out_gain=OFFLINE_PICK_OUT_GAIN
+        )
+        quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
+        sys.exit(0)
         
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
