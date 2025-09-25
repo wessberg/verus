@@ -295,7 +295,7 @@ REALTIME_PICK_KNEE = 0.5
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
 PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
-PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 129
+PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 513
 PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
 PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
