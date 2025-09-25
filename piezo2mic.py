@@ -1056,7 +1056,7 @@ def _reson_learn_offline(inp, mask, style_time):
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="offline_pickreso_post_hp")(xg)
     
-    xh = SoftClip1D(drive=OFFLINE_PICK_POST_COMP_P, limit=0.98, name="offline_pickattack_softclip")(xh)
+    xh = SoftClip1D(drive=OFFLINE_PICK_POST_COMP_P, limit=0.98, name="offline_pickreso_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="offline_pickreso_scale")(xh)
@@ -1099,7 +1099,7 @@ def _reson_learn_realtime(inp, mask, style_time):
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="realtime_pickreso_post_hp")(xg)
     
-    xh = SoftClip1D(drive=REALTIME_PICK_POST_COMP_P, limit=0.98, name="realtime_pickattack_softclip")(xh)
+    xh = SoftClip1D(drive=REALTIME_PICK_POST_COMP_P, limit=0.98, name="realtime_pickreso_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="realtime_pickreso_scale")(xh)
