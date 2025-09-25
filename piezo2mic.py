@@ -5724,144 +5724,118 @@ def train_offline_picklearn_from_mic():
     print("✅ Saved OFFLINE picklearn (static):", stat_path)
     return dyn
 
-def _get_input_tensor_by_name(model, name):
-    # Prefer InputLayer lookup
-    try:
-        return model.get_layer(name).input
-    except Exception:
-        # Fallback: match against model.inputs stripping ':0'
-        for t in model.inputs:
-            base = t.name.split(':')[0].split('/')[-1]
-            if base == name:
-                return t
-        raise ValueError(f"Input '{name}' not found in model '{model.name}'. "
-                         f"Available inputs: {[t.name for t in model.inputs]}")
-
 def train_realtime_picklearn_from_offline():
     """
-    Distill REALTIME stems (pickattack and pickreso) from OFFLINE teacher, stem-by-stem.
+    Distill REALTIME pick branches from the OFFLINE pick stems (pickattack + pickreso)
+    at 96k → 48k, with separate KD losses per stem.
 
-    Teacher (96k): offline_*_pickattack_scale, offline_*_pickreso_scale → style-gated → decimate x2
-    Student (48k): realtime_*_pickattack_scale, realtime_*_pickreso_scale → style-gated
-    KD: two paths (pickattack, reso) with shift-aware L2 + MR-STFT add_loss.
+    Changes vs old version:
+      - No 'picklearn_pred' single stem anymore.
+      - KD runs for two stems independently: pickattack and pickreso.
+      - Teacher stems: offline_pickattack_scale and offline_pickreso_scale (96k),
+        decimated-by-2 to 48k for student KD targets.
+      - Student stems: realtime_pickattack_scale and realtime_pickreso_scale (48k).
     """
-    # Prefer a learned-pick offline teacher if present; else fall back to baseline offline dynamic
-    off_dyn_pick_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
-    off_dyn_base_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-    teacher_path = off_dyn_pick_path if os.path.exists(off_dyn_pick_path) else off_dyn_base_path
-    if not os.path.exists(teacher_path):
-        print("ERROR: offline dynamic model (teacher) not found. Train offline first.")
-        sys.exit(1)
+    # 1) Load the OFFLINE learned-pick (teacher) dynamic and build a causal clone (no lookahead)
+    off_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_PICKLEARN_DYNAMIC_MODEL_FILENAME)
+    if not os.path.exists(off_dyn_path):
+        print("ERROR: offline learned-pick dynamic not found. Run --migrate-picklearn first."); sys.exit(1)
+    off_nc = tf.keras.models.load_model(off_dyn_path, compile=False)
 
-    off_nc = tf.keras.models.load_model(teacher_path, compile=False)
+    def build_offline_pickstems_causal(src):
+        m = build_offline_model(dynamic_time=True,
+                                lookahead_samples=0,
+                                name="piezo2mic_offline_pickstems_causal")
+        copy_weights_by_name(m, src, verbose=True)
+        for l in m.layers:
+            l.trainable = False
+        return m
 
-    # Causalize teacher (no lookahead) and freeze
-    off_causal = build_offline_model_causal(off_nc, dynamic_time=True)
-    for l in off_causal.layers:
-        l.trainable = False
+    off_causal = build_offline_pickstems_causal(off_nc)
 
-    # Build student realtime (static) WITH offline teacher connected for style blend
+    # 2) Build the REALTIME student (static) WITH the offline teacher connection (for style blend)
+    #    and copy backbone weights from the baseline realtime dynamic.
+    rt = build_realtime_model(offline=off_causal, dynamic_time=False)
+
     rt_src_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
     if not os.path.exists(rt_src_path):
-        print("ERROR: baseline realtime dynamic not found. Train realtime first.")
-        sys.exit(1)
+        print("ERROR: baseline realtime dynamic not found:", rt_src_path); sys.exit(1)
     rt_src = tf.keras.models.load_model(rt_src_path, compile=False)
-
-    rt = build_realtime_model(
-        offline=off_causal,
-        dynamic_time=False,
-        cap_mask_with_gate=False,       # learned-pick graph (no fixed gate)
-        use_learned_hf_mask=True,
-        enable_mask_kd=False,           # KD is external in this wrapper
-        detach_mask_from_audio=True,
-        mask_min_floor=0.0,
-        use_pick_normalizer=True,
-        coloreq_trainable=False
-    )
     copy_weights_by_name(rt, rt_src, verbose=True)
 
-    # Wrapper inputs to feed both student and teacher subgraphs
-    factor = OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE  # expect 2
-    assert factor == 2, "This KD wrapper expects 96k teacher and 48k student (ratio 2)."
-    rt_inp        = Input(shape=(REALTIME_SEG_LEN, 1), name="realtime_piezo_input")
-    off_inp       = Input(shape=(REALTIME_SEG_LEN * factor, 1), name="realtime_offline_piezo_input")
-    style_true_in = Input(shape=(1,), name="realtime_style_true_input")
-    style_force_in= Input(shape=(1,), name="realtime_style_force_input")
+    # Train only tiny pick heads
+    _freeze_only_prefixes(
+        rt,
+        prefixes=("realtime_picklearn_", "realtime_pickattack_", "realtime_pickreso_")
+    )
 
-    # Student forward (so the full audio path exists for regular outputs, even if masked by KD-only loss)
+    # 3) Wrapper inputs (fresh Input tensors so both student and teacher sit in one graph)
+    factor = OFFLINE_SAMPLE_RATE // REALTIME_SAMPLE_RATE  # expect 2 for 96k→48k
+    if factor != 2:
+        raise ValueError("Expected OFFLINE:REALTIME SR ratio of 2:1 (96k:48k).")
+
+    rt_inp         = Input(shape=(REALTIME_SEG_LEN, 1),                name="realtime_piezo_input")
+    off_inp        = Input(shape=(REALTIME_SEG_LEN * factor, 1),       name="realtime_offline_piezo_input")
+    style_true_in  = Input(shape=(1,),                                 name="realtime_style_true_input")
+    style_force_in = Input(shape=(1,),                                 name="realtime_style_force_input")
+
+    # Route through the STUDENT on these fresh inputs (audio + style head)
     y_audio, y_style = rt([rt_inp, off_inp, style_true_in, style_force_in])
 
-    # ── Teacher stems (96k) → style-gated → decimate-by-2 ─────────────────────
-    # Try to fetch raw teacher stems; if names differ, raise with guidance.
-    t_pickattack_raw = off_causal.get_layer("offline_pickattack_scale").output
-    t_reso_raw    = off_causal.get_layer("offline_pickreso_scale").output
+    # 4) Teacher stems at 96k → decimate-by-2 to 48k
+    #    Use the post-scale stem nodes for KD:
+    #      - "offline_pickattack_scale"
+    #      - "offline_pickreso_scale"
+    t_att_96_node = off_causal.get_layer("offline_pickattack_scale").output
+    t_res_96_node = off_causal.get_layer("offline_pickreso_scale").output
 
-    # Offline style timeline (B,T96,1)
-    t_style_time = off_causal.get_layer("offline_style_time_used").output
+    teacher_stems = tf.keras.models.Model(
+        inputs=off_causal.inputs,
+        outputs=[t_att_96_node, t_res_96_node],
+        name="offline_pickstems_teacher"
+    )
+    teacher_stems.trainable = False
 
-    # Style-gated teacher stems
-    t_pickattack_g = Multiply(name="teacher_offline_pickattack_gated")([t_pickattack_raw, t_style_time])
-    t_reso_g    = Multiply(name="teacher_offline_pickreso_gated")([t_reso_raw,  t_style_time])
+    t_att_96, t_res_96 = teacher_stems([off_inp, style_true_in, style_force_in])  # (B, T96, 1) each
+    t_att_48 = FIRDecimateBy2(name="rt_pickattack_teacher_ds2")(t_att_96)
+    t_res_48 = FIRDecimateBy2(name="rt_pickreso_teacher_ds2")(t_res_96)
+    t_att_48 = Lambda(stop_grad, name="rt_pickattack_teacher_stopgrad")(t_att_48)
+    t_res_48 = Lambda(stop_grad, name="rt_pickreso_teacher_stopgrad")(t_res_48)
 
-    # Decimate to 48k for student KD
-    t_pickattack_48 = FIRDecimateBy2(name="teacher_pickattack_ds2")(t_pickattack_g)
-    t_reso_48    = FIRDecimateBy2(name="teacher_reso_ds2")(t_reso_g)
-    t_pickattack_48 = Lambda(stop_grad, name="teacher_pickattack_stopgrad")(t_pickattack_48)
-    t_reso_48    = Lambda(stop_grad, name="teacher_reso_stopgrad")(t_reso_48)
-
-    # ── Student stems (48k) → style-gated ─────────────────────────────────────
-    # Prefer built-in gated nodes if you added them; else gate raw stems here.
-    def _student_raw(name):
-        try:
-            return tf.keras.models.Model(
-                inputs=rt.inputs,
-                outputs=rt.get_layer(name).output,
-                name=f"stub_{name}"
-            )([rt_inp, off_inp, style_true_in, style_force_in])
-        except Exception as e:
-            raise RuntimeError(f"Student is missing '{name}'. Add this layer in the realtime builder.") from e
-
-    # Raw (pre-style) student stems
-    s_pickattack_raw = _student_raw("realtime_pickattack_scale")
-    s_reso_raw    = _student_raw("realtime_pickreso_scale")
-
-    # Style time (B,1,1) from student graph
+    # 5) Student stems (48k) from the student model, driven by wrapper inputs
     try:
-        s_style_b3 = tf.keras.models.Model(
-            inputs=rt.inputs,
-            outputs=rt.get_layer("realtime_style_scalar_broadcast").output,
-            name="stub_realtime_style_scalar_broadcast"
-        )([rt_inp, off_inp, style_true_in, style_force_in])
+        s_att_node = rt.get_layer("realtime_pickattack_scale").output
+        s_res_node = rt.get_layer("realtime_pickreso_scale").output
     except Exception as e:
-        raise RuntimeError(
-            "Student is missing 'realtime_style_scalar_broadcast'. "
-            "Ensure the realtime builder exports this node (it should)."
-        ) from e
+        raise RuntimeError("Expected student pick stems 'realtime_pickattack_scale' and 'realtime_pickreso_scale' "
+                           "in the realtime graph.") from e
 
-    s_pickattack_g = Multiply(name="student_realtime_pickattack_gated")([s_pickattack_raw, s_style_b3])
-    s_reso_g    = Multiply(name="student_realtime_pickreso_gated")([s_reso_raw,  s_style_b3])
+    s_att = tf.keras.models.Model(inputs=rt.inputs, outputs=s_att_node,
+                                  name="realtime_pickattack_stub")([rt_inp, off_inp, style_true_in, style_force_in])
+    s_res = tf.keras.models.Model(inputs=rt.inputs, outputs=s_res_node,
+                                  name="realtime_pickreso_stub")([rt_inp, off_inp, style_true_in, style_force_in])
 
-    # ── KD terms (training-only add_losses) ───────────────────────────────────
+    # 6) KD losses per stem (training-only add_loss). Best-shift L2 + multi-scale STFT per stem.
     kd_terms = []
-    kd_terms.append(DistillLossBestShift(alpha=1.0,  max_shift=8,  name="kd_pickattack_l2")([t_pickattack_48, s_pickattack_g]))
-    kd_terms.append(MSTFTDistillLoss(    alpha=0.6,               name="kd_pickattack_stft")([t_pickattack_48, s_pickattack_g]))
-    kd_terms.append(DistillLossBestShift(alpha=1.0,  max_shift=8,  name="kd_reso_l2")([t_reso_48, s_reso_g]))
-    kd_terms.append(MSTFTDistillLoss(    alpha=0.6,               name="kd_reso_stft")([t_reso_48, s_reso_g]))
+    kd_terms.append(DistillLossBestShift(alpha=1.0, max_shift=8, name="rt_pickattack_l2")([t_att_48, s_att]))
+    kd_terms.append(MSTFTDistillLoss(alpha=0.6,                 name="rt_pickattack_stft")([t_att_48, s_att]))
+    kd_terms.append(DistillLossBestShift(alpha=1.0, max_shift=8, name="rt_pickreso_l2")([t_res_48, s_res]))
+    kd_terms.append(MSTFTDistillLoss(alpha=0.6,                 name="rt_pickreso_stft")([t_res_48, s_res]))
 
-    # Tether to keep add_losses in the graph; pass audio through unchanged
+    # Tether so KD add_losses are reachable from the outputs
     y_audio_kd = LossTether(name="rt_pickstems_kd_tether")([y_audio] + kd_terms)
 
-    # Final training wrapper
+    # 7) Final training wrapper (student weights are part of 'rt' and will be updated)
     rt_train = tf.keras.models.Model(
         inputs=[rt_inp, off_inp, style_true_in, style_force_in],
         outputs=[y_audio_kd, y_style],
         name="realtime_pickstems_train"
     )
 
-    # Dataset (KD-only, same as before)
+    # 8) Dataset (KD-only; audio/style losses disabled via sample-weights)
     ds, steps = _make_realtime_dual_ds(FINETUNE_BATCH_SIZE)
 
-    # Disable primary losses; learning is via KD add_loss only
+    # Disable primary losses; learning is driven by KD add_loss only
     loss_dummy = FinetuneCombinedLossLite(
         sample_rate=REALTIME_SAMPLE_RATE,
         stft_scales=((1024, 256, 1024),),
@@ -5876,27 +5850,17 @@ def train_realtime_picklearn_from_offline():
 
     rt_train.fit(ds, epochs=int(PICKLEARN_REALTIME_EPOCHS), steps_per_epoch=int(steps), verbose=1)
 
-    # Export teacher‑free realtime dynamic with the same student graph (no teacher connection)
-    rt_dyn = build_realtime_model(
-        offline=None,
-        dynamic_time=True,
-        cap_mask_with_gate=False,
-        use_learned_hf_mask=True,
-        enable_mask_kd=False,
-        detach_mask_from_audio=True,
-        mask_min_floor=0.0,
-        use_pick_normalizer=True,
-        coloreq_trainable=False
-    )
+    # 9) Export teacher‑free realtime dynamic (copy from the STUDENT 'rt', not the wrapper)
+    rt_dyn = build_realtime_model(offline=None, dynamic_time=True)
     copy_weights_by_name(rt_dyn, rt, verbose=True)
     dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_DYNAMIC_MODEL_FILENAME)
     rt_dyn.save(dyn_path)
-    print("✅ Saved REALTIME split-stems KD (dynamic):", dyn_path)
+    print("✅ Saved REALTIME pick stems (dynamic):", dyn_path)
 
-    # Optionally save the static training wrapper
+    # Optionally save the static training graph (contains teacher)
     stat_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_PICKLEARN_STATIC_MODEL_FILENAME)
     rt_train.save(stat_path)
-    print("✅ Saved REALTIME split-stems KD (static):", stat_path)
+    print("✅ Saved REALTIME pick stems (static with teacher):", stat_path)
     return rt_dyn
 
 def migrate_picklearn(do_offline=True, do_realtime=True):
