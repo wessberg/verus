@@ -277,20 +277,20 @@ REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
 OFFLINE_PICK_ENV_FAST_MS = 0.1
 REALTIME_PICK_ENV_FAST_MS = 0.30
 
-OFFLINE_PICK_ENV_SLOW_MS = 12.0
+OFFLINE_PICK_ENV_SLOW_MS = 24.0
 REALTIME_PICK_ENV_SLOW_MS = 12.0
 
-OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.08
+OFFLINE_PICK_SMOOTH_ATTACK_MS  = 0.10
 REALTIME_PICK_SMOOTH_ATTACK_MS  = 0.08
 
-OFFLINE_PICK_SMOOTH_RELEASE_MS = 12.0
+OFFLINE_PICK_SMOOTH_RELEASE_MS = 24.0
 REALTIME_PICK_SMOOTH_RELEASE_MS = 12.0
 
-OFFLINE_PICK_OUT_GAIN = 10.0
+OFFLINE_PICK_OUT_GAIN = 6.0
 REALTIME_PICK_OUT_GAIN = 5.0
 
-OFFLINE_PICK_KNEE = 2.5
-REALTIME_PICK_KNEE = 2.5
+OFFLINE_PICK_KNEE = 8.5
+REALTIME_PICK_KNEE = 8.5
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
@@ -6476,14 +6476,14 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
         # Realtime mask sweep example
         mask_overrides = dict(
-            knee=OFFLINE_PICK_KNEE,              # default 0.30 (your constants), try 0.2
-            env_fast_ms=OFFLINE_PICK_ENV_FAST_MS,       # was ~0.30
-            env_slow_ms=OFFLINE_PICK_ENV_SLOW_MS,       # was ~12.0
-            smooth_attack_ms=OFFLINE_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
-            smooth_release_ms=OFFLINE_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
-            out_gain=OFFLINE_PICK_OUT_GAIN
+            knee=REALTIME_PICK_KNEE,              # default 0.30 (your constants), try 0.2
+            env_fast_ms=REALTIME_PICK_ENV_FAST_MS,       # was ~0.30
+            env_slow_ms=REALTIME_PICK_ENV_SLOW_MS,       # was ~12.0
+            smooth_attack_ms=REALTIME_PICK_SMOOTH_ATTACK_MS,  # was ~0.08
+            smooth_release_ms=REALTIME_PICK_SMOOTH_RELEASE_MS,  # was ~6.0
+            out_gain=REALTIME_PICK_OUT_GAIN
         )
-        quick_mask_tweak_stems(kind="offline", mask_overrides=mask_overrides)
+        quick_mask_tweak_stems(kind="realtime", mask_overrides=mask_overrides)
         sys.exit(0)
         
         # Flags (can be combined):
