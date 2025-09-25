@@ -299,12 +299,12 @@ PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 513
 PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
 PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
-PICK_RESO_LOWBAND_PENALTY_ORDER     = 129
+PICK_RESO_LOWBAND_PENALTY_ORDER     = 513
 PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.5
 
 # Also do this from the main mix path, to prevent build-up in ultra low frequencies
 ULTRALOW_MAIN_CUTOFF_HZ            = 40.0
-ULTRALOW_MAIN_ORDER        = 129
+ULTRALOW_MAIN_ORDER        = 513
 ULTRALOW_MAIN_WEIGHT               = 0.15  # keep modest; adjust by ear/plots
 
 # Finetune params
