@@ -3708,11 +3708,10 @@ def fine_tune(offline=True, realtime=True):
         off_static_train = build_offline_model(dynamic_time=False, coloreq_trainable=False)
         copy_weights_by_name(off_static_train, base_off_dyn, verbose=True)
 
-        # Unfreeze only FiLM + IrScale + coloreq
+        # Unfreeze only FiLM + coloreq
         off_static_train = set_trainable_layers(
             off_static_train,
             enable_film=True,
-            enable_scales=True,
             enable_coloreq=True
         )
 
@@ -3765,11 +3764,10 @@ def fine_tune(offline=True, realtime=True):
         )
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
-        # Unfreeze only FiLM + IrScale + coloreq
+        # Unfreeze only FiLM + coloreq
         rt_static_train = set_trainable_layers(
             rt_static_train,
             enable_film=True,
-            enable_scales=True,
             enable_coloreq=True
         )
 
@@ -4044,11 +4042,12 @@ def render_isolated_stems(debug_model,
                           use_finetuned=False):
     """
     Streaming stems renderer that:
-      - feeds model inputs by NAME, not by position (robust to saved input order),
+      - feeds model inputs by NAME, not by position,
       - uses float32 scalars for style_true/style_force,
-      - writes full prediction and isolated stems (pick, finger, picklearn, pickreso, optional IR).
+      - writes full prediction and isolated stems (pick, finger, pickattack, pickreso, optional IR),
+      - avoids duplicate writes (each stem written once per block), so durations match sec exactly.
 
-    The 'forced' passes explicitly set the style inputs:
+    Forced passes:
       - pred:          style_force=0 → use the model's own predicted style
       - forced_pick:   style_force=1, style_true=1 → force pick
       - forced_finger: style_force=1, style_true=0 → force finger
@@ -4056,7 +4055,7 @@ def render_isolated_stems(debug_model,
     os.makedirs(out_dir, exist_ok=True)
     _boost_scales(model=debug_model, sample_rate=sample_rate, use_finetuned=use_finetuned)
 
-    # Style flag from filename (for info only)
+    # Info-only style from filename
     if "pick" in path_src:
         style_true_flag = 1.0
     elif "finger" in path_src:
@@ -4077,14 +4076,13 @@ def render_isolated_stems(debug_model,
     resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
     block_core_model = max(1, int(round(block_sec * sample_rate)))
 
-    # Determine which input namespace this debug model uses
+    # Determine input namespace used by the debug model
     dbg_in_names = [t.name.split(':')[0].split('/')[-1] for t in debug_model.inputs]
     if "offline_piezo_input" in dbg_in_names:
         base = "offline"
     elif "realtime_piezo_input" in dbg_in_names:
         base = "realtime"
     else:
-        # Fallback based on sample_rate if names are unexpected
         base = "offline" if int(sample_rate) == int(OFFLINE_SAMPLE_RATE) else "realtime"
 
     piezo_name       = f"{base}_piezo_input"
@@ -4103,19 +4101,19 @@ def render_isolated_stems(debug_model,
             w["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
 
         w["main_core"] = sf.SoundFile(os.path.join(out_dir, "stem_main_core_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                    mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                                      mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         w["pick"] = sf.SoundFile(os.path.join(out_dir, "stem_pick_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         w["fing"] = sf.SoundFile(os.path.join(out_dir, "stem_finger_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-        w["picklearn"] = None
-        w["ir"] = None
-        w["pickreso"] = None
+                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["pickattack"] = None
+        w["picklearn"]  = None
+        w["ir"]         = None
+        w["pickreso"]   = None
         w["sumcheck"] = sf.SoundFile(os.path.join(out_dir, "pred_full_sumcheck" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
-                                    mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                                     mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
         return w
 
-    # Forced variants: make sure scalars are float32
     forced_variants = [
         ("pred",
          np.zeros((1, 1), dtype=np.float32),  # style_true (ignored)
@@ -4180,10 +4178,8 @@ def render_isolated_stems(debug_model,
         x_b = x_inp[None, :, None].astype(np.float32)
 
         for pass_key, style_in, force_in in forced_variants:
-            # Build feed dict by name, not position
             feeds = {piezo_name: x_b, style_true_name: style_in, style_force_name: force_in}
             outs = debug_model.predict(feeds, batch_size=1, verbose=0)
-
             if not isinstance(outs, dict):
                 raise RuntimeError(f"Expected dict outputs from debug_model; got {type(outs)}")
 
@@ -4192,25 +4188,22 @@ def render_isolated_stems(debug_model,
                 return arr[core_start_in_inp:core_end_in_inp]
 
             wset = pass_writers[pass_key]
-            
-            # Collect cores (time-cropped)
+
+            # Collect cropped signals
             y_full     = core_of("y_pred")
             main_c     = core_of("main_core")   if "main_core"   in outs else np.zeros_like(y_full)
             pick_only  = core_of("main_pick")   if "main_pick"   in outs else np.zeros_like(y_full)
-            fing_only  = core_of("main_finger") if "main_finger" in outs else np.zeros_like(y_full)
-            picklearn  = core_of("picklearn")   if "picklearn"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
-            pickattack  = core_of("pickattack")  if "pickattack"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
-            pickreso  = core_of("pickreso")  if "pickreso"   in outs else np.zeros_like(y_full)   # pre-scale, FYI
+            fing_only  = core_of("main_finger") if "main_finger" in outs else (main_c - pick_only)
+            picklearn  = core_of("picklearn")   if "picklearn"   in outs else np.zeros_like(y_full)
+            pickattack = core_of("pickattack")  if "pickattack"  in outs else np.zeros_like(y_full)
+            pickreso   = core_of("pickreso")    if "pickreso"    in outs else np.zeros_like(y_full)
             ir_only    = core_of("ir_only")     if "ir_only"     in outs else np.zeros_like(y_full)
-            mask_core  = core_of("mask") if "mask" in outs else np.zeros_like(y_full)
+            mask_core  = core_of("mask")        if "mask"        in outs else np.zeros_like(y_full)
 
+            # Sum-check
             sum_est = main_c + pickattack + pickreso + ir_only
-            
-            
-            
-            
-            
-            # After computing y_full, main_c, pickattack, pickreso, pick_only, fing_only, mask_core if available:
+
+            # Metrics
             core_outs = {
                 "y_pred": y_full,
                 "main_core": main_c,
@@ -4220,8 +4213,6 @@ def render_isolated_stems(debug_model,
                 "main_finger": fing_only,
                 "mask": mask_core
             }
-
-            # Target core for overshoot proxy (only available in pred pass since we read y_resamp)
             y_target_core = None
             if pass_key == "pred":
                 core_start_global = inp_start + core_start_in_inp
@@ -4229,7 +4220,6 @@ def render_isolated_stems(debug_model,
                 y_target_core = y_resamp[core_start_global:core_end_global]
 
             m = _metrics_for_core(core_outs, y_target_core=y_target_core)
-            # Persist metrics once per pass (append or write)
             metrics_fn = os.path.join(out_dir, f"metrics_{pass_key}.json")
             try:
                 import json
@@ -4238,108 +4228,64 @@ def render_isolated_stems(debug_model,
             except Exception:
                 pass
 
-            # Also print a compact crest/mask overview:
             if pass_key == "pred":
                 print(f"[crest] full={m.get('crest_full',0):.2f} main={m.get('crest_main',0):.2f} "
-                    f"pAtt={m.get('crest_pickattack',0):.2f} pRes={m.get('crest_pick_reso',0):.2f} "
-                    f"mask_duty@0.2={m.get('mask_duty20',0):.2f} overshoot_q99={m.get('overshoot_q99_ratio',0):.2f} "
-                    f"sum_err_rms={m.get('rms_sum_err',0):.6f}")
-            
-            
-            
-            
-            
-            
-            
-            
+                      f"pAtt={m.get('crest_pickattack',0):.2f} pRes={m.get('crest_pick_reso',0):.2f} "
+                      f"mask_duty@0.2={m.get('mask_duty20',0):.2f} overshoot_q99={m.get('overshoot_q99_ratio',0):.2f} "
+                      f"sum_err_rms={m.get('rms_sum_err',0):.6f}")
 
-            # Diagnostics
             print(f"[stems:{pass_key}] "
-                f"RMS full={_rms(y_full):.6f}  main={_rms(main_c):.6f}  "
-                f"pick={_rms(pick_only):.6f}  fing={_rms(fing_only):.6f}  "
-                f"picklearn(pre)={_rms(picklearn):.6f}  pick_attack={_rms(pickattack):.6f}  "
-                f"pick_reso={_rms(pickreso):.6f}  ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
+                  f"RMS full={_rms(y_full):.6f}  main={_rms(main_c):.6f}  "
+                  f"pick={_rms(pick_only):.6f}  fing={_rms(fing_only):.6f}  "
+                  f"picklearn(pre)={_rms(picklearn):.6f}  pick_attack={_rms(pickattack):.6f}  "
+                  f"pick_reso={_rms(pickreso):.6f}  ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
 
-            # Writes
+            # Writes (once per stem)
             wset["full"].write(y_full)
             wset["main_core"].write(main_c)
-            wset["pick"].write(pick_only)
-            wset["fing"].write(fing_only)
 
-            # Optional: write pickattack if you added it to debug model
+            # Optional pickattack stem
             if "pickattack" in outs:
                 if wset.get("pickattack") is None:
                     fn = "stem_pickattack_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["pickattack"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["pickattack"].write(core_of("pickattack"))
+                wset["pickattack"].write(pickattack)
 
+            # Optional picklearn (pre-scale) stem
             if "picklearn" in outs:
                 if wset["picklearn"] is None:
                     fn = "stem_picklearn_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["picklearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["picklearn"].write(picklearn)
 
+            # Optional IR stem
             if "ir_only" in outs:
                 if wset["ir"] is None:
                     fn = "stem_ir_lowpass" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["ir"].write(ir_only)
 
+            # Optional pickreso stem
             if "pickreso" in outs:
                 if wset["pickreso"] is None:
                     fn = "stem_pickreso_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["pickreso"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["pickreso"].write(core_of("pickreso"))
+                wset["pickreso"].write(pickreso)
 
-            # Sum-check write (now correct)
+            # Pick/finger stems from main_core decomposition
+            wset["pick"].write(pick_only)
+            wset["fing"].write(fing_only)
+
+            # Sum-check
             wset["sumcheck"].write(sum_est)
-            
-            # Accumulate predicted style only for the 'pred' pass
+
+            # Accumulate predicted style prob (only in 'pred' pass if available)
             if pass_key == "pred" and "style_pred" in outs:
                 sp = float(np.asarray(outs["style_pred"])[0, 0])
                 pred_prob_sum += sp * float(core_len)
                 pred_prob_count += core_len
 
-            # Full prediction
-            wset["full"].write(core_of("y_pred"))
-
-            # Picklearn stem (if present)
-            if "picklearn" in outs:
-                if wset["picklearn"] is None:
-                    fn = "stem_picklearn_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
-                    wset["picklearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["picklearn"].write(core_of("picklearn"))
-
-            # IR stem (optional, realtime debug model)
-            if "ir_only" in outs:
-                if wset["ir"] is None:
-                    fn = "stem_ir_lowpass" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
-                    wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["ir"].write(core_of("ir_only"))
-
-            # Learned resonance stem (optional)
-            if "pickreso" in outs:
-                if wset["pickreso"] is None:
-                    fn = "stem_pickreso_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
-                    wset["pickreso"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-                wset["pickreso"].write(core_of("pickreso"))
-
-            # Pick/finger stems from main_core decomposition (if available)
-            if "main_core" in outs:
-                if "main_pick" in outs:
-                    pick_only = core_of("main_pick")
-                else:
-                    pick_only = core_of("main_core") * 0.0  # fallback if unavailable
-
-                if "main_finger" in outs:
-                    finger_only = core_of("main_finger")
-                else:
-                    finger_only = core_of("main_core") - pick_only
-
-                wset["pick"].write(pick_only)
-                wset["fing"].write(finger_only)
-
-        # Write source/target aligned to the same core region
+        # Write source/target aligned to the same core region (once per block)
         core_start_global = inp_start + core_start_in_inp
         core_end_global   = inp_start + core_end_in_inp
         if "src" in pass_writers["pred"]:
@@ -4348,7 +4294,7 @@ def render_isolated_stems(debug_model,
 
         produced_model += core_len
 
-    # Close all writers
+    # Close writers
     for wset in pass_writers.values():
         for w in list(wset.values()):
             try:
@@ -4363,7 +4309,6 @@ def render_isolated_stems(debug_model,
         print(f"✅ Stems saved to {out_dir}. Predicted style (avg): {label} (p={p:.4f})")
     else:
         print(f"✅ Stems saved to {out_dir}.")
-
 
 def run_render_stems_offline(use_finetuned=False):
     sample_rate = OFFLINE_SAMPLE_RATE
