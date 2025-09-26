@@ -3755,7 +3755,7 @@ def fine_tune(offline=True, realtime=True):
         offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
 
         # Student init: base realtime dynamic
-        base_rt_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
+        base_rt_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
 
         # Build the REALTIME training graph (teacher attached for style blend)
         rt_static_train = build_realtime_model(
