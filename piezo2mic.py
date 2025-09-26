@@ -368,8 +368,8 @@ LR_PLATEAU_PATIENCE = 5
 OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
-FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
-FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -4367,9 +4367,17 @@ def render_isolated_stems(debug_model,
 
 def run_render_stems_offline(use_finetuned=False):
     sample_rate = OFFLINE_SAMPLE_RATE
-    if not all_pairs:
-        print("ERROR: No baseline training pairs found."); sys.exit(1)
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    
+    src = None
+    tgt = None
+    
+    if use_finetuned:
+        src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+        tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+    else:
+        if not all_pairs:
+            print("ERROR: No baseline training pairs found."); sys.exit(1)
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
     dpath = _select_stems_model_path(kind="offline", use_finetuned=bool(use_finetuned))
     if dpath is None:
@@ -4388,9 +4396,16 @@ def run_render_stems_offline(use_finetuned=False):
 
 def run_render_stems_realtime(use_finetuned=False):
     sample_rate = REALTIME_SAMPLE_RATE
-    if not all_pairs:
-        print("ERROR: No baseline training pairs found."); sys.exit(1)
-    src, tgt = all_pairs[DEMO_PAIR_INDEX]
+    src = None
+    tgt = None
+    
+    if use_finetuned:
+        src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+        tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+    else:
+        if not all_pairs:
+            print("ERROR: No baseline training pairs found."); sys.exit(1)
+        src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
     dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
     if dpath is None:
