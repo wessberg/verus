@@ -403,7 +403,7 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 48.0
 REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -891,12 +891,8 @@ class CausalPickDBMask(tf.keras.layers.Layer):
 @register_keras_serializable()
 class AutoThreshCompressor1D(tf.keras.layers.Layer):
     """
-    Causal, auto-threshold compressor:
-      - Threshold is implicit from a slow reference envelope (env_slow) times ref_mult.
-      - Compresses when env_fast > ref_mult * env_slow (i.e., over_db > 0).
-      - Soft knee around 0 dB with configurable width.
-      - Attack/release smoothing in the gain domain.
-    All ops are causal; kernels are fixed non-trainable weights (TFLite-friendly).
+    Causal, auto-threshold compressor using fast vs slow envelopes.
+    All numeric controls are non-trainable weights so they can be tweaked post-training.
     """
     def __init__(self,
                  sample_rate,
@@ -904,121 +900,115 @@ class AutoThreshCompressor1D(tf.keras.layers.Layer):
                  env_slow_ms=10.0,
                  ratio=4.0,
                  knee_db=6.0,
-                 ref_mult_db=0.0,          # raises/lowers the dynamic threshold (dB on reference)
-                 gain_attack_ms=0.06,       # gain decreasing (more attenuation) time
-                 gain_release_ms=8.0,       # gain increasing (less attenuation) time
-                 floor_db=-30.0,            # do not attenuate more than this
+                 ref_mult_db=0.0,          # threshold bias (dB on slow ref)
+                 gain_attack_ms=0.06,
+                 gain_release_ms=8.0,
+                 floor_db=-30.0,
                  name=None,
                  **kwargs):
         super().__init__(name=name, **kwargs)
         self.sample_rate     = int(sample_rate)
         self.env_fast_ms     = float(env_fast_ms)
         self.env_slow_ms     = float(env_slow_ms)
-        self.ratio           = float(ratio)
-        self.knee_db         = float(knee_db)
-        self.ref_mult_db     = float(ref_mult_db)
+        self._ratio_init     = float(ratio)
+        self._knee_db_init   = float(knee_db)
+        self._ref_mult_init  = float(ref_mult_db)
         self.gain_attack_ms  = float(gain_attack_ms)
         self.gain_release_ms = float(gain_release_ms)
-        self.floor_db        = float(floor_db)
+        self._floor_db_init  = float(floor_db)
 
-        # Will be created in build()
+        # Kernels (fixed)
         self.k_fast     = None
         self.k_slow     = None
         self.k_gain_att = None
         self.k_gain_rel = None
+
+        # Live scalar weights
+        self.ratio_w     = None
+        self.knee_db_w   = None
+        self.ref_db_w    = None
+        self.floor_db_w  = None
 
     def build(self, input_shape):
         def ema_kernel(ms, scale, Lmax):
             s = max(1, int(round((float(ms) / 1000.0) * self.sample_rate)))
             return _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
 
-        # Envelope followers (fast and slow)
+        # Envelopes
         k_fast = ema_kernel(self.env_fast_ms, scale=3.0, Lmax=1024)
         k_slow = ema_kernel(self.env_slow_ms, scale=3.0, Lmax=4096)
-        # Gain smoothing (attack/release in gain domain)
+        self.k_fast = self.add_weight("comp_env_fast", shape=k_fast.shape,
+                                      initializer=tf.keras.initializers.Constant(k_fast), trainable=False)
+        self.k_slow = self.add_weight("comp_env_slow", shape=k_slow.shape,
+                                      initializer=tf.keras.initializers.Constant(k_slow), trainable=False)
+
+        # Gain smoothing
         k_att  = ema_kernel(self.gain_attack_ms,  scale=4.0, Lmax=2048)
         k_rel  = ema_kernel(self.gain_release_ms, scale=4.0, Lmax=2048)
+        self.k_gain_att = self.add_weight("comp_gain_att", shape=k_att.shape,
+                                          initializer=tf.keras.initializers.Constant(k_att), trainable=False)
+        self.k_gain_rel = self.add_weight("comp_gain_rel", shape=k_rel.shape,
+                                          initializer=tf.keras.initializers.Constant(k_rel), trainable=False)
 
-        self.k_fast = self.add_weight(
-            name="comp_env_fast", shape=k_fast.shape,
-            initializer=tf.keras.initializers.Constant(k_fast), trainable=False
-        )
-        self.k_slow = self.add_weight(
-            name="comp_env_slow", shape=k_slow.shape,
-            initializer=tf.keras.initializers.Constant(k_slow), trainable=False
-        )
-        self.k_gain_att = self.add_weight(
-            name="comp_gain_att", shape=k_att.shape,
-            initializer=tf.keras.initializers.Constant(k_att), trainable=False
-        )
-        self.k_gain_rel = self.add_weight(
-            name="comp_gain_rel", shape=k_rel.shape,
-            initializer=tf.keras.initializers.Constant(k_rel), trainable=False
-        )
+        # Live scalar weights (non-trainable)
+        self.ratio_w    = self.add_weight("ratio_w",    shape=(1,),
+                            initializer=tf.keras.initializers.Constant([self._ratio_init]),    trainable=False)
+        self.knee_db_w  = self.add_weight("knee_db_w",  shape=(1,),
+                            initializer=tf.keras.initializers.Constant([self._knee_db_init]),  trainable=False)
+        self.ref_db_w   = self.add_weight("ref_db_w",   shape=(1,),
+                            initializer=tf.keras.initializers.Constant([self._ref_mult_init]), trainable=False)
+        self.floor_db_w = self.add_weight("floor_db_w", shape=(1,),
+                            initializer=tf.keras.initializers.Constant([self._floor_db_init]), trainable=False)
 
-        # Precompute constants
-        self._ln10 = self.add_weight(
-            name="ln10_const", shape=(1,),
-            initializer=tf.keras.initializers.Constant([np.log(10.0)]), trainable=False
-        )
-        self._alpha = self.add_weight(
-            name="alpha_ln10_over_20", shape=(1,),
-            initializer=tf.keras.initializers.Constant([np.log(10.0)/20.0]), trainable=False
-        )
+        # Constants
+        self._ln10  = self.add_weight("ln10_const",  shape=(1,),
+                         initializer=tf.keras.initializers.Constant([np.log(10.0)]), trainable=False)
+        self._a20   = self.add_weight("alpha_ln10_over_20", shape=(1,),
+                         initializer=tf.keras.initializers.Constant([np.log(10.0)/20.0]), trainable=False)
 
         super().build(input_shape)
 
     def call(self, x):
-        # x: (B,T,1)
-        eps = tf.constant(1e-12, dtype=x.dtype)
-
         # Envelopes
+        eps = tf.constant(1e-12, dtype=x.dtype)
         env_fast = _causal_conv1d(tf.abs(x), self.k_fast)
         env_slow = _causal_conv1d(tf.abs(x), self.k_slow)
 
-        # Relative level in dB: 20*log10(env_fast / (ref_mult * env_slow))
-        ref_mult_lin = tf.pow(10.0, tf.constant(self.ref_mult_db, dtype=x.dtype) / 20.0)
-        denom = tf.maximum(ref_mult_lin * env_slow + eps, eps)
-
+        # Over level in dB relative to slow env (with bias ref_db_w)
+        ref_lin = tf.exp(self._a20[0] * self.ref_db_w[0])  # 10^(ref_db/20)
+        denom = tf.maximum(ref_lin * env_slow + eps, eps)
         r_db = (20.0 / self._ln10[0]) * (tf.math.log(env_fast + eps) - tf.math.log(denom))
 
-        # Soft-knee downward compression around thr=0 dB
-        ratio = tf.constant(self.ratio, dtype=x.dtype)
-        knee  = tf.constant(self.knee_db, dtype=x.dtype)
+        # Soft-knee compression around 0 dB
+        ratio = tf.maximum(self.ratio_w[0], tf.constant(1.0, x.dtype))
+        knee  = tf.maximum(self.knee_db_w[0], tf.constant(1e-3, x.dtype))
         half  = 0.5 * knee
-        one_minus_inv = (1.0 - 1.0 / tf.maximum(ratio, tf.constant(1.0, x.dtype)))
+        one_minus_inv = 1.0 - 1.0 / ratio
 
-        # Regions: below knee → no gain; above knee → linear compression; inside → quadratic transition
         below = tf.less_equal(r_db, -half)
         above = tf.greater_equal(r_db,  half)
 
-        # Full compression above knee: gain_db = -(1 - 1/ratio) * (r_db - 0)
         gain_db_above = -one_minus_inv * r_db
-
-        # Knee region: gain_db = -(1 - 1/ratio) * ((r_db + half)^2) / (2*knee)
-        # Guard knee>0
-        knee_safe = tf.maximum(knee, tf.constant(1e-3, x.dtype))
-        gain_db_knee = -one_minus_inv * tf.square(r_db + half) / (2.0 * knee_safe)
+        gain_db_knee  = -one_minus_inv * tf.square(r_db + half) / (2.0 * knee)
 
         gain_db = tf.where(below,
                            tf.zeros_like(r_db),
                            tf.where(above, gain_db_above, gain_db_knee))
 
-        # Floor the gain (do not attenuate more than floor_db)
-        floor_db = tf.constant(self.floor_db, dtype=x.dtype)
+        # Floor and convert to linear gain
+        floor_db = self.floor_db_w[0]
         gain_db  = tf.maximum(gain_db, floor_db)
+        g_tgt    = tf.exp(self._a20[0] * gain_db)
 
-        # Linear gain
-        g_tgt = tf.exp(self._alpha[0] * gain_db)
-
-        # Asymmetric gain smoothing (attack when gain decreases; release when increases)
+        # Asymmetric smoothing in gain domain
         prev = tf.pad(g_tgt, [[0,0],[1,0],[0,0]])[:, :-1, :]
         more_atten = tf.cast(g_tgt < prev, x.dtype)
         g_att = _causal_conv1d(g_tgt, self.k_gain_att)
         g_rel = _causal_conv1d(g_tgt, self.k_gain_rel)
         g = more_atten * g_att + (1.0 - more_atten) * g_rel
-        g = tf.clip_by_value(g, tf.exp(self._alpha[0] * floor_db), 1.0)
 
+        # Clamp to [exp(floor_db), 1]
+        g = tf.clip_by_value(g, tf.exp(self._a20[0] * floor_db), 1.0)
         return x * g
 
     def get_config(self):
@@ -1026,12 +1016,12 @@ class AutoThreshCompressor1D(tf.keras.layers.Layer):
             "sample_rate": self.sample_rate,
             "env_fast_ms": self.env_fast_ms,
             "env_slow_ms": self.env_slow_ms,
-            "ratio": self.ratio,
-            "knee_db": self.knee_db,
-            "ref_mult_db": self.ref_mult_db,
+            "ratio": float(self._ratio_init),
+            "knee_db": float(self._knee_db_init),
+            "ref_mult_db": float(self._ref_mult_init),
             "gain_attack_ms": self.gain_attack_ms,
             "gain_release_ms": self.gain_release_ms,
-            "floor_db": self.floor_db,
+            "floor_db": float(self._floor_db_init),
             **super().get_config()
         }
 
@@ -6725,51 +6715,37 @@ def set_autocomp_params_inplace(model,
                                 env_fast_ms=None,
                                 env_slow_ms=None,
                                 floor_db=None):
-    """
-    In-place tweaks for AutoThreshCompressor1D.
-    Re-synthesizes EMA kernels at the SAME length to avoid shape changes.
-    """
-    try:
-        l = model.get_layer(layer_name)
-    except Exception as e:
-        raise ValueError(f"Layer '{layer_name}' not found for auto-compressor") from e
-
+    l = model.get_layer(layer_name)
     sr = int(getattr(l, "sample_rate", REALTIME_SAMPLE_RATE))
 
-    if ratio is not None:
-        l.ratio = float(ratio)
-    if knee_db is not None:
-        l.knee_db = float(knee_db)
-    if ref_mult_db is not None:
-        l.ref_mult_db = float(ref_mult_db)
-    if floor_db is not None:
-        l.floor_db = float(floor_db)
+    # Scalars: assign to weights so the graph sees the new values
+    if ratio is not None and hasattr(l, "ratio_w"):
+        l.ratio_w.assign([float(ratio)])
+    if knee_db is not None and hasattr(l, "knee_db_w"):
+        l.knee_db_w.assign([float(knee_db)])
+    if ref_mult_db is not None and hasattr(l, "ref_db_w"):
+        l.ref_db_w.assign([float(ref_mult_db)])
+    if floor_db is not None and hasattr(l, "floor_db_w"):
+        l.floor_db_w.assign([float(floor_db)])
 
-    # Retune env windows (fixed length)
-    if env_fast_ms is not None and hasattr(l, "k_fast"):
-        Lf = int(l.k_fast.shape[0])
-        kf = _ema_kernel_fixed_len_for_sr(sr, env_fast_ms, Lf, scale=3.0, Lmax=1024)
-        l.k_fast.assign(kf)
-        l.env_fast_ms = float(env_fast_ms)
+    # Re-synthesize EMA kernels at fixed lengths (so shapes don't change)
+    def _retune(kernel_attr, ms, scale, Lmax):
+        if ms is None or not hasattr(l, kernel_attr):
+            return
+        L = int(getattr(l, kernel_attr).shape[0])
+        k = _ema_kernel_fixed_len_for_sr(sr, ms, L, scale=scale, Lmax=Lmax)
+        getattr(l, kernel_attr).assign(k)
 
-    if env_slow_ms is not None and hasattr(l, "k_slow"):
-        Ls = int(l.k_slow.shape[0])
-        ks = _ema_kernel_fixed_len_for_sr(sr, env_slow_ms, Ls, scale=3.0, Lmax=4096)
-        l.k_slow.assign(ks)
-        l.env_slow_ms = float(env_slow_ms)
+    _retune("k_fast",      env_fast_ms,     scale=3.0, Lmax=1024)
+    _retune("k_slow",      env_slow_ms,     scale=3.0, Lmax=4096)
+    _retune("k_gain_att",  gain_attack_ms,  scale=4.0, Lmax=2048)
+    _retune("k_gain_rel",  gain_release_ms, scale=4.0, Lmax=2048)
 
-    # Retune gain attack/release smoothing (fixed length)
-    if gain_attack_ms is not None and hasattr(l, "k_gain_att"):
-        La = int(l.k_gain_att.shape[0])
-        ka = _ema_kernel_fixed_len_for_sr(sr, gain_attack_ms, La, scale=4.0, Lmax=2048)
-        l.k_gain_att.assign(ka)
-        l.gain_attack_ms = float(gain_attack_ms)
-
-    if gain_release_ms is not None and hasattr(l, "k_gain_rel"):
-        Lr = int(l.k_gain_rel.shape[0])
-        kr = _ema_kernel_fixed_len_for_sr(sr, gain_release_ms, Lr, scale=4.0, Lmax=2048)
-        l.k_gain_rel.assign(kr)
-        l.gain_release_ms = float(gain_release_ms)
+    # Also keep the Python mirrors in sync (optional)
+    if env_fast_ms is not None:     l.env_fast_ms     = float(env_fast_ms)
+    if env_slow_ms is not None:     l.env_slow_ms     = float(env_slow_ms)
+    if gain_attack_ms is not None:  l.gain_attack_ms  = float(gain_attack_ms)
+    if gain_release_ms is not None: l.gain_release_ms = float(gain_release_ms)
 
 def quick_mask_tweak_stems(kind="realtime",
                            mask_overrides=None,
@@ -7067,8 +7043,8 @@ def main ():
                     post_comp_p=OFFLINE_PICK_MASK_POST_COMP_P, post_comp_gain=OFFLINE_PICK_MASK_POST_COMP_GAIN,
                     floor=OFFLINE_PICK_FLOOR, out_gain=OFFLINE_PICK_MASK_OUT_GAIN,
                     softclip_drive_db=OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE,
-                    comp_ratio=6.0,
-                    #comp_knee_db=8.0,
+                    #comp_ratio=60.0,
+                    #comp_knee_db=1.0,
                     #comp_attack_ms=0.08,
                     #comp_release_ms=12.0,
                     #comp_ref_db=0.0,        # threshold = slow env
