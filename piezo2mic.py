@@ -917,59 +917,101 @@ class AutoThreshCompressor1D(tf.keras.layers.Layer):
         self.gain_release_ms = float(gain_release_ms)
         self._floor_db_init  = float(floor_db)
 
-        # Kernels (fixed)
+        # Placeholders for kernels and live scalars
         self.k_fast     = None
         self.k_slow     = None
         self.k_gain_att = None
         self.k_gain_rel = None
-
-        # Live scalar weights
         self.ratio_w     = None
         self.knee_db_w   = None
         self.ref_db_w    = None
         self.floor_db_w  = None
+        self._ln10       = None
+        self._a20        = None
 
     def build(self, input_shape):
-        def ema_kernel(ms, scale, Lmax):
+        def ema_kernel_np(ms, scale, Lmax):
             s = max(1, int(round((float(ms) / 1000.0) * self.sample_rate)))
-            return _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
+            k = _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
+            return k.numpy() if tf.is_tensor(k) else np.array(k, dtype=np.float32, copy=False)
 
-        # Envelopes
-        k_fast = ema_kernel(self.env_fast_ms, scale=3.0, Lmax=1024)
-        k_slow = ema_kernel(self.env_slow_ms, scale=3.0, Lmax=4096)
-        self.k_fast = self.add_weight("comp_env_fast", shape=k_fast.shape,
-                                      initializer=tf.keras.initializers.Constant(k_fast), trainable=False)
-        self.k_slow = self.add_weight("comp_env_slow", shape=k_slow.shape,
-                                      initializer=tf.keras.initializers.Constant(k_slow), trainable=False)
+        # Envelopes (use keyword args; Constant gets NumPy arrays)
+        k_fast_np = ema_kernel_np(self.env_fast_ms, scale=3.0, Lmax=1024)
+        k_slow_np = ema_kernel_np(self.env_slow_ms, scale=3.0, Lmax=4096)
+        self.k_fast = self.add_weight(
+            name="comp_env_fast",
+            shape=k_fast_np.shape,
+            initializer=tf.keras.initializers.Constant(k_fast_np),
+            trainable=False
+        )
+        self.k_slow = self.add_weight(
+            name="comp_env_slow",
+            shape=k_slow_np.shape,
+            initializer=tf.keras.initializers.Constant(k_slow_np),
+            trainable=False
+        )
 
         # Gain smoothing
-        k_att  = ema_kernel(self.gain_attack_ms,  scale=4.0, Lmax=2048)
-        k_rel  = ema_kernel(self.gain_release_ms, scale=4.0, Lmax=2048)
-        self.k_gain_att = self.add_weight("comp_gain_att", shape=k_att.shape,
-                                          initializer=tf.keras.initializers.Constant(k_att), trainable=False)
-        self.k_gain_rel = self.add_weight("comp_gain_rel", shape=k_rel.shape,
-                                          initializer=tf.keras.initializers.Constant(k_rel), trainable=False)
+        k_att_np = ema_kernel_np(self.gain_attack_ms,  scale=4.0, Lmax=2048)
+        k_rel_np = ema_kernel_np(self.gain_release_ms, scale=4.0, Lmax=2048)
+        self.k_gain_att = self.add_weight(
+            name="comp_gain_att",
+            shape=k_att_np.shape,
+            initializer=tf.keras.initializers.Constant(k_att_np),
+            trainable=False
+        )
+        self.k_gain_rel = self.add_weight(
+            name="comp_gain_rel",
+            shape=k_rel_np.shape,
+            initializer=tf.keras.initializers.Constant(k_rel_np),
+            trainable=False
+        )
 
         # Live scalar weights (non-trainable)
-        self.ratio_w    = self.add_weight("ratio_w",    shape=(1,),
-                            initializer=tf.keras.initializers.Constant([self._ratio_init]),    trainable=False)
-        self.knee_db_w  = self.add_weight("knee_db_w",  shape=(1,),
-                            initializer=tf.keras.initializers.Constant([self._knee_db_init]),  trainable=False)
-        self.ref_db_w   = self.add_weight("ref_db_w",   shape=(1,),
-                            initializer=tf.keras.initializers.Constant([self._ref_mult_init]), trainable=False)
-        self.floor_db_w = self.add_weight("floor_db_w", shape=(1,),
-                            initializer=tf.keras.initializers.Constant([self._floor_db_init]), trainable=False)
+        self.ratio_w = self.add_weight(
+            name="ratio_w",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant([self._ratio_init]),
+            trainable=False
+        )
+        self.knee_db_w = self.add_weight(
+            name="knee_db_w",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant([self._knee_db_init]),
+            trainable=False
+        )
+        self.ref_db_w = self.add_weight(
+            name="ref_db_w",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant([self._ref_mult_init]),
+            trainable=False
+        )
+        self.floor_db_w = self.add_weight(
+            name="floor_db_w",
+            shape=(1,),
+            initializer=tf.keras.initializers.Constant([self._floor_db_init]),
+            trainable=False
+        )
 
-        # Constants
-        self._ln10  = self.add_weight("ln10_const",  shape=(1,),
-                         initializer=tf.keras.initializers.Constant([np.log(10.0)]), trainable=False)
-        self._a20   = self.add_weight("alpha_ln10_over_20", shape=(1,),
-                         initializer=tf.keras.initializers.Constant([np.log(10.0)/20.0]), trainable=False)
+        # Constants as weights (so no tf.constant captures)
+        ln10_np = np.array([np.log(10.0)], dtype=np.float32)
+        a20_np  = np.array([np.log(10.0)/20.0], dtype=np.float32)
+        self._ln10 = self.add_weight(
+            name="ln10_const",
+            shape=ln10_np.shape,
+            initializer=tf.keras.initializers.Constant(ln10_np),
+            trainable=False
+        )
+        self._a20 = self.add_weight(
+            name="alpha_ln10_over_20",
+            shape=a20_np.shape,
+            initializer=tf.keras.initializers.Constant(a20_np),
+            trainable=False
+        )
 
         super().build(input_shape)
 
     def call(self, x):
-        # Envelopes
         eps = tf.constant(1e-12, dtype=x.dtype)
         env_fast = _causal_conv1d(tf.abs(x), self.k_fast)
         env_slow = _causal_conv1d(tf.abs(x), self.k_slow)
@@ -990,10 +1032,7 @@ class AutoThreshCompressor1D(tf.keras.layers.Layer):
 
         gain_db_above = -one_minus_inv * r_db
         gain_db_knee  = -one_minus_inv * tf.square(r_db + half) / (2.0 * knee)
-
-        gain_db = tf.where(below,
-                           tf.zeros_like(r_db),
-                           tf.where(above, gain_db_above, gain_db_knee))
+        gain_db = tf.where(below, tf.zeros_like(r_db), tf.where(above, gain_db_above, gain_db_knee))
 
         # Floor and convert to linear gain
         floor_db = self.floor_db_w[0]
@@ -1007,7 +1046,6 @@ class AutoThreshCompressor1D(tf.keras.layers.Layer):
         g_rel = _causal_conv1d(g_tgt, self.k_gain_rel)
         g = more_atten * g_att + (1.0 - more_atten) * g_rel
 
-        # Clamp to [exp(floor_db), 1]
         g = tf.clip_by_value(g, tf.exp(self._a20[0] * floor_db), 1.0)
         return x * g
 
