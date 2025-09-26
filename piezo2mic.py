@@ -248,8 +248,8 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -4551,7 +4551,7 @@ def build_realtime_model(offline=None,
     )
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
-        # Sum (no bus HPF)
+    # Sum (no bus HPF)
     y_pre  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
 
     # Keep the same published node name but make it a no-op (preserves debug/stems)
