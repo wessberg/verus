@@ -248,8 +248,8 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 12.0
+OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -259,7 +259,7 @@ FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 # Realtime kernels are short to keep left context low; offline can be longer.
 
 RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 80.0,  72.0,   66.0,   60.0,   54.0,   48.0,   42.0,   36.0,   32.0]
+RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
 RESBP_MODAL_LEN_OFFLINE        = 8192
 
 RESBP_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
@@ -301,14 +301,14 @@ REALTIME_PICK_MASK_POST_COMP_P = 5.0
 OFFLINE_PICK_MASK_POST_COMP_GAIN = 1.0
 REALTIME_PICK_MASK_POST_COMP_GAIN = 1.0
 
-OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE  = 5.0
-REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE = 5.0
+OFFLINE_PICK_MASK_FLOOR = 0.0
+REALTIME_PICK_MASK_FLOOR = 0.00
 
-OFFLINE_PICK_ATTACK_COMP_RATIO = 6.0
-REALTIME_PICK_ATTACK_COMP_RATIO = 6.0
+OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE = 2.0
+REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE = 2.0
 
-OFFLINE_PICK_FLOOR = 0.0
-REALTIME_PICK_FLOOR = 0.00
+OFFLINE_PICK_RESO_SOFTCLIP_DRIVE = 2.0
+REALTIME_PICK_RESO_SOFTCLIP_DRIVE = 2.0
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
@@ -316,9 +316,13 @@ PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
 PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 513
 PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
-PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 740.0
+PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
 PICK_RESO_LOWBAND_PENALTY_ORDER     = 513
 PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.5
+
+# Peak protection for pick stems (post user scale)
+PICK_LIMITER_HEADROOM_DB = 1.0   # ceiling = -1 dBFS (≈ 0.891)
+PICK_LIMITER_DRIVE       = 4.0   # higher = harder knee, still smoother than hard clip
 
 # Also do this from the main mix path, to prevent build-up in ultra low frequencies
 ULTRALOW_MAIN_CUTOFF_HZ            = 40.0
@@ -403,8 +407,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 48.0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -433,11 +437,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 10
+DEMO_SEC        = 4
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 4
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -888,180 +892,6 @@ class CausalPickDBMask(tf.keras.layers.Layer):
             **super().get_config()
         }
 
-@register_keras_serializable()
-class AutoThreshCompressor1D(tf.keras.layers.Layer):
-    """
-    Causal, auto-threshold compressor using fast vs slow envelopes.
-    All numeric controls are non-trainable weights so they can be tweaked post-training.
-    """
-    def __init__(self,
-                 sample_rate,
-                 env_fast_ms=0.25,
-                 env_slow_ms=10.0,
-                 ratio=4.0,
-                 knee_db=6.0,
-                 ref_mult_db=0.0,          # threshold bias (dB on slow ref)
-                 gain_attack_ms=0.06,
-                 gain_release_ms=8.0,
-                 floor_db=-30.0,
-                 name=None,
-                 **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.sample_rate     = int(sample_rate)
-        self.env_fast_ms     = float(env_fast_ms)
-        self.env_slow_ms     = float(env_slow_ms)
-        self._ratio_init     = float(ratio)
-        self._knee_db_init   = float(knee_db)
-        self._ref_mult_init  = float(ref_mult_db)
-        self.gain_attack_ms  = float(gain_attack_ms)
-        self.gain_release_ms = float(gain_release_ms)
-        self._floor_db_init  = float(floor_db)
-
-        # Placeholders for kernels and live scalars
-        self.k_fast     = None
-        self.k_slow     = None
-        self.k_gain_att = None
-        self.k_gain_rel = None
-        self.ratio_w     = None
-        self.knee_db_w   = None
-        self.ref_db_w    = None
-        self.floor_db_w  = None
-        self._ln10       = None
-        self._a20        = None
-
-    def build(self, input_shape):
-        def ema_kernel_np(ms, scale, Lmax):
-            s = max(1, int(round((float(ms) / 1000.0) * self.sample_rate)))
-            k = _exp_smoothing_kernel(s, scale=scale, Lmax=Lmax)
-            return k.numpy() if tf.is_tensor(k) else np.array(k, dtype=np.float32, copy=False)
-
-        # Envelopes (use keyword args; Constant gets NumPy arrays)
-        k_fast_np = ema_kernel_np(self.env_fast_ms, scale=3.0, Lmax=1024)
-        k_slow_np = ema_kernel_np(self.env_slow_ms, scale=3.0, Lmax=4096)
-        self.k_fast = self.add_weight(
-            name="comp_env_fast",
-            shape=k_fast_np.shape,
-            initializer=tf.keras.initializers.Constant(k_fast_np),
-            trainable=False
-        )
-        self.k_slow = self.add_weight(
-            name="comp_env_slow",
-            shape=k_slow_np.shape,
-            initializer=tf.keras.initializers.Constant(k_slow_np),
-            trainable=False
-        )
-
-        # Gain smoothing
-        k_att_np = ema_kernel_np(self.gain_attack_ms,  scale=4.0, Lmax=2048)
-        k_rel_np = ema_kernel_np(self.gain_release_ms, scale=4.0, Lmax=2048)
-        self.k_gain_att = self.add_weight(
-            name="comp_gain_att",
-            shape=k_att_np.shape,
-            initializer=tf.keras.initializers.Constant(k_att_np),
-            trainable=False
-        )
-        self.k_gain_rel = self.add_weight(
-            name="comp_gain_rel",
-            shape=k_rel_np.shape,
-            initializer=tf.keras.initializers.Constant(k_rel_np),
-            trainable=False
-        )
-
-        # Live scalar weights (non-trainable)
-        self.ratio_w = self.add_weight(
-            name="ratio_w",
-            shape=(1,),
-            initializer=tf.keras.initializers.Constant([self._ratio_init]),
-            trainable=False
-        )
-        self.knee_db_w = self.add_weight(
-            name="knee_db_w",
-            shape=(1,),
-            initializer=tf.keras.initializers.Constant([self._knee_db_init]),
-            trainable=False
-        )
-        self.ref_db_w = self.add_weight(
-            name="ref_db_w",
-            shape=(1,),
-            initializer=tf.keras.initializers.Constant([self._ref_mult_init]),
-            trainable=False
-        )
-        self.floor_db_w = self.add_weight(
-            name="floor_db_w",
-            shape=(1,),
-            initializer=tf.keras.initializers.Constant([self._floor_db_init]),
-            trainable=False
-        )
-
-        # Constants as weights (so no tf.constant captures)
-        ln10_np = np.array([np.log(10.0)], dtype=np.float32)
-        a20_np  = np.array([np.log(10.0)/20.0], dtype=np.float32)
-        self._ln10 = self.add_weight(
-            name="ln10_const",
-            shape=ln10_np.shape,
-            initializer=tf.keras.initializers.Constant(ln10_np),
-            trainable=False
-        )
-        self._a20 = self.add_weight(
-            name="alpha_ln10_over_20",
-            shape=a20_np.shape,
-            initializer=tf.keras.initializers.Constant(a20_np),
-            trainable=False
-        )
-
-        super().build(input_shape)
-
-    def call(self, x):
-        eps = tf.constant(1e-12, dtype=x.dtype)
-        env_fast = _causal_conv1d(tf.abs(x), self.k_fast)
-        env_slow = _causal_conv1d(tf.abs(x), self.k_slow)
-
-        # Over level in dB relative to slow env (with bias ref_db_w)
-        ref_lin = tf.exp(self._a20[0] * self.ref_db_w[0])  # 10^(ref_db/20)
-        denom = tf.maximum(ref_lin * env_slow + eps, eps)
-        r_db = (20.0 / self._ln10[0]) * (tf.math.log(env_fast + eps) - tf.math.log(denom))
-
-        # Soft-knee compression around 0 dB
-        ratio = tf.maximum(self.ratio_w[0], tf.constant(1.0, x.dtype))
-        knee  = tf.maximum(self.knee_db_w[0], tf.constant(1e-3, x.dtype))
-        half  = 0.5 * knee
-        one_minus_inv = 1.0 - 1.0 / ratio
-
-        below = tf.less_equal(r_db, -half)
-        above = tf.greater_equal(r_db,  half)
-
-        gain_db_above = -one_minus_inv * r_db
-        gain_db_knee  = -one_minus_inv * tf.square(r_db + half) / (2.0 * knee)
-        gain_db = tf.where(below, tf.zeros_like(r_db), tf.where(above, gain_db_above, gain_db_knee))
-
-        # Floor and convert to linear gain
-        floor_db = self.floor_db_w[0]
-        gain_db  = tf.maximum(gain_db, floor_db)
-        g_tgt    = tf.exp(self._a20[0] * gain_db)
-
-        # Asymmetric smoothing in gain domain
-        prev = tf.pad(g_tgt, [[0,0],[1,0],[0,0]])[:, :-1, :]
-        more_atten = tf.cast(g_tgt < prev, x.dtype)
-        g_att = _causal_conv1d(g_tgt, self.k_gain_att)
-        g_rel = _causal_conv1d(g_tgt, self.k_gain_rel)
-        g = more_atten * g_att + (1.0 - more_atten) * g_rel
-
-        g = tf.clip_by_value(g, tf.exp(self._a20[0] * floor_db), 1.0)
-        return x * g
-
-    def get_config(self):
-        return {
-            "sample_rate": self.sample_rate,
-            "env_fast_ms": self.env_fast_ms,
-            "env_slow_ms": self.env_slow_ms,
-            "ratio": float(self._ratio_init),
-            "knee_db": float(self._knee_db_init),
-            "ref_mult_db": float(self._ref_mult_init),
-            "gain_attack_ms": self.gain_attack_ms,
-            "gain_release_ms": self.gain_release_ms,
-            "floor_db": float(self._floor_db_init),
-            **super().get_config()
-        }
 
 @register_keras_serializable()
 def _pick_mask_engine(inp,
@@ -1167,12 +997,19 @@ def _pick_attack(prefix,
                  style_time,
                  sample_rate,
                  filters=16,
-                 softclip_drive=5.0,
-                 comp_ratio=6.0,
+                 softclip_drive=2.0,
                  lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
                  lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
                  lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER):
-    # Mask-gated tiny CNN
+    """
+    Tiny causal HF synthesis gated by the analytic pick mask, then style-gated,
+    then a runtime HPF safety-net, then final scale.
+
+    Returns:
+      - y:    post-style, post-HPF, post-scale stem named '{prefix}_pickattack_scale'
+      - patt: training-only lowband penalty attached to the post-scale stem
+    """
+    # Mask-gated input for the tiny CNN
     x = Multiply(name=f"{prefix}_picklearn_gate")([hf_in, mask])
     x = causal_sep_conv(x, filters, 7, 1, name=f"{prefix}_picklearn_c1", activation="relu")
     x = causal_sep_conv(x, filters, 7, 2, name=f"{prefix}_picklearn_c2", activation="relu")
@@ -1180,34 +1017,25 @@ def _pick_attack(prefix,
 
     # Style gating
     xg = Multiply(name=f"{prefix}_pickattack_gated")([x, style_time])
-
-    # Optional soft-clip safety before the HPF (keep as-is)
+    
     xg = SoftClip1D(drive=softclip_drive, limit=0.98, name=f"{prefix}_pickattack_softclip")(xg)
 
-    # Runtime HPF safety-net
+    # Runtime HPF safety-net (cut below penalty_cutoff_hz)
     xh = HFHighpass(sample_rate=sample_rate,
                     cutoff_hz=lowband_penalty_cutoff_hz,
                     order=lowband_penalty_order,
                     name=f"{prefix}_pickattack_post_hp")(xg)
 
-    # Auto-threshold compressor (post-HPF, pre-scale)
-    xc = AutoThreshCompressor1D(
-            sample_rate=sample_rate,
-            env_fast_ms=0.25,
-            env_slow_ms=10.0,
-            ratio=comp_ratio,
-            knee_db=6.0,
-            ref_mult_db=0.0,          # threshold = slow env (0 dB over)
-            gain_attack_ms=0.08,
-            gain_release_ms=8.0,
-            floor_db=-30.0,
-            name=f"{prefix}_pickattack_comp"
-        )(xh)
+    # Final scale (stems are POST-HPF as requested)
+    y = IrScale(init=1.0, name=f"{prefix}_pickattack_scale")(xh)
+    
+    # Post-scale peak protection with ≥1 dB headroom
+    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
+    y = SoftClip1D(drive=PICK_LIMITER_DRIVE,
+                   limit=limit_lin,
+                   name=f"{prefix}_pickattack_limit")(y)
 
-    # Final scale (post-compression)
-    y = IrScale(init=1.0, name=f"{prefix}_pickattack_scale")(xc)
-
-    # Training-only lowband penalty
+    # Training-only lowband penalty on the post-scale signal
     patt = HFLowbandPenalty(alpha=lowband_penalty_alpha,
                             cutoff_hz=lowband_penalty_cutoff_hz,
                             order=lowband_penalty_order,
@@ -1245,10 +1073,16 @@ def _reson_learn_offline(inp, mask, style_time):
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="offline_pickreso_post_hp")(xg)
     
-    xh = SoftClip1D(drive=OFFLINE_PICK_MASK_POST_COMP_P, limit=0.98, name="offline_pickreso_softclip")(xh)
+    xh = SoftClip1D(drive=OFFLINE_PICK_RESO_SOFTCLIP_DRIVE, limit=0.98, name="offline_pickreso_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="offline_pickreso_scale")(xh)
+    
+    # Post-scale peak protection with ≥1 dB headroom
+    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
+    y = SoftClip1D(drive=PICK_LIMITER_DRIVE,
+                   limit=limit_lin,
+                   name="offline_pickreso_limit")(y)
 
     # Training-only lowband penalty on the post-scale stem
     patt = HFLowbandPenalty(alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
@@ -1288,10 +1122,16 @@ def _reson_learn_realtime(inp, mask, style_time):
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="realtime_pickreso_post_hp")(xg)
     
-    xh = SoftClip1D(drive=REALTIME_PICK_MASK_POST_COMP_P, limit=0.98, name="realtime_pickreso_softclip")(xh)
+    xh = SoftClip1D(drive=REALTIME_PICK_RESO_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickreso_softclip")(xh)
 
     # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="realtime_pickreso_scale")(xh)
+    
+    # Post-scale peak protection with ≥1 dB headroom
+    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
+    y = SoftClip1D(drive=PICK_LIMITER_DRIVE,
+                   limit=limit_lin,
+                   name="realtime_pickreso_limit")(y)
 
     # Training-only lowband penalty on the post-scale stem
     patt = HFLowbandPenalty(alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
@@ -4550,7 +4390,7 @@ def build_offline_model(dynamic_time=False,
                              ref_is_hp=True,
                              post_comp_p=OFFLINE_PICK_MASK_POST_COMP_P,
                              post_comp_gain=OFFLINE_PICK_MASK_POST_COMP_GAIN,
-                             floor=OFFLINE_PICK_FLOOR,
+                             floor=OFFLINE_PICK_MASK_FLOOR,
                              out_gain=OFFLINE_PICK_MASK_OUT_GAIN,
                              env_fast_ms=OFFLINE_PICK_MASK_ENV_FAST_MS,
                              env_slow_ms=OFFLINE_PICK_MASK_ENV_SLOW_MS,
@@ -4571,8 +4411,7 @@ def build_offline_model(dynamic_time=False,
         softclip_drive=OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE,
         lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
         lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
-        lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
-        comp_ratio=OFFLINE_PICK_ATTACK_COMP_RATIO
+        lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER
     )
     pickreso, pr_pen = _reson_learn_offline(inp, mask, style_time)
 
@@ -4688,7 +4527,7 @@ def build_realtime_model(offline=None,
                              ref_is_hp=True,
                              post_comp_p=REALTIME_PICK_MASK_POST_COMP_P,
                              post_comp_gain=REALTIME_PICK_MASK_POST_COMP_GAIN,
-                             floor=REALTIME_PICK_FLOOR,
+                             floor=REALTIME_PICK_MASK_FLOOR,
                              out_gain=REALTIME_PICK_MASK_OUT_GAIN,
                              env_fast_ms=REALTIME_PICK_MASK_ENV_FAST_MS,
                              env_slow_ms=REALTIME_PICK_MASK_ENV_SLOW_MS,
@@ -4705,10 +4544,10 @@ def build_realtime_model(offline=None,
         "realtime", hf_in, mask, style_scalar_b3,
         filters=16,
         sample_rate=REALTIME_SAMPLE_RATE,
+        softclip_drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE,
         lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
         lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
         lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
-        comp_ratio=REALTIME_PICK_ATTACK_COMP_RATIO
     )
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
@@ -5468,8 +5307,8 @@ def build_offline_debug_model(model):
     add("main_pick",    "offline_pick_contrib")
     add("main_finger",  "offline_finger_contrib")
     # Style-gated pick stems
-    add("pickreso",     "offline_pickreso_scale")
-    add("pickattack",   "offline_pickattack_scale")
+    add("pickreso",     "offline_pickreso_limit")
+    add("pickattack",   "offline_pickattack_limit")
     add("style_pred",   "offline_style_prob"),
     add("mask",         "offline_pick_mask_db")
     add("style_time",   "offline_style_time_used")
@@ -5489,8 +5328,8 @@ def build_realtime_debug_model(model):
     add("main_finger",  "realtime_finger_contrib")
     add("ir_only",      "realtime_ir_matchlen")
     # Style-gated pick stems
-    add("pickreso",     "realtime_pickreso_scale")
-    add("pickattack",   "realtime_pickattack_scale")
+    add("pickreso",     "realtime_pickreso_limit")
+    add("pickattack",   "realtime_pickattack_limit")
     add("style_pred",   "realtime_style_prob"),
     add("mask",         "realtime_pick_mask_db")
     add("style_time",   "realtime_style_scalar_broadcast")
@@ -6510,8 +6349,8 @@ def train_realtime_picklearn_from_offline():
     #    Use the post-scale stem nodes for KD:
     #      - "offline_pickattack_scale"
     #      - "offline_pickreso_scale"
-    t_att_96_node = off_causal.get_layer("offline_pickattack_scale").output
-    t_res_96_node = off_causal.get_layer("offline_pickreso_scale").output
+    t_att_96_node = off_causal.get_layer("offline_pickattack_limit").output
+    t_res_96_node = off_causal.get_layer("offline_pickreso_limit").output
 
     teacher_stems = tf.keras.models.Model(
         inputs=off_causal.inputs,
@@ -6733,57 +6572,6 @@ def set_dbmask_params_inplace(model,
         l.k_hp.assign(kh)
         l.hp_cut_hz = float(hp_cut_hz)
 
-def _ema_kernel_fixed_len_for_sr(sr, ms, L, scale, Lmax):
-    s = max(1, int(round((float(ms)/1000.0) * float(sr))))
-    L = max(1, int(L))
-    # Build at requested L using the same exponential form
-    a = np.exp(-1.0 / float(max(1, s))).astype(np.float32)
-    n = np.arange(L, dtype=np.float32)
-    taps = (1.0 - a) * (a ** n)
-    taps = taps / max(np.sum(taps, dtype=np.float64), 1e-12)
-    return taps[::-1].reshape(-1, 1, 1).astype(np.float32)
-
-def set_autocomp_params_inplace(model,
-                                layer_name,
-                                ratio=None,
-                                knee_db=None,
-                                ref_mult_db=None,
-                                gain_attack_ms=None,
-                                gain_release_ms=None,
-                                env_fast_ms=None,
-                                env_slow_ms=None,
-                                floor_db=None):
-    l = model.get_layer(layer_name)
-    sr = int(getattr(l, "sample_rate", REALTIME_SAMPLE_RATE))
-
-    # Scalars: assign to weights so the graph sees the new values
-    if ratio is not None and hasattr(l, "ratio_w"):
-        l.ratio_w.assign([float(ratio)])
-    if knee_db is not None and hasattr(l, "knee_db_w"):
-        l.knee_db_w.assign([float(knee_db)])
-    if ref_mult_db is not None and hasattr(l, "ref_db_w"):
-        l.ref_db_w.assign([float(ref_mult_db)])
-    if floor_db is not None and hasattr(l, "floor_db_w"):
-        l.floor_db_w.assign([float(floor_db)])
-
-    # Re-synthesize EMA kernels at fixed lengths (so shapes don't change)
-    def _retune(kernel_attr, ms, scale, Lmax):
-        if ms is None or not hasattr(l, kernel_attr):
-            return
-        L = int(getattr(l, kernel_attr).shape[0])
-        k = _ema_kernel_fixed_len_for_sr(sr, ms, L, scale=scale, Lmax=Lmax)
-        getattr(l, kernel_attr).assign(k)
-
-    _retune("k_fast",      env_fast_ms,     scale=3.0, Lmax=1024)
-    _retune("k_slow",      env_slow_ms,     scale=3.0, Lmax=4096)
-    _retune("k_gain_att",  gain_attack_ms,  scale=4.0, Lmax=2048)
-    _retune("k_gain_rel",  gain_release_ms, scale=4.0, Lmax=2048)
-
-    # Also keep the Python mirrors in sync (optional)
-    if env_fast_ms is not None:     l.env_fast_ms     = float(env_fast_ms)
-    if env_slow_ms is not None:     l.env_slow_ms     = float(env_slow_ms)
-    if gain_attack_ms is not None:  l.gain_attack_ms  = float(gain_attack_ms)
-    if gain_release_ms is not None: l.gain_release_ms = float(gain_release_ms)
 
 def quick_mask_tweak_stems(kind="realtime",
                            mask_overrides=None,
@@ -6840,44 +6628,6 @@ def quick_mask_tweak_stems(kind="realtime",
         smooth_release_ms=mask_overrides.get("smooth_release_ms", None),
         hp_cut_hz=mask_overrides.get("hp_cut_hz", None)
     )
-    
-     # Optional: tweak pick-attack auto-compressor (post-HPF, pre-scale)
-    comp_layer_name = f"{prefix}_pickattack_comp"
-    comp_kwargs = {}
-    # Accept these keys if present
-    key_map = {
-        "comp_ratio": "ratio",
-        "comp_knee_db": "knee_db",
-        "comp_ref_db": "ref_mult_db",
-        "comp_attack_ms": "gain_attack_ms",
-        "comp_release_ms": "gain_release_ms",
-        "comp_env_fast_ms": "env_fast_ms",
-        "comp_env_slow_ms": "env_slow_ms",
-        "comp_floor_db": "floor_db",
-    }
-    for k_src, k_dst in key_map.items():
-        if k_src in mask_overrides:
-            comp_kwargs[k_dst] = mask_overrides[k_src]
-    if comp_kwargs:
-        try:
-            set_autocomp_params_inplace(tweaked, comp_layer_name, **comp_kwargs)
-            print(f"[mask-tweak-db] Tweaked {comp_layer_name} with {comp_kwargs}")
-        except Exception as e:
-            print(f"[mask-tweak-db] Could not tweak {comp_layer_name}: {e}")
-    
-     # Optional: override pickattack SoftClip drive in dB for quick audition
-    sc_db = mask_overrides.get("softclip_drive_db", None)
-    if sc_db is not None:
-        sc_layer_name = f"{prefix}_pickattack_softclip"
-        try:
-            sc_layer = tweaked.get_layer(sc_layer_name)
-            if isinstance(sc_layer, SoftClip1D):
-                sc_layer.drive = float(10.0 ** (float(sc_db) / 20.0))
-                print(f"[mask-tweak-db] Set {sc_layer_name}.drive to {sc_layer.drive:.3f} (from {sc_db} dB)")
-            else:
-                print(f"[mask-tweak-db] Layer {sc_layer_name} is not SoftClip1D; skipping.")
-        except Exception as e:
-            print(f"[mask-tweak-db] Could not set {sc_layer_name} drive: {e}")
 
     # Debug model (shares variables with 'tweaked')
     dbg = build_offline_debug_model(tweaked) if kind == "offline" else build_realtime_debug_model(tweaked)
@@ -7073,23 +6823,19 @@ def main ():
 
         # Realtime mask sweep example
         quick_mask_tweak_stems(
-                kind="offline",
+                kind="realtime",
                 mask_overrides=dict(
-                    thr_db=OFFLINE_PICK_MASK_THRESHOLD_DB, knee_db=OFFLINE_PICK_MASK_KNEE_DB,
-                    env_fast_ms=OFFLINE_PICK_MASK_ENV_FAST_MS, env_slow_ms=OFFLINE_PICK_MASK_ENV_SLOW_MS,
-                    smooth_attack_ms=OFFLINE_PICK_MASK_SMOOTH_ATTACK_MS, smooth_release_ms=OFFLINE_PICK_MASK_SMOOTH_RELEASE_MS,
-                    post_comp_p=OFFLINE_PICK_MASK_POST_COMP_P, post_comp_gain=OFFLINE_PICK_MASK_POST_COMP_GAIN,
-                    floor=OFFLINE_PICK_FLOOR, out_gain=OFFLINE_PICK_MASK_OUT_GAIN,
-                    softclip_drive_db=OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE,
-                    #comp_ratio=60.0,
-                    #comp_knee_db=1.0,
-                    #comp_attack_ms=0.08,
-                    #comp_release_ms=12.0,
-                    #comp_ref_db=0.0,        # threshold = slow env
-                    #comp_floor_db=-24.0      # don't attenuate deeper than -24 dB
+                    thr_db=REALTIME_PICK_MASK_THRESHOLD_DB, knee_db=REALTIME_PICK_MASK_KNEE_DB,
+                    env_fast_ms=REALTIME_PICK_MASK_ENV_FAST_MS, env_slow_ms=REALTIME_PICK_MASK_ENV_SLOW_MS,
+                    smooth_attack_ms=REALTIME_PICK_MASK_SMOOTH_ATTACK_MS, smooth_release_ms=REALTIME_PICK_MASK_SMOOTH_RELEASE_MS,
+                    post_comp_p=REALTIME_PICK_MASK_POST_COMP_P, post_comp_gain=REALTIME_PICK_MASK_POST_COMP_GAIN,
+                    floor=REALTIME_PICK_MASK_FLOOR, out_gain=REALTIME_PICK_MASK_OUT_GAIN,
                 ),
-                sec=10, offset_sec=0
+                sec=6, offset_sec=0.0
             )    
+                
+        
+               
         
         sys.exit(0)
         
