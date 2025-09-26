@@ -367,7 +367,7 @@ PICKLEARN_REALTIME_LR        = 1e-4
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
 
-FINETUNE_DEMO_SEC = 4
+FINETUNE_DEMO_SEC = 10
 FINETUNE_DEMO_OFFSET_SEC = 0
 
 HP_PRE_EMPHASIS_HF        = 0.98
@@ -437,11 +437,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 4
+DEMO_SEC        = 10
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 4
+LONG_DEMO_SEC        = 10
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -6822,22 +6822,22 @@ def main ():
     elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
 
         # Realtime mask sweep example
-        quick_mask_tweak_stems(
-                kind="realtime",
-                mask_overrides=dict(
-                    thr_db=REALTIME_PICK_MASK_THRESHOLD_DB, knee_db=REALTIME_PICK_MASK_KNEE_DB,
-                    env_fast_ms=REALTIME_PICK_MASK_ENV_FAST_MS, env_slow_ms=REALTIME_PICK_MASK_ENV_SLOW_MS,
-                    smooth_attack_ms=REALTIME_PICK_MASK_SMOOTH_ATTACK_MS, smooth_release_ms=REALTIME_PICK_MASK_SMOOTH_RELEASE_MS,
-                    post_comp_p=REALTIME_PICK_MASK_POST_COMP_P, post_comp_gain=REALTIME_PICK_MASK_POST_COMP_GAIN,
-                    floor=REALTIME_PICK_MASK_FLOOR, out_gain=REALTIME_PICK_MASK_OUT_GAIN,
-                ),
-                sec=6, offset_sec=0.0
-            )    
+        # quick_mask_tweak_stems(
+        #         kind="realtime",
+        #         mask_overrides=dict(
+        #             thr_db=REALTIME_PICK_MASK_THRESHOLD_DB, knee_db=REALTIME_PICK_MASK_KNEE_DB,
+        #             env_fast_ms=REALTIME_PICK_MASK_ENV_FAST_MS, env_slow_ms=REALTIME_PICK_MASK_ENV_SLOW_MS,
+        #             smooth_attack_ms=REALTIME_PICK_MASK_SMOOTH_ATTACK_MS, smooth_release_ms=REALTIME_PICK_MASK_SMOOTH_RELEASE_MS,
+        #             post_comp_p=REALTIME_PICK_MASK_POST_COMP_P, post_comp_gain=REALTIME_PICK_MASK_POST_COMP_GAIN,
+        #             floor=REALTIME_PICK_MASK_FLOOR, out_gain=REALTIME_PICK_MASK_OUT_GAIN,
+        #         ),
+        #         sec=6, offset_sec=0.0
+        #     )    
                 
         
                
         
-        sys.exit(0)
+        # sys.exit(0)
         
         # Flags (can be combined):
         # --finetuned        → finetuned dynamic models (if present)
