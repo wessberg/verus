@@ -2780,7 +2780,7 @@ class HFLowbandPenalty(Layer, AdjustableAlphaMixin):
         super().build(input_shape)
 
     def call(self, x, training=None):
-        if training is False:
+        if not training:
             return x
         pad = tf.shape(self.kernel)[0] - 1
         x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
@@ -4558,21 +4558,10 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
         build_model_fn=build_realtime_model,
         build_model_fn_args_static={
-            'offline': offline_causal,
-            'cap_mask_with_gate': True,       # rely on fixed gate in base training
-            'use_learned_hf_mask': False,     # learned mask not used to gate audio in base model
-            'enable_mask_kd': False,          # do not KD the mask in base training
-            'detach_mask_from_audio': True,   # if/when enabled later, keep mask grads clean
-            'mask_min_floor': 0.0
+            'offline': offline_causal
         },
         build_model_fn_args_dynamic={
-            # dynamic preview model used by DemoCallback; mirror the static gating behavior
-            'offline': None,
-            'cap_mask_with_gate': True,
-            'use_learned_hf_mask': False,
-            'enable_mask_kd': False,
-            'detach_mask_from_audio': True,
-            'mask_min_floor': 0.0
+            'offline': None
         },
         checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
         logs_out_dir=LOGS_REALTIME_OUT_DIR,
@@ -4876,12 +4865,6 @@ def main ():
                 build_model_fn_args_dynamic={
                     'offline': None,
                     'dynamic_time': True,
-                    'cap_mask_with_gate': True,     # fixed gate baseline
-                    'use_learned_hf_mask': False,
-                    'enable_mask_kd': False,
-                    'detach_mask_from_audio': True,
-                    'mask_min_floor': 0.0,
-                    'use_pick_normalizer': False,
                     'coloreq_trainable': False
                 },
                 use_safe_weight_copy=True
