@@ -809,9 +809,6 @@ class SoftClip1D(tf.keras.layers.Layer):
 
 @register_keras_serializable()
 class LearnedModalBank(tf.keras.layers.Layer):
-    """
-    Trainable version of ModalBank; initialized from your fixed modal kernels.
-    """
     def __init__(self, centers_hz, decays_ms, length, sample_rate, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.centers_hz = [float(x) for x in centers_hz]
@@ -831,9 +828,7 @@ class LearnedModalBank(tf.keras.layers.Layer):
 
     def call(self, x):
         shp = tf.shape(x); b = shp[0]; t = shp[1]; c = tf.reduce_prod(shp[2:])
-        assert_op = tf.debugging.assert_equal(c, 1, message="LearnedModalBank expects 1 channel.")
-        with tf.control_dependencies([assert_op]):
-            x3 = tf.reshape(x, [b, t, c])
+        x3 = tf.reshape(x, [b, t, c])
         pad = self.length - 1
         x_pad = tf.pad(x3, [[0,0],[pad,0],[0,0]])
         return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
@@ -1814,7 +1809,7 @@ def compute_pickreso_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RA
       LC = (L_onset_pulse - 1) + (L_modal - 1)
 
     - onset pulse layer: CausalExpSmoother named 'realtime_pickreso_onset_pulse'
-    - modal bank: LearnedModalBank or ModalBank named 'realtime_pickreso_modal'
+    - modal bank: LearnedModalBank named 'realtime_pickreso_modal'
     If the branch is absent, returns 0.
     """
     sr = int(sample_rate)
@@ -1823,17 +1818,8 @@ def compute_pickreso_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RA
     env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_pickreso_onset_pulse")
     L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
 
-    # Modal bank (prefer LearnedModalBank; fallback to ModalBank)
+    # Modal bank
     mb_layers = _find_layers(model, LearnedModalBank, name_prefix="realtime_pickreso_modal")
-    if not mb_layers:
-        mb_layers = _find_layers(model, ModalBank, name_prefix="realtime_pickreso_modal")
-
-    if not mb_layers:
-        LC = max(0, L_env - 1)
-        if verbose:
-            ms = 1000.0 * float(LC) / float(sr)
-            print(f"[pickreso] branch not present; LC={LC} samples ({ms:.3f} ms)")
-        return int(LC)
 
     mb = mb_layers[0]
     # length is a config property (available even if not built); kernel.shape[0] is also fine post-build
@@ -2921,65 +2907,6 @@ def _make_modal_kernels(centers_hz, decays_ms, length, sample_rate):
     K = np.stack(kernels, axis=1)      # (L, M)
     K = K[::-1, :]                     # reverse for conv1d (cross-correlation → convolution)
     return K.reshape(L, 1, -1).astype(np.float32)
-
-@register_keras_serializable()
-class ModalBank(tf.keras.layers.Layer):
-    """
-    Fixed bank of causal decaying-sine FIRs (one output channel per mode).
-    - Normal input: (B,T,1)
-    - Output: (B,T,M)
-    """
-    def __init__(self, centers_hz, decays_ms, length, sample_rate, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.centers_hz = [float(x) for x in centers_hz]
-        self.decays_ms  = [float(x) for x in decays_ms]
-        self.length     = int(length)
-        self.sample_rate= int(sample_rate)
-
-    def build(self, input_shape):
-        K = _make_modal_kernels(self.centers_hz, self.decays_ms, self.length, self.sample_rate)
-        self.kernel = self.add_weight(
-            name="modal_kernels",
-            shape=K.shape,
-            initializer=tf.keras.initializers.Constant(K),
-            trainable=False
-        )
-        super().build(input_shape)
-
-    def call(self, x):
-        # Ensure rank >= 3 by collapsing all dims from axis=2 onward into the channel dim.
-        # This tolerates legacy rank-4 inputs like (B,T,1,1).
-        shp   = tf.shape(x)
-        b     = shp[0]
-        t     = shp[1]
-        # new_c = product of all trailing dims (must be 1 for our fixed 1-in channel kernels)
-        new_c = tf.reduce_prod(shp[2:])
-        # Enforce single-channel at runtime (keeps conv1d filter compatibility: (L,1,M))
-        assert_op = tf.debugging.assert_equal(
-            new_c, 1,
-            message="ModalBank expects a single input channel; got trailing dims product != 1."
-        )
-        with tf.control_dependencies([assert_op]):
-            x3 = tf.reshape(x, [b, t, new_c])  # becomes (B,T,1)
-        pad = self.length - 1
-        x_pad = tf.pad(x3, [[0,0],[pad,0],[0,0]])
-        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
-
-    def compute_output_shape(self, input_shape):
-        # Works for (B,T,1) and legacy (B,T,1,1) since only B,T matter.
-        b = input_shape[0]
-        t = input_shape[1]
-        return (b, t, len(self.centers_hz))
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({
-            "centers_hz": self.centers_hz,
-            "decays_ms":  self.decays_ms,
-            "length":     self.length,
-            "sample_rate":self.sample_rate
-        })
-        return cfg
 
 def _exp_smoothing_kernel(samples, scale=4.0, Lmax=2048):
     """
