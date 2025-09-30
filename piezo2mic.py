@@ -236,7 +236,7 @@ OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
 OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
@@ -245,13 +245,13 @@ FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
 # Realtime kernels are short to keep left context low; offline can be longer.
 
-RESBP_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
-RESBP_MODAL_LEN_OFFLINE        = 8192
+PICK_RESO_MODAL_CENTERS_HZ_OFFLINE = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
+PICK_RESO_MODAL_DECAYS_MS_OFFLINE  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   18.0,   16.0]
+PICK_RESO_MODAL_LEN_OFFLINE        = 8192
 
-RESBP_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
-RESBP_MODAL_DECAYS_MS_REALTIME  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   20.0,   28.0]
-RESBP_MODAL_LEN_REALTIME        = 1024
+PICK_RESO_MODAL_CENTERS_HZ_REALTIME = [740.0, 880.0, 1040.0, 1200.0, 1380.0, 1580.0, 1800.0, 2050.0, 2200.0]
+PICK_RESO_MODAL_DECAYS_MS_REALTIME  = [ 45.0,  40.0,   36.0,   32.0,   27.0,   24.0,   20.0,   20.0,   28.0]
+PICK_RESO_MODAL_LEN_REALTIME        = 1024
 
 # Strike envelope smoothing (controls amplitude vs pick intensity)
 RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
@@ -355,6 +355,10 @@ REALTIME_IR_FIR_SIZE          = 129
 REALTIME_IR_CUTOFF            = 1.0 / REALTIME_IR_DOWNSAMPLE_FACTOR
 REALTIME_IR_KERNEL    = 33
 REALTIME_IR_DILATIONS = (1,2,4,8)
+
+REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR = 8
+REALTIME_PICK_RESO_DS_TAPS           = 33
+REALTIME_PICK_RESO_INTERP_TAPS       = 65
 
 REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
 FINETUNE_REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
@@ -579,6 +583,157 @@ def apply_runtime_gain(x, knob_scalar, name):
     k3 = Reshape((1,1), name=f"{name}_expand")(knob_scalar)
     return Multiply(name=f"{name}_mul")([x, k3])
 
+
+def _len_lr_from_full(L_full, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR):
+    return (int(L_full) - 1) // int(factor) + 1
+
+def _decimate_modal_kernels(kernel_full_rev, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR):
+    """
+    Given trained modal kernels (reversed for conv1d) of shape (L_full,1,M),
+    build low-rate reversed kernels by taking every 'factor'-th tap along time.
+    Returns shape (L_low,1,M).
+
+    Important: we renormalize each mode to preserve its original L2 norm so the
+    post-mix level doesn't collapse after decimation.
+    """
+    K = np.asarray(kernel_full_rev, dtype=np.float32)
+    L_full = K.shape[0]
+    M = K.shape[2]
+    F = int(factor)
+    L_low = (int(L_full) - 1) // F + 1
+    idx = np.arange(L_low, dtype=np.int32) * F
+    K_low = K[idx, :, :].copy()  # (L_low, 1, M)
+
+    # Renormalize each mode to the original L2 norm
+    eps = 1e-12
+    for m in range(M):
+        orig_l2 = float(np.sqrt(np.sum(K[:, 0, m]**2, dtype=np.float64)))
+        low_l2  = float(np.sqrt(np.sum(K_low[:, 0, m]**2, dtype=np.float64)))
+        if low_l2 > eps and orig_l2 > eps:
+            K_low[:, 0, m] *= (orig_l2 / low_l2)
+
+    return K_low.astype(np.float32)
+
+def _extract_trained_modal_kernel_rt(old_model, legacy_name="realtime_pickreso_modal"):
+    """
+    Return the trained full-rate modal kernel from an old (legacy) realtime model
+    if present; otherwise None.
+    """
+    try:
+        L = old_model.get_layer(legacy_name)
+        W = L.get_weights()
+        if W and isinstance(W[0], np.ndarray):
+            return W[0].astype(np.float32)
+    except Exception:
+        pass
+    return None
+
+@register_keras_serializable()
+class PickResoDownsampleFIR(Layer):
+    """
+    Decimate by integer factor with a short, causal min-phase FIR (for pickreso branch).
+    """
+    def __init__(self, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR, num_taps=REALTIME_PICK_RESO_DS_TAPS, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.factor = int(factor)
+        self.num_taps = int(num_taps)
+
+    def build(self, input_shape):
+        cutoff = 0.45 / float(self.factor)
+        taps = firwin(self.num_taps, cutoff=cutoff, window=('kaiser', 8.0), pass_zero=True).astype(np.float32)
+        taps_min = minimum_phase(taps, method='homomorphic').astype(np.float32)
+        taps_min = taps_min / max(np.sum(taps_min), 1e-12)
+        k = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)
+        self.kernel = self.add_weight(
+            name="ds_lpf_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        pad = tf.shape(self.kernel)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=self.factor, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        b, T, _ = input_shape
+        if T is None:
+            return (b, None, 1)
+        out_T = (T + self.factor - 1) // self.factor  # ceil(T/factor)
+        return (b, out_T, 1)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"factor": self.factor, "num_taps": self.num_taps})
+        return cfg
+
+@register_keras_serializable()
+class LowrateModalBank(tf.keras.layers.Layer):
+    """
+    Trainable low-rate modal bank: conv1d with kernel shape (L_low,1,M).
+    Initialized by decimating the default modal kernels or by a provided kernel_init.
+    """
+    def __init__(self, num_modes, length_lr, kernel_init=None, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.num_modes  = int(num_modes)
+        self.length_lr  = int(length_lr)
+        self._kernel_init_np = None if kernel_init is None else np.asarray(kernel_init, dtype=np.float32)
+
+    def build(self, input_shape):
+        if self._kernel_init_np is None:
+            K_full = _make_modal_kernels(PICK_RESO_MODAL_CENTERS_HZ_REALTIME,
+                                         PICK_RESO_MODAL_DECAYS_MS_REALTIME,
+                                         PICK_RESO_MODAL_LEN_REALTIME,
+                                         REALTIME_SAMPLE_RATE)
+            K_lr = _decimate_modal_kernels(K_full, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR)
+        else:
+            K_lr = self._kernel_init_np
+
+        # Ensure expected shape (length_lr,1,num_modes) with center-crop or symmetric pad
+        K_lr = np.asarray(K_lr, dtype=np.float32)
+        want = (self.length_lr, 1, self.num_modes)
+        if K_lr.shape != want:
+            L_have = K_lr.shape[0]
+            if L_have > self.length_lr:
+                # Center-crop
+                drop = L_have - self.length_lr
+                start = drop // 2
+                end = start + self.length_lr
+                K_lr = K_lr[start:end, :, :]
+            elif L_have < self.length_lr:
+                # Symmetric pad on time axis
+                pad = self.length_lr - L_have
+                pL = pad // 2
+                pR = pad - pL
+                K_lr = np.pad(K_lr, ((pL, pR), (0,0), (0,0)), mode='constant')
+        assert K_lr.shape == want, f"LowrateModalBank kernel shape mismatch: {K_lr.shape} != {want}"
+
+        self.kernel = self.add_weight(
+            name="modal_kernels_lr",
+            shape=want,
+            initializer=tf.keras.initializers.Constant(K_lr.astype(np.float32)),
+            trainable=True
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        pad = tf.shape(self.kernel)[0] - 1
+        x_pad = tf.pad(x, [[0,0],[pad,0],[0,0]])
+        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        b, t, _ = input_shape
+        return (b, t, self.num_modes)
+
+    def get_config(self):
+        return {
+            "num_modes": self.num_modes,
+            "length_lr": self.length_lr,
+            **super().get_config()
+        }
+
 @register_keras_serializable()
 class CausalPickDBMask(tf.keras.layers.Layer):
     """
@@ -752,7 +907,6 @@ class CausalPickDBMask(tf.keras.layers.Layer):
             **super().get_config()
         }
 
-
 @register_keras_serializable()
 def _pick_mask_engine(inp,
                          sample_rate,
@@ -846,6 +1000,7 @@ class LearnedModalBank(tf.keras.layers.Layer):
         }
 
 
+
 def _pick_attack(prefix,
                  hf_in,
                  mask,
@@ -903,8 +1058,8 @@ def _reson_learn_offline(inp, mask, style_time):
     onset = Lambda(gate_onset, name="offline_pickreso_onset")(mask)
     strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_OFFLINE, sample_rate=sr, Lmax=4096,
                                name="offline_pickreso_onset_pulse")(onset)
-    ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_OFFLINE),
-                      high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_OFFLINE),
+    ana = BandpassFIR(low_hz=0.9*min(PICK_RESO_MODAL_CENTERS_HZ_OFFLINE),
+                      high_hz=1.1*max(PICK_RESO_MODAL_CENTERS_HZ_OFFLINE),
                       order=OFFLINE_PICK_RESO_BP_ORDER, sample_rate=sr,
                       name="offline_pickreso_ctrl_bp")(inp)
     amp = CausalExpSmoother(time_const_ms=4.0, sample_rate=sr, Lmax=1024,
@@ -912,9 +1067,9 @@ def _reson_learn_offline(inp, mask, style_time):
     amp = Lambda(clip_01x4, name="offline_pickreso_ctrl_gain")(amp)
     exc = Multiply(name="offline_pickreso_excite")([strike, amp])
 
-    modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_OFFLINE,
-                             decays_ms =RESBP_MODAL_DECAYS_MS_OFFLINE,
-                             length    =RESBP_MODAL_LEN_OFFLINE,
+    modes = LearnedModalBank(centers_hz=PICK_RESO_MODAL_CENTERS_HZ_OFFLINE,
+                             decays_ms =PICK_RESO_MODAL_DECAYS_MS_OFFLINE,
+                             length    =PICK_RESO_MODAL_LEN_OFFLINE,
                              sample_rate=sr,
                              name="offline_pickreso_modal")(exc)
     mixed = Conv1D(1, 1, use_bias=True, padding="same", name="offline_pickreso_mix")(modes)
@@ -952,8 +1107,8 @@ def _reson_learn_realtime(inp, mask, style_time):
     onset = Lambda(gate_onset, name="realtime_pickreso_onset")(mask)
     strike = CausalExpSmoother(time_const_ms=RESBP_STRIKE_ENV_MS_REALTIME, sample_rate=sr, Lmax=512,
                                name="realtime_pickreso_onset_pulse")(onset)
-    ana = BandpassFIR(low_hz=0.9*min(RESBP_MODAL_CENTERS_HZ_REALTIME),
-                      high_hz=1.1*max(RESBP_MODAL_CENTERS_HZ_REALTIME),
+    ana = BandpassFIR(low_hz=0.9*min(PICK_RESO_MODAL_CENTERS_HZ_REALTIME),
+                      high_hz=1.1*max(PICK_RESO_MODAL_CENTERS_HZ_REALTIME),
                       order=REALTIME_PICK_RESO_BP_ORDER, sample_rate=sr,
                       name="realtime_pickreso_ctrl_bp")(inp)
     amp = CausalExpSmoother(time_const_ms=3.0, sample_rate=sr, Lmax=256,
@@ -961,34 +1116,35 @@ def _reson_learn_realtime(inp, mask, style_time):
     amp = Lambda(clip_01x4, name="realtime_pickreso_ctrl_gain")(amp)
     exc = Multiply(name="realtime_pickreso_excite")([strike, amp])
 
-    modes = LearnedModalBank(centers_hz=RESBP_MODAL_CENTERS_HZ_REALTIME,
-                             decays_ms =RESBP_MODAL_DECAYS_MS_REALTIME,
-                             length    =RESBP_MODAL_LEN_REALTIME,
-                             sample_rate=sr,
-                             name="realtime_pickreso_modal")(exc)
-    mixed = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_pickreso_mix")(modes)
+    # DS → low-rate modal bank → 1x1 mix → upsample → match T
+    ds = PickResoDownsampleFIR(factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR, num_taps=REALTIME_PICK_RESO_DS_TAPS,
+                               name="realtime_pickreso_ds8")(exc)
+    num_modes = len(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    L_lr = _len_lr_from_full(PICK_RESO_MODAL_LEN_REALTIME, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR)
+    modes_lr = LowrateModalBank(num_modes=num_modes, length_lr=L_lr,
+                                name="realtime_pickreso_modal_lr")(ds)
+    mixed_lr = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_pickreso_mix")(modes_lr)
 
-    # Style-gate first
+    up = FIRInterpByN(factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR, num_taps=REALTIME_PICK_RESO_INTERP_TAPS,
+                      cutoff=0.45/REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR, window=('kaiser', 9.0),
+                      name="realtime_pickreso_interp")(mixed_lr)
+    mixed = MatchTimeToRef(name="realtime_pickreso_matchlen")([up, inp])
+
     xg = Multiply(name="realtime_pickreso_gated")([mixed, style_time])
-
-    # Then runtime HPF safety-net at the requested cutoff
     xh = HFHighpass(sample_rate=sr,
                     cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                     order=PICK_RESO_LOWBAND_PENALTY_ORDER,
                     name="realtime_pickreso_post_hp")(xg)
-    
     xh = SoftClip1D(drive=REALTIME_PICK_RESO_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickreso_softclip")(xh)
-
-    # Final scale (POST-HPF)
     y = IrScale(init=1.0, name="realtime_pickreso_scale")(xh)
-    
-    # Post-scale peak protection with ≥1 dB headroom
-    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
-    y = SoftClip1D(drive=PICK_LIMITER_DRIVE,
-                   limit=limit_lin,
-                   name="realtime_pickreso_limit")(y)
 
-    # Training-only lowband penalty on the post-scale stem
+    # Post-scale peak protection
+    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
+    y = SoftClip1D(drive=PICK_LIMITER_DRIVE, limit=limit_lin, name="realtime_pickreso_limit")(y)
+
+    # NEW: calibration scale (migration will set its weight so knob dB → same loudness as legacy)
+    y = IrScale(init=1.0, name="realtime_pickreso_calib")(y)
+
     patt = HFLowbandPenalty(alpha=PICK_RESO_LOWBAND_PENALTY_ALPHA,
                             cutoff_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
                             order=PICK_RESO_LOWBAND_PENALTY_ORDER,
@@ -1302,12 +1458,12 @@ def band_limited_l1_loss_weighted(y_true, y_pred, sample_rate,
 @register_keras_serializable()
 def resonance_band_loss(y_true, y_pred, sample_rate):
     if int(sample_rate) == OFFLINE_SAMPLE_RATE:
-        lo = 0.9 * min(RESBP_MODAL_CENTERS_HZ_OFFLINE)
-        hi = 1.1 * max(RESBP_MODAL_CENTERS_HZ_OFFLINE)
+        lo = 0.9 * min(PICK_RESO_MODAL_CENTERS_HZ_OFFLINE)
+        hi = 1.1 * max(PICK_RESO_MODAL_CENTERS_HZ_OFFLINE)
         order = OFFLINE_PICK_RESO_BP_ORDER
     else:
-        lo = 0.9 * min(RESBP_MODAL_CENTERS_HZ_REALTIME)
-        hi = 1.1 * max(RESBP_MODAL_CENTERS_HZ_REALTIME)
+        lo = 0.9 * min(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+        hi = 1.1 * max(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
         order = REALTIME_PICK_RESO_BP_ORDER
     return band_limited_l1_loss_weighted(
         y_true, y_pred, sample_rate,
@@ -1804,36 +1960,45 @@ def compute_pickattack_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_
 
 
 def compute_pickreso_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
-    """
-    Left context for the learned resonance (pickreso) stem:
-      LC = (L_onset_pulse - 1) + (L_modal - 1)
-
-    - onset pulse layer: CausalExpSmoother named 'realtime_pickreso_onset_pulse'
-    - modal bank: LearnedModalBank named 'realtime_pickreso_modal'
-    If the branch is absent, returns 0.
-    """
     sr = int(sample_rate)
 
     # Onset pulse smoother
     env_layers = _find_layers(model, CausalExpSmoother, name_prefix="realtime_pickreso_onset_pulse")
     L_env = int(env_layers[0].kernel.shape[0]) if env_layers else 1
+    lc_env = L_env - 1
 
-    # Modal bank
+    # Fast path pieces
+    ds_layers = _find_layers(model, PickResoDownsampleFIR, name_prefix="realtime_pickreso_ds8")
+    mlr_layers = _find_layers(model, LowrateModalBank,     name_prefix="realtime_pickreso_modal_lr")
+    up_layers = _find_layers(model, FIRInterpByN,          name_prefix="realtime_pickreso_interp")
+
+    if ds_layers and mlr_layers and up_layers:
+        L_ds = int(getattr(ds_layers[0], "num_taps", REALTIME_PICK_RESO_DS_TAPS))
+        L_mlr = int(getattr(mlr_layers[0], "length_lr",  _len_lr_from_full(PICK_RESO_MODAL_LEN_REALTIME)))
+        F = int(getattr(ds_layers[0], "factor", REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR))
+        L_up = int(getattr(up_layers[0], "num_taps", REALTIME_PICK_RESO_INTERP_TAPS))
+        LC = lc_env + (L_ds - 1) + F * (L_mlr - 1) + (L_up - 1)
+        if verbose:
+            ms = 1000.0 * float(LC) / float(sr)
+            print(f"[pickreso-fast] env={lc_env}, ds={L_ds-1}, modal_lr={F*(L_mlr-1)}, interp={L_up-1} → {LC} samples ({ms:.3f} ms)")
+        return int(LC)
+
+    # Fallback: legacy path if encountered
     mb_layers = _find_layers(model, LearnedModalBank, name_prefix="realtime_pickreso_modal")
+    if mb_layers:
+        try:
+            L_modal = int(getattr(mb_layers[0], "length"))
+        except Exception:
+            L_modal = int(mb_layers[0].kernel.shape[0])
+        LC = lc_env + (L_modal - 1)
+        if verbose:
+            ms = 1000.0 * float(LC) / float(sr)
+            print(f"[pickreso-legacy] env={lc_env}, modal={L_modal-1} → {LC} samples ({ms:.3f} ms)")
+        return int(LC)
 
-    mb = mb_layers[0]
-    # length is a config property (available even if not built); kernel.shape[0] is also fine post-build
-    try:
-        L_modal = int(getattr(mb, "length"))
-    except Exception:
-        L_modal = int(mb.kernel.shape[0])
-
-    LC = (L_env - 1) + (L_modal - 1)
     if verbose:
-        ms = 1000.0 * float(LC) / float(sr)
-        print(f"[pickreso] env={L_env - 1}, modal={L_modal - 1} → {LC} samples ({ms:.3f} ms)")
-    return int(LC)
-
+        print("[pickreso] no recognizable branch; LC=0")
+    return 0
 
 def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
     """
