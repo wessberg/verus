@@ -377,6 +377,8 @@ REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 
+KNOB_DEFAULT_WET_PCT = 100.0
+
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
 COLOREQ_BANDS_REALTIME_BODY = [
@@ -450,6 +452,15 @@ STEMS_REALTIME_OUT_DIR = os.path.join(STEMS_OUT_DIR, "realtime")
 STEMS_FINETUNE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "finetune")
 STEMS_FINETUNE_OFFLINE_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "offline")
 STEMS_FINETUNE_REALTIME_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "realtime")
+
+def _default_dryness_value():
+    # Clamp to [0,1] and convert wet% -> dry fraction
+    try:
+        w = float(KNOB_DEFAULT_WET_PCT)
+    except Exception:
+        w = 100.0
+    w = max(0.0, min(100.0, w))
+    return float(1.0 - (w / 100.0))
 
 def hp_cutoff_for_sr(sr):
     sr = int(sr)
@@ -1205,7 +1216,20 @@ class DemoCallback(Callback):
         else:
             self.dynamic_model.set_weights(self.static_model.get_weights())
 
-        # Compute slicing in FILE sample-rate, not model sample-rate
+        # Determine kind from sample rate
+        if int(self.sample_rate) == int(OFFLINE_SAMPLE_RATE):
+            kind = "offline"
+        elif int(self.sample_rate) == int(REALTIME_SAMPLE_RATE):
+            kind = "realtime"
+        else:
+            kind = "realtime"
+
+        # Helper to filter a feed dict to the model’s actual input names
+        model_input_names = [t.name.split(':')[0].split('/')[-1] for t in self.dynamic_model.inputs]
+        def filter_feed(d):
+            return {k: v for k, v in d.items() if k in model_input_names}
+
+        # Compute slicing at file rate
         info_src = sf.info(self.src_path)
         file_sr = info_src.samplerate
         start_frames = int(round(self.offset_sec * file_sr))
@@ -1230,35 +1254,52 @@ class DemoCallback(Callback):
             x_mod = x_src
             y_mod = y_src
         x_demo = x_mod[None, :, None]
-        
-        # First predict the style using the dynamic model, not based on the true style flag, but on the classifier itself.
+
+        # Knobs
+        knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=False)
+
+        # Predicted-style pass
         dummy_style = np.zeros((1, 1), dtype=np.float32)
         force_zero  = np.zeros((1, 1), dtype=np.float32)
-        y_inf_style_pred, style_pred_out = self.dynamic_model.predict([x_demo, dummy_style, force_zero], batch_size=1, verbose=0)
+        base_feed = {
+            f"{kind}_piezo_input": x_demo,
+            f"{kind}_style_true_input": dummy_style,
+            f"{kind}_style_force_input": force_zero,
+        }
+        base_feed.update(knob_feeds)
+        feed = filter_feed(base_feed)
+
+        y_inf_style_pred, style_pred_out = self.dynamic_model.predict(feed, batch_size=1, verbose=0)
         y_inf_style_pred = y_inf_style_pred[0, :, 0]
         style_pred = float(style_pred_out[0, 0])
         style_pred_name = 'pick' if style_pred > STYLE_FLAG_PROB_THRESHOLD else 'finger'
 
-        # If true style known, also infer with true style flag
+        # True-style pass if known
         if self.style_true_flag is not None:
             style_true = np.array([[self.style_true_flag]], dtype=np.float32)
             force_one  = np.ones((1, 1), dtype=np.float32)
-            y_inf_style_true, _ = self.dynamic_model.predict([x_demo, style_true, force_one], batch_size=1, verbose=0)
+            tf_feed = {
+                f"{kind}_piezo_input": x_demo,
+                f"{kind}_style_true_input": style_true,
+                f"{kind}_style_force_input": force_one,
+            }
+            tf_feed.update(knob_feeds)
+            feed_true = filter_feed(tf_feed)
+            y_inf_style_true, _ = self.dynamic_model.predict(feed_true, batch_size=1, verbose=0)
             y_inf_style_true = y_inf_style_true[0, :, 0]
             style_true_name = 'pick' if self.style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
         else:
             y_inf_style_true = None
             style_true_name = None
-        
+
         epoch_dir = os.path.join(self.demos_out_dir, f"epoch_{epoch+1:03d}")
         os.makedirs(epoch_dir, exist_ok=True)
         sf.write(os.path.join(epoch_dir,"demo_source.wav"), x_mod, self.sample_rate, subtype='FLOAT')
         sf.write(os.path.join(epoch_dir,"demo_target.wav"), y_mod, self.sample_rate, subtype='FLOAT')
-        
         sf.write(os.path.join(epoch_dir,"demo_pred_style_pred.wav"),   y_inf_style_pred, self.sample_rate, subtype='FLOAT')
         if y_inf_style_true is not None:
             sf.write(os.path.join(epoch_dir,"demo_pred_style_true.wav"), y_inf_style_true, self.sample_rate, subtype='FLOAT')
-        
+
         print(f"[DemoCallback] epoch {epoch+1}: predicted style={style_pred_name}, true style={style_true_name}, written to {epoch_dir}")
 
         
@@ -3131,21 +3172,19 @@ def _resolve_demo_knobs(kind, use_finetuned=False):
 
 def _prepare_knob_feeds(kind, use_finetuned=False):
     pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind, use_finetuned=use_finetuned)
+    dry_frac = _default_dryness_value()
 
     feeds = {}
     if kind == "realtime":
-        # Realtime knobs
         feeds["realtime_knob_pickattack"] = np.array([[pa_lin]], dtype=np.float32)
         feeds["realtime_knob_pickreso"]   = np.array([[pr_lin]], dtype=np.float32)
         feeds["realtime_knob_ir"]         = np.array([[ir_lin]], dtype=np.float32)
-
+        feeds["realtime_knob_drywet"]     = np.array([[dry_frac]], dtype=np.float32)
     elif kind == "offline":
-        # Offline knobs
         feeds["offline_knob_pickattack"]  = np.array([[pa_lin]], dtype=np.float32)
         feeds["offline_knob_pickreso"]    = np.array([[pr_lin]], dtype=np.float32)
-
+        feeds["offline_knob_drywet"]      = np.array([[dry_frac]], dtype=np.float32)
     return feeds
-
 
 @register_keras_serializable()
 def gate_gain_signal(
@@ -3465,6 +3504,7 @@ def build_offline_model(dynamic_time=False,
     
     knob_pa_in = Input(shape=(1,), name="offline_knob_pickattack")  # linear gain
     knob_pr_in = Input(shape=(1,), name="offline_knob_pickreso")    # linear gain
+    knob_dw_in = Input(shape=(1,), name="offline_knob_drywet")
 
     # Multiply knobs post-limit/post-HPF so user gain doesn't re-open headroom or subsonics.
     pickattack = apply_runtime_gain(pickattack, knob_pa_in, name="offline_pickattack_user_gain")
@@ -3480,7 +3520,14 @@ def build_offline_model(dynamic_time=False,
     out = add_coloreq(out_prehp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
                       name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
 
-    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in], outputs=[out, style_prob], name=name)
+    # dry/wet mixer (dry = piezo input)
+    wet_gain   = Lambda(invert, name="offline_wet_from_drywet")(knob_dw_in)           # (B,1)
+    wet_scaled = apply_runtime_gain(out,    wet_gain,       name="offline_wet_gain")  # (B,T,1)
+    dry_scaled = apply_runtime_gain(inp,    knob_dw_in,     name="offline_dry_gain")  # (B,T,1)
+    out = Add(name="offline_drywet_mix")([wet_scaled, dry_scaled])
+
+
+    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_dw_in], outputs=[out, style_prob], name=name)
 
 @register_keras_serializable()
 def build_realtime_model(offline=None,
@@ -3500,6 +3547,7 @@ def build_realtime_model(offline=None,
     knob_pa_in = Input(shape=(1,), name="realtime_knob_pickattack")  # linear gain
     knob_pr_in = Input(shape=(1,), name="realtime_knob_pickreso")    # linear gain
     knob_ir_in = Input(shape=(1,), name="realtime_knob_ir")          # linear gain
+    knob_dw_in = Input(shape=(1,), name="realtime_knob_drywet")
 
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
@@ -3619,13 +3667,18 @@ def build_realtime_model(offline=None,
     y_prehp = LossTether(name="realtime_pick_lowband_penalties")([y_prehp, pa_pen, pr_pen])
 
     # Color EQ last
-    y_final = add_coloreq(y_prehp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
+    y_wet = add_coloreq(y_prehp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                           name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
+    
+    wet_gain   = Lambda(invert, name="realtime_wet_from_drywet")(knob_dw_in)
+    wet_scaled = apply_runtime_gain(y_wet,  wet_gain,    name="realtime_wet_gain")
+    dry_scaled = apply_runtime_gain(inp,    knob_dw_in,  name="realtime_dry_gain")
+    y_final    = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
-    inputs_list += [knob_pa_in, knob_pr_in, knob_ir_in]
+    inputs_list += [knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in]
     return tf.keras.models.Model(inputs=inputs_list, outputs=[y_final, style_prob], name=name)
 
 
@@ -3644,44 +3697,6 @@ def approx_steps_from_chunks(chunks, seg_len, model_sample_rate, batch_size):
     return 10 if DEBUG else max(total_windows // batch_size, 1)
 
 # ────────────────────────────── TRAINING ─────────────────────────────────────
-
-@register_keras_serializable()
-def add_sw_offline(x, y):
-    y_audio, style_flag = y
-    b = tf.shape(x)[0]; T = tf.shape(x)[1]
-    style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    # 50% chance to force truth
-    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
-    style_force = force_mask  # 1 or 0
-    inputs = {
-    'offline_piezo_input': x,
-    'offline_style_true_input': style_true,
-    'offline_style_force_input': style_force,
-    }
-    outputs = (y_audio, style_true)
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
-    sw_style = tf.ones_like(style_true, dtype=tf.float32)
-    return inputs, outputs, (sw_audio, sw_style)
-
-@register_keras_serializable()
-def add_sw_realtime(x, y):
-    y_audio, style_flag = y
-    b = tf.shape(x)[0]; T = tf.shape(x)[1]
-    style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
-    
-    # 50% chance to force truth
-    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
-    style_force = force_mask  # 1 or 0
-    
-    inputs = {
-    'realtime_piezo_input': x,
-    'realtime_style_true_input': style_true,
-    'realtime_style_force_input': style_force,
-    }
-    outputs = (y_audio, style_true)
-    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
-    sw_style = tf.ones_like(style_true, dtype=tf.float32)
-    return inputs, outputs, (sw_audio, sw_style)
 
 @register_keras_serializable()
 def add_shared_random_gain_offline(db_lo=-24.0, db_hi=+12.0):
@@ -3729,97 +3744,129 @@ def add_shared_random_gain_dual(db_lo=-24.0, db_hi=+12.0):
     return _map
 
 @register_keras_serializable()
-def add_sw_realtime_dual_nf(x, y):
-    """
-    Finetune (no style labels) for realtime model with an offline teacher.
-    x = (x_realtime_48k, x_offline_96k)
-    y = (y_audio_realtime_48k, style_flag_unused)
+def add_sw_offline(x, y):
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    style_true  = tf.expand_dims(style_flag, axis=-1)
+    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
+    style_force = force_mask
 
-    - Forces the model to use its own classifier (style_force=0).
-    - Disables the style BCE by providing zero sample-weights for the style output.
-    """
+    # Default knob values for training: PA/PR unity; dry = default dryness
+    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
+    inputs = {
+        'offline_piezo_input': x,
+        'offline_style_true_input': style_true,
+        'offline_style_force_input': style_force,
+        'offline_knob_pickattack': tf.ones((b,1), tf.float32),
+        'offline_knob_pickreso':   tf.ones((b,1), tf.float32),
+        'offline_knob_drywet':     tf.ones((b,1), tf.float32) * dry_default,
+    }
+    outputs = (y_audio, style_true)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+
+@register_keras_serializable()
+def add_sw_realtime(x, y):
+    y_audio, style_flag = y
+    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    style_true  = tf.expand_dims(style_flag, axis=-1)
+
+    force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
+    style_force = force_mask
+
+    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
+    inputs = {
+        'realtime_piezo_input': x,
+        'realtime_style_true_input': style_true,
+        'realtime_style_force_input': style_force,
+        'realtime_knob_pickattack': tf.ones((b,1), tf.float32),
+        'realtime_knob_pickreso':   tf.ones((b,1), tf.float32),
+        'realtime_knob_ir':         tf.ones((b,1), tf.float32),
+        'realtime_knob_drywet':     tf.ones((b,1), tf.float32) * dry_default,
+    }
+    outputs = (y_audio, style_true)
+    sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
+    sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
+
+
+@register_keras_serializable()
+def add_sw_realtime_dual_nf(x, y):
     x_realtime, x_offline = x
     y_audio, _ = y
     b = tf.shape(x_realtime)[0]
     T_realtime = tf.shape(x_realtime)[1]
-
-    # Dummy style label (ignored)
     style_true  = tf.zeros((b, 1), dtype=tf.float32)
-    # Force the model to use its own classifier during finetune
-    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 = use prediction
+    style_force = tf.zeros((b, 1), dtype=tf.float32)
 
+    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
     inputs = {
         'realtime_piezo_input':         x_realtime,
         'realtime_offline_piezo_input': x_offline,
         'realtime_style_true_input':    style_true,
         'realtime_style_force_input':   style_force,
+        'realtime_knob_pickattack':     tf.ones((b,1), tf.float32),
+        'realtime_knob_pickreso':       tf.ones((b,1), tf.float32),
+        'realtime_knob_ir':             tf.ones((b,1), tf.float32),
+        'realtime_knob_drywet':         tf.ones((b,1), tf.float32) * dry_default,
     }
     outputs = (y_audio, style_true)
-
-    # Sample weights: train audio only, disable style BCE
     sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
     sw_style = tf.zeros_like(style_true, dtype=tf.float32)
-
     return inputs, outputs, (sw_audio, sw_style)
+
 
 @register_keras_serializable()
 def add_sw_realtime_dual(x, y):
-    """
-    x = (x_realtime, x_offline96k)
-    y = (y_audio_realtime, style_flag)
-    Produces a dict of model inputs with both realtime and offline inputs for distillation.
-    Returns sample_weights as a tuple matching the model's output order for maximum compatibility.
-
-    Note: style_force is randomized (50%) so the network sometimes uses the predicted path
-    (where the teacher-student blended style is applied) during training.
-    """
     x_realtime, x_offline = x
     y_audio, style_flag = y
     b = tf.shape(x_realtime)[0]; T_realtime = tf.shape(x_realtime)[1]
-    style_true  = tf.expand_dims(style_flag, axis=-1)          # (B,1)
+    style_true  = tf.expand_dims(style_flag, axis=-1)
 
-    # 50% chance to force ground-truth style vs. predicted (blended) style
     force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
-    style_force = force_mask  # 1 or 0
+    style_force = force_mask
 
+    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
     inputs = {
         'realtime_piezo_input':         x_realtime,
         'realtime_offline_piezo_input': x_offline,
         'realtime_style_true_input':    style_true,
         'realtime_style_force_input':   style_force,
+        'realtime_knob_pickattack':     tf.ones((b,1), tf.float32),
+        'realtime_knob_pickreso':       tf.ones((b,1), tf.float32),
+        'realtime_knob_ir':             tf.ones((b,1), tf.float32),
+        'realtime_knob_drywet':         tf.ones((b,1), tf.float32) * dry_default,
     }
     outputs = (y_audio, style_true)
-
     sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
+    return inputs, outputs, (sw_audio, sw_style)
 
-    sample_weights = (sw_audio, sw_style)
-    return inputs, outputs, sample_weights
 
 @register_keras_serializable()
 def add_sw_offline_finetune_nf(x, y):
-    # y = (y_audio, style_flag) but finetune uses no true style labels
     y_audio, _ = y
     b = tf.shape(x)[0]
     T = tf.shape(x)[1]
 
-    # Dummy style label for the style head (B,1)
     style_true  = tf.zeros((b, 1), dtype=tf.float32)
-    # Force the model to use its own classifier during finetune
-    style_force = tf.zeros((b, 1), dtype=tf.float32)  # 0 = use prediction
+    style_force = tf.zeros((b, 1), dtype=tf.float32)
 
+    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
     inputs = {
         'offline_piezo_input':        x,
         'offline_style_true_input':   style_true,
         'offline_style_force_input':  style_force,
+        'offline_knob_pickattack':    tf.ones((b,1), tf.float32),
+        'offline_knob_pickreso':      tf.ones((b,1), tf.float32),
+        'offline_knob_drywet':        tf.ones((b,1), tf.float32) * dry_default,
     }
 
     outputs = (y_audio, style_true)
-
-    # Sample weights: train audio only, disable style BCE
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.zeros_like(style_true, dtype=tf.float32)
-
     return inputs, outputs, (sw_audio, sw_style)
 
 def fine_tune(offline=True, realtime=True):
@@ -4092,12 +4139,14 @@ def build_offline_debug_model(model):
             outs[name] = model.get_layer(lname).output
         except Exception:
             pass
-    # Full mix before coloreq (already includes post-knob stems)
-    add("y_pred",       "offline_with_picklearn_prehp")
+    # Full mix AFTER dry/wet so stems 'full' respects knob
+    add("y_pred",       "offline_drywet_mix")  # fallback will be added below if missing
+    if "y_pred" not in outs:
+        add("y_pred",   "offline_with_picklearn_prehp")
+
     add("main_core",    "offline_main_core")
     add("main_pick",    "offline_pick_contrib")
     add("main_finger",  "offline_finger_contrib")
-    # Post-knob stems
     add("pickreso",     "offline_pickreso_user_gain_mul")
     add("pickattack",   "offline_pickattack_user_gain_mul")
     add("style_pred",   "offline_style_prob")
@@ -4113,12 +4162,14 @@ def build_realtime_debug_model(model):
             outs[name] = model.get_layer(lname).output
         except Exception:
             pass
-    # Full mix before coloreq (already includes post-knob stems)
-    add("y_pred",       "realtime_with_picklearn_prehp")
+    # Full mix AFTER dry/wet so stems 'full' respects knob
+    add("y_pred",       "realtime_drywet_mix")
+    if "y_pred" not in outs:
+        add("y_pred",   "realtime_with_picklearn_prehp")
+
     add("main_core",    "realtime_main")
     add("main_pick",    "realtime_pick_contrib")
     add("main_finger",  "realtime_finger_contrib")
-    # Post-knob stems
     add("ir_only",      "realtime_ir_user_gain_mul")
     add("pickreso",     "realtime_pickreso_user_gain_mul")
     add("pickattack",   "realtime_pickattack_user_gain_mul")
