@@ -93,12 +93,10 @@ CONSTRAINTS
 - The realtime model must be fully causal, with no look-ahead, and ultra low-latency.
 """
 
-import os, glob, random, shutil, sys, re, math, time, threading, json
-
+import os, glob, random, shutil, sys, re, math, zipfile
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
-from typing import Dict, Any, Tuple
 from scipy.signal import minimum_phase, firwin, resample_poly
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.utils import register_keras_serializable # pyright: ignore[reportMissingImports]
@@ -453,11 +451,6 @@ STEMS_FINETUNE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "finetune")
 STEMS_FINETUNE_OFFLINE_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "offline")
 STEMS_FINETUNE_REALTIME_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "realtime")
 
-TFLITE_OUT_DIR = os.path.join(OUT_DIR, "tflite")
-TFLITE_REALTIME_OUT_DIR = os.path.join(TFLITE_OUT_DIR, "realtime")
-TFLITE_OFFLINE_OUT_DIR = os.path.join(TFLITE_OUT_DIR, "offline")
-TFLITE_CALIBRATION_PACK_DIR = os.path.join(TFLITE_OUT_DIR, "calibration_packs")
-
 def hp_cutoff_for_sr(sr):
     sr = int(sr)
     if sr == OFFLINE_SAMPLE_RATE:
@@ -473,8 +466,7 @@ for dir_path in [
     DEMO_CHECKPOINTS_REALTIME_OUT_DIR, LONG_DEMOS_OFFLINE_OUT_DIR, LONG_DEMOS_REALTIME_OUT_DIR,
     FINETUNE_DEMOS_OUT_DIR, MODELS_OFFLINE_OUT_DIR, MODELS_REALTIME_OUT_DIR,
     STEMS_OFFLINE_OUT_DIR, STEMS_REALTIME_OUT_DIR,
-    STEMS_FINETUNE_OFFLINE_OUT_DIR, STEMS_FINETUNE_REALTIME_OUT_DIR,
-    TFLITE_OUT_DIR, TFLITE_REALTIME_OUT_DIR, TFLITE_OFFLINE_OUT_DIR, TFLITE_CALIBRATION_PACK_DIR
+    STEMS_FINETUNE_OFFLINE_OUT_DIR, STEMS_FINETUNE_REALTIME_OUT_DIR
 ]:
     os.makedirs(dir_path, exist_ok=True)
 
@@ -635,6 +627,7 @@ def _extract_trained_modal_kernel_rt(old_model, legacy_name="realtime_pickreso_m
     except Exception:
         pass
     return None
+
 
 @register_keras_serializable()
 class PickResoDownsampleFIR(Layer):
@@ -4987,833 +4980,6 @@ def _metrics_for_core(outs_dict, y_target_core=None):
 
     return m
 
-
-# ────────────────────────────── Model selection/wrapping ─────────────────────
-
-def _select_static_model_path_for_tflite(kind: str, use_finetuned: bool=False) -> str:
-    """
-    Select the STATIC model file to use as the weight source.
-    For realtime we prefer the self-contained static export (no teacher input).
-    """
-    if kind == "offline":
-        p_ft = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
-        p_bl = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
-        if use_finetuned and os.path.exists(p_ft): return p_ft
-        if os.path.exists(p_bl): return p_bl
-        return None
-    elif kind == "realtime":
-        p_ft_self = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-        p_ft      = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-        p_bl_self = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-        p_bl      = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
-        if use_finetuned:
-            if os.path.exists(p_ft_self): return p_ft_self
-            if os.path.exists(p_ft):      return p_ft
-        if os.path.exists(p_bl_self): return p_bl_self
-        if os.path.exists(p_bl):      return p_bl
-        return None
-    else:
-        raise ValueError("kind must be 'offline' or 'realtime'")
-
-def _build_dynamic_inference_model(kind: str) -> tf.keras.Model:
-    """
-    Build the dynamic-time inference graph for the given kind, teacherless for realtime.
-    """
-    if kind == "offline":
-        return build_offline_model(dynamic_time=True, coloreq_trainable=False)
-    elif kind == "realtime":
-        return build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
-    else:
-        raise ValueError("kind must be 'offline' or 'realtime'")
-
-def _slice_center_tensor(tensor, start: int, length: int):
-    def _fn(x):
-        return x[:, start:start+length, :]
-    return Lambda(_fn, name=f"slice_center_{start}_{length}")(tensor)
-
-def _make_serving_model_from_static(kind: str, use_finetuned: bool, T_core: int):
-    """
-    Build a fixed-length Keras model for serving and TFLite conversion:
-    - Loads the STATIC model as weight source
-    - Builds the dynamic-time teacherless graph for inference
-    - Copies weights by name
-    - Computes (left_ctx, right_ctx) and creates Inputs with T_total = left + T_core + right
-    - Crops audio output to exactly T_core to enable streaming-friendly usage
-    Returns: (serve_model, sample_rate, left_ctx, right_ctx, T_total, static_path)
-    """
-    static_path = _select_static_model_path_for_tflite(kind, use_finetuned=use_finetuned)
-    if static_path is None or not os.path.exists(static_path):
-        raise FileNotFoundError(f"No STATIC {kind} model found for {'finetuned' if use_finetuned else 'baseline'}.")
-
-    dyn = _build_dynamic_inference_model(kind)
-    src = tf.keras.models.load_model(static_path, compile=False)
-    copy_weights_by_name(dyn, src, verbose=True)
-
-    sample_rate = OFFLINE_SAMPLE_RATE if kind == "offline" else REALTIME_SAMPLE_RATE
-    left_ctx, right_ctx = _get_model_context_for_streaming(sample_rate, model=dyn)
-    T_total = int(left_ctx + int(T_core) + right_ctx)
-    if T_total <= 0:
-        raise ValueError("Computed non-positive T_total. Check context calculations.")
-
-    # Build serving inputs with the expected names and fixed shapes
-    if kind == "offline":
-        inp_audio  = Input(shape=(T_total, 1), name="offline_piezo_input", dtype=tf.float32)
-        in_style_t = Input(shape=(1,),       name="offline_style_true_input",  dtype=tf.float32)
-        in_style_f = Input(shape=(1,),       name="offline_style_force_input", dtype=tf.float32)
-        in_knob_pa = Input(shape=(1,),       name="offline_knob_pickattack",   dtype=tf.float32)
-        in_knob_pr = Input(shape=(1,),       name="offline_knob_pickreso",     dtype=tf.float32)
-        y_full, p  = dyn([inp_audio, in_style_t, in_style_f, in_knob_pa, in_knob_pr])
-        y_core = _slice_center_tensor(y_full, start=left_ctx, length=int(T_core))
-        serve  = tf.keras.Model(inputs=[inp_audio, in_style_t, in_style_f, in_knob_pa, in_knob_pr],
-                                outputs=[y_core, p], name=f"{kind}_serve_t{int(T_core)}")
-    else:
-        inp_audio  = Input(shape=(T_total, 1), name="realtime_piezo_input", dtype=tf.float32)
-        in_style_t = Input(shape=(1,),         name="realtime_style_true_input",  dtype=tf.float32)
-        in_style_f = Input(shape=(1,),         name="realtime_style_force_input", dtype=tf.float32)
-        in_knob_pa = Input(shape=(1,),         name="realtime_knob_pickattack",   dtype=tf.float32)
-        in_knob_pr = Input(shape=(1,),         name="realtime_knob_pickreso",     dtype=tf.float32)
-        in_knob_ir = Input(shape=(1,),         name="realtime_knob_ir",           dtype=tf.float32)
-        y_full, p  = dyn([inp_audio, in_style_t, in_style_f, in_knob_pa, in_knob_pr, in_knob_ir])
-        y_core = _slice_center_tensor(y_full, start=left_ctx, length=int(T_core))
-        serve  = tf.keras.Model(inputs=[inp_audio, in_style_t, in_style_f, in_knob_pa, in_knob_pr, in_knob_ir],
-                                outputs=[y_core, p], name=f"{kind}_serve_t{int(T_core)}")
-
-    return serve, sample_rate, int(left_ctx), int(right_ctx), int(T_total), static_path
-
-# ────────────────────────────── Progress + heartbeat ─────────────────────────
-
-def _now():
-    return time.strftime("%H:%M:%S")
-
-def _human_sec(s):
-    return f"{int(s)}s" if s < 120 else f"{s/60.0:.1f}m"
-
-def _heartbeat_thread(stop_event, progress: Dict[str, Any], label="convert", interval=5.0):
-    last_seen = -1
-    last_change = time.time()
-    while not stop_event.wait(interval):
-        seen = progress.get("seen", 0)
-        phase = progress.get("phase", label)
-        if seen != last_seen:
-            last_seen = seen
-            last_change = time.time()
-        idle = time.time() - last_change
-        print(f"[{_now()}] [TFLite] heartbeat: phase={phase} seen={seen} idle={_human_sec(idle)}", flush=True)
-
-# ────────────────────────────── Calibration packs ────────────────────────────
-
-_CALIB_MEM: Dict[str, Dict[str, np.ndarray]] = {}
-
-def _calib_key(kind: str, sample_rate: int, T_total: int, version: int = 1) -> str:
-    return f"{kind}_sr{int(sample_rate)}_T{int(T_total)}_v{version}"
-
-def _calib_pack_paths(kind: str, sample_rate: int, T_total: int, version: int = 1, pack_dir: str = TFLITE_CALIBRATION_PACK_DIR):
-    key = _calib_key(kind, sample_rate, T_total, version)
-    base = os.path.join(pack_dir, key)
-    return base + ".npz", base + ".meta.json"
-
-def _save_calib_pack(arrs: Dict[str, np.ndarray],
-                     meta: Dict[str, Any],
-                     kind: str, sample_rate: int, T_total: int,
-                     version: int = 1,
-                     pack_dir: str = TFLITE_CALIBRATION_PACK_DIR):
-    npz_path, meta_path = _calib_pack_paths(kind, sample_rate, T_total, version, pack_dir)
-    np.savez_compressed(npz_path, **arrs)
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-    print(f"[calib-pack] saved: {npz_path} and {meta_path}")
-
-def _load_calib_pack(kind: str, sample_rate: int, T_total: int,
-                     version: int = 1,
-                     pack_dir: str = TFLITE_CALIBRATION_PACK_DIR) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
-    npz_path, meta_path = _calib_pack_paths(kind, sample_rate, T_total, version, pack_dir)
-    if not (os.path.exists(npz_path) and os.path.exists(meta_path)):
-        raise FileNotFoundError("calib pack not found")
-    with np.load(npz_path) as z:
-        arrs = {k: z[k] for k in z.files}
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
-    return arrs, meta
-
-def _build_calib_arrays(kind: str,
-                        serve_model: tf.keras.Model,
-                        sample_rate: int,
-                        T_total: int,
-                        want_batches: int,
-                        max_seconds_audio: int = 180,
-                        tflite_debug: bool = False) -> Dict[str, np.ndarray]:
-    """
-    Build calibration arrays in memory for the given kind/SR/T_total.
-    Returns dict of arrays keyed by model input names:
-      - audio input: (B, T_total, 1)
-      - scalars (style/knobs): (B, 1)
-    """
-    t0 = time.time()
-    input_names = [t.name.split(':')[0].split('/')[-1] for t in serve_model.inputs]
-    B = int(want_batches)
-    # Pre-allocate arrays for each input name we expect
-    arrs: Dict[str, np.ndarray] = {}
-    audio_name = f"{kind}_piezo_input"
-    if audio_name not in input_names:
-        raise RuntimeError(f"Unexpected inputs for {kind}: {input_names}")
-
-    arrs[audio_name] = np.zeros((B, T_total, 1), dtype=np.float32)
-    st_true = f"{kind}_style_true_input"
-    st_force= f"{kind}_style_force_input"
-    arrs[st_true]  = np.zeros((B, 1), dtype=np.float32)
-    arrs[st_force] = np.zeros((B, 1), dtype=np.float32)
-    if kind == "offline":
-        arrs["offline_knob_pickattack"] = np.zeros((B, 1), dtype=np.float32)
-        arrs["offline_knob_pickreso"]   = np.zeros((B, 1), dtype=np.float32)
-        knob_vals = _prepare_knob_feeds(kind="offline", use_finetuned=False)
-    else:
-        arrs["realtime_knob_pickattack"] = np.zeros((B, 1), dtype=np.float32)
-        arrs["realtime_knob_pickreso"]   = np.zeros((B, 1), dtype=np.float32)
-        arrs["realtime_knob_ir"]         = np.zeros((B, 1), dtype=np.float32)
-        knob_vals = _prepare_knob_feeds(kind="realtime", use_finetuned=False)
-    for k, v in knob_vals.items():
-        if k in arrs:
-            arrs[k][:] = v.astype(np.float32)
-
-    # Gather audio (base dataset) up to max_seconds_audio
-    if tflite_debug:
-        print(f"[{_now()}] [calib-pack] building arrays kind={kind} sr={sample_rate} T_total={T_total} B={B}")
-    bufs = []
-    total_s = 0.0
-    for (src, _) in (all_pairs or []):
-        x2d, _ = sf.read(src, dtype='float32', always_2d=True)
-        sr_in = sf.info(src).samplerate
-        x = x2d[:, 0].astype(np.float32, copy=False)
-        if sr_in != sample_rate:
-            x = resample_to_model_sr(x, sr_in, sample_rate)
-        bufs.append(x)
-        total_s += len(x) / float(sample_rate)
-        if tflite_debug:
-            print(f"[{_now()}] [calib-pack] + {os.path.basename(src)} dur={len(x)/sample_rate:.2f}s cum={total_s:.2f}s")
-        if total_s >= float(max_seconds_audio):
-            break
-    if not bufs:
-        dur = max(1, int(sample_rate * min(30, max_seconds_audio)))
-        bufs = [np.random.randn(dur).astype(np.float32) * 0.02]
-        if tflite_debug:
-            print(f"[{_now()}] [calib-pack] using noise fallback dur={dur/sample_rate:.2f}s")
-
-    hop = max(1, T_total // 2)
-    bi = 0
-    for sig in bufs:
-        pos = 0
-        while (bi < B) and (pos < len(sig)):
-            end = min(pos + T_total, len(sig))
-            win = sig[pos:end]
-            if len(win) < T_total:
-                win = np.pad(win, (0, T_total - len(win)))
-            arrs[audio_name][bi, :, 0] = win.astype(np.float32, copy=False)
-            arrs[st_true][bi, 0]  = 1.0 if (random.random() < 0.5) else 0.0
-            arrs[st_force][bi, 0] = 0.0  # use predicted style by default
-            bi += 1
-            pos += hop
-            if (tflite_debug and (bi % 50 == 0)):
-                print(f"[{_now()}] [calib-pack] filled {bi}/{B}")
-        if bi >= B:
-            break
-
-    if tflite_debug:
-        print(f"[{_now()}] [calib-pack] done in {time.time()-t0:.2f}s, produced {bi}/{B}")
-
-    if bi < B:
-        for k in list(arrs.keys()):
-            arrs[k] = arrs[k][:bi]
-    return arrs
-
-def _ensure_calib_pack(kind: str,
-                       serve_model: tf.keras.Model,
-                       sample_rate: int,
-                       T_total: int,
-                       want_batches: int,
-                       max_seconds_audio: int = 180,
-                       pack_dir: str = TFLITE_CALIBRATION_PACK_DIR,
-                       save_pack: bool = True,
-                       use_pack: bool = True,
-                       tflite_debug: bool = False) -> Dict[str, np.ndarray]:
-    """
-    Returns a dict of arrays keyed by model input names.
-    If use_pack=True and a pack exists, loads and returns it.
-    Else builds from base dataset, optionally saves it, caches in process, and returns.
-    """
-    if not use_pack:
-        return _build_calib_arrays(kind, serve_model, sample_rate, T_total,
-                                   want_batches=want_batches, max_seconds_audio=max_seconds_audio,
-                                   tflite_debug=tflite_debug)
-
-    key = _calib_key(kind, sample_rate, T_total, version=1)
-    if key in _CALIB_MEM:
-        arrs = _CALIB_MEM[key]
-        if len(list(arrs.values())[0]) >= want_batches:
-            if tflite_debug:
-                print(f"[calib-pack] reusing in-process pack {key} (B={list(arrs.values())[0].shape[0]})")
-            return arrs
-
-    try:
-        arrs, meta = _load_calib_pack(kind, sample_rate, T_total, version=1, pack_dir=pack_dir)
-        if tflite_debug:
-            print(f"[calib-pack] loaded {meta.get('key','?')} B={meta.get('count','?')}")
-        _CALIB_MEM[key] = arrs
-        return arrs
-    except FileNotFoundError:
-        pass
-
-    arrs = _build_calib_arrays(kind, serve_model, sample_rate, T_total,
-                               want_batches=want_batches, max_seconds_audio=max_seconds_audio,
-                               tflite_debug=tflite_debug)
-    if save_pack:
-        meta = {
-            "key": key,
-            "kind": kind,
-            "sample_rate": int(sample_rate),
-            "T_total": int(T_total),
-            "count": int(list(arrs.values())[0].shape[0]),
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "version": 1
-        }
-        _save_calib_pack(arrs, meta, kind, sample_rate, T_total, version=1, pack_dir=pack_dir)
-    _CALIB_MEM[key] = arrs
-    return arrs
-
-def _rep_from_pack_arrays(arrs: Dict[str, np.ndarray],
-                          input_names: list,
-                          limit_batches: int = None,
-                          log_every: int = 50,
-                          progress: Dict[str, Any] = None):
-    """
-    Turn a saved pack into a representative dataset generator.
-    Yields a dict keyed by TFLite input tensor names so ordering can't break:
-      - "<base>": arr
-      - "<base>:0": arr
-      - "serving_default_<base>:0": arr
-    This ensures the calibrator can index by exact interpreter input_details[i]['name'].
-    """
-    B = list(arrs.values())[0].shape[0]
-    use_B = min(B, int(limit_batches) if limit_batches is not None else B)
-
-    def gen():
-        t0 = time.time()
-        for i in range(use_B):
-            if progress is not None:
-                progress["phase"] = "calibration"
-                progress["seen"] = i + 1
-            if (i % max(1, log_every)) == 0:
-                print(f"[{_now()}] [INT8] rep-pack: yielding {i}/{use_B}")
-            sample = {}
-            for base in input_names:
-                v = arrs[base][i:i+1]
-                # Provide multiple aliases to be robust across TF/TFLite naming
-                sample[base] = v
-                sample[f"{base}:0"] = v
-                sample[f"serving_default_{base}:0"] = v
-            yield sample
-        print(f"[{_now()}] [INT8] rep-pack: done ({use_B} samples, {time.time()-t0:.2f}s)")
-    return gen
-
-# ────────────────────────────── Converters with logs ─────────────────────────
-
-def _convert_to_tflite_fp32_with_logs(serve_model, label="fp32"):
-    t0 = time.time()
-    print(f"[{_now()}] [TFLite] FP32 convert start: {label}", flush=True)
-    conv = tf.lite.TFLiteConverter.from_keras_model(serve_model)
-    tfl = conv.convert()
-    print(f"[{_now()}] [TFLite] FP32 convert done in {_human_sec(time.time()-t0)}", flush=True)
-    return tfl
-
-def _convert_to_tflite_int8_with_logs(serve_model,
-                                      rep_factory_maker,  # <-- maker(progress) -> generator function
-                                      label="int8",
-                                      timeout_sec=None,
-                                      use_old_converter=None):
-    progress = {"seen": 0, "phase": "build-graph", "last_print": 0.0}
-    stop_evt = threading.Event()
-    hb = threading.Thread(target=_heartbeat_thread, args=(stop_evt, progress, label, 5.0), daemon=True)
-    hb.start()
-
-    def _do_convert(full_integer=True):
-        # Bind a generator factory that updates 'progress'
-        rep_factory = rep_factory_maker(progress)  # returns a callable that yields batches
-        progress["phase"] = "calibration"
-
-        conv = tf.lite.TFLiteConverter.from_keras_model(serve_model)
-        conv.optimizations = [tf.lite.Optimize.DEFAULT]
-        conv.representative_dataset = rep_factory
-        if use_old_converter is not None:
-            try:
-                conv._experimental_new_converter = (not use_old_converter)
-            except Exception:
-                pass
-        if full_integer:
-            conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-            conv.inference_input_type = tf.int8
-            conv.inference_output_type = tf.int8
-        else:
-            conv.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-        return conv
-
-    t0 = time.time()
-    try:
-        print(f"[{_now()}] [TFLite] INT8 convert start: {label} (full-integer attempt)", flush=True)
-        conv = _do_convert(full_integer=True)
-
-        tfl_bytes = [None]
-        err_box = [None]
-        def _runner():
-            try:
-                tfl_bytes[0] = conv.convert()
-            except Exception as e:
-                err_box[0] = e
-
-        th = threading.Thread(target=_runner, daemon=True)
-        th.start()
-        th.join(timeout=None if timeout_sec is None else float(timeout_sec))
-
-        if th.is_alive():
-            print(f"[{_now()}] [TFLite] INT8 convert timeout after {timeout_sec}s → fallback to float-IO INT8.", flush=True)
-            conv_fb = _do_convert(full_integer=False)
-            tfl_bytes = [conv_fb.convert()]
-        elif err_box[0] is not None:
-            print(f"[{_now()}] [TFLite] INT8 full-integer failed: {err_box[0]} → fallback to float-IO INT8.", flush=True)
-            conv_fb = _do_convert(full_integer=False)
-            tfl_bytes = [conv_fb.convert()]
-
-        print(f"[{_now()}] [TFLite] INT8 convert finished in {_human_sec(time.time()-t0)} (seen={progress.get('seen',0)})",
-              flush=True)
-        return tfl_bytes[0]
-    finally:
-        stop_evt.set()
-        hb.join(timeout=2.0)
-
-def _save_tflite_model(tflite_bytes, out_path: str):
-    with open(out_path, "wb") as f:
-        f.write(tflite_bytes)
-    print("💾 Saved", out_path)
-
-# ────────────────────────────── Export orchestrator ──────────────────────────
-
-def _export_one(kind: str, use_finetuned: bool, T_core: int,
-                do_fp32=True,
-                do_int8=True,
-                int8_batches=600,
-                rep_seconds=180,
-                timeout_sec=None,
-                tflite_debug=False,
-                use_calib_pack=True,
-                save_calib_pack=True,
-                calib_pack_dir=TFLITE_CALIBRATION_PACK_DIR):
-    """
-    Export both FP32 and INT8 tflite for one (kind, finetuned?) and T_core.
-    Uses calibration packs to avoid rescanning audio for each export.
-    """
-    serve, sr, lc, rc, T_total, src_path = _make_serving_model_from_static(kind, use_finetuned, T_core=T_core)
-
-    # Representative dataset from calib-pack
-    input_names = [t.name.split(':')[0].split('/')[-1] for t in serve.inputs]
-    arrs = _ensure_calib_pack(kind=kind,
-                              serve_model=serve,
-                              sample_rate=sr,
-                              T_total=T_total,
-                              want_batches=int8_batches,
-                              max_seconds_audio=int(rep_seconds),
-                              pack_dir=calib_pack_dir,
-                              save_pack=bool(save_calib_pack),
-                              use_pack=bool(use_calib_pack),
-                              tflite_debug=bool(tflite_debug))
-    
-    rep = _rep_from_pack_arrays(
-        arrs,
-        input_names=input_names,
-        limit_batches=int8_batches,
-        log_every=(1 if tflite_debug else 50)
-        )
-
-    which = "finetune" if use_finetuned else "baseline"
-    subdir = TFLITE_REALTIME_OUT_DIR if kind == "realtime" else TFLITE_OFFLINE_OUT_DIR
-    os.makedirs(subdir, exist_ok=True)
-    tag = f"{kind}_{which}_t{int(T_core)}"
-    base = os.path.join(subdir, tag)
-
-    if do_fp32:
-        fp32_tfl = _convert_to_tflite_fp32_with_logs(serve, label=f"{tag}")
-        _save_tflite_model(fp32_tfl, base + "_fp32.tflite")
-
-    if do_int8:
-        # Create a maker(progress) → generator function
-        rep_maker = lambda progress: _rep_from_pack_arrays(
-            arrs,
-            input_names=input_names,
-            limit_batches=int8_batches,
-            log_every=(1 if tflite_debug else 50),
-            progress=progress
-        )
-
-        int8_tfl = _convert_to_tflite_int8_with_logs(
-            serve_model=serve,
-            rep_factory_maker=rep_maker,
-            label=f"{tag}",
-            timeout_sec=timeout_sec,
-            use_old_converter=None
-        )
-        _save_tflite_model(int8_tfl, base + "_int8.tflite")
-
-    return {
-        "serve_model": serve,
-        "sample_rate": sr,
-        "left_ctx": lc,
-        "right_ctx": rc,
-        "T_total": T_total,
-        "static_src": src_path,
-        "paths": {
-            "fp32": base + "_fp32.tflite" if do_fp32 else None,
-            "int8": base + "_int8.tflite" if do_int8 else None
-        }
-    }
-
-def export_tflite_all(
-    do_offline=True,
-    do_realtime=True,
-    do_baseline=True,
-    do_finetune=True,
-    rt_T_list=(32, 64),
-    off_T_core=2048,
-    do_fp32=True,
-    do_int8=True,
-    int8_batches=600,
-    rep_seconds=180,
-    int8_timeout_sec=None,
-    tflite_debug=False,
-    use_calib_pack=True,
-    save_calib_pack=True,
-    calib_pack_dir=TFLITE_CALIBRATION_PACK_DIR
-):
-    """
-    High-level export orchestrator. Will skip missing models gracefully.
-    Returns a list of dicts with metadata and file paths.
-    """
-    results = []
-    def _run(kind, ft, T_core):
-        try:
-            res = _export_one(kind, use_finetuned=ft, T_core=int(T_core),
-                              do_fp32=do_fp32, do_int8=do_int8,
-                              int8_batches=int(int8_batches),
-                              rep_seconds=int(rep_seconds),
-                              timeout_sec=int8_timeout_sec,
-                              tflite_debug=tflite_debug,
-                              use_calib_pack=use_calib_pack,
-                              save_calib_pack=save_calib_pack,
-                              calib_pack_dir=calib_pack_dir)
-            results.append(res)
-        except FileNotFoundError as e:
-            print(f"[{kind}] {e}", flush=True)
-
-    if do_offline:
-        for ft in [False, True]:
-            if (ft and not do_finetune) or ((not ft) and not do_baseline):
-                continue
-            _run("offline", ft, off_T_core)
-
-    if do_realtime:
-        for ft in [False, True]:
-            if (ft and not do_finetune) or ((not ft) and not do_baseline):
-                continue
-            for T_core in rt_T_list:
-                _run("realtime", ft, T_core)
-
-    if not results:
-        print("Nothing exported (no matching STATIC models found).")
-    else:
-        print("✅ TFLite export complete.")
-    return results
-
-def make_calibration_packs(
-    do_offline=True,
-    do_realtime=True,
-    do_baseline=True,
-    do_finetune=True,
-    rt_T_list=(32, 64),
-    off_T_core=2048,
-    int8_batches=600,
-    rep_seconds=180,
-    tflite_debug=False,
-    calib_pack_dir=TFLITE_CALIBRATION_PACK_DIR
-):
-    """
-    Precompute and save calibration packs only (no conversion).
-    """
-    def _prep(kind, T_core, use_ft):
-        serve, sr, lc, rc, T_total, _ = _make_serving_model_from_static(kind, use_ft, T_core=T_core)
-        arrs = _ensure_calib_pack(kind=kind,
-                                  serve_model=serve,
-                                  sample_rate=sr,
-                                  T_total=T_total,
-                                  want_batches=int(int8_batches),
-                                  max_seconds_audio=int(rep_seconds),
-                                  pack_dir=calib_pack_dir,
-                                  save_pack=True,
-                                  use_pack=True,
-                                  tflite_debug=tflite_debug)
-        key = _calib_key(kind, sr, T_total, 1)
-        print(f"[calib-pack] ready → {key} (B={list(arrs.values())[0].shape[0]})")
-
-    if do_offline:
-        for ft in [False, True]:
-            if (ft and not do_finetune) or ((not ft) and not do_baseline):
-                continue
-            _prep("offline", int(off_T_core), ft)
-    if do_realtime:
-        for ft in [False, True]:
-            if (ft and not do_finetune) or ((not ft) and not do_baseline):
-                continue
-            for T_core in rt_T_list:
-                _prep("realtime", int(T_core), ft)
-
-# ────────────────────────────── TFLite demo renderers ────────────────────────
-
-def _interp_set_input(interpreter, name2arr: Dict[str, np.ndarray]):
-    """
-    Set interpreter inputs by matching the base name (no ':0') of each tensor.
-    Performs quantization if model expects int8.
-    """
-    inps = interpreter.get_input_details()
-    for d in inps:
-        tname = d['name'].split(':')[0].split('/')[-1]
-        key = tname if tname in name2arr else d['name']
-        if key not in name2arr:
-            raise KeyError(f"Missing input for TFLite tensor: {d['name']} (base={tname}). Have keys={list(name2arr.keys())}")
-        x = name2arr[key]
-        if d['dtype'] == np.int8:
-            scale, zp = d['quantization']
-            if scale is None or scale == 0.0:
-                scale = 1.0
-            x_q = np.round(x / scale + zp).astype(np.int8)
-            interpreter.set_tensor(d['index'], x_q)
-        else:
-            interpreter.set_tensor(d['index'], x.astype(d['dtype'], copy=False))
-
-def _interp_get_outputs(interpreter):
-    """
-    Return a list of outputs (as float32). Dequantizes if needed.
-    Expecting [y_core, style_prob].
-    """
-    outs = []
-    for d in interpreter.get_output_details():
-        y = interpreter.get_tensor(d['index'])
-        if d['dtype'] == np.int8:
-            scale, zp = d['quantization']
-            if scale is None or scale == 0.0:
-                scale = 1.0
-            y = scale * (y.astype(np.float32) - float(zp))
-        else:
-            y = y.astype(np.float32)
-        outs.append(y)
-    return outs
-
-def _render_demo_tflite_one(
-    tflite_path: str,
-    kind: str,
-    sample_rate: int,
-    out_dir: str,
-    T_core: int=None,
-    style_true_flag: float=None,
-    src_path: str=None,
-    tgt_path: str=None,
-    offset_sec: float=LONG_DEMO_OFFSET_SEC,
-    sec: float=LONG_DEMO_SEC
-):
-    """
-    Streaming-like render for one TFLite model.
-    We rebuild the serving wrapper to query left/right context and T_total.
-    The TFLite graph outputs the core T samples already; we slide by T_core.
-    """
-    # Infer T_core from filename if not provided
-    if T_core is None:
-        m = re.search(r"_t(\d+)_", os.path.basename(tflite_path))
-        T_core = int(m.group(1)) if m else (32 if kind == "realtime" else 2048)
-
-    os.makedirs(out_dir, exist_ok=True)
-    knob_feeds = _prepare_knob_feeds(kind, use_finetuned=("finetune" in tflite_path))
-
-    # Data sources
-    if (src_path is None) or (tgt_path is None):
-        if not all_pairs:
-            raise RuntimeError("No dataset pairs available to render demo.")
-        src_path, tgt_path = all_pairs[DEMO_PAIR_INDEX]
-
-    info = sf.info(src_path)
-    file_sr = info.samplerate
-    start_f = int(round(offset_sec * file_sr))
-    tot_f   = int(round(sec * file_sr))
-
-    x2d, _ = sf.read(src_path, start=start_f, frames=tot_f, dtype='float32', always_2d=True)
-    y2d, _ = sf.read(tgt_path, start=start_f, frames=tot_f, dtype='float32', always_2d=True)
-    x_file = x2d[:,0]; y_file = y2d[:,0]
-
-    x = resample_to_model_sr(x_file, file_sr, sample_rate) if file_sr != sample_rate else x_file
-    y = resample_to_model_sr(y_file, file_sr, sample_rate) if file_sr != sample_rate else y_file
-
-    # Rebuild serving wrapper to get T_total (left+core+right) precisely
-    serve, _, left_ctx, right_ctx, T_total, _ = _make_serving_model_from_static(kind, use_finetuned=("finetune" in tflite_path), T_core=int(T_core))
-    del serve  # not used further; just to query contexts
-
-    interpreter = tf.lite.Interpreter(model_path=tflite_path, num_threads=max(1, os.cpu_count()//2))
-    interpreter.allocate_tensors()
-
-    stem = os.path.splitext(os.path.basename(tflite_path))[0]
-    out_pred = os.path.join(out_dir, f"{stem}_pred.wav")
-    out_true = os.path.join(out_dir, f"{stem}_pred_trueStyle.wav")
-    out_src  = os.path.join(out_dir, f"{stem}_source.wav")
-    out_tgt  = os.path.join(out_dir, f"{stem}_target.wav")
-
-    w_pred = sf.SoundFile(out_pred, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    w_true = None
-    if style_true_flag is not None:
-        w_true = sf.SoundFile(out_true, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    ws = sf.SoundFile(out_src, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-    wt = sf.SoundFile(out_tgt, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
-
-    pos = 0
-    prob_sum = 0.0
-    prob_cnt = 0
-    N = len(x)
-    while pos < N:
-        core_start = pos
-        core_end   = min(pos + T_core, N)
-        core_len   = core_end - core_start
-        if core_len <= 0:
-            break
-
-        # Build read window of T_total length such that core aligns after left_ctx
-        win_start = max(0, core_start - left_ctx)
-        if win_start + T_total > N:
-            win_start = max(0, N - T_total)
-        win_end = min(win_start + T_total, N)
-        x_win = x[win_start:win_end]
-        if len(x_win) < T_total:
-            x_win = np.pad(x_win, (0, T_total - len(x_win)))
-
-        if kind == "offline":
-            feed = {
-                "offline_piezo_input": x_win[None,:,None].astype(np.float32),
-                "offline_style_true_input": np.array([[0.0]], dtype=np.float32),
-                "offline_style_force_input": np.array([[0.0]], dtype=np.float32),
-                "offline_knob_pickattack": knob_feeds["offline_knob_pickattack"],
-                "offline_knob_pickreso":   knob_feeds["offline_knob_pickreso"],
-            }
-            feed_true = None
-            if style_true_flag is not None:
-                feed_true = {
-                    "offline_piezo_input": x_win[None,:,None].astype(np.float32),
-                    "offline_style_true_input": np.array([[float(style_true_flag)]], dtype=np.float32),
-                    "offline_style_force_input": np.array([[1.0]], dtype=np.float32),
-                    "offline_knob_pickattack": knob_feeds["offline_knob_pickattack"],
-                    "offline_knob_pickreso":   knob_feeds["offline_knob_pickreso"],
-                }
-        else:
-            feed = {
-                "realtime_piezo_input": x_win[None,:,None].astype(np.float32),
-                "realtime_style_true_input": np.array([[0.0]], dtype=np.float32),
-                "realtime_style_force_input": np.array([[0.0]], dtype=np.float32),
-                "realtime_knob_pickattack": knob_feeds["realtime_knob_pickattack"],
-                "realtime_knob_pickreso":   knob_feeds["realtime_knob_pickreso"],
-                "realtime_knob_ir":         knob_feeds["realtime_knob_ir"],
-            }
-            feed_true = None
-            if style_true_flag is not None:
-                feed_true = {
-                    "realtime_piezo_input": x_win[None,:,None].astype(np.float32),
-                    "realtime_style_true_input": np.array([[float(style_true_flag)]], dtype=np.float32),
-                    "realtime_style_force_input": np.array([[1.0]], dtype=np.float32),
-                    "realtime_knob_pickattack": knob_feeds["realtime_knob_pickattack"],
-                    "realtime_knob_pickreso":   knob_feeds["realtime_knob_pickreso"],
-                    "realtime_knob_ir":         knob_feeds["realtime_knob_ir"],
-                }
-
-        _interp_set_input(interpreter, feed)
-        interpreter.invoke()
-        y_pred, p_out = _interp_get_outputs(interpreter)
-        y_core_pred = y_pred[0, :core_len, 0]
-        w_pred.write(y_core_pred)
-        prob_sum += float(p_out[0,0]) * float(core_len)
-        prob_cnt += core_len
-
-        if feed_true is not None:
-            _interp_set_input(interpreter, feed_true)
-            interpreter.invoke()
-            y_truepass, _ = _interp_get_outputs(interpreter)
-            y_core_true = y_truepass[0, :core_len, 0]
-            w_true.write(y_core_true)
-
-        # A/B
-        ws.write(x[core_start:core_end])
-        wt.write(y[core_start:core_end])
-
-        pos += core_len
-
-    w_pred.close(); ws.close(); wt.close()
-    if w_true is not None:
-        w_true.close()
-
-    if prob_cnt > 0:
-        p = prob_sum / float(prob_cnt)
-        label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
-        print(f"✅ TFLite demo: {out_pred}  avg style={label} (p={p:.4f})")
-    else:
-        print(f"✅ TFLite demo: {out_pred}")
-
-def demo_tflite_all(
-    do_offline=True,
-    do_realtime=True,
-    do_baseline=True,
-    do_finetune=True
-):
-    """
-    Generate demos for all matching TFLite models (both FP32 and INT8).
-    """
-    paths = sorted(glob.glob(os.path.join(TFLITE_REALTIME_OUT_DIR, "*.tflite"))
-                 + glob.glob(os.path.join(TFLITE_OFFLINE_OUT_DIR, "*.tflite")))
-    if not paths:
-        print("No TFLite files found under", TFLITE_OUT_DIR)
-        return
-
-    # Determine canonical style_true_flag from the demo pair (optional)
-    style_true = None
-    if all_pairs:
-        demo_src, _ = all_pairs[DEMO_PAIR_INDEX]
-        if "pick" in demo_src:
-            style_true = 1.0
-        elif "finger" in demo_src:
-            style_true = 0.0
-
-    for pth in paths:
-        bn = os.path.basename(pth)
-        if ("realtime_" in bn and not do_realtime) or ("offline_" in bn and not do_offline):
-            continue
-        is_ft = ("finetune" in bn)
-        if (is_ft and not do_finetune) or ((not is_ft) and not do_baseline):
-            continue
-
-        m = re.search(r"_t(\d+)_", bn)
-        T_core = int(m.group(1)) if m else (32 if "realtime" in bn else 2048)
-        if "realtime" in bn:
-            kind = "realtime"; sr = REALTIME_SAMPLE_RATE
-        else:
-            kind = "offline";  sr = OFFLINE_SAMPLE_RATE
-
-        out_dir = os.path.join(DEMOS_OUT_DIR, "tflite", kind)
-        _render_demo_tflite_one(
-            tflite_path=pth,
-            kind=kind,
-            sample_rate=sr,
-            out_dir=out_dir,
-            T_core=T_core,
-            style_true_flag=style_true
-        )
-
-
 def _parse_ints_after_flag(argv, flag):
     if flag not in argv: return None
     idx = argv.index(flag)
@@ -5832,6 +4998,233 @@ def _get_single_int_after_flag(argv, flag, default=None):
     vals = _parse_ints_after_flag(argv, flag)
     return (vals[0] if vals else default)
 
+def _migrate_add_drywet_single(model_in_path: str, model_out_path: str):
+    """
+    Load a saved Keras model (static or dynamic, offline or realtime, any variant),
+    and wrap it with a new dry/wet input and mixer: y_out = (1 - dw) * y_proc + dw * piezo.
+    Saves the updated model to model_out_path (can be same as input to overwrite).
+    """
+    if not os.path.exists(model_in_path):
+        return False
+    print(f"[migrate] loading: {model_in_path}")
+    m = tf.keras.models.load_model(model_in_path, compile=False)
+
+    # Determine kind and whether dry/wet already present
+    in_names = [t.name.split(':')[0].split('/')[-1] for t in m.inputs]
+    if any(("knob_drywet" in n) for n in in_names):
+        print(f"[migrate] already has dry/wet: {model_in_path}")
+        return True
+
+    if any(n.startswith("offline_piezo_input") for n in in_names):
+        kind = "offline"
+        piezo_key = "offline_piezo_input"
+        knob_name = "offline_knob_drywet"
+    elif any(n.startswith("realtime_piezo_input") for n in in_names):
+        kind = "realtime"
+        piezo_key = "realtime_piezo_input"
+        knob_name = "realtime_knob_drywet"
+    else:
+        raise RuntimeError("Unrecognized model inputs; cannot infer kind.")
+
+    # Recreate inputs (same shapes/dtypes/names)
+    new_inputs = []
+    name2inp = {}
+    for t in m.inputs:
+        nm = t.name.split(':')[0].split('/')[-1]
+        new_inp = Input(shape=t.shape[1:], dtype=t.dtype, name=nm)
+        new_inputs.append(new_inp)
+        name2inp[nm] = new_inp
+
+    # NEW dry/wet knob
+    dw_in = Input(shape=(1,), dtype=tf.float32, name=knob_name)
+
+    # Call original model
+    outs = m(new_inputs, training=False)
+    if isinstance(outs, (list, tuple)):
+        y_proc = outs[0]
+        style  = outs[1]
+    else:
+        y_proc = outs
+        # Build a dummy style output if absent
+        style  = tf.zeros((tf.shape(new_inputs[0])[0], 1), dtype=tf.float32)
+
+    # Mixer
+    wet_gain   = Lambda(invert, name=f"{kind}_wet_from_drywet_mig")(dw_in)
+    wet_scaled = apply_runtime_gain(y_proc, wet_gain,  name=f"{kind}_wet_gain_mig")
+    dry_scaled = apply_runtime_gain(name2inp[piezo_key], dw_in, name=f"{kind}_dry_gain_mig")
+    y_out      = Add(name=f"{kind}_drywet_mix_mig")([wet_scaled, dry_scaled])
+
+    # Save
+    out_model = tf.keras.Model(inputs=new_inputs + [dw_in], outputs=[y_out, style], name=m.name)
+    out_model.save(model_out_path)
+    print(f"[migrate] saved: {model_out_path}")
+    return True
+
+def migrate_add_drywet_all():
+    """
+    Upgrade all known saved models in-place to include the dry/wet knob and mixer.
+    """
+    paths = []
+    # Offline baseline + finetuned (static + dynamic)
+    paths += [os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME),
+              os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
+              os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME),
+              os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)]
+    # Realtime: static teacher, static self-contained, dynamic (baseline + finetuned)
+    paths += [os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
+              os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
+              os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
+              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME),
+              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
+              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)]
+    ok = False
+    for p in paths:
+        if os.path.exists(p):
+            _migrate_add_drywet_single(p, p)
+            ok = True
+    if not ok:
+        print("[migrate] no saved models found to migrate.")
+
+def _hard_copy_weights(dst: tf.keras.Model, src: tf.keras.Model):
+    # try strict order-copy first
+    try:
+        dst.set_weights(src.get_weights())
+        print("[copy] set_weights OK (strict ordering)")
+        return True
+    except Exception as e:
+        print(f"[copy] set_weights failed, falling back to by-name: {e}")
+        matched = copy_weights_by_name(dst, src, verbose=True)
+        with_w = sum(1 for l in dst.layers if l.weights)
+        print(f"[copy] by-name matched={matched}/{with_w} layers-with-weights")
+        return matched == with_w
+
+def prepare_and_generate_demo_static_selfcontained(kind, sample_rate, demo_out_dir, use_finetuned=False):
+    os.makedirs(demo_out_dir, exist_ok=True)
+    if kind == "realtime":
+        static_path = os.path.join(
+            MODELS_REALTIME_OUT_DIR,
+            FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
+            else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME
+        )
+        if not os.path.exists(static_path):
+            print(f"[demo-static] realtime static self-contained not found: {static_path}")
+            return
+
+        print(f"[demo-static] loading static from: {static_path}")
+        static_model = tf.keras.models.load_model(static_path, compile=False)
+
+        # Build the teacherless dynamic-time graph
+        dyn = build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
+
+        ok = _hard_copy_weights(dyn, static_model)
+
+        # Quick sanity: print critical scales
+        def _get_scale(m, name):
+            try: return float(m.get_layer(name).get_weights()[0][0])
+            except: return None
+        for lname in ["realtime_ir_scale", "realtime_pickattack_scale", "realtime_pickreso_scale", "realtime_pickreso_calib"]:
+            print(f"[demo-static] {lname} =", _get_scale(dyn, lname))
+
+        # Also print streaming context so you can compare to --demo logs
+        lc, rc = compute_realtime_streaming_context(dyn, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+
+        generate_demo(model=dyn, kind="realtime", out_dir=demo_out_dir, sample_rate=sample_rate)
+
+    elif kind == "offline":
+        # unchanged...
+        dyn = build_offline_model(dynamic_time=True, coloreq_trainable=False)
+        static_path = os.path.join(
+            MODELS_OFFLINE_OUT_DIR,
+            FINETUNE_OFFLINE_STATIC_MODEL_FILENAME if use_finetuned else OFFLINE_STATIC_MODEL_FILENAME
+        )
+        print(f"[demo-static] loading static from: {static_path}")
+        static_model = tf.keras.models.load_model(static_path, compile=False)
+        _hard_copy_weights(dyn, static_model)
+        lc, rc = _get_model_context_for_streaming(sample_rate, model=dyn)
+        print(f"[demo-static] offline context lc={lc} rc={rc}")
+        generate_demo(model=dyn, kind="offline", out_dir=demo_out_dir, sample_rate=sample_rate)
+    else:
+        raise ValueError("kind must be 'offline' or 'realtime'")
+
+def rebuild_realtime_dynamic_from_static(use_finetuned=False):
+    static_path = os.path.join(
+        MODELS_REALTIME_OUT_DIR,
+        FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
+        else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME
+    )
+    if not os.path.exists(static_path):
+        raise FileNotFoundError(static_path)
+    dyn = build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
+    static_m = tf.keras.models.load_model(static_path, compile=False)
+    dyn.set_weights(static_m.get_weights())
+    out_path = os.path.join(
+        MODELS_REALTIME_OUT_DIR,
+        FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME if use_finetuned
+        else REALTIME_DYNAMIC_MODEL_FILENAME
+    )
+    dyn.save(out_path)
+    print("✅ rebuilt dynamic from static:", out_path)
+
+def rebuild_realtime_static_self_from_dynamic(use_finetuned=False):
+    """
+    Rebuild the realtime STATIC self-contained model from the realtime DYNAMIC (teacherless) model.
+    This ensures the two models are bit-for-bit identical in weights (aside from input shape).
+    """
+    # Paths
+    dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR,
+                            FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME if use_finetuned
+                            else REALTIME_DYNAMIC_MODEL_FILENAME)
+    static_out = os.path.join(MODELS_REALTIME_OUT_DIR,
+                              FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
+                              else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
+
+    if not os.path.exists(dyn_path):
+        raise FileNotFoundError(f"Dynamic teacherless realtime model not found: {dyn_path}")
+
+    # Load the preferred dynamic model (teacherless, current graph)
+    rt_dyn = tf.keras.models.load_model(dyn_path, compile=False)
+
+    # Build the teacherless STATIC realtime graph (same layer names, fixed time axis)
+    rt_static = build_realtime_model(offline=None, dynamic_time=False, coloreq_trainable=False)
+
+    # Copy by name and report coverage
+    matched = copy_weights_by_name(rt_static, rt_dyn, verbose=True)
+
+    # Optional: assert sufficient coverage to catch future drift
+    with_weights = sum(1 for l in rt_static.layers if len(l.get_weights()) > 0)
+    coverage = matched / max(1, with_weights)
+    print(f"[rebuild] matched={matched} layers with weights={with_weights} → coverage={coverage:.3f}")
+    if coverage < 0.9:
+        print("[rebuild] Warning: low weight copy coverage (<90%). Your saved dynamic/static graphs may be out of sync.")
+
+    # Save rebuilt static
+    rt_static.save(static_out)
+    print("✅ Rebuilt realtime static self-contained from dynamic:", static_out)
+
+def scan_keras_files_for_legacy(paths):
+    pats = [b'"class_name": "Gate"', b'"class_name": "GateInt8Linear"', b'"class_name": "ModalBank"',
+            b'Custom>Gate', b'Custom>GateInt8Linear', b'Custom>ModalBank', b'offline_gate']
+    hits = []
+    for p in paths:
+        if not os.path.exists(p): 
+            continue
+        try:
+            with zipfile.ZipFile(p, 'r') as z:
+                blob = b"".join(z.read(n) for n in z.namelist() if n.endswith((".json",".pb")))
+            if any(tok in blob for tok in pats):
+                hits.append(p)
+        except zipfile.BadZipFile:
+            # Older H5 or something unexpected: fallback to raw read
+            try:
+                with open(p, "rb") as f:
+                    blob = f.read()
+                if any(tok in blob for tok in pats):
+                    hits.append(p)
+            except Exception:
+                pass
+    return hits
+
+# Expect both lists to be empty
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -5888,6 +5281,30 @@ def main ():
                 },
                 use_safe_weight_copy=True
             )
+    
+    elif len(sys.argv) > 1 and sys.argv[1] == "--demo-static":
+        print("Generating demo audio from STATIC (self-contained) models...")
+        args = set(sys.argv[2:])
+        do_offline   = ("--realtime-only" not in args)
+        do_realtime  = ("--offline-only"  not in args)
+        use_finetuned = ("--finetuned" in args)
+
+        if do_offline:
+            prepare_and_generate_demo_static_selfcontained(
+                kind="offline",
+                sample_rate=OFFLINE_SAMPLE_RATE,
+                demo_out_dir=LONG_DEMOS_OFFLINE_OUT_DIR,
+                use_finetuned=use_finetuned
+            )
+
+        if do_realtime:
+            prepare_and_generate_demo_static_selfcontained(
+                kind="realtime",
+                sample_rate=REALTIME_SAMPLE_RATE,
+                demo_out_dir=LONG_DEMOS_REALTIME_OUT_DIR,
+                use_finetuned=use_finetuned
+            )
+        sys.exit(0)
 
     elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune":
         offline_dyn, realtime_dyn = fine_tune(offline=len(sys.argv) <= 2 or sys.argv[2] !="--realtime-only", realtime=len(sys.argv) <= 2 or sys.argv[2] !="--offline-only")
@@ -5952,45 +5369,27 @@ def main ():
                 # single selection
                 run_render_stems_realtime(use_finetuned=do_finetuned)
         sys.exit(0)
-    if len(sys.argv) > 1 and sys.argv[1] == "--export-tflite":
-        args = set(sys.argv[2:])
-        do_offline   = ("--realtime-only" not in args)
-        do_realtime  = ("--offline-only"  not in args)
-        do_baseline  = ("--baseline" in args) or ("--finetune" not in args)
-        do_finetune  = ("--finetune" in args) or ("--baseline" not in args)
-        do_fp32      = ("--no-fp32" not in args)
-        do_int8      = ("--no-int8" not in args)
-
-        # realtime T list
-        rt_t = _parse_ints_after_flag(sys.argv, "--rt-t")
-        if rt_t is None:
-            rt_t = [32, 64]
-        off_T_core = _get_single_int_after_flag(sys.argv, "--off-t", default=2048)
-
-        export_tflite_all(
-            do_offline=do_offline,
-            do_realtime=do_realtime,
-            do_baseline=do_baseline,
-            do_finetune=do_finetune,
-            rt_T_list=rt_t,
-            off_T_core=off_T_core,
-            do_fp32=do_fp32,
-            do_int8=do_int8
-        )
+    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-add-drywet":
+        migrate_add_drywet_all()
+        print("✅ Migration done.")
         sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--rebuild-static-self":
+        use_finetuned = ("--finetuned" in set(sys.argv[2:]))
+        rebuild_realtime_static_self_from_dynamic(use_finetuned=use_finetuned)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--rebuild-dynamic-self":
+        use_finetuned = ("--finetuned" in set(sys.argv[2:]))
+        rebuild_realtime_dynamic_from_static(use_finetuned=use_finetuned)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--foo":
+        cands = []
+        cands += glob.glob(os.path.join(MODELS_OFFLINE_OUT_DIR,  "*.keras"))
+        cands += glob.glob(os.path.join(MODELS_REALTIME_OUT_DIR, "*.keras"))
+        cands += glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR,  "*.keras"))
+        cands += glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras"))
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--demo-tflite":
-        args = set(sys.argv[2:])
-        do_offline   = ("--realtime-only" not in args)
-        do_realtime  = ("--offline-only"  not in args)
-        do_baseline  = ("--baseline" in args) or ("--finetune" not in args)
-        do_finetune  = ("--finetune" in args) or ("--baseline" not in args)
-        demo_tflite_all(
-            do_offline=do_offline,
-            do_realtime=do_realtime,
-            do_baseline=do_baseline,
-            do_finetune=do_finetune
-        )
+        legacy_files = scan_keras_files_for_legacy(cands)
+        print("Files containing legacy classes:", legacy_files)
         sys.exit(0)
     else:
         print("No command given.")
