@@ -236,7 +236,7 @@ OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
 OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
@@ -300,7 +300,7 @@ REALTIME_PICK_RESO_SOFTCLIP_DRIVE = 2.0
 
 # If we don't apply lowpass penalties during training, there can be excessive low-end build-up in the pick-branches high frequency output.
 # So much so that we can't boost their volumes due to excessive energy below 100hz, even sometimes below 30hz
-PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
+PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 3000.0
 PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 513
 PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
@@ -371,8 +371,8 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
+OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
@@ -3560,7 +3560,7 @@ def build_realtime_model(offline=None,
         audio_out, style_prob_out = teacher.outputs
         teacher_combo = tf.keras.Model(inputs=teacher.inputs, outputs=[audio_out, style_prob_out],
                                        name="offline_teacher_combo")
-        combo = teacher_combo([offline_inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in])
+        combo = teacher_combo([offline_inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_dw_in])
         offline_style_prob = combo[1]
         style_pred_source = BlendScalar(init_alpha=REALTIME_STYLE_BLEND_INIT,
                                         trainable=REALTIME_STYLE_BLEND_TRAINABLE,
@@ -5031,111 +5031,6 @@ def _metrics_for_core(outs_dict, y_target_core=None):
 
     return m
 
-def _parse_ints_after_flag(argv, flag):
-    if flag not in argv: return None
-    idx = argv.index(flag)
-    vals = []
-    i = idx + 1
-    while i < len(argv):
-        if argv[i].startswith("--"): break
-        try:
-            vals.append(int(argv[i]))
-        except Exception:
-            break
-        i += 1
-    return vals if vals else None
-
-def _get_single_int_after_flag(argv, flag, default=None):
-    vals = _parse_ints_after_flag(argv, flag)
-    return (vals[0] if vals else default)
-
-def _migrate_add_drywet_single(model_in_path: str, model_out_path: str):
-    """
-    Load a saved Keras model (static or dynamic, offline or realtime, any variant),
-    and wrap it with a new dry/wet input and mixer: y_out = (1 - dw) * y_proc + dw * piezo.
-    Saves the updated model to model_out_path (can be same as input to overwrite).
-    """
-    if not os.path.exists(model_in_path):
-        return False
-    print(f"[migrate] loading: {model_in_path}")
-    m = tf.keras.models.load_model(model_in_path, compile=False)
-
-    # Determine kind and whether dry/wet already present
-    in_names = [t.name.split(':')[0].split('/')[-1] for t in m.inputs]
-    if any(("knob_drywet" in n) for n in in_names):
-        print(f"[migrate] already has dry/wet: {model_in_path}")
-        return True
-
-    if any(n.startswith("offline_piezo_input") for n in in_names):
-        kind = "offline"
-        piezo_key = "offline_piezo_input"
-        knob_name = "offline_knob_drywet"
-    elif any(n.startswith("realtime_piezo_input") for n in in_names):
-        kind = "realtime"
-        piezo_key = "realtime_piezo_input"
-        knob_name = "realtime_knob_drywet"
-    else:
-        raise RuntimeError("Unrecognized model inputs; cannot infer kind.")
-
-    # Recreate inputs (same shapes/dtypes/names)
-    new_inputs = []
-    name2inp = {}
-    for t in m.inputs:
-        nm = t.name.split(':')[0].split('/')[-1]
-        new_inp = Input(shape=t.shape[1:], dtype=t.dtype, name=nm)
-        new_inputs.append(new_inp)
-        name2inp[nm] = new_inp
-
-    # NEW dry/wet knob
-    dw_in = Input(shape=(1,), dtype=tf.float32, name=knob_name)
-
-    # Call original model
-    outs = m(new_inputs, training=False)
-    if isinstance(outs, (list, tuple)):
-        y_proc = outs[0]
-        style  = outs[1]
-    else:
-        y_proc = outs
-        # Build a dummy style output if absent
-        style  = tf.zeros((tf.shape(new_inputs[0])[0], 1), dtype=tf.float32)
-
-    # Mixer
-    wet_gain   = Lambda(invert, name=f"{kind}_wet_from_drywet_mig")(dw_in)
-    wet_scaled = apply_runtime_gain(y_proc, wet_gain,  name=f"{kind}_wet_gain_mig")
-    dry_scaled = apply_runtime_gain(name2inp[piezo_key], dw_in, name=f"{kind}_dry_gain_mig")
-    y_out      = Add(name=f"{kind}_drywet_mix_mig")([wet_scaled, dry_scaled])
-
-    # Save
-    out_model = tf.keras.Model(inputs=new_inputs + [dw_in], outputs=[y_out, style], name=m.name)
-    out_model.save(model_out_path)
-    print(f"[migrate] saved: {model_out_path}")
-    return True
-
-def migrate_add_drywet_all():
-    """
-    Upgrade all known saved models in-place to include the dry/wet knob and mixer.
-    """
-    paths = []
-    # Offline baseline + finetuned (static + dynamic)
-    paths += [os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME),
-              os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
-              os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME),
-              os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)]
-    # Realtime: static teacher, static self-contained, dynamic (baseline + finetuned)
-    paths += [os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
-              os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
-              os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
-              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME),
-              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
-              os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)]
-    ok = False
-    for p in paths:
-        if os.path.exists(p):
-            _migrate_add_drywet_single(p, p)
-            ok = True
-    if not ok:
-        print("[migrate] no saved models found to migrate.")
-
 def _hard_copy_weights(dst: tf.keras.Model, src: tf.keras.Model):
     # try strict order-copy first
     try:
@@ -5196,86 +5091,6 @@ def prepare_and_generate_demo_static_selfcontained(kind, sample_rate, demo_out_d
         generate_demo(model=dyn, kind="offline", out_dir=demo_out_dir, sample_rate=sample_rate)
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
-
-def rebuild_realtime_dynamic_from_static(use_finetuned=False):
-    static_path = os.path.join(
-        MODELS_REALTIME_OUT_DIR,
-        FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
-        else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME
-    )
-    if not os.path.exists(static_path):
-        raise FileNotFoundError(static_path)
-    dyn = build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
-    static_m = tf.keras.models.load_model(static_path, compile=False)
-    dyn.set_weights(static_m.get_weights())
-    out_path = os.path.join(
-        MODELS_REALTIME_OUT_DIR,
-        FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME if use_finetuned
-        else REALTIME_DYNAMIC_MODEL_FILENAME
-    )
-    dyn.save(out_path)
-    print("✅ rebuilt dynamic from static:", out_path)
-
-def rebuild_realtime_static_self_from_dynamic(use_finetuned=False):
-    """
-    Rebuild the realtime STATIC self-contained model from the realtime DYNAMIC (teacherless) model.
-    This ensures the two models are bit-for-bit identical in weights (aside from input shape).
-    """
-    # Paths
-    dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR,
-                            FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME if use_finetuned
-                            else REALTIME_DYNAMIC_MODEL_FILENAME)
-    static_out = os.path.join(MODELS_REALTIME_OUT_DIR,
-                              FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
-                              else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-
-    if not os.path.exists(dyn_path):
-        raise FileNotFoundError(f"Dynamic teacherless realtime model not found: {dyn_path}")
-
-    # Load the preferred dynamic model (teacherless, current graph)
-    rt_dyn = tf.keras.models.load_model(dyn_path, compile=False)
-
-    # Build the teacherless STATIC realtime graph (same layer names, fixed time axis)
-    rt_static = build_realtime_model(offline=None, dynamic_time=False, coloreq_trainable=False)
-
-    # Copy by name and report coverage
-    matched = copy_weights_by_name(rt_static, rt_dyn, verbose=True)
-
-    # Optional: assert sufficient coverage to catch future drift
-    with_weights = sum(1 for l in rt_static.layers if len(l.get_weights()) > 0)
-    coverage = matched / max(1, with_weights)
-    print(f"[rebuild] matched={matched} layers with weights={with_weights} → coverage={coverage:.3f}")
-    if coverage < 0.9:
-        print("[rebuild] Warning: low weight copy coverage (<90%). Your saved dynamic/static graphs may be out of sync.")
-
-    # Save rebuilt static
-    rt_static.save(static_out)
-    print("✅ Rebuilt realtime static self-contained from dynamic:", static_out)
-
-def scan_keras_files_for_legacy(paths):
-    pats = [b'"class_name": "Gate"', b'"class_name": "GateInt8Linear"', b'"class_name": "ModalBank"',
-            b'Custom>Gate', b'Custom>GateInt8Linear', b'Custom>ModalBank', b'offline_gate']
-    hits = []
-    for p in paths:
-        if not os.path.exists(p): 
-            continue
-        try:
-            with zipfile.ZipFile(p, 'r') as z:
-                blob = b"".join(z.read(n) for n in z.namelist() if n.endswith((".json",".pb")))
-            if any(tok in blob for tok in pats):
-                hits.append(p)
-        except zipfile.BadZipFile:
-            # Older H5 or something unexpected: fallback to raw read
-            try:
-                with open(p, "rb") as f:
-                    blob = f.read()
-                if any(tok in blob for tok in pats):
-                    hits.append(p)
-            except Exception:
-                pass
-    return hits
-
-# Expect both lists to be empty
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -5420,27 +5235,29 @@ def main ():
                 # single selection
                 run_render_stems_realtime(use_finetuned=do_finetuned)
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-add-drywet":
-        migrate_add_drywet_all()
-        print("✅ Migration done.")
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--rebuild-static-self":
-        use_finetuned = ("--finetuned" in set(sys.argv[2:]))
-        rebuild_realtime_static_self_from_dynamic(use_finetuned=use_finetuned)
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--rebuild-dynamic-self":
-        use_finetuned = ("--finetuned" in set(sys.argv[2:]))
-        rebuild_realtime_dynamic_from_static(use_finetuned=use_finetuned)
-        sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--foo":
-        cands = []
-        cands += glob.glob(os.path.join(MODELS_OFFLINE_OUT_DIR,  "*.keras"))
-        cands += glob.glob(os.path.join(MODELS_REALTIME_OUT_DIR, "*.keras"))
-        cands += glob.glob(os.path.join(CHECKPOINT_OFFLINE_OUT_DIR,  "*.keras"))
-        cands += glob.glob(os.path.join(CHECKPOINT_REALTIME_OUT_DIR, "*.keras"))
+    elif len(sys.argv)>1 and sys.argv[1]=="--print-layers":
+        
+        paths = [
+            os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
+            os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
+            os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME),
+            os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+        ]
 
-        legacy_files = scan_keras_files_for_legacy(cands)
-        print("Files containing legacy classes:", legacy_files)
+        for p in paths:
+            print("[offline/persist] loading:", p)
+            m = tf.keras.models.load_model(p, compile=False)
+            
+            for l in m.layers:
+                # Print layer name
+                print(f"Layer: {l.name}, Type: {type(l)}")
+            print("-----")
         sys.exit(0)
     else:
         print("No command given.")
