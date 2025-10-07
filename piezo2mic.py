@@ -93,7 +93,7 @@ CONSTRAINTS
 - The realtime model must be fully causal, with no look-ahead, and ultra low-latency.
 """
 
-import os, glob, random, shutil, sys, re, math, json
+import os, glob, random, shutil, sys, re, math, json, time
 import numpy as np
 import soundfile as sf
 import tensorflow as tf
@@ -415,11 +415,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 10
+DEMO_SEC        = 2
 DEMO_OFFSET_SEC = 0
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 10
+LONG_DEMO_SEC        = 2
 LONG_DEMO_OFFSET_SEC = 0
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -2909,6 +2909,7 @@ class LossTether(tf.keras.layers.Layer):
             return inputs[0]
         return inputs
     
+    
 @register_keras_serializable()
 class CausalExpSmoother(tf.keras.layers.Layer):
     """
@@ -4949,7 +4950,7 @@ def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, checkpo
         cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
         if os.path.exists(cand): prefer = cand
     elif kind == "realtime":
-        cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
         if os.path.exists(cand): prefer = cand
 
     dpath = prefer if prefer is not None else dynamic_model_filepath
@@ -4968,6 +4969,7 @@ def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, checkpo
             sys.exit(1)
     else:
         dynamic_model = tf.keras.models.load_model(dpath, compile=False)
+        dynamic_model.summary()
 
     generate_demo(model=dynamic_model, kind=kind, out_dir=demo_out_dir, sample_rate=sample_rate)
 
@@ -5330,63 +5332,62 @@ def compute_streaming_ctx_constants(kind):
         raise ValueError("kind must be 'offline' or 'realtime'")
 
 
-def _select_tflite_demo_paths(kind, use_finetuned=False):
+def _select_tflite_demo_paths(kind, use_finetuned=False, small=False):
+    """
+    Return the TFLite path for the demo:
+    - realtime: small=False → use large 'demo T' (e.g., 6144); small=True → base T=32
+    - offline: only one T is exported
+    """
     if kind == "offline":
         if use_finetuned:
             return os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_TFLITE_FP32_FILENAME)
         return os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_TFLITE_FP32_FILENAME)
     elif kind == "realtime":
         if use_finetuned:
-            return os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_DEMO_FILENAME)
-        return os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_DEMO_FILENAME)
+            return os.path.join(
+                MODELS_REALTIME_OUT_DIR,
+                FINETUNE_REALTIME_TFLITE_FP32_FILENAME if small
+                else FINETUNE_REALTIME_TFLITE_FP32_DEMO_FILENAME
+            )
+        return os.path.join(
+            MODELS_REALTIME_OUT_DIR,
+            REALTIME_TFLITE_FP32_FILENAME if small
+            else REALTIME_TFLITE_FP32_DEMO_FILENAME
+        )
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
 
-def _select_dynamic_for_ctx(kind, use_finetuned=False):
-    """
-    For streaming context estimation in the TFLite demo, we optionally load an
-    equivalent dynamic TF model (teacherless) to compute left context precisely.
-    If not found, we’ll fall back to default per-sample-rate contexts.
-    """
-    if kind == "offline":
-        p = os.path.join(MODELS_OFFLINE_OUT_DIR,
-                         FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME if use_finetuned
-                         else OFFLINE_DYNAMIC_MODEL_FILENAME)
-    else:
-        p = os.path.join(MODELS_REALTIME_OUT_DIR,
-                         FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME if use_finetuned
-                         else REALTIME_DYNAMIC_MODEL_FILENAME)
-    return p if os.path.exists(p) else None
-
 def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
-                           style_true_flag=None, use_finetuned=False, out_dir="."):
+                           style_true_flag=None, use_finetuned=False, out_dir=".",
+                           fixed_hop=None):
     os.makedirs(out_dir, exist_ok=True)
     piezo_key = f"{kind}_piezo_input"
     T_fixed = tflite_runner.input_length_T(piezo_key)
 
     lc_m, rc_m = compute_streaming_ctx_constants(kind)
 
-    # Reserve a meaningful core region inside the fixed-T window
-    # Offline needs a bigger core; realtime can be smaller.
-    desired_core = max(1, min(T_fixed // 2, 8192 if kind == "offline" else 512))
-
-    # Start by honoring full left, then right; shrink if needed to reach desired_core
-    left_this  = min(int(lc_m), max(0, T_fixed - 1))
-    right_this = min(int(rc_m), max(0, T_fixed - 1 - left_this))
-    core_len   = T_fixed - left_this - right_this
-    
-    print(f"[TFLite/demo] kind={kind} T={T_fixed} lc={left_this} rc={right_this} -> core={core_len}")
-    if core_len < 64:
-        print("[TFLite/demo] WARNING: core is very small; export a larger T for representative audio.")
-
-    if core_len < desired_core:
-        need = desired_core - core_len
-        # Prefer shrinking right first, then left
-        r_dec = min(right_this, need); right_this -= r_dec; need -= r_dec
-        if need > 0:
-            l_dec = min(left_this, need); left_this -= l_dec; need -= l_dec
-        core_len = T_fixed - left_this - right_this
-    core_len = max(1, core_len)
+    # Choose left/core/right for each call
+    if fixed_hop is not None:
+        core_len = int(fixed_hop)
+        if core_len < 1 or core_len > T_fixed:
+            raise ValueError(f"fixed_hop must be in [1, {T_fixed}], got {fixed_hop}")
+        # Exact pedal-style schedule: use all remaining as left context, no right look-ahead for realtime
+        left_this  = T_fixed - core_len
+        right_this = 0
+        print(f"[TFLite/demo] fixed_hop={core_len} → left={left_this}, core={core_len}, right={right_this}")
+    else:
+        # Default policy (existing behavior): use model ctx but keep a reasonable core
+        desired_core = max(1, min(T_fixed // 2, 8192 if kind == "offline" else 512))
+        left_this  = min(int(lc_m), max(0, T_fixed - 1))
+        right_this = min(int(rc_m), max(0, T_fixed - 1 - left_this))
+        core_len   = T_fixed - left_this - right_this
+        if core_len < desired_core:
+            need = desired_core - core_len
+            r_dec = min(right_this, need); right_this -= r_dec; need -= r_dec
+            if need > 0:
+                l_dec = min(left_this, need); left_this -= l_dec; need -= l_dec
+            core_len = T_fixed - left_this - right_this
+        print(f"[TFLite/demo] auto schedule: T={T_fixed} lc={lc_m} rc={rc_m} → left={left_this}, core={core_len}, right={right_this}")
 
     knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
     style_pred_path = os.path.join(out_dir, "demo_pred_style_pred_tflite.wav")
@@ -5428,7 +5429,7 @@ def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
         base_feed[f"{kind}_style_true_input"]  = np.zeros((1,1), np.float32)
         base_feed[f"{kind}_style_force_input"] = np.zeros((1,1), np.float32)
 
-        y_pred, s_pred = tflite_runner.invoke(base_feed)  # y_pred → [1,T,1]
+        y_pred, s_pred = tflite_runner.invoke(base_feed)
         y_core = y_pred[0, left_this:left_this + core, 0]
         w_pred.write(y_core)
 
@@ -5457,7 +5458,8 @@ def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
     if prob_count > 0:
         p = prob_sum / float(prob_count)
         label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
-        print(f"✅ TFLite demo written to {style_pred_path} and {style_true_path}. Predicted style (avg): {label} ({p:.4f})")
+        print(f"✅ TFLite demo written to {style_pred_path}. Predicted style (avg): {label} ({p:.4f})")
+
 class TFLiteRunner:
     """
     Robust TFLite runner for ai_edge_litert:
@@ -5604,8 +5606,14 @@ class TFLiteRunner:
 
         return self._normalize_audio_style(audio_arr, style_arr)
 
-def generate_demo_tflite(kind, use_finetuned=False):
-    # Resolve demo pair
+def generate_demo_tflite(kind, use_finetuned=False, small=False, out_dir=None, hop=None):
+    """
+    Run the TFLite model in a streaming fashion and write WAVs.
+    kind: 'offline' or 'realtime'
+    small=False uses the larger 'demo' T (e.g., 6144) for realtime; True uses T=32.
+    hop: if provided (int), use exact pedal-style schedule:
+         left = T - hop, right = 0, core = hop.
+    """
     assert_has_pairs()
     pth_src, pth_tgt = all_pairs[LONG_DEMO_PAIR_INDEX]
 
@@ -5616,13 +5624,18 @@ def generate_demo_tflite(kind, use_finetuned=False):
     else:
         style_true_flag = None
 
-    # Load a short segment and resample to model rate
     if kind == "offline":
         sr = OFFLINE_SAMPLE_RATE
-        out_dir = LONG_DEMOS_OFFLINE_OUT_DIR
+        base_out_dir = LONG_DEMOS_OFFLINE_OUT_DIR
+        subdir = f"t{OFFLINE_TFLITE_T}"
     else:
         sr = REALTIME_SAMPLE_RATE
-        out_dir = LONG_DEMOS_REALTIME_OUT_DIR
+        base_out_dir = LONG_DEMOS_REALTIME_OUT_DIR
+        subdir = f"t{REALTIME_TFLITE_T if small else REALTIME_TFLITE_T_DEMO}"
+
+    if out_dir is None:
+        out_dir = os.path.join(base_out_dir, subdir)
+    os.makedirs(out_dir, exist_ok=True)
 
     info = sf.info(pth_src)
     file_sr = info.samplerate
@@ -5636,18 +5649,104 @@ def generate_demo_tflite(kind, use_finetuned=False):
     x_mod = x_src if file_sr == sr else resample_to_model_sr(x_src, file_sr, sr)
     y_mod = y_src if file_sr == sr else resample_to_model_sr(y_src, file_sr, sr)
 
-    # TFLite runner
-    tflite_path = _select_tflite_demo_paths(kind=kind, use_finetuned=use_finetuned)
+    tflite_path = _select_tflite_demo_paths(kind=kind, use_finetuned=use_finetuned, small=small)
     if not os.path.exists(tflite_path):
         print(f"[TFLite/demo] TFLite model not found at {tflite_path}. Run --export-tflite first.")
         return
 
     print(f"[TFLite/demo] Using: {tflite_path}")
     runner = TFLiteRunner(tflite_path)
-    
+
     _tflite_demo_blockwise(kind, runner, sample_rate=sr,
                            x_mod=x_mod, y_mod=y_mod, style_true_flag=style_true_flag,
-                           use_finetuned=use_finetuned, out_dir=out_dir)
+                           use_finetuned=use_finetuned, out_dir=out_dir,
+                           fixed_hop=hop)
+
+def _norm_name_tf(n):
+    n = n.split(":")[0]
+    if n.startswith("serving_default_"):
+        n = n[len("serving_default_"):]
+    return n
+
+def _make_windows_T(x, T, hop):
+    """
+    Build batched windows for causal, stateless TFLite inference:
+      - left = T - hop, right = 0
+      - window[i] = [left context, core hop samples]
+    Returns (W, core_lens) with shapes:
+      W: (num_windows, T, 1), core_lens: (num_windows,)
+    """
+    x = np.asarray(x, dtype=np.float32)
+    N = int(x.shape[0])
+    hop = int(hop)
+    T = int(T)
+    left = T - hop
+    if hop < 1 or hop > T:
+        raise ValueError(f"hop must be in [1, {T}], got {hop}")
+    num_windows = (N + hop - 1) // hop
+    W = np.zeros((num_windows, T, 1), dtype=np.float32)
+    core_lens = np.zeros((num_windows,), dtype=np.int32)
+    for i in range(num_windows):
+        j = i * hop
+        core = min(hop, N - j)
+        core_lens[i] = core
+        # Left context (pad zeros if not enough history)
+        ltake = min(left, j)
+        if ltake > 0:
+            W[i, left - ltake:left, 0] = x[j - ltake:j]
+        # Core
+        if core > 0:
+            W[i, left:left + core, 0] = x[j:j + core]
+    return W, core_lens
+
+def _tflite_invoke_batched_exact(model_path, feed_dict):
+    """
+    Single batched TFLite invoke:
+      - Resizes inputs to feed shapes (batch-first).
+      - Returns outputs as numpy arrays (copies).
+    """
+    interp = Interpreter(model_path=model_path)
+    in_details = interp.get_input_details()
+    in_idx = { _norm_name_tf(d["name"]): d["index"] for d in in_details }
+
+    # Resize to match batched shapes
+    for k, v in feed_dict.items():
+        key = _norm_name_tf(k)
+        if key in in_idx:
+            arr = np.asarray(v, dtype=np.float32)
+            try:
+                interp.resize_tensor_input(in_idx[key], arr.shape, strict=False)
+            except TypeError:
+                interp.resize_tensor_input(in_idx[key], arr.shape)
+    interp.allocate_tensors()
+
+    # Set tensors
+    for k, v in feed_dict.items():
+        key = _norm_name_tf(k)
+        if key in in_idx:
+            interp.set_tensor(in_idx[key], np.asarray(v, dtype=np.float32, copy=False))
+
+    # Invoke
+    interp.invoke()
+
+    out_details = interp.get_output_details()
+    outs = []
+    for d in out_details:
+        name = _norm_name_tf(d["name"])
+        val = np.array(interp.get_tensor(d["index"]), dtype=np.float32, copy=True)
+        outs.append((name, val))
+
+    # Pick audio as largest tensor; style as (B,1) if available, else smallest
+    audio_name, audio_arr = max(outs, key=lambda t: t[1].size)
+    rest = [(n, a) for (n, a) in outs if n != audio_name]
+    style_arr = None
+    for n, a in rest:
+        if a.ndim == 2 and a.shape[1] == 1:
+            style_arr = a
+            break
+    if style_arr is None and rest:
+        style_arr = min(rest, key=lambda t: t[1].size)[1]
+    return audio_arr, style_arr
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -5823,14 +5922,36 @@ def main ():
 
     elif len(sys.argv)>1 and sys.argv[1]=="--demo-tflite":
         args = set(sys.argv[2:])
-        do_offline   = ("--realtime-only" not in args)
-        do_realtime  = ("--offline-only"  not in args)
-        use_finetuned = ("--finetuned" in args)
+        do_offline    = ("--realtime-only" not in args)
+        do_realtime   = ("--offline-only"  not in args)
+        use_finetuned = ("--finetuned"     in args)
+        prefer_t32    = ("--t32" in args) or ("--small" in args)
+        do_both       = ("--both" in args)
+        
+        # Measure the time it takes to do this:
+        time_start = time.time()
+
+        # Optional hop parsing: --hop=16
+        hop = None
+        for a in list(args):
+            if a.startswith("--hop="):
+                try:
+                    hop = int(a.split("=",1)[1])
+                except Exception:
+                    hop = None
 
         if do_offline:
-            generate_demo_tflite(kind="offline", use_finetuned=use_finetuned)
+            generate_demo_tflite(kind="offline", use_finetuned=use_finetuned, small=False)
+
         if do_realtime:
-            generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned)
+            if do_both:
+                # T=32 and large demo-T, both
+                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=True,  hop=hop)
+                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=False, hop=None)
+            else:
+                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=prefer_t32, hop=hop)
+        time_end = time.time()
+        print(f"[TFLite/demo] All done in {time_end - time_start:.1f} seconds.")
         sys.exit(0)
     else:
         print("No command given.")
