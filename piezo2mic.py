@@ -238,7 +238,7 @@ OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
 OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
+REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
 
 FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
 FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
@@ -5982,14 +5982,13 @@ def train_shared(
     # kind == 'realtime': always export self-contained streaming runtime models
     rt_dyn_stream = build_realtime_streaming_model(dynamic_time=True)
     copy_weights_by_name(rt_dyn_stream, static_model, verbose=True)
-    # Force-patch HPF kernels to known-good taps (guards against bad copies)
-    force_patch_realtime_hpf_kernels(rt_dyn_stream, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+
     rt_dyn_stream.save(dynamic_model_filepath)
     print("✅ Saved realtime streaming dynamic model:", dynamic_model_filepath)
 
     rt_static_stream = build_realtime_streaming_model()
     copy_weights_by_name(rt_static_stream, static_model, verbose=True)
-    force_patch_realtime_hpf_kernels(rt_static_stream, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+
     rt_static_stream.save(static_model_filepath)
     print("✅ Saved realtime streaming static model:", static_model_filepath)
 
@@ -7147,34 +7146,6 @@ def migrate_realtime_models_inplace():
     copy_weights_by_name(realtime_static_finetuned_streaming_model, realtime_static_finetuned_training_model_old, verbose=True)
     copy_weights_by_name(realtime_dynamic_finetuned_streaming_model, realtime_static_finetuned_training_model_old, verbose=True)
     
-    # _seed_pick_heads_from_legacy(realtime_dynamic_baseline_streaming_model,
-    #                             realtime_static_baseline_training_model_old, verbose=True)
-    # _seed_pick_heads_from_legacy(realtime_dynamic_finetuned_streaming_model,
-    #                             realtime_static_finetuned_training_model_old, verbose=True)
-    # _seed_pick_heads_from_legacy(realtime_static_baseline_streaming_model,
-    #                             realtime_static_baseline_training_model_old, verbose=True)
-    # _seed_pick_heads_from_legacy(realtime_static_finetuned_streaming_model,
-    #                             realtime_static_finetuned_training_model_old, verbose=True)
-    
-    
-      # Patch kernels
-    # force_patch_realtime_hpf_kernels(realtime_dynamic_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_dynamic_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_hpf_kernels(realtime_static_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_static_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-
-    # force_patch_realtime_hpf_kernels(realtime_dynamic_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_dynamic_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_hpf_kernels(realtime_static_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_static_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-
-    # # Calibration boost (tune dB as needed)
-    # # a touch of lift; keep PR at 12 dB, PA smaller because soft-gated content is already hot
-    # force_patch_realtime_pick_scales(realtime_dynamic_baseline_streaming_model, pa_db=0.0, pr_db=0.0, verbose=True)
-    # force_patch_realtime_pick_scales(realtime_static_baseline_streaming_model,  pa_db=0.0, pr_db=0.0, verbose=True)
-    # force_patch_realtime_pick_scales(realtime_dynamic_finetuned_streaming_model, pa_db=0.0, pr_db=0.0, verbose=True)
-    # force_patch_realtime_pick_scales(realtime_static_finetuned_streaming_model,  pa_db=0.0, pr_db=0.0, verbose=True)
-    
     # Save the new training model to disk
     realtime_static_baseline_training_model.save(destination_realtime_baseline_training_model)
     realtime_static_finetuned_training_model.save(destination_realtime_finetuned_training_model)
@@ -7844,95 +7815,6 @@ def _bp_minphase_rev_padded(sr, low_hz, high_hz, target_len):
         pad = nt - M
         k_full[pad:] = k_rev_small
     return k_full.reshape(nt, 1, 1).astype(np.float32)
-
-# Replaces earlier force_patch, shape-safe and exact-length padded
-@register_keras_serializable()
-def force_patch_realtime_hpf_kernels(model,
-                                     sample_rate=REALTIME_SAMPLE_RATE,
-                                     pa_cut_hz=2000.0,   # lowered vs 3 kHz (realtime-only)
-                                     pr_cut_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
-                                     verbose=True):
-    """
-    Force-set streaming post-HPF kernels to exact-length, conv1d-ready min-phase taps.
-    """
-    def _patch(lname, cut_hz):
-        try:
-            L = model.get_layer(lname)
-        except Exception:
-            if verbose:
-                print(f"[patch-hpf] WARN: layer '{lname}' not found; skipping.")
-            return False
-        w_old = L.get_weights()
-        if w_old and len(w_old) > 0:
-            L_len = int(w_old[0].shape[0]); out_ch = int(w_old[0].shape[2]); norm_old = float(np.linalg.norm(w_old[0]))
-        else:
-            L_len = int(getattr(L, "kernel_len", 257)); out_ch = int(getattr(L, "out_ch", 1)); norm_old = 0.0
-        k_rev_full = _hp_minphase_rev_padded(int(sample_rate), float(cut_hz), int(L_len))
-        if out_ch != 1:
-            k_rev_full = np.tile(k_rev_full, (1,1,out_ch)).astype(np.float32)
-        L.set_weights([k_rev_full])
-        norm_new = float(np.linalg.norm(L.get_weights()[0])) if L.get_weights() else 0.0
-        if verbose:
-            print(f"[patch-hpf] {lname}: L={L_len} C_out={out_ch} ||old||={norm_old:.6e} → ||new||={norm_new:.6f}")
-        return True
-
-    ok_pa = _patch("realtime_pickattack_post_hp", pa_cut_hz)
-    ok_pr = _patch("realtime_pickreso_post_hp",   pr_cut_hz)
-    if verbose and (not ok_pa or not ok_pr):
-        print("[patch-hpf] Note: one or more HPFs were not patched.")
-
-@register_keras_serializable()
-def force_patch_realtime_pickreso_ctrl_bp_kernel(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
-    """
-    Ensure realtime_pickreso_ctrl_bp has a sane exact-length BP kernel.
-    """
-    try:
-        L = model.get_layer("realtime_pickreso_ctrl_bp")
-    except Exception:
-        if verbose:
-            print("[patch-bp] WARN: layer 'realtime_pickreso_ctrl_bp' not found; skipping.")
-        return False
-    w_old = L.get_weights()
-    if w_old and len(w_old) > 0:
-        L_len = int(w_old[0].shape[0]); out_ch = int(w_old[0].shape[2]); norm_old = float(np.linalg.norm(w_old[0]))
-    else:
-        L_len = int(getattr(L, "kernel_len", REALTIME_PICK_RESO_BP_ORDER)); out_ch = int(getattr(L, "out_ch", 1)); norm_old = 0.0
-    low = 0.9 * min(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
-    high= 1.1 * max(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
-    k_rev_full = _bp_minphase_rev_padded(int(sample_rate), low, high, int(L_len))
-    if out_ch != 1:
-        k_rev_full = np.tile(k_rev_full, (1,1,out_ch)).astype(np.float32)
-    L.set_weights([k_rev_full])
-    norm_new = float(np.linalg.norm(L.get_weights()[0])) if L.get_weights() else 0.0
-    if verbose:
-        print(f"[patch-bp] realtime_pickreso_ctrl_bp: L={L_len} C_out={out_ch} ||old||={norm_old:.6e} → ||new||={norm_new:.6f}")
-    return True
-
-@register_keras_serializable()
-def force_patch_realtime_pick_scales(model, pa_db=12.0, pr_db=12.0, verbose=True):
-    """
-    Boost fixed scales for realtime pick stems (post-HPF, pre-user).
-    This is a simple calibration so stems sit in mix after we fixed HPFs.
-    """
-    def _set_scale(lname, db):
-        try:
-            L = model.get_layer(lname)
-        except Exception:
-            if verbose: print(f"[patch-scale] WARN: '{lname}' not found; skipping.")
-            return False
-        w = L.get_weights()
-        if not w or len(w[0].shape) != 1:
-            if verbose: print(f"[patch-scale] WARN: '{lname}' has unexpected weights; skipping.")
-            return False
-        old = float(w[0][0]); fac = float(10.0 ** (float(db) / 20.0))
-        w[0][0] = old * fac
-        L.set_weights(w)
-        if verbose:
-            print(f"[patch-scale] {lname}: {old:.6f} * {fac:.3f} → {float(L.get_weights()[0][0]):.6f}")
-        return True
-
-    _set_scale("realtime_pickattack_scale", pa_db)
-    _set_scale("realtime_pickreso_scale",   pr_db)
 
 @register_keras_serializable()
 def dump_realtime_hpf_debug(model, sample_rate=REALTIME_SAMPLE_RATE):
