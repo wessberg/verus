@@ -259,9 +259,12 @@ PICK_RESO_MODAL_LEN_REALTIME        = 1024
 RESBP_STRIKE_ENV_MS_OFFLINE     = 15.0
 RESBP_STRIKE_ENV_MS_REALTIME    = 4.0
 
+# These two represent streaming friendly version of the realtime models
 REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_baseline_realtime.keras"
-REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME = "piezo2mic_baseline_realtime_selfcontained.keras"
 REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_baseline_realtime_dynamic.keras"
+
+# This represents a trainable version of the realtime model, where the entire model is trainable (e.g. non-streamable), and have the offline teacher baked into their graphs
+REALTIME_TRAINABLE_MODEL_FILENAME  = "piezo2mic_baseline_trainable_realtime.keras"
 
 # Pick
 OFFLINE_PICK_MASK_ENV_FAST_MS = 0.1
@@ -320,21 +323,18 @@ ULTRALOW_MAIN_ORDER        = 513
 ULTRALOW_MAIN_WEIGHT               = 0.15  # keep modest; adjust by ear/plots
 
 # Finetune params
+FINETUNE_REALTIME_TRAINABLE_MODEL_FILENAME  = "piezo2mic_finetuned_trainable_realtime.keras"
 FINETUNE_REALTIME_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_realtime.keras"
-FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME = "piezo2mic_finetuned_realtime_selfcontained.keras"
 FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_realtime_dynamic.keras"
 FINETUNE_OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_offline.keras"
 FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.keras"
 
 OFFLINE_TFLITE_T = 40960
-REALTIME_TFLITE_T = 32
-REALTIME_TFLITE_T_DEMO = 6144
+REALTIME_TFLITE_T = 6144 * 4
 OFFLINE_TFLITE_FP32_FILENAME = f"piezo2mic_baseline_offline_t{OFFLINE_TFLITE_T}_fp32.tflite"
 REALTIME_TFLITE_FP32_FILENAME = f"piezo2mic_baseline_realtime_t{REALTIME_TFLITE_T}_fp32.tflite"
-REALTIME_TFLITE_FP32_DEMO_FILENAME = f"piezo2mic_baseline_realtime_t{REALTIME_TFLITE_T_DEMO}_demo_fp32.tflite"
 FINETUNE_OFFLINE_TFLITE_FP32_FILENAME = f"piezo2mic_finetuned_offline_t{OFFLINE_TFLITE_T}_fp32.tflite"
 FINETUNE_REALTIME_TFLITE_FP32_FILENAME = f"piezo2mic_finetuned_realtime_t{REALTIME_TFLITE_T}_fp32.tflite"
-FINETUNE_REALTIME_TFLITE_FP32_DEMO_FILENAME = f"piezo2mic_finetuned_realtime_t{REALTIME_TFLITE_T_DEMO}_demo_fp32.tflite"
 
 FINETUNE_OFFLINE_LR     = 1e-4
 FINETUNE_REALTIME_LR     = 3e-5
@@ -384,7 +384,7 @@ LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
 OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
 
 FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
 FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
@@ -651,7 +651,62 @@ def _extract_trained_modal_kernel_rt(old_model, legacy_name="realtime_pickreso_m
         pass
     return None
 
+@register_keras_serializable()
+class StreamingLinearRamp(tf.keras.layers.Layer):
+    """
+    Streaming linear fade-in from 0→1 over 'ramp_len' samples, with explicit state.
+    inputs: [ref (B,T,1), s_count (B,1,1)]
+      - 'ref' is only used to get T; it is not modified.
+    outputs: [ramp (B,T,1), s_next (B,1,1)]
+    """
+    def __init__(self, ramp_len, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.ramp_len = int(max(1, ramp_len))
 
+    def call(self, inputs):
+        ref, s_count = inputs
+        T = tf.shape(ref)[1]                         # time length this hop
+        # previous count (how many samples already emitted, clamped to ramp_len)
+        c0 = tf.cast(tf.squeeze(s_count, axis=[1,2]), tf.int32)  # (B,)
+        c0c = tf.clip_by_value(c0, 0, self.ramp_len)
+
+        # ramp indices for this hop: c0 + [1..T]
+        idx = tf.range(T, dtype=tf.int32)[None, :] + c0c[:, None] + 1
+        r = tf.clip_by_value(tf.cast(idx, ref.dtype) / float(self.ramp_len), 0.0, 1.0)
+        ramp = r[:, :, None]                         # (B,T,1)
+
+        # next state: clamp to ramp_len so it stops at 1.0 after ramp_len samples
+        c_next = tf.clip_by_value(c0c + T, 0, self.ramp_len)
+        s_next = tf.reshape(tf.cast(c_next, ref.dtype), (-1, 1, 1))
+        return [ramp, s_next]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"ramp_len": self.ramp_len})
+        return cfg
+
+@register_keras_serializable()
+class StreamingScalarEMA(tf.keras.layers.Layer):
+    """
+    Streaming EMA for a scalar per-batch value (shape (B,1)).
+    inputs: [x (B,1), s_prev (B,1)] → outputs: [y (B,1), s_next (B,1)]
+    y = alpha * s_prev + (1-alpha) * x
+    """
+    def __init__(self, alpha=0.98, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.alpha = float(alpha)
+
+    def call(self, inputs):
+        x, s_prev = inputs
+        a = tf.constant(self.alpha, dtype=x.dtype)
+        y = a * s_prev + (1.0 - a) * x
+        return [y, y]  # y is also the next state
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"alpha": self.alpha})
+        return cfg
+    
 @register_keras_serializable()
 class PickResoDownsampleFIR(Layer):
     """
@@ -1023,8 +1078,6 @@ class LearnedModalBank(tf.keras.layers.Layer):
             **super().get_config()
         }
 
-
-
 def _pick_attack(prefix,
                  hf_in,
                  mask,
@@ -1182,6 +1235,453 @@ class ZeroBias(constraints.Constraint):
         return tf.zeros_like(w)
     def get_config(self):
         return {}
+    
+    
+# ─────────────────────────────────────────────────────────────────────────────
+# NEW helper ops/layers for streaming, Keras-serializable, TFLite-friendly
+# ─────────────────────────────────────────────────────────────────────────────
+
+@register_keras_serializable()
+def _take_last(x, n):
+    return x[:, -int(n):, :]
+
+@register_keras_serializable()
+class ConcatTime(tf.keras.layers.Layer):
+    """Concat [state, x] along time axis."""
+    def call(self, inputs):
+        s, x = inputs
+        return tf.concat([s, x], axis=1)
+    def get_config(self):
+        return super().get_config()
+
+@register_keras_serializable()
+class TakeLastN(tf.keras.layers.Layer):
+    def __init__(self, n, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.n = int(n)
+    def call(self, x):
+        return _take_last(x, self.n)
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"n": self.n})
+        return cfg
+
+@register_keras_serializable()
+class StreamFixedFIR(tf.keras.layers.Layer):
+    """
+    Generic streaming fixed FIR with explicit state.
+    Inputs: [x, state] where state has shape (L-1, C_in)
+    Kernel shape: (L, 1, C_out) (time-reversed taps for conv1d)
+    Returns: [y (B,T,C_out), state_next (B,L-1,C_in)]
+    If taps_init is provided (np.array or tf.Tensor of shape (L,1,C_out)), it is used
+    as the initializer instead of zeros. This avoids 'silent branch' when no copy-by-name occurs.
+    """
+    def __init__(self, kernel_len, out_ch, weight_name, trainable_kernel=False, taps_init=None, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.kernel_len = int(kernel_len)
+        self.out_ch = int(out_ch)
+        self.weight_name = str(weight_name)
+        self.trainable_kernel = bool(trainable_kernel)
+        # Keep init only in memory; do not serialize to JSON config
+        if taps_init is None:
+            self._taps_init_np = None
+        else:
+            if tf.is_tensor(taps_init):
+                self._taps_init_np = taps_init.numpy().astype(np.float32)
+            else:
+                self._taps_init_np = np.asarray(taps_init, dtype=np.float32)
+
+    def build(self, input_shape):
+        if self._taps_init_np is not None:
+            k = self._taps_init_np
+        else:
+            k = np.zeros((self.kernel_len, 1, self.out_ch), dtype=np.float32)
+
+        # Safety: enforce expected shape if out_ch==1 and a scalar kernel provided
+        if k.shape != (self.kernel_len, 1, self.out_ch):
+            # Try to reshape/broadcast if possible
+            try:
+                k = np.reshape(k, (self.kernel_len, 1, self.out_ch)).astype(np.float32)
+            except Exception:
+                # fallback to zeros with warning
+                k = np.zeros((self.kernel_len, 1, self.out_ch), dtype=np.float32)
+
+        self.kernel = self.add_weight(
+            name=self.weight_name,
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=self.trainable_kernel
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        x, state = inputs  # x: (B,T,C_in), state: (B,L-1,C_in)
+        T = tf.shape(x)[1]
+        x_cat = tf.concat([state, x], axis=1)  # (B, L-1+T, C_in)
+        y_full = tf.nn.conv1d(x_cat, filters=self.kernel, stride=1, padding='VALID')  # ideally (B, T, C_out)
+        y = y_full[:, -T:, :]
+        s_next = x_cat[:, - (self.kernel_len - 1):, :]
+        return [y, s_next]
+
+    def compute_output_shape(self, input_shapes):
+        x_shp, _ = input_shapes
+        b, t, _ = x_shp
+        return [(b, t, self.out_ch), (b, self.kernel_len - 1, x_shp[2])]
+
+    def get_config(self):
+        # do not serialize taps_init (weights persist in the saved model anyway)
+        return {
+            "kernel_len": self.kernel_len,
+            "out_ch": self.out_ch,
+            "weight_name": self.weight_name,
+            "trainable_kernel": self.trainable_kernel,
+            **super().get_config()
+        }
+
+@register_keras_serializable()
+class StreamingRealtimeIrDownsampleFIR(tf.keras.layers.Layer):
+    """
+    Streaming decimate-by-N with causal FIR.
+    If use_ir_prototype=True, use the exact same taps as the non-streaming IR branch
+    (global _ir_fir_kernel), guaranteeing equivalence for the IR path.
+      inputs: [x (B,T,1), state (B,L-1,1)]
+      outputs: [y_ds (B, floor(T/N), 1), state_next (B,L-1,1)]
+    """
+    def __init__(self, factor=REALTIME_IR_DOWNSAMPLE_FACTOR, kernel_size=REALTIME_IR_FIR_SIZE, use_ir_prototype=False, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.factor = int(factor)
+        self.kernel_size = int(kernel_size)
+        self.use_ir_prototype = bool(use_ir_prototype)
+
+    def build(self, input_shape):
+        if self.use_ir_prototype:
+            k = _ir_fir_kernel.astype(np.float32)  # (L,1,1), already reversed for conv1d
+        else:
+            cutoff = 0.45 / float(self.factor)
+            taps = firwin(self.kernel_size, cutoff=cutoff, window=('kaiser', 8.0), pass_zero=True).astype(np.float32)
+            taps_min = minimum_phase(taps, method='homomorphic').astype(np.float32)
+            taps_min = taps_min / max(np.sum(taps_min), 1e-12)
+            k = taps_min[::-1].reshape(-1, 1, 1).astype(np.float32)
+
+        self.kernel = self.add_weight(
+            name="ds_lpf_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        x, state = inputs  # x: (B,T,1), state: (B,L-1,1)
+        x_cat = tf.concat([state, x], axis=1)  # (B, L-1+T, 1)
+        y = tf.nn.conv1d(x_cat, filters=self.kernel, stride=self.factor, padding='VALID')  # (B, floor(T/N), 1)
+        s_next = x_cat[:, - (tf.shape(self.kernel)[0] - 1):, :]
+        return [y, s_next]
+
+    def get_config(self):
+        return {"factor": self.factor, "kernel_size": self.kernel_size, "use_ir_prototype": self.use_ir_prototype, **super().get_config()}
+
+@register_keras_serializable()
+class StreamingFIRInterpByN(tf.keras.layers.Layer):
+    """
+    Streaming version of FIRInterpByN:
+      inputs: [x_low (B,Tl,C), state_low (B,L-1,C_low=1)]
+      outputs: [y_up (B,Tl*F,C), state_next_low (B,L-1,C_low)]
+    It zero-inserts at low rate, filters, and discards the first F*(L-1) samples,
+    returning exactly Tl*F samples (aligned with new low-rate input).
+    """
+    def __init__(self, factor, num_taps=257, cutoff=None, window=('kaiser', 9.0), name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.factor = int(factor)
+        self.num_taps = int(num_taps)
+        self.cutoff = float(0.45 / self.factor) if cutoff is None else float(cutoff)
+        self.window = window
+
+    def build(self, input_shape):
+        win = self.window
+        try:
+            if not isinstance(win, (str, tuple)):
+                win = tuple(win)
+        except TypeError:
+            win = 'hann'
+        try:
+            taps = firwin(self.num_taps, cutoff=self.cutoff, window=win, pass_zero=True).astype(np.float32)
+        except Exception:
+            taps = firwin(self.num_taps, cutoff=self.cutoff, window=('kaiser', 9.0), pass_zero=True).astype(np.float32)
+        taps = taps / np.maximum(np.sum(taps), 1e-12)
+        k = taps[::-1].reshape(-1, 1, 1).astype(np.float32)
+        self.kernel = self.add_weight(
+            name="fir_interp_taps",
+            shape=k.shape,
+            initializer=tf.keras.initializers.Constant(k),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, inputs):
+        x_low, state_low = inputs
+        # concat low-rate state
+        x_cat = tf.concat([state_low, x_low], axis=1)  # (B, L-1 + Tl, 1)
+
+        # Zero insertion (upsample) at factor
+        b = tf.shape(x_cat)[0]
+        t = tf.shape(x_cat)[1]
+        c = tf.shape(x_cat)[2]
+        x4 = tf.reshape(x_cat, [b, t, 1, c])                        # (B,t,1,C)
+        pad_zeros = tf.zeros([b, t, self.factor - 1, c], x_cat.dtype)
+        xz = tf.concat([x4, pad_zeros], axis=2)                     # (B,t,F,C)
+        xu = tf.reshape(xz, [b, t * self.factor, c])                # (B, t*F, C)
+
+        # Valid conv with left alignment → upsampled
+        L = self.num_taps
+        xu_pad = tf.pad(xu, [[0,0],[L-1,0],[0,0]])
+        yu = tf.nn.conv1d(xu_pad, filters=self.kernel, stride=1, padding='VALID')  # (B, t*F, C)
+
+        # Discard first factor * (L-1) samples (they correspond to the prepended low-rate state)
+        left_drop = self.factor * (L - 1)
+        yu_eff = yu[:, left_drop:, :]
+
+        # Keep exactly new low-rate contribution length = Tl*F
+        Tl = tf.shape(x_low)[1]
+        out_len = Tl * self.factor
+        yu_eff = yu_eff[:, :out_len, :]
+
+        # Next low-rate state = last (L-1) low-rate samples from x_cat
+        s_next = x_cat[:, - (L - 1):, :]
+
+        return [yu_eff, s_next]
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "factor": self.factor,
+            "num_taps": self.num_taps,
+            "cutoff": self.cutoff,
+            "window": self.window
+        })
+        return cfg
+
+@register_keras_serializable()
+class StreamingPickDBMask(tf.keras.layers.Layer):
+    """
+    Streaming analytic pick detector in dB domain with soft-knee + post compression.
+    Now includes a 1-sample continuity state for 'prev(m0)' so rising/decay selection
+    is seamless across hops.
+
+    Inputs:
+      [ x, s_hp, s_fast, s_slow, s_att, s_rel, s_prev_m0 ]
+        - x: (B,T,1)
+        - s_*: streaming FIR states (B,L-1,1)
+        - s_prev_m0: (B,1,1) last m0 sample from previous hop
+
+    Outputs:
+      [ y, s_hp_n, s_fast_n, s_slow_n, s_att_n, s_rel_n, s_prev_m0_n ]
+        - y: (B,T,1) mask in [0,1]
+        - s_prev_m0_n: (B,1,1) last m0 of this hop
+    """
+    def __init__(self,
+                 sample_rate,
+                 hp_cut_hz=3500.0,
+                 hp_order=129,
+                 env_fast_ms=0.25,
+                 env_slow_ms=10.0,
+                 thr_db=0.0,
+                 knee_db=12.0,
+                 smooth_attack_ms=0.06,
+                 smooth_release_ms=6.0,
+                 ref_is_hp=True,
+                 post_comp_p=1.6,
+                 post_comp_gain=1.15,
+                 floor=0.02,
+                 out_gain=1.0,
+                 name=None,
+                 **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.sample_rate       = int(sample_rate)
+        self.hp_cut_hz         = float(hp_cut_hz)
+        self.hp_order          = int(hp_order)
+        self.env_fast_ms       = float(env_fast_ms)
+        self.env_slow_ms       = float(env_slow_ms)
+        self.thr_db            = float(thr_db)
+        self.knee_db           = float(knee_db)
+        self.smooth_attack_ms  = float(smooth_attack_ms)
+        self.smooth_release_ms = float(smooth_release_ms)
+        self.ref_is_hp         = bool(ref_is_hp)
+        self.post_comp_p       = float(post_comp_p)
+        self.post_comp_gain    = float(post_comp_gain)
+        self.floor             = float(floor)
+        self.out_gain          = float(out_gain)
+
+    def build(self, input_shape):
+        k_hp = _get_minphase_hp_kernel(self.sample_rate, self.hp_cut_hz, self.hp_order)
+        self.k_hp = self.add_weight(
+            name="dbmask_hp_taps", shape=k_hp.shape,
+            initializer=tf.keras.initializers.Constant(k_hp), trainable=False
+        )
+        def ema_ms(ms, scale, Lmax):
+            smpls = max(1, int(round((float(ms)/1000.0) * self.sample_rate)))
+            return _exp_smoothing_kernel(smpls, scale=scale, Lmax=Lmax)
+        k_fast = ema_ms(self.env_fast_ms, scale=3.0, Lmax=1024)
+        k_slow = ema_ms(self.env_slow_ms, scale=3.0, Lmax=4096)
+        k_att  = ema_ms(self.smooth_attack_ms,  scale=4.0, Lmax=2048)
+        k_rel  = ema_ms(self.smooth_release_ms, scale=4.0, Lmax=2048)
+
+        self.k_fast = self.add_weight(
+            name="dbmask_env_fast", shape=k_fast.shape,
+            initializer=tf.keras.initializers.Constant(k_fast), trainable=False
+        )
+        self.k_slow = self.add_weight(
+            name="dbmask_env_slow", shape=k_slow.shape,
+            initializer=tf.keras.initializers.Constant(k_slow), trainable=False
+        )
+        self.k_att  = self.add_weight(
+            name="dbmask_att", shape=k_att.shape,
+            initializer=tf.keras.initializers.Constant(k_att), trainable=False
+        )
+        self.k_rel  = self.add_weight(
+            name="dbmask_rel", shape=k_rel.shape,
+            initializer=tf.keras.initializers.Constant(k_rel), trainable=False
+        )
+
+        slope_val = float(np.log(9.0) / max(self.knee_db, 1e-3))
+        self.slope = self.add_weight(
+            name="dbmask_sigmoid_slope", shape=(1,),
+            initializer=tf.keras.initializers.Constant([slope_val]), trainable=False
+        )
+        self.thr_db_w = self.add_weight(
+            name="dbmask_thr_db", shape=(1,),
+            initializer=tf.keras.initializers.Constant([self.thr_db]), trainable=False
+        )
+        self.gain = self.add_weight(
+            name="dbmask_out_gain", shape=(1,),
+            initializer=tf.keras.initializers.Constant([self.out_gain]), trainable=False
+        )
+        super().build(input_shape)
+
+    def _stream_conv(self, x, k, s):
+        x_cat = tf.concat([s, x], axis=1)  # (B, L-1+T, C)
+        y = tf.nn.conv1d(x_cat, filters=k, stride=1, padding='VALID')
+        T = tf.shape(x)[1]
+        y = y[:, -T:, :]
+        s_next = x_cat[:, tf.shape(x_cat)[1] - (tf.shape(k)[0] - 1):, :]
+        return y, s_next
+
+    def call(self, inputs):
+        # Backward-compat: accept 6 or 7 inputs
+        if len(inputs) == 6:
+            x, s_hp, s_fast, s_slow, s_att, s_rel = inputs
+            s_prev_m0 = None
+        else:
+            x, s_hp, s_fast, s_slow, s_att, s_rel, s_prev_m0 = inputs
+
+        eps = tf.constant(1e-8, dtype=x.dtype)
+
+        hp, s_hp_n = self._stream_conv(x, self.k_hp, s_hp)
+        abs_hp = tf.abs(hp)
+
+        env_hi, s_fast_n = self._stream_conv(abs_hp, self.k_fast, s_fast)
+        if self.ref_is_hp:
+            env_lo, s_slow_n = self._stream_conv(abs_hp, self.k_slow, s_slow)
+        else:
+            abs_x = tf.abs(x)
+            env_lo, s_slow_n = self._stream_conv(abs_x, self.k_slow, s_slow)
+
+        ln10 = tf.math.log(tf.constant(10.0, dtype=x.dtype))
+        r_db = (20.0 / ln10) * (tf.math.log(env_hi + eps) - tf.math.log(env_lo + eps))
+        z  = (r_db - self.thr_db_w[0]) * self.slope[0]
+        m0 = tf.math.sigmoid(z)
+
+        # Continuous prev across hops
+        if s_prev_m0 is None:
+            prev = tf.pad(m0, [[0,0],[1,0],[0,0]])[:, :-1, :]
+        else:
+            prev = tf.concat([s_prev_m0, m0[:, :-1, :]], axis=1)
+        s_prev_m0_n = m0[:, -1:, :]
+
+        rising = tf.cast(m0 > prev, x.dtype)
+        m_att, s_att_n = self._stream_conv(m0, self.k_att, s_att)
+        m_rel, s_rel_n = self._stream_conv(m0, self.k_rel, s_rel)
+        m1 = tf.clip_by_value(rising * m_att + (1.0 - rising) * m_rel, 0.0, 1.0)
+
+        if self.post_comp_p != 1.0:
+            p = tf.constant(self.post_comp_p, dtype=x.dtype)
+            y = 1.0 - tf.pow(1.0 - m1, p)
+            if self.post_comp_gain != 1.0:
+                y = tf.clip_by_value(tf.constant(self.post_comp_gain, dtype=x.dtype) * y, 0.0, 1.0)
+        else:
+            y = m1
+
+        if self.floor > 0.0:
+            fl = tf.constant(self.floor, dtype=x.dtype)
+            y = fl + (1.0 - fl) * y
+
+        y = tf.clip_by_value(y * self.gain[0], 0.0, 1.0)
+
+        if s_prev_m0 is None:
+            return [y, s_hp_n, s_fast_n, s_slow_n, s_att_n, s_rel_n]
+        return [y, s_hp_n, s_fast_n, s_slow_n, s_att_n, s_rel_n, s_prev_m0_n]
+
+    def get_config(self):
+        return {
+            "sample_rate": self.sample_rate,
+            "hp_cut_hz": self.hp_cut_hz,
+            "hp_order": self.hp_order,
+            "env_fast_ms": self.env_fast_ms,
+            "env_slow_ms": self.env_slow_ms,
+            "thr_db": self.thr_db,
+            "knee_db": self.knee_db,
+            "smooth_attack_ms": self.smooth_attack_ms,
+            "smooth_release_ms": self.smooth_release_ms,
+            "ref_is_hp": self.ref_is_hp,
+            "post_comp_p": self.post_comp_p,
+            "post_comp_gain": self.post_comp_gain,
+            "floor": self.floor,
+            "out_gain": self.out_gain,
+            **super().get_config()
+        }
+
+@register_keras_serializable()
+class StreamingDiffPos(tf.keras.layers.Layer):
+    """
+    Streaming positive first difference with 1-sample continuity state:
+      inputs: [x (B,T,1), s_prev (B,1,1)]
+      outputs: [y (B,T,1), s_next (B,1,1)]
+      y[n] = relu(x[n] - x[n-1]) with x[-1] coming from s_prev.
+    """
+    def call(self, inputs):
+        x, s_prev = inputs
+        prev = tf.concat([s_prev, x[:, :-1, :]], axis=1)
+        y = tf.nn.relu(x - prev)
+        s_next = x[:, -1:, :]
+        return [y, s_next]
+
+    def get_config(self):
+        return super().get_config()
+    
+@register_keras_serializable()
+class PreEmphasisStream(tf.keras.layers.Layer):
+    """
+    Streaming 1st-order pre-emphasis with explicit state:
+      inputs: [x (B,T,1), s (B,1,1)] where s is previous x[-1]
+      outputs: [y (B,T,1), s_next (B,1,1)]
+      y[n] = x[n] - alpha * x[n-1]
+    """
+    def __init__(self, alpha=HP_PRE_EMPHASIS_HF, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.alpha = float(alpha)
+
+    def call(self, inputs):
+        x, s = inputs
+        prev = tf.concat([s, x[:, :-1, :]], axis=1)
+        y = x - tf.constant(self.alpha, dtype=x.dtype) * prev
+        s_next = x[:, -1:, :]
+        return [y, s_next]
+
+    def get_config(self):
+        return {"alpha": self.alpha, **super().get_config()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
         
 class DemoCallback(Callback):
     def __init__(self, sample_rate, demo_checkpoints_out_dir, build_model_fn, build_model_fn_args_dynamic={}, use_safe_weight_copy=False):
@@ -2348,19 +2848,6 @@ def calibrate_loss_weights(model, dataset, sample_rate, n_batches=5,
         new_w[k] = (declared[k] / bs * ref) if bs > 0 else 0.0
     return new_w, avgs
 
-def generate_demo (model, kind, out_dir, sample_rate, prediction_name="demo_pred", only_prediction=False):
-    assert_has_pairs()
-    pth_src, pth_tgt = all_pairs[LONG_DEMO_PAIR_INDEX]
-    return generate_demo_from_files(
-        model                      = model,
-        kind                       = kind,
-        out_dir                    = out_dir,
-        sample_rate                = sample_rate,
-        path_src                   = pth_src,
-        path_target                = pth_tgt,
-        prediction_name            = prediction_name,
-        only_prediction            = only_prediction
-    )
 
 def _get_model_context_for_streaming(model_sample_rate: int, model=None):
     """
@@ -3419,7 +3906,7 @@ def film_apply(x, style_embed, filters, prefix,
 # ────────────────────────────── MODEL BUILDERS ───────────────────────────────
 
 @register_keras_serializable()
-def build_offline_model_causal(offline_src, dynamic_time=True):
+def build_offline_model_causal(offline_src, dynamic_time=False):
     """
     Build a causalized offline model (right-lookahead=0) and copy weights by name
     from the provided non-causal offline model. Returned model is frozen.
@@ -3543,10 +4030,19 @@ def build_offline_model(dynamic_time=False,
     return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_dw_in], outputs=[out, style_prob], name=name)
 
 @register_keras_serializable()
-def build_realtime_model(offline=None,
+def build_realtime_training_model(offline=None,
                         dynamic_time=False,
                         name="piezo2mic_realtime",
                         coloreq_trainable=False):
+    """
+    Realtime NON-streaming graph.
+    - If 'offline' is provided: builds KD training graph (extra teacher input).
+    - If 'offline' is None: builds teacherless (self-contained) NON-streaming graph.
+    This function no longer supports a streaming flag.
+
+    For streaming self-contained models (static T=32 or dynamic time),
+    use build_realtime_streaming_model(...) below.
+    """
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -3608,10 +4104,10 @@ def build_realtime_model(offline=None,
         xb = Multiply(name=f"realtime_gate_mul_{i}")([c, Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
         xb = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(xb)
         xb = ConstScale(0.35, name=f"realtime_res_scale_{i}")(xb)
-        x = Add(name=f"realtime_res_add_{i}")([xb, res])
-        x = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
-                       gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
-                       gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
+        x  = Add(name=f"realtime_res_add_{i}")([xb, res])
+        x  = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
+                        gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
+                        gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
 
     out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
     out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
@@ -3620,7 +4116,7 @@ def build_realtime_model(offline=None,
     finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
     y_main     = Add(name="realtime_main")([pick_c, finger_c])
 
-    # IR branch
+    # IR branch (non-streaming)
     ir = RealtimeIrDownsampleFIR(name="realtime_ir_downsample")(inp)
     for i, d in enumerate(REALTIME_IR_DILATIONS):
         pad = (REALTIME_IR_KERNEL - 1) * d
@@ -3656,7 +4152,7 @@ def build_realtime_model(offline=None,
 
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
 
-    # Post-HPF stems inside the heads
+    # Pick-attack and pick-reso (POST-HPF inside heads)
     pickattack, pa_pen = _pick_attack(
         "realtime", hf_in, mask, style_scalar_b3,
         filters=16,
@@ -3668,20 +4164,17 @@ def build_realtime_model(offline=None,
     )
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
-        # Multiply knobs post-limit/post-HPF so user gain doesn't re-open headroom or subsonics.
+    # Apply knobs post-limit/post-HPF
     pickattack = apply_runtime_gain(pickattack, knob_pa_in, name="realtime_pickattack_user_gain")
     pickreso   = apply_runtime_gain(pickreso,   knob_pr_in, name="realtime_pickreso_user_gain")
     ir         = apply_runtime_gain(ir,         knob_ir_in, name="realtime_ir_user_gain")
 
-    # Sum (no bus HPF)
+    # Sum and color EQ
     y_prehp  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
+    y_prehp  = LossTether(name="realtime_pick_lowband_penalties")([y_prehp, pa_pen, pr_pen])
 
-    # Tie in penalties (post-no-op)
-    y_prehp = LossTether(name="realtime_pick_lowband_penalties")([y_prehp, pa_pen, pr_pen])
-
-    # Color EQ last
     y_wet = add_coloreq(y_prehp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
-                          name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
+                        name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
     
     wet_gain   = Lambda(invert, name="realtime_wet_from_drywet")(knob_dw_in)
     wet_scaled = apply_runtime_gain(y_wet,  wet_gain,    name="realtime_wet_gain")
@@ -3694,6 +4187,348 @@ def build_realtime_model(offline=None,
     inputs_list += [knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in]
     return tf.keras.models.Model(inputs=inputs_list, outputs=[y_final, style_prob], name=name)
 
+@register_keras_serializable()
+def build_realtime_streaming_model(dynamic_time=False,
+                                   name="piezo2mic_realtime",
+                                   coloreq_trainable=False,
+                                   static_T=REALTIME_TFLITE_T):
+    if dynamic_time:
+        T = None
+    else:
+        T = int(static_T)
+
+    inp = Input(shape=(T,1), name="realtime_piezo_input")
+    state_inputs = []
+    state_outputs = []
+
+    style_true_in  = Input(shape=(1,), name="realtime_style_true_input")
+    style_force_in = Input(shape=(1,), name="realtime_style_force_input")
+
+    knob_pa_in = Input(shape=(1,), name="realtime_knob_pickattack")
+    knob_pr_in = Input(shape=(1,), name="realtime_knob_pickreso")
+    knob_ir_in = Input(shape=(1,), name="realtime_knob_ir")
+    knob_dw_in = Input(shape=(1,), name="realtime_knob_drywet")
+
+    # Style head (unchanged)
+    cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
+    cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
+    style_logit = Dense(1, name="realtime_style_logit")(cls)
+    style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
+
+    # Streaming EMA for style (unchanged)
+    s_style = Input(shape=(1,1), name="realtime_state_style_ema")
+    state_inputs.append(s_style)
+    s_style_flat = Reshape((1,), name="realtime_state_style_ema_flat")(s_style)
+    style_prob_ema, s_style_next_flat = StreamingScalarEMA(alpha=0.98, name="realtime_style_prob_ema")([style_prob, s_style_flat])
+    s_style_next = Reshape((1,1), name="realtime_state_style_ema_expand")(s_style_next_flat)
+    state_outputs.append(Activation('linear', name="realtime_state_style_ema_next")(s_style_next))
+
+    one_minus_force   = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
+    style_used_scalar = Add(name="realtime_style_used_scalar")([
+        Multiply(name="realtime_style_pred_part")([one_minus_force, style_prob_ema]),
+        Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
+    ])
+    style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
+    style_embed     = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
+
+    # Main stack (unchanged)
+    BC = ZeroBias()
+    x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
+    for i in range(REALTIME_PRE_BLOCKS):
+        pad_len = (REALTIME_PRE_KERNEL - 1) * 1
+        s_in = Input(shape=(pad_len, REALTIME_FILTERS), name=f"realtime_state_pre_{i}")
+        state_inputs.append(s_in)
+        x_cat = ConcatTime(name=f"realtime_pre_{i}_concat")([s_in, x])
+        g = SeparableConv1D(2*REALTIME_FILTERS, REALTIME_PRE_KERNEL, dilation_rate=1, padding="valid",
+                            bias_constraint=BC, name=f"realtime_pre_{i}_sep")(x_cat)
+        c  = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_pre_{i}_slice_c")(g)
+        g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_pre_{i}_slice_g")(g)
+        xb = Multiply(name=f"realtime_pre_{i}_gate_mul")([c, Activation("sigmoid", name=f"realtime_pre_{i}_sigmoid")(g2)])
+        xb = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pre_{i}_pw")(xb)
+        xb = ConstScale(0.35, name=f"realtime_pre_{i}_res_scale")(xb)
+        x  = Add(name=f"realtime_pre_{i}_res_add")([xb, x])
+        x  = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_pre_{i}",
+                        gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
+                        gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
+        s_out = TakeLastN(pad_len, name=f"realtime_state_pre_{i}_next")(x_cat)
+        state_outputs.append(s_out)
+
+    for i, d in enumerate(REALTIME_DILATIONS):
+        pad_len = (REALTIME_KERNEL_SIZE - 1) * d
+        s_in = Input(shape=(pad_len, REALTIME_FILTERS), name=f"realtime_state_sep_{i}")
+        state_inputs.append(s_in)
+        x_cat = ConcatTime(name=f"realtime_padcat_{i}")([s_in, x])
+        g = SeparableConv1D(2*REALTIME_FILTERS, REALTIME_KERNEL_SIZE, dilation_rate=d, padding="valid",
+                            bias_constraint=BC, name=f"realtime_sep_{i}")(x_cat)
+        c  = Lambda(slice_content, arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_c_{i}")(g)
+        g2 = Lambda(slice_gate,    arguments={"filters": REALTIME_FILTERS}, name=f"realtime_slice_g_{i}")(g)
+        xb = Multiply(name=f"realtime_gate_mul_{i}")([c, Activation("sigmoid", name=f"realtime_sigmoid_{i}")(g2)])
+        xb = Conv1D(REALTIME_FILTERS, 1, padding="same", bias_constraint=BC, name=f"realtime_pw_{i}")(xb)
+        xb = ConstScale(0.35, name=f"realtime_res_scale_{i}")(xb)
+        x  = Add(name=f"realtime_res_add_{i}")([xb, x])
+        x  = film_apply(x, style_embed, REALTIME_FILTERS, prefix=f"realtime_dil_{i}",
+                        gamma_scale=REALTIME_FILM_GAMMA_SCALE, beta_scale=REALTIME_FILM_BETA_SCALE,
+                        gamma_mag=REALTIME_FILM_GAMMA_MAG, beta_mag=REALTIME_FILM_BETA_MAG)
+        s_out = TakeLastN(pad_len, name=f"realtime_state_sep_{i}_next")(x_cat)
+        state_outputs.append(s_out)
+
+    out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
+    out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
+    inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
+    pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
+    finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
+    y_main     = Add(name="realtime_main")([pick_c, finger_c])
+
+    # IR branch: use exact prototype taps for DS to ensure equivalence
+    s_ir_ds = Input(shape=(REALTIME_IR_FIR_SIZE - 1, 1), name="realtime_state_ir_ds")
+    state_inputs.append(s_ir_ds)
+    ir_ds, s_ir_ds_next = StreamingRealtimeIrDownsampleFIR(
+        factor=REALTIME_IR_DOWNSAMPLE_FACTOR,
+        kernel_size=REALTIME_IR_FIR_SIZE,
+        use_ir_prototype=True,
+        name="realtime_ir_downsample"
+    )([inp, s_ir_ds])
+    state_outputs.append(Activation('linear', name="realtime_state_ir_ds_next")(s_ir_ds_next))
+
+    ir_lr = ir_ds
+    for i, d in enumerate(REALTIME_IR_DILATIONS):
+        pad = (REALTIME_IR_KERNEL - 1) * d
+        s_in = Input(shape=(pad, 1), name=f"realtime_state_ir_sep_{i}")
+        state_inputs.append(s_in)
+        ir_cat = ConcatTime(name=f"realtime_ir_padcat_{i}")([s_in, ir_lr])
+        ir_lr = SeparableConv1D(filters=1, kernel_size=REALTIME_IR_KERNEL, dilation_rate=d, padding="valid",
+                                depthwise_regularizer=regularizers.l2(1e-4),
+                                pointwise_regularizer=regularizers.l2(1e-4),
+                                depthwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+                                pointwise_constraint=constraints.MinMaxNorm(min_value=0.0, max_value=1.0, rate=1.0),
+                                bias_constraint=BC, name=f"realtime_ir_sep_{i}")(ir_cat)
+        s_out = TakeLastN(pad, name=f"realtime_state_ir_sep_{i}_next")(ir_cat)
+        state_outputs.append(s_out)
+    ir_lr = IrScale(init=0.6, name="realtime_ir_scale")(ir_lr)
+
+    s_ir_up = Input(shape=(max(193, REALTIME_LP_ORDER)-1, 1), name="realtime_state_ir_interp")
+    state_inputs.append(s_ir_up)
+    ir_up, s_ir_up_next = StreamingFIRInterpByN(factor=REALTIME_IR_DOWNSAMPLE_FACTOR,
+                                                num_taps=max(193, REALTIME_LP_ORDER),
+                                                cutoff=0.45/REALTIME_IR_DOWNSAMPLE_FACTOR,
+                                                window=('kaiser', 9.0),
+                                                name="realtime_ir_interp")(inputs=[ir_lr, s_ir_up])
+    state_outputs.append(Activation('linear', name="realtime_state_ir_interp_next")(s_ir_up_next))
+    ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir_up, inp])
+
+    # Pick mask (unchanged)
+    def ema_len(ms, sr, scale, Lmax):
+        s = max(1, int(round((float(ms)/1000.0) * float(sr))))
+        L = int(np.clip(np.ceil(scale * s), 8, Lmax))
+        return L
+    L_hp   = REALTIME_HF_HP_ORDER
+    L_fast = ema_len(REALTIME_PICK_MASK_ENV_FAST_MS, REALTIME_SAMPLE_RATE, 3.0, 1024)
+    L_slow = ema_len(REALTIME_PICK_MASK_ENV_SLOW_MS, REALTIME_SAMPLE_RATE, 3.0, 4096)
+    L_att  = ema_len(REALTIME_PICK_MASK_SMOOTH_ATTACK_MS,  REALTIME_SAMPLE_RATE, 4.0, 2048)
+    L_rel  = ema_len(REALTIME_PICK_MASK_SMOOTH_RELEASE_MS, REALTIME_SAMPLE_RATE, 4.0, 2048)
+
+    s_m_hp   = Input(shape=(L_hp-1,   1), name="realtime_state_pickmask_hp")
+    s_m_fast = Input(shape=(L_fast-1, 1), name="realtime_state_pickmask_fast")
+    s_m_slow = Input(shape=(L_slow-1, 1), name="realtime_state_pickmask_slow")
+    s_m_att  = Input(shape=(L_att-1,  1), name="realtime_state_pickmask_att")
+    s_m_rel  = Input(shape=(L_rel-1,  1), name="realtime_state_pickmask_rel")
+    s_m_prev = Input(shape=(1,1),         name="realtime_state_pickmask_prev")
+    state_inputs += [s_m_hp, s_m_fast, s_m_slow, s_m_att, s_m_rel, s_m_prev]
+
+    mask_outs = StreamingPickDBMask(
+        sample_rate=REALTIME_SAMPLE_RATE,
+        hp_cut_hz=hp_cutoff_for_sr(REALTIME_SAMPLE_RATE),
+        hp_order=REALTIME_HF_HP_ORDER,
+        env_fast_ms=REALTIME_PICK_MASK_ENV_FAST_MS,
+        env_slow_ms=REALTIME_PICK_MASK_ENV_SLOW_MS,
+        thr_db=REALTIME_PICK_MASK_THRESHOLD_DB,
+        knee_db=REALTIME_PICK_MASK_KNEE_DB,
+        smooth_attack_ms=REALTIME_PICK_MASK_SMOOTH_ATTACK_MS,
+        smooth_release_ms=REALTIME_PICK_MASK_SMOOTH_RELEASE_MS,
+        ref_is_hp=True,
+        post_comp_p=REALTIME_PICK_MASK_POST_COMP_P,
+        post_comp_gain=REALTIME_PICK_MASK_POST_COMP_GAIN,
+        floor=REALTIME_PICK_MASK_FLOOR,
+        out_gain=REALTIME_PICK_MASK_OUT_GAIN,
+        name="realtime_pick_mask_db"
+    )([inp, s_m_hp, s_m_fast, s_m_slow, s_m_att, s_m_rel, s_m_prev])
+    mask, s_hp_n, s_fast_n, s_slow_n, s_att_n, s_rel_n, s_prev_n = mask_outs
+    state_outputs += [
+        Activation('linear', name="realtime_state_pickmask_hp_next")(s_hp_n),
+        Activation('linear', name="realtime_state_pickmask_fast_next")(s_fast_n),
+        Activation('linear', name="realtime_state_pickmask_slow_next")(s_slow_n),
+        Activation('linear', name="realtime_state_pickmask_att_next")(s_att_n),
+        Activation('linear', name="realtime_state_pickmask_rel_next")(s_rel_n),
+        Activation('linear', name="realtime_state_pickmask_prev_next")(s_prev_n),
+    ]
+
+    # Pre-emphasis state (unchanged)
+    s_pre = Input(shape=(1,1), name="realtime_state_preemph")
+    state_inputs.append(s_pre)
+    hf_in, s_pre_next = PreEmphasisStream(alpha=HP_PRE_EMPHASIS_HF, name="realtime_hf_pre_emph_stream")([inp, s_pre])
+    state_outputs.append(Activation('linear', name="realtime_state_preemph_next")(s_pre_next))
+
+        # Pick-attack tiny CNN streaming (LeakyReLU to avoid dead branch)
+    x_pa = Multiply(name="realtime_picklearn_gate")([hf_in, mask])
+
+    pad_c1 = (7 - 1) * 1
+    s_c1 = Input(shape=(pad_c1, 1), name="realtime_state_picklearn_c1")
+    state_inputs.append(s_c1)
+    x_cat1 = ConcatTime(name="realtime_picklearn_c1_concat")([s_c1, x_pa])
+    x_pa1 = SeparableConv1D(16, 7, dilation_rate=1, padding="valid", name="realtime_picklearn_c1")(x_cat1)
+    x_pa1 = tf.keras.layers.LeakyReLU(negative_slope=0.1, name="realtime_picklearn_c1_relu")(x_pa1)
+    s_c1n = TakeLastN(pad_c1, name="realtime_state_picklearn_c1_next")(x_cat1)
+    state_outputs.append(s_c1n)
+
+    pad_c2 = (7 - 1) * 2
+    s_c2 = Input(shape=(pad_c2, 16), name="realtime_state_picklearn_c2")
+    state_inputs.append(s_c2)
+    x_cat2 = ConcatTime(name="realtime_picklearn_c2_concat")([s_c2, x_pa1])
+    x_pa2 = SeparableConv1D(16, 7, dilation_rate=2, padding="valid", name="realtime_picklearn_c2")(x_cat2)
+    x_pa2 = tf.keras.layers.LeakyReLU(negative_slope=0.1, name="realtime_picklearn_c2_relu")(x_pa2)
+    s_c2n = TakeLastN(pad_c2, name="realtime_state_picklearn_c2_next")(x_cat2)
+    state_outputs.append(s_c2n)
+
+    x_pa_out = Conv1D(1, 1, padding="same", name="realtime_picklearn_out")(x_pa2)
+    xg = Multiply(name="realtime_pickattack_gated")([x_pa_out, style_scalar_b3])
+    xg = SoftClip1D(drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickattack_softclip")(xg)
+
+    # NEW: streaming fade-in to suppress HPF startup pop (≈ 3 ms)
+    s_pa_ramp = Input(shape=(1,1), name="realtime_state_pickattack_ramp")
+    state_inputs.append(s_pa_ramp)
+    ramp_pa, s_pa_ramp_n = StreamingLinearRamp(ramp_len=int(0.003 * REALTIME_SAMPLE_RATE),
+                                               name="realtime_pickattack_ramp")([xg, s_pa_ramp])
+    state_outputs.append(Activation('linear', name="realtime_state_pickattack_ramp_next")(s_pa_ramp_n))
+    xg = Multiply(name="realtime_pickattack_ramp_apply")([xg, ramp_pa])
+
+    # Pick-attack post HPF (exact-length taps, 2 kHz cutoff for realtime)
+    s_hp_pa = Input(shape=(PICK_ATTACK_LOWBAND_PENALTY_ORDER - 1, 1), name="realtime_state_pickattack_posthp")
+    state_inputs.append(s_hp_pa)
+    L_pa = int(PICK_ATTACK_LOWBAND_PENALTY_ORDER)
+    hp_pa_k_full = _hp_minphase_rev_padded(REALTIME_SAMPLE_RATE, PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ, L_pa)
+    xh_pa, s_hp_pa_n = StreamFixedFIR(kernel_len=L_pa, out_ch=1, weight_name="hp_taps",
+                                      trainable_kernel=False, taps_init=hp_pa_k_full,
+                                      name="realtime_pickattack_post_hp")([xg, s_hp_pa])
+    state_outputs.append(Activation('linear', name="realtime_state_pickattack_posthp_next")(s_hp_pa_n))
+    y_pa = IrScale(init=1.0, name="realtime_pickattack_scale")(xh_pa)
+    limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
+    y_pa = SoftClip1D(drive=PICK_LIMITER_DRIVE, limit=limit_lin, name="realtime_pickattack_limit")(y_pa)
+
+    # Pick-reso streaming
+    s_on_prev = Input(shape=(1,1), name="realtime_state_pickreso_onset_prev")
+    state_inputs.append(s_on_prev)
+    onset, s_on_prev_n = StreamingDiffPos(name="realtime_pickreso_onset_stream")([mask, s_on_prev])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_onset_prev_next")(s_on_prev_n))
+
+    s_on = int(round((RESBP_STRIKE_ENV_MS_REALTIME / 1000.0) * REALTIME_SAMPLE_RATE))
+    L_env = int(np.clip(np.ceil(4.0 * max(1, s_on)), 8, 512))
+    s_env = Input(shape=(L_env - 1, 1), name="realtime_state_pickreso_onset_smooth")
+    state_inputs.append(s_env)
+    k_on = _exp_smoothing_kernel(max(1, s_on), scale=4.0, Lmax=L_env)
+    strike, s_env_n = StreamFixedFIR(kernel_len=L_env, out_ch=1, weight_name="exp_smooth_taps",
+                                     trainable_kernel=False, taps_init=k_on,
+                                     name="realtime_pickreso_onset_pulse")([onset, s_env])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_onset_smooth_next")(s_env_n))
+
+    s_bp = Input(shape=(REALTIME_PICK_RESO_BP_ORDER - 1, 1), name="realtime_state_pickreso_ctrl_bp")
+    state_inputs.append(s_bp)
+    bp_lo = 0.9 * min(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    bp_hi = 1.1 * max(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    bp_k_full = _bp_minphase_rev_padded(REALTIME_SAMPLE_RATE, bp_lo, bp_hi, REALTIME_PICK_RESO_BP_ORDER)
+    bp_out, s_bp_n = StreamFixedFIR(kernel_len=REALTIME_PICK_RESO_BP_ORDER, out_ch=1, weight_name="bp_taps",
+                                    trainable_kernel=False, taps_init=bp_k_full,
+                                    name="realtime_pickreso_ctrl_bp")([inp, s_bp])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_ctrl_bp_next")(s_bp_n))
+    amp_raw = Abs1D()(bp_out)
+
+    s_env2_len = int(np.clip(np.ceil(3.0 * max(1, int(round(3.0/1000.0 * REALTIME_SAMPLE_RATE)))), 8, 256))
+    s_env2 = Input(shape=(s_env2_len - 1, 1), name="realtime_state_pickreso_ctrl_env")
+    state_inputs.append(s_env2)
+    tau_env2 = max(1, int(round((3.0/1000.0) * REALTIME_SAMPLE_RATE)))
+    k_env2 = _exp_smoothing_kernel(tau_env2, scale=4.0, Lmax=s_env2_len)
+    amp, s_env2_n = StreamFixedFIR(kernel_len=s_env2_len, out_ch=1, weight_name="exp_smooth_taps",
+                                   trainable_kernel=False, taps_init=k_env2,
+                                   name="realtime_pickreso_ctrl_env")([amp_raw, s_env2])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_ctrl_env_next")(s_env2_n))
+    amp = Lambda(clip_01x4, name="realtime_pickreso_ctrl_gain")(amp)
+
+    exc = Multiply(name="realtime_pickreso_excite")([strike, amp])
+
+    s_ds8 = Input(shape=(REALTIME_PICK_RESO_DS_TAPS - 1, 1), name="realtime_state_pickreso_ds8")
+    state_inputs.append(s_ds8)
+    ds8, s_ds8_n = StreamingRealtimeIrDownsampleFIR(factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR,
+                                                    kernel_size=REALTIME_PICK_RESO_DS_TAPS,
+                                                    use_ir_prototype=False,
+                                                    name="realtime_pickreso_ds8")([exc, s_ds8])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_ds8_next")(s_ds8_n))
+
+    num_modes = len(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    L_lr = _len_lr_from_full(PICK_RESO_MODAL_LEN_REALTIME, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR)
+    s_mlr = Input(shape=(L_lr - 1, 1), name="realtime_state_pickreso_modal_lr")
+    state_inputs.append(s_mlr)
+    modes_lr, s_mlr_n = StreamFixedFIR(kernel_len=L_lr, out_ch=num_modes, weight_name="modal_kernels_lr",
+                                       trainable_kernel=True, name="realtime_pickreso_modal_lr")([ds8, s_mlr])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_modal_lr_next")(s_mlr_n))
+
+    mixed_lr = Conv1D(1, 1, use_bias=True, padding="same", name="realtime_pickreso_mix")(modes_lr)
+
+    s_interp = Input(shape=(REALTIME_PICK_RESO_INTERP_TAPS - 1, 1), name="realtime_state_pickreso_interp")
+    state_inputs.append(s_interp)
+    up, s_interp_n = StreamingFIRInterpByN(factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR,
+                                           num_taps=REALTIME_PICK_RESO_INTERP_TAPS,
+                                           cutoff=0.45/REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR,
+                                           window=('kaiser', 9.0),
+                                           name="realtime_pickreso_interp")([mixed_lr, s_interp])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_interp_next")(s_interp_n))
+    mixed = MatchTimeToRef(name="realtime_pickreso_matchlen")([up, inp])
+
+    xg_reso = Multiply(name="realtime_pickreso_gated")([mixed, style_scalar_b3])
+
+    s_hp_reso = Input(shape=(PICK_RESO_LOWBAND_PENALTY_ORDER - 1, 1), name="realtime_state_pickreso_posthp")
+    state_inputs.append(s_hp_reso)
+    L_pr = int(PICK_RESO_LOWBAND_PENALTY_ORDER)
+    hp_pr_k_full = _hp_minphase_rev_padded(REALTIME_SAMPLE_RATE, PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ, L_pr)
+    xh_reso, s_hp_reso_n = StreamFixedFIR(kernel_len=L_pr, out_ch=1, weight_name="hp_taps",
+                                          trainable_kernel=False, taps_init=hp_pr_k_full,
+                                          name="realtime_pickreso_post_hp")([xg_reso, s_hp_reso])
+    state_outputs.append(Activation('linear', name="realtime_state_pickreso_posthp_next")(s_hp_reso_n))
+    xh_reso = SoftClip1D(drive=REALTIME_PICK_RESO_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickreso_softclip")(xh_reso)
+    y_reso = IrScale(init=1.0, name="realtime_pickreso_scale")(xh_reso)
+    y_reso = SoftClip1D(drive=PICK_LIMITER_DRIVE, limit=10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0), name="realtime_pickreso_limit")(y_reso)
+    y_reso = IrScale(init=1.0, name="realtime_pickreso_calib")(y_reso)
+
+    # Mix stems and coloreq (unchanged)
+    pickattack = apply_runtime_gain(y_pa, knob_pa_in, name="realtime_pickattack_user_gain")
+    pickreso   = apply_runtime_gain(y_reso, knob_pr_in, name="realtime_pickreso_user_gain")
+    ir         = apply_runtime_gain(ir,   knob_ir_in,   name="realtime_ir_user_gain")
+    y_prehp  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
+
+    # Color EQ streaming bandpasses
+    coloreq_states_in  = []
+    coloreq_states_out = []
+    y_terms = [y_prehp]
+    for bi, (lo, hi) in enumerate(COLOREQ_BANDS_REALTIME_BODY):
+        s_b = Input(shape=(65 - 1, 1), name=f"realtime_state_coloreq_bp_{bi}")
+        coloreq_states_in.append(s_b)
+        bp_y, s_b_n = StreamFixedFIR(kernel_len=65, out_ch=1, weight_name="bp_taps",
+                                     trainable_kernel=False, name=f"realtime_coloreq_bp_{bi}")([y_prehp, s_b])
+        coloreq_states_out.append(Activation('linear', name=f"realtime_state_coloreq_bp_{bi}_next")(s_b_n))
+        g = IrScale(init=0.0, name=f"realtime_coloreq_g_{bi}", trainable=bool(coloreq_trainable))(bp_y)
+        y_terms.append(g)
+
+    y_prehp = LossTether(name="realtime_pick_lowband_penalties_stream")([y_prehp])
+    y_wet = Add(name="realtime_coloreq_sum")(y_terms)
+
+    wet_gain   = Lambda(invert, name="realtime_wet_from_drywet")(knob_dw_in)
+    wet_scaled = apply_runtime_gain(y_wet,  wet_gain,    name="realtime_wet_gain")
+    dry_scaled = apply_runtime_gain(inp,    knob_dw_in,  name="realtime_dry_gain")
+    y_final    = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
+
+    inputs_list  = [inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in]
+    inputs_list += state_inputs + coloreq_states_in
+    outputs_list = [y_final, style_prob] + state_outputs + coloreq_states_out
+
+    return tf.keras.models.Model(inputs=inputs_list, outputs=outputs_list, name=name)
 
 def approx_steps_from_chunks(chunks, seg_len, model_sample_rate, batch_size):
     """
@@ -3920,7 +4755,7 @@ def fine_tune(offline=True, realtime=True):
         base_off_dyn = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
 
         # Build the OFFLINE training graph (same as runtime graph)
-        off_static_train = build_offline_model(dynamic_time=False, coloreq_trainable=False)
+        off_static_train = build_offline_model()
         copy_weights_by_name(off_static_train, base_off_dyn, verbose=True)
 
         # Unfreeze only FiLM + coloreq
@@ -3950,7 +4785,7 @@ def fine_tune(offline=True, realtime=True):
         off_static_train.fit(dsO, epochs=OFFLINE_FINETUNE_EPOCHS, steps_per_epoch=steps_off, verbose=1)
 
         # Export OFFLINE dynamic
-        off_dyn_export = build_offline_model(dynamic_time=True, coloreq_trainable=False)
+        off_dyn_export = build_offline_model(dynamic_time=True)
         copy_weights_by_name(off_dyn_export, off_static_train, verbose=True)
 
         ft_offline_dyn_path = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
@@ -3969,19 +4804,20 @@ def fine_tune(offline=True, realtime=True):
 
         base_rt_dyn = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
 
-        rt_static_train = build_realtime_model(
-            offline=offline_causal,
-            dynamic_time=False,
-            coloreq_trainable=False
+        # Build KD training graph (teacher embedded) and copy weights from baseline
+        rt_static_train = build_realtime_training_model(
+            offline=offline_causal
         )
         copy_weights_by_name(rt_static_train, base_rt_dyn, verbose=True)
 
+        # Unfreeze only FiLM + coloreq (and scales if desired)
         rt_static_train = set_trainable_layers(
             rt_static_train,
             enable_film=True,
             enable_coloreq=True
         )
 
+        # KD dual-rate dataset
         dsRT_dual = make_mixed_ds_from_arrays_realtime_dual(
             cached["x48"], cached["x96"], cached["y48"],
             batch_size=FINETUNE_BATCH_SIZE,
@@ -3999,36 +4835,26 @@ def fine_tune(offline=True, realtime=True):
                                 loss_weights=[1.0, 0.0],
                                 metrics=[["mae"], []])
         rt_static_train.fit(dsRT_dual, epochs=REALTIME_FINETUNE_EPOCHS, steps_per_epoch=steps_rt, verbose=1)
+        
+        ft_rt_trainable_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TRAINABLE_MODEL_FILENAME)
+        rt_static_train.save(ft_rt_trainable_path)
+        print("✅ Saved finetuned realtime training model:", ft_rt_trainable_path)
 
-        # Save teacher-baked static (existing)
-        ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-        rt_static_train.save(ft_rt_static_path)
-        print("✅ Saved finetuned realtime model (static with teacher):", ft_rt_static_path)
-
-        # Export teacherless dynamic (existing)
-        rt_dyn_export = build_realtime_model(
-            offline=None,
-            dynamic_time=True,
-            coloreq_trainable=False
-        )
-        copy_weights_by_name(rt_dyn_export, rt_static_train, verbose=True)
-
+        # Export self-contained streaming runtime artifacts (dynamic + static)
+        rt_dyn_stream = build_realtime_streaming_model(dynamic_time=True)
+        copy_weights_by_name(rt_dyn_stream, rt_static_train, verbose=True)
         ft_rt_dyn_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        rt_dyn_export.save(ft_rt_dyn_path)
-        print("✅ Saved finetuned realtime model (dynamic):", ft_rt_dyn_path)
+        rt_dyn_stream.save(ft_rt_dyn_path)
+        print("✅ Saved finetuned realtime streaming dynamic model:", ft_rt_dyn_path)
 
-        # NEW: also export a teacherless static realtime model (self-contained)
-        rt_static_self = build_realtime_model(
-            offline=None,
-            dynamic_time=False,
-            coloreq_trainable=False
-        )
-        # Copy weights from the already-built teacherless dynamic export
-        copy_weights_by_name(rt_static_self, rt_dyn_export, verbose=True)
+        rt_static_stream = build_realtime_streaming_model()
+        copy_weights_by_name(rt_static_stream, rt_static_train, verbose=True)
+        ft_rt_static_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+        rt_static_stream.save(ft_rt_static_path)
+        print("✅ Saved finetuned realtime streaming static model:", ft_rt_static_path)
 
-        ft_rt_static_self_path = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-        rt_static_self.save(ft_rt_static_self_path)
-        print("✅ Saved finetuned realtime self-contained static model:", ft_rt_static_self_path)
+        # Return dynamic stream (for optional demo)
+        rt_dyn_export = rt_dyn_stream
 
     return off_dyn_export, rt_dyn_export
 
@@ -4146,15 +4972,30 @@ def set_trainable_layers(model,
     return model
 
 def build_offline_debug_model(model):
-    outs = {}
-    def add(name, lname):
+    used = set([l.name for l in model.layers])
+
+    def unique_alias(base):
+        root = f"dbg_{base}"
+        name = root
+        k = 1
+        while name in used:
+            name = f"{root}_{k}"
+            k += 1
+        used.add(name)
+        return name
+
+    outs = []
+    def add(alias, lname):
         try:
-            outs[name] = model.get_layer(lname).output
+            t = model.get_layer(lname).output
         except Exception:
-            pass
+            return
+        outs.append(Activation('linear', name=unique_alias(alias))(t))
+
     # Full mix AFTER dry/wet so stems 'full' respects knob
-    add("y_pred",       "offline_drywet_mix")  # fallback will be added below if missing
-    if "y_pred" not in outs:
+    add("y_pred",       "offline_drywet_mix")
+    # Fallback:
+    if not outs:
         add("y_pred",   "offline_with_picklearn_prehp")
 
     add("main_core",    "offline_main_core")
@@ -4165,30 +5006,55 @@ def build_offline_debug_model(model):
     add("style_pred",   "offline_style_prob")
     add("mask",         "offline_pick_mask_db")
     add("style_time",   "offline_style_time_used")
+
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
-
 def build_realtime_debug_model(model):
-    outs = {}
-    def add(name, lname):
-        try:
-            outs[name] = model.get_layer(lname).output
-        except Exception:
-            pass
-    # Full mix AFTER dry/wet so stems 'full' respects knob
-    add("y_pred",       "realtime_drywet_mix")
-    if "y_pred" not in outs:
-        add("y_pred",   "realtime_with_picklearn_prehp")
+    used = set([l.name for l in model.layers])
 
-    add("main_core",    "realtime_main")
-    add("main_pick",    "realtime_pick_contrib")
-    add("main_finger",  "realtime_finger_contrib")
-    add("ir_only",      "realtime_ir_user_gain_mul")
-    add("pickreso",     "realtime_pickreso_user_gain_mul")
-    add("pickattack",   "realtime_pickattack_user_gain_mul")
-    add("style_pred",   "realtime_style_prob")
-    add("mask",         "realtime_pick_mask_db")
-    add("style_time",   "realtime_style_scalar_broadcast")
+    def unique_alias(base):
+        root = f"dbg_{base}"
+        name = root
+        k = 1
+        while name in used:
+            name = f"{root}_{k}"
+            k += 1
+        used.add(name)
+        return name
+
+    outs = []
+
+    def add(alias, lname):
+        try:
+            t = model.get_layer(lname).output
+        except Exception:
+            return
+        outs.append(Activation("linear", name=unique_alias(alias))(t))
+
+    # Main/full mix AFTER dry/wet so stems 'full' respects knob
+    add("y_pred", "realtime_drywet_mix")
+
+    # Useful stems/features
+    add("main_core",   "realtime_main")
+    add("main_pick",   "realtime_pick_contrib")
+    add("main_finger", "realtime_finger_contrib")
+    add("ir_only",     "realtime_ir_user_gain_mul")
+    add("pickreso",    "realtime_pickreso_user_gain_mul")
+    add("pickattack",  "realtime_pickattack_user_gain_mul")
+    add("style_pred",  "realtime_style_prob")
+    add("mask",        "realtime_pick_mask_db")
+    add("style_time",  "realtime_style_scalar_broadcast")
+
+    # Also expose all streaming state outputs so the renderer can advance state.
+    # These are already named uniquely inside the base model.
+    for l in model.layers:
+        nm = l.name
+        if nm.startswith("realtime_state_") and nm.endswith("_next"):
+            try:
+                outs.append(model.get_layer(nm).output)
+            except Exception:
+                pass
+
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
 
 def _rms(x):
@@ -4206,6 +5072,215 @@ def _corr(a, b):
     if den <= 0: return 0.0
     return float(np.sum(a*b) / den)
 
+def render_isolated_stems_realtime_runtime(model,
+                                           path_src,
+                                           path_tgt,
+                                           out_dir,
+                                           sample_rate,
+                                           sec=LONG_DEMO_SEC,
+                                           offset_sec=LONG_DEMO_OFFSET_SEC,
+                                           hop=1024,
+                                           use_finetuned=False):
+    os.makedirs(out_dir, exist_ok=True)
+
+    def rms(x):
+        x = np.asarray(x, np.float32)
+        return float(np.sqrt(np.mean(x*x) + 1e-12)) if x.size else 0.0
+
+    # Read/resample
+    info = sf.info(path_src)
+    file_sr = info.samplerate
+    start = int(round(offset_sec * file_sr))
+    frames = int(round(sec * file_sr))
+    x_blk_2d, _ = sf.read(path_src, start=start, frames=frames, dtype='float32', always_2d=True)
+    y_blk_2d, _ = sf.read(path_tgt, start=start, frames=frames, dtype='float32', always_2d=True)
+    x_file = x_blk_2d[:, 0]; y_file = y_blk_2d[:, 0]
+    x_mod = x_file if file_sr == sample_rate else resample_to_model_sr(x_file, file_sr, sample_rate)
+    y_mod = y_file if file_sr == sample_rate else resample_to_model_sr(y_file, file_sr, sample_rate)
+
+    # Build a tap-model that exposes post‑knob heads and main
+    taps = []
+    found = {}
+    def tap(lname, tname):
+        try:
+            t = model.get_layer(lname).output
+            taps.append(Activation('linear', name=tname)(t))
+            found[tname] = True
+            return True
+        except Exception:
+            found[tname] = False
+            return False
+
+    tap("realtime_pickattack_user_gain_mul", "tap_pickattack")
+    tap("realtime_pickreso_user_gain_mul",   "tap_pickreso")
+    tap("realtime_ir_user_gain_mul",         "tap_ir")
+    tap("realtime_main",                     "tap_main")
+
+    tap_model = tf.keras.Model(inputs=model.inputs, outputs=list(model.outputs) + taps, name=model.name + "_taps")
+
+    # Names / mapping
+    def _bn(t):
+        nm = t.name.split(':')[0]
+        if '/' in nm: nm = nm.split('/', 1)[0]
+        if nm.startswith("serving_default_"): nm = nm[len("serving_default_"):]
+        return nm
+    in_tensors = list(tap_model.inputs)
+    in_names   = [_bn(t) for t in in_tensors]
+    out_names  = _output_names_from_model(tap_model)
+    out_idx    = {n: i for i, n in enumerate(out_names)}
+
+    # State mapping
+    state_in_names = [n for n in in_names if n.startswith("realtime_state_")]
+    state_out_idx = {}
+    for n in state_in_names:
+        nn = n + "_next"
+        if nn in out_idx:
+            state_out_idx[n] = out_idx[nn]
+    state_bufs = {}
+    for t in in_tensors:
+        nm = _bn(t)
+        if nm in state_in_names:
+            L = int(t.shape[1]) if t.shape[1] is not None else 0
+            C = int(t.shape[2]) if t.shape[2] is not None else 1
+            state_bufs[nm] = np.zeros((1, L, C), dtype=np.float32)
+
+    # Knobs
+    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind="realtime", use_finetuned=use_finetuned)
+    dry_default = _default_dryness_value()
+    def knobs(pa, pr, ir, dry=dry_default):
+        return {
+            "realtime_knob_pickattack": np.array([[float(pa)]], dtype=np.float32),
+            "realtime_knob_pickreso":   np.array([[float(pr)]], dtype=np.float32),
+            "realtime_knob_ir":         np.array([[float(ir)]], dtype=np.float32),
+            "realtime_knob_drywet":     np.array([[float(dry)]], dtype=np.float32),
+        }
+    def filter_feed(d): return {k: v for k, v in d.items() if k in in_names}
+
+    # Single-pass streamer
+    def run_stream(style_true=None, style_force=False, pa=None, pr=None, ir=None):
+        for k in state_bufs: state_bufs[k].fill(0.0)
+        pos, N = 0, len(x_mod)
+        y_full = []; y_main = []; y_pa = []; y_pr = []; y_ir = []
+        st_true  = np.zeros((1,1), np.float32) if style_true is None else np.array([[float(style_true)]], np.float32)
+        st_force = np.zeros((1,1), np.float32) if not style_force else np.ones((1,1), np.float32)
+        pa_val = pa if pa is not None else pa_lin
+        pr_val = pr if pr is not None else pr_lin
+        ir_val = ir if ir is not None else ir_lin
+
+        while pos < N:
+            core = min(hop, N - pos)
+            xb = np.zeros((1, hop, 1), np.float32); xb[0, :core, 0] = x_mod[pos:pos+core]
+            feed = {
+                "realtime_piezo_input": xb,
+                "realtime_style_true_input":  st_true,
+                "realtime_style_force_input": st_force,
+                **knobs(pa=pa_val, pr=pr_val, ir=ir_val, dry=dry_default)
+            }
+            for n in state_in_names: feed[n] = state_bufs[n]
+            outs = tap_model.predict(filter_feed(feed), batch_size=1, verbose=0)
+
+            # audio is first output
+            y_full.append(np.asarray(outs[0], np.float32)[0, :core, 0])
+
+            def take(name):
+                idx = out_idx.get(name, None)
+                if idx is None or idx >= len(outs): return None
+                v = np.asarray(outs[idx], np.float32)
+                if v.ndim == 3: return v[0, :core, 0]
+                if v.ndim == 2: return v[0, :core]
+                return None
+
+            # taps
+            tmn = take("tap_main") if found.get("tap_main", False) else None
+            y_main.append(tmn if tmn is not None else y_full[-1])
+            tpa = take("tap_pickattack") if found.get("tap_pickattack", False) else None
+            tpr = take("tap_pickreso")   if found.get("tap_pickreso",   False) else None
+            tir = take("tap_ir")         if found.get("tap_ir",         False) else None
+            y_pa.append(tpa if tpa is not None else np.zeros((core,), np.float32))
+            y_pr.append(tpr if tpr is not None else np.zeros((core,), np.float32))
+            y_ir.append(tir if tir is not None else np.zeros((core,), np.float32))
+
+            # advance states
+            for n, i in state_out_idx.items():
+                if i < len(outs): state_bufs[n] = outs[i]
+            pos += core
+
+        cat = lambda parts: np.concatenate(parts, axis=0) if parts else np.zeros(0, np.float32)
+        return {"full":cat(y_full), "main":cat(y_main), "pa":cat(y_pa), "pr":cat(y_pr), "ir":cat(y_ir)}
+
+    # DC removal + peak protection for stems
+    def finalize(sig, headroom_db=1.0, dc_remove=True):
+        s = np.asarray(sig, np.float32)
+        if s.size == 0:
+            return s
+        if dc_remove:
+            s = s - float(np.mean(s))
+        peak = float(np.max(np.abs(s)) + 1e-12)
+        ceiling = 10.0 ** (float(-headroom_db) / 20.0)  # ≈0.891 for 1 dB
+        if peak > ceiling:
+            s = s * (ceiling / peak)
+        return s
+
+    # Passes and writers
+    passes = {
+        "pred":        {"style_true": None, "style_force": False},
+        "forced_pick": {"style_true": 1.0,  "style_force": True},
+        "forced_fing": {"style_true": 0.0,  "style_force": True},
+    }
+    writers = {}
+    def open_writers(key):
+        if key == "pred":
+            writers["src"]  = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            writers["tgt"]  = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            writers["full_pred"] = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        elif key == "forced_pick":
+            writers["full_forced_pick"] = sf.SoundFile(os.path.join(out_dir, "pred_full_forced_pick.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        else:
+            writers["full_forced_finger"] = sf.SoundFile(os.path.join(out_dir, "pred_full_forced_finger.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers[f"main_core_{key}"] = sf.SoundFile(os.path.join(out_dir, f"stem_main_core_only_{key}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers[f"pickattack_{key}"] = sf.SoundFile(os.path.join(out_dir, f"stem_pickattack_only_{key}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers[f"pickreso_{key}"]   = sf.SoundFile(os.path.join(out_dir, f"stem_pickreso_only_{key}.wav"),   mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers[f"ir_{key}"]         = sf.SoundFile(os.path.join(out_dir, f"stem_ir_lowpass_{key}.wav"),     mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        writers[f"sumcheck_{key}"]   = sf.SoundFile(os.path.join(out_dir, f"pred_full_sumcheck_{key}.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    print("[stems/realtime] taps found:", found)
+
+    for key, cfg in passes.items():
+        open_writers(key)
+        res = run_stream(style_true=cfg["style_true"], style_force=cfg["style_force"])
+
+        # Finalize stems (DC removal + peak protection)
+        main_f = finalize(res["main"], headroom_db=1.0, dc_remove=True)
+        pa_f   = finalize(res["pa"],   headroom_db=1.0, dc_remove=True)
+        pr_f   = finalize(res["pr"],   headroom_db=1.0, dc_remove=True)
+        ir_f   = finalize(res["ir"],   headroom_db=1.0, dc_remove=True)
+
+        # Write full
+        if key == "pred":
+            writers["src"].write(x_mod); writers["tgt"].write(y_mod); writers["full_pred"].write(res["full"])
+        elif key == "forced_pick":
+            writers["full_forced_pick"].write(res["full"])
+        else:
+            writers["full_forced_finger"].write(res["full"])
+
+        # Write stems (finalized)
+        writers[f"main_core_{key}"].write(main_f)
+        writers[f"pickattack_{key}"].write(pa_f)
+        writers[f"pickreso_{key}"].write(pr_f)
+        writers[f"ir_{key}"].write(ir_f)
+
+        # Sumcheck (use finalized stems)
+        sum_est = np.clip(main_f + pa_f + pr_f + ir_f, -1.0, 1.0)
+        writers[f"sumcheck_{key}"].write(sum_est)
+
+        print(f"[stems/realtime][{key}] wrote RMS main={rms(main_f):.6f} pa={rms(pa_f):.6f} pr={rms(pr_f):.6f} ir={rms(ir_f):.6f}")
+
+    for w in list(writers.values()):
+        try: w.close()
+        except Exception: pass
+
+    print(f"✅ Realtime stems (pred + forced_pick + forced_fing) written to {out_dir}")
+
 def render_isolated_stems(debug_model,
                           kind,
                           path_src,
@@ -4217,18 +5292,6 @@ def render_isolated_stems(debug_model,
                           block_sec=12.0,
                           resample_margin_ms=50.0,
                           use_finetuned=False):
-    """
-    Streaming stems renderer that:
-      - feeds model inputs by NAME, not by position,
-      - uses float32 scalars for style_true/style_force,
-      - writes full prediction and isolated stems (pick, finger, pickattack, pickreso, optional IR),
-      - avoids duplicate writes (each stem written once per block), so durations match sec exactly.
-
-    Forced passes:
-      - pred:          style_force=0 → use the model's own predicted style
-      - forced_pick:   style_force=1, style_true=1 → force pick
-      - forced_finger: style_force=1, style_true=0 → force finger
-    """
     os.makedirs(out_dir, exist_ok=True)
     knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
 
@@ -4236,15 +5299,36 @@ def render_isolated_stems(debug_model,
     file_sr = info.samplerate
     START_FRAME = int(round(offset_sec * file_sr))
     TOTAL_FRAMES = int(round(sec * file_sr))
-    END_FRAME = START_FRAME + TOTAL_FRAMES
-    want_total_model = int(round(TOTAL_FRAMES * (sample_rate / float(file_sr))))
 
-    g_norm = 1.0
+    x_blk_2d, _ = sf.read(path_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
+    y_blk_2d, _ = sf.read(path_tgt, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
+    x_file = x_blk_2d[:, 0]
+    y_file = y_blk_2d[:, 0]
 
-    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
-    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
-    block_core_model = max(1, int(round(block_sec * sample_rate)))
+    if file_sr != sample_rate:
+        x_mod = resample_to_model_sr(x_file, file_sr, sample_rate)
+        y_mod = resample_to_model_sr(y_file,  file_sr, sample_rate)
+    else:
+        x_mod = x_file
+        y_mod = y_file
 
+    # Determine if model is streaming (has explicit realtime_state_* inputs)
+    in_tensors = list(debug_model.inputs)
+    in_names = [t.name.split(':')[0].split('/')[-1] for t in in_tensors]
+    state_in_names = [n for n in in_names if n.startswith("realtime_state_")]
+    streaming = (kind == "realtime") and (len(state_in_names) > 0)
+
+    # Map outputs by name (producer layer names) for robust dict handling
+    def predict_to_dict(model, feeds):
+        out_any = model.predict(feeds, batch_size=1, verbose=0)
+        out_names = [t.name.split(':')[0].split('/')[-1] for t in model.outputs]
+        if isinstance(out_any, dict):
+            return out_any
+        if isinstance(out_any, (list, tuple)):
+            return {out_names[i]: out_any[i] for i in range(min(len(out_names), len(out_any)))}
+        return {out_names[0]: out_any}
+
+    # Prepare writers
     def open_writers(pass_key):
         is_pred = (pass_key == "pred")
         suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"
@@ -4271,16 +5355,221 @@ def render_isolated_stems(debug_model,
         return w
 
     forced_variants = [
-        ("pred",
-         np.zeros((1, 1), dtype=np.float32),  # style_true (ignored)
-         np.zeros((1, 1), dtype=np.float32)), # style_force=0 → use predicted
-        ("forced_pick",
-         np.ones((1, 1), dtype=np.float32),   # style_true=1
-         np.ones((1, 1), dtype=np.float32)),  # style_force=1 → use true
-        ("forced_finger",
-         np.zeros((1, 1), dtype=np.float32),  # style_true=0
-         np.ones((1, 1), dtype=np.float32)),  # style_force=1 → use true
+        ("pred",         np.zeros((1, 1), dtype=np.float32), np.zeros((1, 1), dtype=np.float32)),
+        ("forced_pick",  np.ones((1, 1),  dtype=np.float32), np.ones((1, 1),  dtype=np.float32)),
+        ("forced_finger",np.zeros((1, 1), dtype=np.float32), np.ones((1, 1),  dtype=np.float32)),
     ]
+    pass_writers = {k: open_writers(k) for k, _, _ in forced_variants}
+
+    # Helper to try dbg_ aliases
+    out_name_set = set([t.name.split(':')[0].split('/')[-1] for t in debug_model.outputs])
+    def aliases(k):
+        arr = [k, f"dbg_{k}"]
+        if kind == "realtime" and k == "y_pred":
+            arr.append("realtime_drywet_mix")
+        return arr
+
+    # If streaming: prepare state buffers and a hop size
+    if streaming:
+        # Shapes for zero-initialized states
+        state_in_tensors = [t for t in in_tensors if t.name.split(':')[0].split('/')[-1] in state_in_names]
+        state_bufs = {}
+        for t in state_in_tensors:
+            nm = t.name.split(':')[0].split('/')[-1]
+            s1 = int(t.shape[1]) if t.shape[1] is not None else 0
+            s2 = int(t.shape[2]) if t.shape[2] is not None else 1
+            state_bufs[nm] = np.zeros((1, s1, s2), dtype=np.float32)
+
+        # Build map input_state_name -> output_state_name index (use name + "_next")
+        out_names = [t.name.split(':')[0].split('/')[-1] for t in debug_model.outputs]
+        state_out_map = {}
+        for nm in state_in_names:
+            cand = nm + "_next"
+            if cand in out_names:
+                state_out_map[nm] = cand
+
+        # Choose hop; dynamic streaming graph accepts any T
+        hop = 1024
+
+        def run_stream_pass(style_true_scalar, style_force_scalar, writers):
+            # reset states
+            for nm in state_bufs.keys():
+                state_bufs[nm].fill(0.0)
+
+            pos = 0
+            prob_sum = 0.0
+            prob_count = 0
+            N = len(x_mod)
+
+            while pos < N:
+                core = min(hop, N - pos)
+
+                x_block = np.zeros((1, hop, 1), dtype=np.float32)
+                x_block[0, :core, 0] = x_mod[pos:pos+core]
+
+                feed = {
+                    "realtime_piezo_input": x_block,
+                    "realtime_style_true_input":  style_true_scalar,
+                    "realtime_style_force_input": style_force_scalar,
+                    "realtime_knob_pickattack": knob_feeds["realtime_knob_pickattack"],
+                    "realtime_knob_pickreso":   knob_feeds["realtime_knob_pickreso"],
+                    "realtime_knob_ir":         knob_feeds["realtime_knob_ir"],
+                    "realtime_knob_drywet":     knob_feeds["realtime_knob_drywet"],
+                }
+                # Attach states
+                for nm in state_in_names:
+                    feed[nm] = state_bufs[nm]
+
+                outs = predict_to_dict(debug_model, feed)
+
+                def get_core(name_key):
+                    for kname in aliases(name_key):
+                        if kname in outs:
+                            arr = np.asarray(outs[kname][0, :, 0], dtype=np.float32)
+                            return arr[:core]
+                    return np.zeros((core,), dtype=np.float32)
+
+                y_full     = get_core("y_pred")
+                main_c     = get_core("main_core")
+                pick_only  = get_core("main_pick")
+                fing_only  = get_core("main_finger")
+                picklearn  = get_core("picklearn")
+                pickattack = get_core("pickattack")
+                pickreso   = get_core("pickreso")
+                ir_only    = get_core("ir_only")
+                mask_core  = get_core("mask")
+
+                sum_est = main_c + pickattack + pickreso + ir_only
+
+                # Metrics (optional target comparison on pred pass)
+                core_outs = {
+                    "y_pred": y_full,
+                    "main_core": main_c,
+                    "pickattack": pickattack,
+                    "pickreso": pickreso,
+                    "main_pick": pick_only,
+                    "main_finger": fing_only,
+                    "mask": mask_core
+                }
+                y_target_core = y_mod[pos:pos+core] if writers is pass_writers["pred"] else None
+                m = _metrics_for_core(core_outs, y_target_core=y_target_core)
+                metrics_fn = os.path.join(out_dir, f"metrics_{'pred' if writers is pass_writers['pred'] else 'forced'}.json")
+                try:
+                    with open(metrics_fn, "a") as f:
+                        f.write(json.dumps(m) + "\n")
+                except Exception:
+                    pass
+
+                # Writes
+                writers["full"].write(y_full)
+                writers["main_core"].write(main_c)
+                if pickattack.size:
+                    if writers.get("pickattack") is None:
+                        suffix = "" if writers is pass_writers["pred"] else "_forced"
+                        writers["pickattack"] = sf.SoundFile(os.path.join(out_dir, f"stem_pickattack_only{suffix}.wav"),
+                                                             mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                    writers["pickattack"].write(pickattack)
+                if picklearn.size:
+                    if writers["picklearn"] is None:
+                        suffix = "" if writers is pass_writers["pred"] else "_forced"
+                        writers["picklearn"] = sf.SoundFile(os.path.join(out_dir, f"stem_picklearn_only{suffix}.wav"),
+                                                            mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                    writers["picklearn"].write(picklearn)
+                if ir_only.size:
+                    if writers["ir"] is None:
+                        suffix = "" if writers is pass_writers["pred"] else "_forced"
+                        writers["ir"] = sf.SoundFile(os.path.join(out_dir, f"stem_ir_lowpass{suffix}.wav"),
+                                                     mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                    writers["ir"].write(ir_only)
+                if pickreso.size:
+                    if writers["pickreso"] is None:
+                        suffix = "" if writers is pass_writers["pred"] else "_forced"
+                        writers["pickreso"] = sf.SoundFile(os.path.join(out_dir, f"stem_pickreso_only{suffix}.wav"),
+                                                           mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+                    writers["pickreso"].write(pickreso)
+
+                writers["pick"].write(pick_only)
+                writers["fing"].write(fing_only)
+                writers["sumcheck"].write(sum_est)
+
+                if writers is pass_writers["pred"]:
+                    for kname in aliases("style_pred"):
+                        if kname in outs:
+                            sp = float(np.asarray(outs[kname])[0, 0])
+                            prob_sum += sp * float(core)
+                            prob_count = prob_count + core
+                            break
+
+                # Update states
+                for nm, onm in state_out_map.items():
+                    if onm in outs:
+                        state_bufs[nm] = outs[onm]
+
+                # Source/target once per block
+                if writers is pass_writers["pred"]:
+                    writers["src"].write(x_mod[pos:pos+core])
+                    writers["tgt"].write(y_mod[pos:pos+core])
+
+                pos += core
+
+            return prob_sum, prob_count
+
+        # Run all passes streaming
+        total_prob_sum = 0.0
+        total_prob_cnt = 0
+
+        for pass_key, st_true, st_force in forced_variants:
+            writers = pass_writers[pass_key]
+            ps, pc = run_stream_pass(st_true, st_force, writers)
+            total_prob_sum += ps
+            total_prob_cnt += pc
+
+        for wset in pass_writers.values():
+            for w in list(wset.values()):
+                try:
+                    if w is not None:
+                        w.close()
+                except Exception:
+                    pass
+
+        if total_prob_cnt > 0:
+            p = total_prob_sum / float(total_prob_cnt)
+            label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+            print(f"✅ Stems saved to {out_dir}. Predicted style (avg): {label} (p={p:.4f})")
+        else:
+            print(f"✅ Stems saved to {out_dir}.")
+        return
+
+    # Non-streaming fallback (offline or legacy)
+    left_ctx_model, right_ctx_model = _get_model_context_for_streaming(sample_rate, model=debug_model)
+    resample_margin_file = int(round((resample_margin_ms / 1000.0) * file_sr))
+    block_core_model = max(1, int(round(block_sec * sample_rate)))
+    want_total_model = len(x_mod)
+
+    def open_writers(pass_key):
+        is_pred = (pass_key == "pred")
+        suffix = "" if is_pred else f"_{pass_key.split('_', 1)[1]}"
+        w = {}
+        if is_pred:
+            w["src"]  = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            w["tgt"]  = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),  mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+            w["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        else:
+            w["full"] = sf.SoundFile(os.path.join(out_dir, f"pred_full_forced{suffix}.wav"), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["main_core"] = sf.SoundFile(os.path.join(out_dir, "stem_main_core_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                      mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["pick"] = sf.SoundFile(os.path.join(out_dir, "stem_pick_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["fing"] = sf.SoundFile(os.path.join(out_dir, "stem_finger_only" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                 mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w["pickattack"] = None
+        w["picklearn"]  = None
+        w["ir"]         = None
+        w["pickreso"]   = None
+        w["sumcheck"] = sf.SoundFile(os.path.join(out_dir, "pred_full_sumcheck" + ("" if is_pred else f"_forced{suffix}") + ".wav"),
+                                     mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+        return w
+
     pass_writers = {k: open_writers(k) for k, _, _ in forced_variants}
 
     produced_model = 0
@@ -4292,44 +5581,16 @@ def render_isolated_stems(debug_model,
         left_this = left_ctx_model
         right_this = right_ctx_model if (produced_model + core_model) < want_total_model else 0
 
-        core_start_file_off = int(round(produced_model * (file_sr / float(sample_rate))))
-        core_start_file = START_FRAME + core_start_file_off
+        core_start = produced_model
+        read_start = max(0, core_start - left_this)
+        read_end   = min(want_total_model, core_start + core_model + right_this)
 
-        left_ctx_file = int(math.ceil(left_this * (file_sr / float(sample_rate))))
-        right_ctx_file= int(math.ceil(right_this * (file_sr / float(sample_rate))))
-        core_file_len = int(math.ceil(core_model * (file_sr / float(sample_rate))))
-
-        read_a = max(START_FRAME, core_start_file - left_ctx_file - resample_margin_file)
-        read_b = min(END_FRAME, core_start_file + core_file_len + right_ctx_file + resample_margin_file)
-        n_read = max(0, read_b - read_a)
-        if n_read <= 0:
-            break
-
-        x_blk_2d, _ = sf.read(path_src, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        y_blk_2d, _ = sf.read(path_tgt, start=read_a, frames=n_read, dtype='float32', always_2d=True)
-        x_file = x_blk_2d[:, 0] * g_norm
-        y_file = y_blk_2d[:, 0] * g_norm
-
-        if file_sr != sample_rate:
-            x_resamp = resample_to_model_sr(x_file, file_sr, sample_rate)
-            y_resamp = resample_to_model_sr(y_file, file_sr, sample_rate)
-        else:
-            x_resamp = x_file
-            y_resamp = y_file
-
-        left_off_file  = (core_start_file - left_ctx_file) - read_a
-        left_off_model = int(round(left_off_file * (sample_rate / float(file_sr))))
-        inp_start = max(0, min(left_off_model, len(x_resamp)))
-        inp_end   = max(inp_start, min(inp_start + left_this + core_model + right_this, len(x_resamp)))
-        x_inp     = x_resamp[inp_start:inp_end]
+        x_inp = x_mod[read_start:read_end]
         if x_inp.size <= 0:
             break
 
-        core_start_in_inp = min(left_this, len(x_inp))
-        core_end_in_inp   = min(core_start_in_inp + core_model, len(x_inp))
-        core_len          = max(0, core_end_in_inp - core_start_in_inp)
-        if core_len <= 0:
-            break
+        core_start_in_inp = core_start - read_start
+        core_end_in_inp   = core_start_in_inp + core_model
 
         x_b = x_inp[None, :, None].astype(np.float32)
 
@@ -4340,32 +5601,30 @@ def render_isolated_stems(debug_model,
                 f"{kind}_style_force_input": force_in,
             }
             feeds.update(knob_feeds)
-            
-            outs = debug_model.predict(feeds, batch_size=1, verbose=0)
-            if not isinstance(outs, dict):
-                raise RuntimeError(f"Expected dict outputs from debug_model; got {type(outs)}")
+
+            outs = predict_to_dict(debug_model, feeds)
 
             def core_of(key):
-                arr = np.asarray(outs[key][0, :, 0], dtype=np.float32)
-                return arr[core_start_in_inp:core_end_in_inp]
+                for kname in aliases(key):
+                    if kname in outs:
+                        arr = np.asarray(outs[kname][0, :, 0], dtype=np.float32)
+                        return arr[core_start_in_inp:core_end_in_inp]
+                return np.zeros((core_model,), dtype=np.float32)
 
             wset = pass_writers[pass_key]
 
-            # Collect cropped signals
             y_full     = core_of("y_pred")
-            main_c     = core_of("main_core")   if "main_core"   in outs else np.zeros_like(y_full)
-            pick_only  = core_of("main_pick")   if "main_pick"   in outs else np.zeros_like(y_full)
-            fing_only  = core_of("main_finger") if "main_finger" in outs else (main_c - pick_only)
-            picklearn  = core_of("picklearn")   if "picklearn"   in outs else np.zeros_like(y_full)
-            pickattack = core_of("pickattack")  if "pickattack"  in outs else np.zeros_like(y_full)
-            pickreso   = core_of("pickreso")    if "pickreso"    in outs else np.zeros_like(y_full)
-            ir_only    = core_of("ir_only")     if "ir_only"     in outs else np.zeros_like(y_full)
-            mask_core  = core_of("mask")        if "mask"        in outs else np.zeros_like(y_full)
+            main_c     = core_of("main_core")
+            pick_only  = core_of("main_pick")
+            fing_only  = core_of("main_finger")
+            picklearn  = core_of("picklearn")
+            pickattack = core_of("pickattack")
+            pickreso   = core_of("pickreso")
+            ir_only    = core_of("ir_only")
+            mask_core  = core_of("mask")
 
-            # Sum-check
             sum_est = main_c + pickattack + pickreso + ir_only
 
-            # Metrics
             core_outs = {
                 "y_pred": y_full,
                 "main_core": main_c,
@@ -4375,12 +5634,7 @@ def render_isolated_stems(debug_model,
                 "main_finger": fing_only,
                 "mask": mask_core
             }
-            y_target_core = None
-            if pass_key == "pred":
-                core_start_global = inp_start + core_start_in_inp
-                core_end_global   = inp_start + core_end_in_inp
-                y_target_core = y_resamp[core_start_global:core_end_global]
-
+            y_target_core = y_mod[core_start:core_start+core_model] if pass_key == "pred" else None
             m = _metrics_for_core(core_outs, y_target_core=y_target_core)
             metrics_fn = os.path.join(out_dir, f"metrics_{pass_key}.json")
             try:
@@ -4389,73 +5643,45 @@ def render_isolated_stems(debug_model,
             except Exception:
                 pass
 
-            if pass_key == "pred":
-                print(f"[crest] full={m.get('crest_full',0):.2f} main={m.get('crest_main',0):.2f} "
-                      f"pAtt={m.get('crest_pickattack',0):.2f} pRes={m.get('crest_pick_reso',0):.2f} "
-                      f"mask_duty@0.2={m.get('mask_duty20',0):.2f} overshoot_q99={m.get('overshoot_q99_ratio',0):.2f} "
-                      f"sum_err_rms={m.get('rms_sum_err',0):.6f}")
-
-            print(f"[stems:{pass_key}] "
-                  f"RMS full={_rms(y_full):.6f}  main={_rms(main_c):.6f}  "
-                  f"pick={_rms(pick_only):.6f}  fing={_rms(fing_only):.6f}  "
-                  f"picklearn(pre)={_rms(picklearn):.6f}  pick_attack={_rms(pickattack):.6f}  "
-                  f"pick_reso={_rms(pickreso):.6f}  ir={_rms(ir_only):.6f}  corr(pick,fing)={_corr(pick_only,fing_only):.3f}")
-
-            # Writes (once per stem)
             wset["full"].write(y_full)
             wset["main_core"].write(main_c)
-
-            # Optional pickattack stem
-            if "pickattack" in outs:
+            if pickattack.size:
                 if wset.get("pickattack") is None:
                     fn = "stem_pickattack_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["pickattack"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["pickattack"].write(pickattack)
-
-            # Optional picklearn (pre-scale) stem
-            if "picklearn" in outs:
+            if picklearn.size:
                 if wset["picklearn"] is None:
                     fn = "stem_picklearn_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["picklearn"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["picklearn"].write(picklearn)
-
-            # Optional IR stem
-            if "ir_only" in outs:
+            if ir_only.size:
                 if wset["ir"] is None:
                     fn = "stem_ir_lowpass" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["ir"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["ir"].write(ir_only)
-
-            # Optional pickreso stem
-            if "pickreso" in outs:
+            if pickreso.size:
                 if wset["pickreso"] is None:
                     fn = "stem_pickreso_only" + ("" if pass_key == "pred" else f"_{pass_key.split('_', 1)[1]}") + ".wav"
                     wset["pickreso"] = sf.SoundFile(os.path.join(out_dir, fn), mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
                 wset["pickreso"].write(pickreso)
 
-            # Pick/finger stems from main_core decomposition
             wset["pick"].write(pick_only)
             wset["fing"].write(fing_only)
-
-            # Sum-check
             wset["sumcheck"].write(sum_est)
 
-            # Accumulate predicted style prob (only in 'pred' pass if available)
-            if pass_key == "pred" and "style_pred" in outs:
-                sp = float(np.asarray(outs["style_pred"])[0, 0])
-                pred_prob_sum += sp * float(core_len)
-                pred_prob_count += core_len
+            if pass_key == "pred":
+                for kname in aliases("style_pred"):
+                    if kname in outs:
+                        sp = float(np.asarray(outs[kname])[0, 0])
+                        pred_prob_sum += sp * float(core_model)
+                        pred_prob_count += core_model
+                        break
 
-        # Write source/target aligned to the same core region (once per block)
-        core_start_global = inp_start + core_start_in_inp
-        core_end_global   = inp_start + core_end_in_inp
-        if "src" in pass_writers["pred"]:
-            pass_writers["pred"]["src"].write(x_resamp[core_start_global:core_end_global])
-            pass_writers["pred"]["tgt"].write(y_resamp[core_start_global:core_end_global])
+        pass_writers["pred"]["src"].write(x_mod[core_start:core_start+core_model])
+        pass_writers["pred"]["tgt"].write(y_mod[core_start:core_start+core_model])
+        produced_model += core_model
 
-        produced_model += core_len
-
-    # Close writers
     for wset in pass_writers.values():
         for w in list(wset.values()):
             try:
@@ -4501,16 +5727,14 @@ def run_render_stems_offline(use_finetuned=False):
 
 
 def run_render_stems_realtime(use_finetuned=False):
+    print("[stems/realtime] run_render_stems_realtime (runtime streaming path)")
     sample_rate = REALTIME_SAMPLE_RATE
-    src = None
-    tgt = None
-    
+
     if use_finetuned:
         src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
         tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
     else:
-        if not all_pairs:
-            print("ERROR: No baseline training pairs found."); sys.exit(1)
+        assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
     dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
@@ -4519,13 +5743,18 @@ def run_render_stems_realtime(use_finetuned=False):
     print("[stems/realtime] Using:", dpath)
     realtime_dyn = tf.keras.models.load_model(dpath, compile=False)
 
-    dbg = build_realtime_debug_model(realtime_dyn)
     out_dir = STEMS_FINETUNE_REALTIME_OUT_DIR if use_finetuned else STEMS_REALTIME_OUT_DIR
-    render_isolated_stems(debug_model=dbg, kind="realtime", path_src=src, path_tgt=tgt,
-                          out_dir=out_dir,
-                          sample_rate=sample_rate,
-                          sec=LONG_DEMO_SEC, offset_sec=LONG_DEMO_OFFSET_SEC,
-                          use_finetuned=use_finetuned)
+
+    # Use the runtime streaming renderer that taps post‑knob heads
+    render_isolated_stems_realtime_runtime(model=realtime_dyn,
+                                           path_src=src,
+                                           path_tgt=tgt,
+                                           out_dir=out_dir,
+                                           sample_rate=sample_rate,
+                                           sec=LONG_DEMO_SEC,
+                                           offset_sec=LONG_DEMO_OFFSET_SEC,
+                                           hop=1024,
+                                           use_finetuned=use_finetuned)
 
 def train_shared(
     kind,
@@ -4542,7 +5771,8 @@ def train_shared(
     resume_ckpt_path=None,
     build_model_fn_args_static={},
     build_model_fn_args_dynamic={},
-    dual_offline=False
+    dual_offline=False,
+    trainable_model_filepath=None
 ):
     global L1_WEIGHT, HF_WEIGHT, STFT_WEIGHT, MEL_WEIGHT, RMS_ENV_WEIGHT
 
@@ -4646,15 +5876,9 @@ def train_shared(
 
     if resume and resume_ckpt_path:
         print(f"Resuming training from checkpoint: {resume_ckpt_path}")
-        # Load weights from the checkpoint, but rebuild the full graph (with teacher) first
         ckpt_model = tf.keras.models.load_model(resume_ckpt_path, compile=False)
-
-        # Critical: rebuild the realtime model with the teacher again
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
-
-        # Copy weights by layer name to keep shapes/graph, including KD heads
         copy_weights_by_name(static_model, ckpt_model, verbose=True)
-
         initial_epoch = _extract_epoch_from_ckpt(resume_ckpt_path)
     else:
         static_model = build_model_fn(**build_model_fn_args_static, dynamic_time=False)
@@ -4696,16 +5920,24 @@ def train_shared(
     reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=LR_FACTOR, patience=LR_PLATEAU_PATIENCE, min_lr=MIN_LR, mode='min', verbose=1)
     cp = ModelCheckpoint(filepath=os.path.join(checkpoint_out_dir, "best_model_epoch_{epoch:02d}_val_loss_{val_loss:.4f}.keras"),
                          monitor='val_loss', mode='min', save_best_only=True, verbose=1)
-    
     terminate_on_nan = TerminateOnNaN()
-    
-    demo_cb = DemoCallback(sample_rate=sample_rate,
-                           build_model_fn=build_model_fn,
-                           build_model_fn_args_dynamic=build_model_fn_args_dynamic,
-                           demo_checkpoints_out_dir=demo_checkpoints_out_dir,
-                           use_safe_weight_copy=(kind != 'offline')
-    )
     tb = TensorBoard(log_dir=logs_out_dir, write_graph=False)
+
+    # Use streaming realtime for demo (teacherless), keep offline demo builder unchanged
+    if kind == 'realtime':
+        demo_build_fn = build_realtime_streaming_model
+        demo_build_args = {}  # teacherless streaming
+        demo_safe_copy = True
+    else:
+        demo_build_fn = build_model_fn
+        demo_build_args = build_model_fn_args_dynamic
+        demo_safe_copy = False
+
+    demo_cb = DemoCallback(sample_rate=sample_rate,
+                           build_model_fn=demo_build_fn,
+                           build_model_fn_args_dynamic=demo_build_args,
+                           demo_checkpoints_out_dir=demo_checkpoints_out_dir,
+                           use_safe_weight_copy=demo_safe_copy)
 
     cbs = [es, cp, reduce_lr, terminate_on_nan, tb, demo_cb]
 
@@ -4717,7 +5949,6 @@ def train_shared(
             "feat_distill_1":      (REALTIME_FEAT_DISTILL_ALPHA,         0.5,  0,  80),
             "stem_pick_distill":   (REALTIME_STEM_PICK_DISTILL_ALPHA,    0.2,  0,  80),
             "stem_finger_distill": (REALTIME_STEM_FINGER_DISTILL_ALPHA,  0.2,  0,  80),
-            # Keep style blend anneal if you use it
             "realtime_style_blend":(REALTIME_STYLE_BLEND_INIT,           0.3,  0, 100)
         }
         cbs.append(KDAlphaScheduler(kd_targets))
@@ -4730,20 +5961,39 @@ def train_shared(
                      validation_steps=validation_steps,
                      callbacks=cbs)
 
-    static_model.save(static_model_filepath)
-    print("✅ Saved FP32 static model:", static_model_filepath)
-
-    dynamic_model = build_model_fn(**build_model_fn_args_dynamic, dynamic_time=True)
-    
+    # Export runtime artifacts
     if kind == 'offline':
+        # Keep original offline exports (unchanged)
+        static_model.save(static_model_filepath)
+        print("✅ Saved FP32 static model:", static_model_filepath)
+        dynamic_model = build_model_fn(**build_model_fn_args_dynamic, dynamic_time=True)
         dynamic_model.set_weights(static_model.get_weights())
-    else:
-        copy_weights_by_name(dynamic_model, static_model)
+        dynamic_model.save(dynamic_model_filepath)
+        print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
+        return static_model, dynamic_model
     
-    dynamic_model.save(dynamic_model_filepath)
-    print("✅ Saved FP32 dynamic model:", dynamic_model_filepath)
+    # For realtime, first save the trainable version to disk (which should have the offline teacher baked into its graph)
+    if trainable_model_filepath is not None:
+        static_model.save(trainable_model_filepath)
+        print("✅ Saved FP32 trainable static model (with teacher):", trainable_model_filepath)
 
-    return static_model, dynamic_model
+    static_model.save(static_model_filepath)
+
+    # kind == 'realtime': always export self-contained streaming runtime models
+    rt_dyn_stream = build_realtime_streaming_model(dynamic_time=True)
+    copy_weights_by_name(rt_dyn_stream, static_model, verbose=True)
+    # Force-patch HPF kernels to known-good taps (guards against bad copies)
+    force_patch_realtime_hpf_kernels(rt_dyn_stream, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    rt_dyn_stream.save(dynamic_model_filepath)
+    print("✅ Saved realtime streaming dynamic model:", dynamic_model_filepath)
+
+    rt_static_stream = build_realtime_streaming_model()
+    copy_weights_by_name(rt_static_stream, static_model, verbose=True)
+    force_patch_realtime_hpf_kernels(rt_static_stream, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    rt_static_stream.save(static_model_filepath)
+    print("✅ Saved realtime streaming static model:", static_model_filepath)
+
+    return static_model, rt_dyn_stream
 
 def train_offline(resume=False, resume_ckpt_path=None):
     train_shared(
@@ -4767,16 +6017,14 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         print("Offline model not found, run --train-offline first")
         sys.exit(1)
 
-    # Load the original (non-causal) offline model
+    # Load offline teacher (non-causal) and build a causalized teacher clone (KD)
     offline_nc = tf.keras.models.load_model(offline_dynamic_model_filepath, compile=False)
     print("Loaded offline (non-causal) from", offline_dynamic_model_filepath)
-
-    # Build a causalized teacher clone (no right-lookahead) and copy weights
     offline_causal = build_offline_model_causal(offline_nc, dynamic_time=True)
     print("Built causal teacher clone for KD (right-lookahead=0).")
 
-    # 1) Train the baseline realtime model (fixed gate)
-    static_model, dynamic_model = train_shared(
+    # Train the baseline realtime KD model; export streaming runtime artifacts
+    train_shared(
         kind='realtime',
         resume=resume,
         resume_ckpt_path=resume_ckpt_path,
@@ -4785,32 +6033,15 @@ def train_realtime(resume=False, resume_ckpt_path=None):
         batch_size=REALTIME_BATCH_SIZE,
         static_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
         dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
-        build_model_fn=build_realtime_model,
-        build_model_fn_args_static={
-            'offline': offline_causal
-        },
-        build_model_fn_args_dynamic={
-            'offline': None
-        },
+        trainable_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TRAINABLE_MODEL_FILENAME),
+        build_model_fn=build_realtime_training_model,                   # KD graph for training
+        build_model_fn_args_static={ 'offline': offline_causal },       # teacher embedded
+        build_model_fn_args_dynamic={ 'offline': offline_causal },      # teacher embedded
         checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
         logs_out_dir=LOGS_REALTIME_OUT_DIR,
         demo_checkpoints_out_dir=DEMO_CHECKPOINTS_REALTIME_OUT_DIR,
-        dual_offline=True  # keep dual-rate dataset (48k student + 96k teacher input)
+        dual_offline=True
     )
-    
-    # 2) Also export a second static realtime model that is self-contained (teacherless),
-    #    mirroring the dynamic model's graph but with fixed (static) time.
-    rt_static_self = build_realtime_model(
-        offline=None,
-        dynamic_time=False,
-        coloreq_trainable=False
-    )
-    # Copy student weights by name from the already-produced dynamic teacherless model
-    copy_weights_by_name(rt_static_self, dynamic_model, verbose=True)
-
-    rt_static_self_path = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-    rt_static_self.save(rt_static_self_path)
-    print("✅ Saved realtime self-contained static model:", rt_static_self_path)
 
 def generate_fine_tune_demo(model, kind, sample_rate):
     out_dir = os.path.join(FINETUNE_DEMOS_OUT_DIR, kind)
@@ -4940,38 +6171,267 @@ def cleanup_and_prepare_train (logs_out_dir, checkpoints_out_dir, demo_checkpoin
         return (resume, resume_ckpt)
     else:
         return (False, None)
+def generate_demo(model, kind, out_dir, sample_rate, prediction_name="demo_pred", only_prediction=False):
+    """
+    Offline: unchanged (windowed context).
+    Realtime: requires a self-contained STREAMING model with fixed T=32.
+              This function never builds any graph; it throws if the model is not streaming or not T=32.
+    """
+    assert_has_pairs()
+    pth_src, pth_tgt = all_pairs[LONG_DEMO_PAIR_INDEX]
 
-def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, checkpoint_out_dir,
-                              demo_out_dir, build_model_fn, build_model_fn_args_dynamic={},
-                              use_safe_weight_copy=False):
- 
+    # Style flag for display
+    if "pick" in pth_src:
+        style_true_flag = 1.0
+    elif "finger" in pth_src:
+        style_true_flag = 0.0
+    else:
+        style_true_flag = None
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    if kind == "offline":
+        # Original offline behavior preserved
+        return generate_demo_from_files(
+            model           = model,
+            kind            = "offline",
+            out_dir         = out_dir,
+            sample_rate     = sample_rate,
+            path_src        = pth_src,
+            path_target     = pth_tgt,
+            prediction_name = prediction_name,
+            only_prediction = only_prediction
+        )
+
+    # kind == "realtime": must be streaming + T=32
+    in_tensors  = list(model.inputs)
+    out_tensors = list(model.outputs)
+
+    # Robust names
+    in_names  = [_tensor_basename(t) for t in in_tensors]
+    out_names = _output_names_from_model(model)
+
+    # Find state I/O
+    state_in_names  = [n for n in in_names if n.startswith("realtime_state_")]
+    # Prefer named state outputs; if unavailable, fall back to ordered mapping
+    named_state_outs = [n for n in out_names if n.startswith("realtime_state_") and n.endswith("_next")]
+    n_states = len(state_in_names)
+    n_out = len(out_tensors)
+
+    use_ordered_state_mapping = False
+    if n_states == 0:
+        print("[generate_demo] inputs:", in_names)
+        print("[generate_demo] outputs:", out_names)
+        raise RuntimeError("generate_demo(realtime): provided model is not STREAMING (no realtime_state_* inputs).")
+    if not named_state_outs:
+        # Try ordered mapping: expect exactly [audio, style] + state outs
+        if n_out == 2 + n_states:
+            use_ordered_state_mapping = True
+            print("[generate_demo] Note: output tensors are generically named; using ordered state mapping.")
+        else:
+            print("[generate_demo] inputs:", in_names)
+            print("[generate_demo] outputs:", out_names)
+            raise RuntimeError("generate_demo(realtime): provided model is not STREAMING. "
+                               "Expected explicit realtime_state_* inputs and *_next outputs (or matching count for ordered mapping).")
+
+    # Find the realtime piezo input and enforce fixed T=32
+    def _find_piezo_input():
+        for t in in_tensors:
+            nm = _tensor_basename(t)
+            if nm == "realtime_piezo_input":
+                return t
+        for t in in_tensors:
+            nm = _tensor_basename(t)
+            if "piezo_input" in nm:
+                return t
+        return None
+
+    piezo_in = _find_piezo_input()
+    if piezo_in is None:
+        raise RuntimeError("generate_demo(realtime): could not find 'realtime_piezo_input' in model inputs.")
+
+    T_dim = piezo_in.shape[1]
+    if (T_dim is None) or (int(T_dim) != int(REALTIME_TFLITE_T)):
+        raise RuntimeError(f"generate_demo(realtime): expected static T={REALTIME_TFLITE_T} streaming model; "
+                           f"got T={T_dim}.")
+
+    # Load audio
+    info = sf.info(pth_src)
+    file_sr = info.samplerate
+    START_FRAME = int(round(LONG_DEMO_OFFSET_SEC * file_sr))
+    TOTAL_FRAMES = int(round(LONG_DEMO_SEC * file_sr))
+
+    x_long, _ = sf.read(pth_src, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True)
+    y_long, _ = sf.read(pth_tgt, start=START_FRAME, frames=TOTAL_FRAMES, dtype='float32', always_2d=True) if not only_prediction else (None, None)
+    x_src = x_long[:, 0]
+    y_src = y_long[:, 0] if y_long is not None else None
+
+    x_mod = x_src if file_sr == sample_rate else resample_to_model_sr(x_src, file_sr, sample_rate)
+    y_mod = y_src if (y_src is not None and file_sr == sample_rate) else (resample_to_model_sr(y_src, file_sr, sample_rate) if y_src is not None else None)
+
+    # Writers
+    style_pred_path = os.path.join(out_dir, prediction_name + "_style_pred.wav")
+    style_true_path = os.path.join(out_dir, prediction_name + "_style_true.wav")
+    w_pred = sf.SoundFile(style_pred_path, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+    w_true = None
+    if style_true_flag is not None:
+        w_true = sf.SoundFile(style_true_path, mode='w', samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    w_src = None
+    w_tgt = None
+    if not only_prediction:
+        w_src = sf.SoundFile(os.path.join(out_dir, "demo_source.wav"), mode='w',
+                             samplerate=sample_rate, channels=1, subtype='FLOAT')
+        w_tgt = sf.SoundFile(os.path.join(out_dir, "demo_target.wav"), mode='w',
+                             samplerate=sample_rate, channels=1, subtype='FLOAT')
+
+    # Streaming loop with fixed hop=T=REALTIME_TFLITE_T (pad last block with zeros)
+    hop = REALTIME_TFLITE_T
+    N = len(x_mod)
+
+    # Prepare state buffers (zero-initialized by input spec order)
+    state_in_tensors = [t for t in in_tensors if _tensor_basename(t).startswith("realtime_state_")]
+    state_in_names   = [_tensor_basename(t) for t in state_in_tensors]
+    state_bufs = {
+        nm: np.zeros((1,
+                      int(t.shape[1]) if t.shape[1] is not None else 0,
+                      int(t.shape[2]) if t.shape[2] is not None else 1),
+                     dtype=np.float32)
+        for nm, t in zip(state_in_names, state_in_tensors)
+    }
+
+    # Build a position map for ordered mapping if needed
+    if use_ordered_state_mapping:
+        # outputs = [y, style] + states..., same order as state_inputs
+        state_out_start = 2
+        state_out_indices = {nm: (state_out_start + i) for i, nm in enumerate(state_in_names)}
+    else:
+        # Name-based mapping: out_names are producing layer names
+        state_out_indices = {}
+        out_names = _output_names_from_model(model)  # recompute in case
+        out_index_map = {name: idx for idx, name in enumerate(out_names)}
+        for nm in state_in_names:
+            nm_next = nm + "_next"
+            if nm_next in out_index_map:
+                state_out_indices[nm] = out_index_map[nm_next]
+
+    knob_feeds = _prepare_knob_feeds(kind="realtime", use_finetuned=False)
+
+    def run_one_pass(force_style=None):
+        pos = 0
+        # Reset states
+        for k in state_bufs.keys():
+            st = state_bufs[k]
+            st.fill(0.0)
+
+        if force_style is None:
+            st_true  = np.zeros((1, 1), dtype=np.float32)
+            st_force = np.zeros((1, 1), dtype=np.float32)
+        else:
+            st_true  = np.array([[float(force_style)]], dtype=np.float32)
+            st_force = np.ones((1, 1), dtype=np.float32)
+
+        prob_sum = 0.0
+        prob_count = 0
+
+        while pos < N:
+            core = min(hop, N - pos)
+            x_block = np.zeros((1, hop, 1), dtype=np.float32)
+            x_block[0, :core, 0] = x_mod[pos:pos + core].astype(np.float32, copy=False)
+
+            feed = {
+                "realtime_piezo_input": x_block,
+                "realtime_style_true_input": st_true,
+                "realtime_style_force_input": st_force,
+                "realtime_knob_pickattack": knob_feeds["realtime_knob_pickattack"],
+                "realtime_knob_pickreso":   knob_feeds["realtime_knob_pickreso"],
+                "realtime_knob_ir":         knob_feeds["realtime_knob_ir"],
+                "realtime_knob_drywet":     knob_feeds["realtime_knob_drywet"],
+            }
+            # Attach states by input name
+            for nm in state_in_names:
+                feed[nm] = state_bufs[nm]
+
+            outs = model.predict(feed, batch_size=1, verbose=0)
+            # Ordered: y=outs[0], style=outs[1]
+            y_arr = outs[0]
+            s_arr = outs[1]
+            y_block = y_arr[0, :hop, 0]
+            y_core  = y_block[:core]
+
+            if force_style is None:
+                w_pred.write(y_core)
+            else:
+                w_true.write(y_core)
+
+            if not only_prediction:
+                w_src.write(x_mod[pos:pos + core])
+                if y_mod is not None:
+                    w_tgt.write(y_mod[pos:pos + core])
+
+            if force_style is None:
+                s_prob = float(np.asarray(s_arr, dtype=np.float32)[0, 0])
+                prob_sum   += s_prob * float(core)
+                prob_count += core
+
+            # Update states (ordered or name-based)
+            for nm in state_in_names:
+                idx = state_out_indices.get(nm, None)
+                if idx is None:
+                    continue
+                state_bufs[nm] = outs[idx]
+
+            pos += core
+
+        return (prob_sum / float(prob_count)) if prob_count > 0 else None
+
+    # Predicted-style pass and optional true-style pass
+    p_avg = run_one_pass(force_style=None)
+    if style_true_flag is not None:
+        run_one_pass(force_style=style_true_flag)
+
+    w_pred.close()
+    if w_true is not None: w_true.close()
+    if w_src is not None:  w_src.close()
+    if w_tgt is not None:  w_tgt.close()
+
+    if p_avg is not None:
+        label = 'pick' if p_avg > STYLE_FLAG_PROB_THRESHOLD else 'finger'
+        print(f"✅ Demo saved to {style_pred_path}. Predicted style (avg): {label} ({p_avg:.4f})")
+        if style_true_flag is not None:
+            tlabel = 'pick' if style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
+            print(f"✅ Demo saved to {style_true_path}. True style: {tlabel}")
+    else:
+        print(f"✅ Demo saved to {style_pred_path}.")
+        
+def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, demo_out_dir):
+    """
+    For demos, only load saved artifacts:
+      - offline: dynamic offline model (non-streaming)
+      - realtime: static T=32 streaming model (self-contained)
+    This function never builds graphs.
+    """
+    # Prefer saved artifacts by kind
     prefer = None
     if kind == "offline":
         cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-        if os.path.exists(cand): prefer = cand
+        if os.path.exists(cand):
+            prefer = cand
     elif kind == "realtime":
-        cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
-        if os.path.exists(cand): prefer = cand
+        cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+        if os.path.exists(cand):
+            prefer = cand
+    else:
+        raise ValueError("kind must be 'offline' or 'realtime'")
 
     dpath = prefer if prefer is not None else dynamic_model_filepath
     if not os.path.exists(dpath):
-        checkpoints = sorted(glob.glob(os.path.join(checkpoint_out_dir, "*.keras")))
-        if checkpoints:
-            dpath = checkpoints[-1]
-            static_model = tf.keras.models.load_model(dpath, compile=False)
-            dynamic_model = build_model_fn(**build_model_fn_args_dynamic, dynamic_time=True)
-            if use_safe_weight_copy:
-                copy_weights_by_name(dynamic_model, static_model)
-            else:
-                dynamic_model.set_weights(static_model.get_weights())
-        else:
-            print("Dynamic model not found. Train models first.")
-            sys.exit(1)
-    else:
-        dynamic_model = tf.keras.models.load_model(dpath, compile=False)
-        dynamic_model.summary()
+        raise FileNotFoundError(f"[demo] Missing model for kind='{kind}'. Expected at: {dpath}. "
+                                f"For realtime, train/export the static T={REALTIME_TFLITE_T} streaming model first.")
+    model = tf.keras.models.load_model(dpath, compile=False)
+    model.summary()
 
-    generate_demo(model=dynamic_model, kind=kind, out_dir=demo_out_dir, sample_rate=sample_rate)
+    generate_demo(model=model, kind=kind, out_dir=demo_out_dir, sample_rate=sample_rate)
 
 def _crest(x):
     x = np.asarray(x, dtype=np.float32)
@@ -5042,86 +6502,6 @@ def _metrics_for_core(outs_dict, y_target_core=None):
 
     return m
 
-def _hard_copy_weights(dst: tf.keras.Model, src: tf.keras.Model):
-    # try strict order-copy first
-    try:
-        dst.set_weights(src.get_weights())
-        print("[copy] set_weights OK (strict ordering)")
-        return True
-    except Exception as e:
-        print(f"[copy] set_weights failed, falling back to by-name: {e}")
-        matched = copy_weights_by_name(dst, src, verbose=True)
-        with_w = sum(1 for l in dst.layers if l.weights)
-        print(f"[copy] by-name matched={matched}/{with_w} layers-with-weights")
-        return matched == with_w
-
-def prepare_and_generate_demo_static_selfcontained(kind, sample_rate, demo_out_dir, use_finetuned=False):
-    os.makedirs(demo_out_dir, exist_ok=True)
-    if kind == "realtime":
-        static_path = os.path.join(
-            MODELS_REALTIME_OUT_DIR,
-            FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME if use_finetuned
-            else REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME
-        )
-        if not os.path.exists(static_path):
-            print(f"[demo-static] realtime static self-contained not found: {static_path}")
-            return
-
-        print(f"[demo-static] loading static from: {static_path}")
-        static_model = tf.keras.models.load_model(static_path, compile=False)
-
-        # Build the teacherless dynamic-time graph
-        dyn = build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
-
-        ok = _hard_copy_weights(dyn, static_model)
-
-        # Quick sanity: print critical scales
-        def _get_scale(m, name):
-            try: return float(m.get_layer(name).get_weights()[0][0])
-            except: return None
-        for lname in ["realtime_ir_scale", "realtime_pickattack_scale", "realtime_pickreso_scale", "realtime_pickreso_calib"]:
-            print(f"[demo-static] {lname} =", _get_scale(dyn, lname))
-
-        # Also print streaming context so you can compare to --demo logs
-        lc, rc = compute_realtime_streaming_context(dyn, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
-
-        generate_demo(model=dyn, kind="realtime", out_dir=demo_out_dir, sample_rate=sample_rate)
-
-    elif kind == "offline":
-        # unchanged...
-        dyn = build_offline_model(dynamic_time=True, coloreq_trainable=False)
-        static_path = os.path.join(
-            MODELS_OFFLINE_OUT_DIR,
-            FINETUNE_OFFLINE_STATIC_MODEL_FILENAME if use_finetuned else OFFLINE_STATIC_MODEL_FILENAME
-        )
-        print(f"[demo-static] loading static from: {static_path}")
-        static_model = tf.keras.models.load_model(static_path, compile=False)
-        _hard_copy_weights(dyn, static_model)
-        lc, rc = _get_model_context_for_streaming(sample_rate, model=dyn)
-        print(f"[demo-static] offline context lc={lc} rc={rc}")
-        generate_demo(model=dyn, kind="offline", out_dir=demo_out_dir, sample_rate=sample_rate)
-    else:
-        raise ValueError("kind must be 'offline' or 'realtime'")
-
-
-def _build_dyn_model_for_export(kind):
-    """
-    Build the dynamic-time runtime graph (teacherless) for export,
-    so we can copy weights from the static checkpoints and wrap it
-    at any required T for TFLite.
-    """
-    if kind == "offline":
-        dyn = build_offline_model(dynamic_time=True, coloreq_trainable=False)
-    elif kind == "realtime":
-        dyn = build_realtime_model(offline=None, dynamic_time=True, coloreq_trainable=False)
-    else:
-        raise ValueError("kind must be 'offline' or 'realtime'")
-    for l in dyn.layers:
-        l.trainable = False
-    return dyn
-
-
-
 def _wrap_fixed_T_for_tflite(dyn_model, kind, T_fixed):
     if kind == "offline":
         inp  = Input(shape=(T_fixed,1), name="offline_piezo_input")
@@ -5190,35 +6570,61 @@ def _convert_keras_to_tflite_fp32(model, out_path):
         f.write(tflm)
     print(f"✅ Saved FP32 TFLite: {out_path}")
 
+def _build_dyn_model_for_export(kind):
+    """
+    Build the dynamic-time runtime graph (teacherless) for export.
+    Realtime no longer uses this (we export the streaming/stateful graph directly).
+    """
+    if kind == "offline":
+        dyn = build_offline_model(dynamic_time=True)
+        for l in dyn.layers:
+            l.trainable = False
+        return dyn
+    elif kind == "realtime":
+        raise RuntimeError("_build_dyn_model_for_export is not used for realtime. "
+                           "Use build_realtime_streaming_model with a fixed T instead.")
+    else:
+        raise ValueError("kind must be 'offline' or 'realtime'")
+
 def _export_one_tflite(kind, static_src_path, out_tflite_path, T_fixed):
     """
     Export a single FP32 TFLite for a given 'kind' from a static Keras model.
+    - offline: wrap teacherless runtime graph to fixed T
+    - realtime: convert the self-contained STREAMING graph at fixed T (state I/O preserved)
     """
     if not os.path.exists(static_src_path):
         print(f"[TFLite/export] Missing source model: {static_src_path}")
         return False
 
-    print(f"[TFLite/export] Loading static: {static_src_path}")
-    static_m = tf.keras.models.load_model(static_src_path, compile=False)
+    if kind == "offline":
+        print(f"[TFLite/export] Loading offline static: {static_src_path}")
+        static_m = tf.keras.models.load_model(static_src_path, compile=False)
 
-    dyn = _build_dyn_model_for_export(kind=kind)
-    # Copy by name to teacherless graph
-    copy_weights_by_name(dyn, static_m, verbose=True)
+        dyn = _build_dyn_model_for_export(kind="offline")
+        copy_weights_by_name(dyn, static_m, verbose=True)
 
-    # Wrap with fixed T
-    export = _wrap_fixed_T_for_tflite(dyn, kind=kind, T_fixed=T_fixed)
-    _convert_keras_to_tflite_fp32(export, out_tflite_path)
+        export = _wrap_fixed_T_for_tflite(dyn, kind="offline", T_fixed=T_fixed)
+        _convert_keras_to_tflite_fp32(export, out_tflite_path)
+        return True
+
+    # kind == "realtime": export streaming/stateful graph with fixed T
+    print(f"[TFLite/export] Loading realtime streaming static: {static_src_path}")
+    rt_static = tf.keras.models.load_model(static_src_path, compile=False)
+
+    T_fixed = int(T_fixed)
+    if T_fixed == int(REALTIME_TFLITE_T):
+        # Already T=32 streaming: convert as-is
+        _convert_keras_to_tflite_fp32(rt_static, out_tflite_path)
+        return True
+
+    # Rebuild streaming with desired fixed T and copy weights by name
+    rt_fixedT = build_realtime_streaming_model(static_T=T_fixed)
+    copy_weights_by_name(rt_fixedT, rt_static, verbose=True)
+    _convert_keras_to_tflite_fp32(rt_fixedT, out_tflite_path)
     return True
 
 def export_tflite_all():
-    """
-    Export all requested FP32 TFLite models:
-      - Offline baseline static (T=OFFLINE_TFLITE_T)
-      - Offline finetuned static (T=OFFLINE_TFLITE_T) if available
-      - Realtime baseline static self-contained (T=REALTIME_TFLITE_T)
-      - Realtime finetuned static self-contained (T=REALTIME_TFLITE_T) if available
-    """
-    # OFFLINE
+    # OFFLINE (unchanged)
     offline_static_src = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
     offline_tflite_out = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_TFLITE_FP32_FILENAME)
     _export_one_tflite(kind="offline",
@@ -5236,36 +6642,24 @@ def export_tflite_all():
     else:
         print(f"[TFLite/export] Skipping finetuned OFFLINE (not found): {offline_ft_src}")
 
-    # REALTIME (self-contained)
-    rt_static_self_src = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
+    # REALTIME (streaming/stateful)
+    rt_static_src = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
     rt_tflite_out      = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_FILENAME)
-    rt_tflite_out_demo = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_DEMO_FILENAME)
+
     _export_one_tflite(kind="realtime",
-                       static_src_path=rt_static_self_src,
+                       static_src_path=rt_static_src,
                        out_tflite_path=rt_tflite_out,
                        T_fixed=REALTIME_TFLITE_T)
 
-    _export_one_tflite(kind="realtime",
-                       static_src_path=rt_static_self_src,
-                       out_tflite_path=rt_tflite_out_demo,
-                       T_fixed=REALTIME_TFLITE_T_DEMO)
-
-    rt_ft_self_src = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME)
+    rt_ft_static_src = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
     rt_ft_out      = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_FILENAME)
-    rt_ft_out_demo = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_DEMO_FILENAME)
-    if os.path.exists(rt_ft_self_src):
+    if os.path.exists(rt_ft_static_src):
         _export_one_tflite(kind="realtime",
-                           static_src_path=rt_ft_self_src,
+                           static_src_path=rt_ft_static_src,
                            out_tflite_path=rt_ft_out,
                            T_fixed=REALTIME_TFLITE_T)
-        
-        _export_one_tflite(kind="realtime",
-                           static_src_path=rt_ft_self_src,
-                           out_tflite_path=rt_ft_out_demo,
-                           T_fixed=REALTIME_TFLITE_T_DEMO)
     else:
-        print(f"[TFLite/export] Skipping finetuned REALTIME (self-contained) (not found): {rt_ft_self_src}")
-
+        print(f"[TFLite/export] Skipping finetuned REALTIME (not found): {rt_ft_static_src}")
 
 def _sum_rf(kernel, dilations):
     return (int(kernel) - 1) * sum(int(d) for d in dilations)
@@ -5332,12 +6726,7 @@ def compute_streaming_ctx_constants(kind):
         raise ValueError("kind must be 'offline' or 'realtime'")
 
 
-def _select_tflite_demo_paths(kind, use_finetuned=False, small=False):
-    """
-    Return the TFLite path for the demo:
-    - realtime: small=False → use large 'demo T' (e.g., 6144); small=True → base T=32
-    - offline: only one T is exported
-    """
+def _select_tflite_demo_paths(kind, use_finetuned=False):
     if kind == "offline":
         if use_finetuned:
             return os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_TFLITE_FP32_FILENAME)
@@ -5346,13 +6735,11 @@ def _select_tflite_demo_paths(kind, use_finetuned=False, small=False):
         if use_finetuned:
             return os.path.join(
                 MODELS_REALTIME_OUT_DIR,
-                FINETUNE_REALTIME_TFLITE_FP32_FILENAME if small
-                else FINETUNE_REALTIME_TFLITE_FP32_DEMO_FILENAME
+                FINETUNE_REALTIME_TFLITE_FP32_FILENAME
             )
         return os.path.join(
             MODELS_REALTIME_OUT_DIR,
-            REALTIME_TFLITE_FP32_FILENAME if small
-            else REALTIME_TFLITE_FP32_DEMO_FILENAME
+            REALTIME_TFLITE_FP32_FILENAME
         )
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
@@ -5606,11 +6993,11 @@ class TFLiteRunner:
 
         return self._normalize_audio_style(audio_arr, style_arr)
 
-def generate_demo_tflite(kind, use_finetuned=False, small=False, out_dir=None, hop=None):
+def generate_demo_tflite(kind, use_finetuned=False, out_dir=None, hop=None):
     """
     Run the TFLite model in a streaming fashion and write WAVs.
     kind: 'offline' or 'realtime'
-    small=False uses the larger 'demo' T (e.g., 6144) for realtime; True uses T=32.
+    uses T=32.
     hop: if provided (int), use exact pedal-style schedule:
          left = T - hop, right = 0, core = hop.
     """
@@ -5631,7 +7018,7 @@ def generate_demo_tflite(kind, use_finetuned=False, small=False, out_dir=None, h
     else:
         sr = REALTIME_SAMPLE_RATE
         base_out_dir = LONG_DEMOS_REALTIME_OUT_DIR
-        subdir = f"t{REALTIME_TFLITE_T if small else REALTIME_TFLITE_T_DEMO}"
+        subdir = f"t{REALTIME_TFLITE_T}"
 
     if out_dir is None:
         out_dir = os.path.join(base_out_dir, subdir)
@@ -5649,7 +7036,7 @@ def generate_demo_tflite(kind, use_finetuned=False, small=False, out_dir=None, h
     x_mod = x_src if file_sr == sr else resample_to_model_sr(x_src, file_sr, sr)
     y_mod = y_src if file_sr == sr else resample_to_model_sr(y_src, file_sr, sr)
 
-    tflite_path = _select_tflite_demo_paths(kind=kind, use_finetuned=use_finetuned, small=small)
+    tflite_path = _select_tflite_demo_paths(kind=kind, use_finetuned=use_finetuned)
     if not os.path.exists(tflite_path):
         print(f"[TFLite/demo] TFLite model not found at {tflite_path}. Run --export-tflite first.")
         return
@@ -5662,91 +7049,950 @@ def generate_demo_tflite(kind, use_finetuned=False, small=False, out_dir=None, h
                            use_finetuned=use_finetuned, out_dir=out_dir,
                            fixed_hop=hop)
 
-def _norm_name_tf(n):
-    n = n.split(":")[0]
-    if n.startswith("serving_default_"):
-        n = n[len("serving_default_"):]
-    return n
+def _seed_pick_heads_from_legacy(rt_stream_model, legacy_rt_model, verbose=True):
+    """
+    Seed streaming pick heads from a legacy (non-streaming) realtime model:
+      - realtime_pickreso_modal_lr: from legacy realtime_pickreso_modal (full-rate) by decimation,
+        or from legacy realtime_pickreso_modal_lr if already present there.
+      - realtime_picklearn_* layers explicitly copied if copy-by-name ever missed them.
+    Leaves layers untouched if sources are not found.
+    """
+    # 1) Seed pick-reso modal bank
+    k_lr = None
 
-def _make_windows_T(x, T, hop):
+    # If legacy had the legacy full-rate modal bank, decimate it
+    k_full = _extract_trained_modal_kernel_rt(legacy_rt_model, legacy_name="realtime_pickreso_modal")
+    if k_full is not None:
+        try:
+            k_lr = _decimate_modal_kernels(k_full, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR)
+            if verbose:
+                print(f"[seed] Decimated legacy 'realtime_pickreso_modal' -> low-rate kernel with shape {k_lr.shape}")
+        except Exception as e:
+            if verbose:
+                print(f"[seed] Could not decimate legacy full-rate modal kernels: {e}")
+
+    # Otherwise try to get already-lowrate kernels from legacy
+    if k_lr is None:
+        try:
+            k_lr = legacy_rt_model.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
+            if verbose:
+                print(f"[seed] Reused legacy 'realtime_pickreso_modal_lr' weights with shape {k_lr.shape}")
+        except Exception:
+            k_lr = None
+
+    # Set into streaming model if both present
+    if k_lr is not None:
+        try:
+            rt_stream_model.get_layer("realtime_pickreso_modal_lr").set_weights([k_lr.astype(np.float32)])
+            if verbose:
+                w0 = rt_stream_model.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
+                print(f"[seed] Set streaming 'realtime_pickreso_modal_lr' weights; ||W||={float(np.linalg.norm(w0)):.6f}")
+        except Exception as e:
+            if verbose:
+                print(f"[seed] Could not set 'realtime_pickreso_modal_lr' in streaming model: {e}")
+
+    # 2) Ensure the tiny pick-attack CNN is copied (paranoia)
+    for lname in ("realtime_picklearn_c1", "realtime_picklearn_c2", "realtime_picklearn_out"):
+        try:
+            w = legacy_rt_model.get_layer(lname).get_weights()
+            rt_stream_model.get_layer(lname).set_weights(w)
+            if verbose:
+                s = sum(np.sum(np.abs(a)) for a in w)
+                print(f"[seed] Copied weights for {lname}; L1 sum={float(s):.6f}")
+        except Exception:
+            pass
+
+def migrate_realtime_models_inplace():
+    # Destination paths
+    destination_realtime_baseline_training_model = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TRAINABLE_MODEL_FILENAME)
+    destination_realtime_finetuned_training_model = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TRAINABLE_MODEL_FILENAME)
+    destination_realtime_static_baseline_streaming_model = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+    destination_realtime_dynamic_baseline_streaming_model = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+    destination_realtime_static_finetuned_streaming_model = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+    destination_realtime_dynamic_finetuned_streaming_model = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+    
+    # Load the two old models to migrate from. We can use those to generate the dynamic models and eventually flatten all weights
+    realtime_static_baseline_training_model_old = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TRAINABLE_MODEL_FILENAME), compile=False)
+    realtime_static_finetuned_training_model_old = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TRAINABLE_MODEL_FILENAME), compile=False)
+    
+    # Load offline teachers for KD distill
+    offline_static_teacher = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME), compile=False)
+    offline_dynamic_teacher = tf.keras.models.load_model(os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME), compile=False)
+    
+    # Generate causal teacher clones
+    offline_static_teacher_causal = build_offline_model_causal(offline_static_teacher)
+    offline_dynamic_teacher_causal = build_offline_model_causal(offline_dynamic_teacher, dynamic_time=True)
+    
+    # Now, moving into the actual migration, first rebuild training graphs
+    realtime_static_baseline_training_model = build_realtime_training_model(offline=offline_static_teacher_causal)
+    realtime_dynamic_baseline_training_model = build_realtime_training_model(offline=offline_dynamic_teacher_causal, dynamic_time=True)
+    
+    realtime_static_finetuned_training_model = build_realtime_training_model(offline=offline_static_teacher_causal)
+    realtime_dynamic_finetuned_training_model = build_realtime_training_model(offline=offline_dynamic_teacher_causal, dynamic_time=True)
+    
+    # Now copy weights by name from the training models to the new training graphs
+    copy_weights_by_name(realtime_static_baseline_training_model, realtime_static_baseline_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_dynamic_baseline_training_model, realtime_static_baseline_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_static_finetuned_training_model, realtime_static_finetuned_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_dynamic_finetuned_training_model, realtime_static_finetuned_training_model_old, verbose=True)    
+    
+    # Now write the streaming-friendly, stateful flat models
+    realtime_static_baseline_streaming_model = build_realtime_streaming_model()
+    realtime_dynamic_baseline_streaming_model = build_realtime_streaming_model(dynamic_time=True)
+    realtime_static_finetuned_streaming_model = build_realtime_streaming_model()
+    realtime_dynamic_finetuned_streaming_model = build_realtime_streaming_model(dynamic_time=True)
+    
+    copy_weights_by_name(realtime_static_baseline_streaming_model, realtime_static_baseline_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_dynamic_baseline_streaming_model, realtime_static_baseline_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_static_finetuned_streaming_model, realtime_static_finetuned_training_model_old, verbose=True)
+    copy_weights_by_name(realtime_dynamic_finetuned_streaming_model, realtime_static_finetuned_training_model_old, verbose=True)
+    
+    # _seed_pick_heads_from_legacy(realtime_dynamic_baseline_streaming_model,
+    #                             realtime_static_baseline_training_model_old, verbose=True)
+    # _seed_pick_heads_from_legacy(realtime_dynamic_finetuned_streaming_model,
+    #                             realtime_static_finetuned_training_model_old, verbose=True)
+    # _seed_pick_heads_from_legacy(realtime_static_baseline_streaming_model,
+    #                             realtime_static_baseline_training_model_old, verbose=True)
+    # _seed_pick_heads_from_legacy(realtime_static_finetuned_streaming_model,
+    #                             realtime_static_finetuned_training_model_old, verbose=True)
+    
+    
+      # Patch kernels
+    # force_patch_realtime_hpf_kernels(realtime_dynamic_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_dynamic_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_hpf_kernels(realtime_static_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_static_baseline_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+
+    # force_patch_realtime_hpf_kernels(realtime_dynamic_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_dynamic_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_hpf_kernels(realtime_static_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+    # force_patch_realtime_pickreso_ctrl_bp_kernel(realtime_static_finetuned_streaming_model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True)
+
+    # # Calibration boost (tune dB as needed)
+    # # a touch of lift; keep PR at 12 dB, PA smaller because soft-gated content is already hot
+    # force_patch_realtime_pick_scales(realtime_dynamic_baseline_streaming_model, pa_db=0.0, pr_db=0.0, verbose=True)
+    # force_patch_realtime_pick_scales(realtime_static_baseline_streaming_model,  pa_db=0.0, pr_db=0.0, verbose=True)
+    # force_patch_realtime_pick_scales(realtime_dynamic_finetuned_streaming_model, pa_db=0.0, pr_db=0.0, verbose=True)
+    # force_patch_realtime_pick_scales(realtime_static_finetuned_streaming_model,  pa_db=0.0, pr_db=0.0, verbose=True)
+    
+    # Save the new training model to disk
+    realtime_static_baseline_training_model.save(destination_realtime_baseline_training_model)
+    realtime_static_finetuned_training_model.save(destination_realtime_finetuned_training_model)
+    
+    print(f"[migrate] Successfully wrote updated training models")
+    
+    realtime_static_baseline_streaming_model.save(destination_realtime_static_baseline_streaming_model)
+    realtime_dynamic_baseline_streaming_model.save(destination_realtime_dynamic_baseline_streaming_model)
+    realtime_static_finetuned_streaming_model.save(destination_realtime_static_finetuned_streaming_model)
+    realtime_dynamic_finetuned_streaming_model.save(destination_realtime_dynamic_finetuned_streaming_model)
+
+    print(f"[migrate] Successfully wrote updated streaming models (T={REALTIME_TFLITE_T})")
+    print("✅ Migration complete.")
+
+def _tensor_basename(x):
+    nm = getattr(x, "name", str(x))
+    nm = nm.split(":")[0]
+    if "/" in nm:
+        nm = nm.split("/", 1)[0]
+    if nm.startswith("serving_default_"):
+        nm = nm[len("serving_default_"):]
+    return nm
+
+def _producer_layer_name(t):
+    # Keras 2.x: t._keras_history.layer; Keras 3: tuple(layer, node_index, tensor_index)
+    kh = getattr(t, "_keras_history", None)
+    try:
+        if isinstance(kh, (tuple, list)) and len(kh) >= 1:
+            layer = kh[0]
+        else:
+            layer = getattr(kh, "layer", None)
+        return getattr(layer, "name", None)
+    except Exception:
+        return None
+
+def _output_names_from_model(model):
+    names = []
+    for t in model.outputs:
+        nm = _producer_layer_name(t)
+        if not nm:
+            nm = _tensor_basename(t)
+        names.append(nm)
+    return names
+
+def _shape_tuple(x):
+    s = getattr(x, "shape", None)
+    if s is None and hasattr(x, "get_shape"):
+        s = x.get_shape()
+    try:
+        return tuple(s.as_list())
+    except Exception:
+        try:
+            return tuple(s)
+        except Exception:
+            return ()
+
+def _print_model_io_summary(model):
+    print("== Inputs ==")
+    for t in model.inputs:
+        print(f"  {_tensor_basename(t):<56} shape={_shape_tuple(t)}")
+    print("== Outputs ==")
+    for t in model.outputs:
+        base = _tensor_basename(t)
+        prod = _producer_layer_name(t)
+        if prod:
+            print(f"  {base:<32} <- {prod:<48} shape={_shape_tuple(t)}")
+        else:
+            print(f"  {base:<32} shape={_shape_tuple(t)}")
+
+    in_names  = [_tensor_basename(t) for t in model.inputs]
+    out_names = _output_names_from_model(model)
+    state_in_names  = [n for n in in_names  if n.startswith("realtime_state_")]
+    state_out_names = [n for n in out_names if n.startswith("realtime_state_") and n.endswith("_next")]
+    print(f"Streaming states: inputs={len(state_in_names)} outputs={len(state_out_names)}")
+    if state_in_names:
+        print("  first inputs:", state_in_names[:5])
+    if state_out_names:
+        print("  first outputs:", state_out_names[:5])
+
+def check_streaming_equivalence_realtime(use_finetuned=False,
+                                         hop=None,
+                                         sec=None,
+                                         offset_sec=None,
+                                         pair_index=None,
+                                         style_mode="pred",
+                                         only="full"):
     """
-    Build batched windows for causal, stateless TFLite inference:
-      - left = T - hop, right = 0
-      - window[i] = [left context, core hop samples]
-    Returns (W, core_lens) with shapes:
-      W: (num_windows, T, 1), core_lens: (num_windows,)
+    Compare realtime DYNAMIC streaming model monolithic vs streaming.
+
+    We FORCE THE SAME STYLE in both passes to remove EMA/hop effects:
+      - style_mode='pick'   → style_true=1.0, style_force=1
+      - style_mode='finger' → style_true=0.0, style_force=1
+      - style_mode='pred'   → compute one global probability once on full clip
+      - style_mode='prob=<float>' → force exact value
+
+    Branch isolation:
+      --only=full  → compare full mix (main + IR + PA + PR)
+      --only=main  → compare main path only (PA=PR=IR=0)
+      --only=ir    → compare [main+IR] - [main]
+      --only=pa    → compare [main+PA] - [main]
+      --only=pr    → compare [main+PR] - [main]
+
+    Writes mono.wav, stream.wav, diff.wav under:
+      out/demos/realtime_streaming_equivalence/only_<mode>
     """
-    x = np.asarray(x, dtype=np.float32)
-    N = int(x.shape[0])
+    assert_has_pairs()
+    if sec is None:
+        sec = float(LONG_DEMO_SEC)
+    if offset_sec is None:
+        offset_sec = float(LONG_DEMO_OFFSET_SEC)
+    if pair_index is None:
+        pair_index = int(LONG_DEMO_PAIR_INDEX)
+    if hop is None:
+        hop = int(REALTIME_TFLITE_T)
     hop = int(hop)
-    T = int(T)
-    left = T - hop
-    if hop < 1 or hop > T:
-        raise ValueError(f"hop must be in [1, {T}], got {hop}")
-    num_windows = (N + hop - 1) // hop
-    W = np.zeros((num_windows, T, 1), dtype=np.float32)
-    core_lens = np.zeros((num_windows,), dtype=np.int32)
-    for i in range(num_windows):
-        j = i * hop
-        core = min(hop, N - j)
-        core_lens[i] = core
-        # Left context (pad zeros if not enough history)
-        ltake = min(left, j)
-        if ltake > 0:
-            W[i, left - ltake:left, 0] = x[j - ltake:j]
-        # Core
-        if core > 0:
-            W[i, left:left + core, 0] = x[j:j + core]
-    return W, core_lens
+    only = str(only).strip().lower()
 
-def _tflite_invoke_batched_exact(model_path, feed_dict):
+    # Select pair
+    try:
+        path_src, path_tgt = all_pairs[pair_index]
+    except Exception:
+        raise RuntimeError(f"Invalid pair_index={pair_index}; there are {len(all_pairs)} pair(s).")
+
+    # Load realtime DYNAMIC streaming model
+    dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
+    if dpath is None or (not os.path.exists(dpath)):
+        raise FileNotFoundError(f"[check-streaming] Realtime dynamic model not found. Expected at: {dpath}")
+    print(f"[check-streaming] Using realtime DYNAMIC model: {dpath}")
+    rt_dyn = tf.keras.models.load_model(dpath, compile=False)
+
+    # Read and resample audio to 48k
+    info = sf.info(path_src)
+    file_sr = info.samplerate
+    start = int(round(offset_sec * file_sr))
+    frames = int(round(sec * file_sr))
+    x_blk_2d, _ = sf.read(path_src, start=start, frames=frames, dtype='float32', always_2d=True)
+    y_blk_2d, _ = sf.read(path_tgt, start=start, frames=frames, dtype='float32', always_2d=True)
+    x_file = x_blk_2d[:, 0]
+    y_file = y_blk_2d[:, 0]
+    x_mod = x_file if file_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(x_file, file_sr, REALTIME_SAMPLE_RATE)
+    y_mod = y_file if file_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(y_file, file_sr, REALTIME_SAMPLE_RATE)
+    N = len(x_mod)
+    if N <= 0:
+        raise RuntimeError("[check-streaming] Empty input after resampling.")
+
+    # Helpers
+    def _basename(t):
+        nm = t.name.split(':')[0]
+        if '/' in nm:
+            nm = nm.split('/',1)[0]
+        if nm.startswith("serving_default_"):
+            nm = nm[len("serving_default_"):]
+        return nm
+
+    in_tensors = list(rt_dyn.inputs)
+    in_names   = [_basename(t) for t in in_tensors]
+    out_names  = _output_names_from_model(rt_dyn)
+
+    # State input names and zero buffers
+    state_in_names = [n for n in in_names if n.startswith("realtime_state_")]
+    state_zero = {}
+    for t in in_tensors:
+        nm = _basename(t)
+        if nm in state_in_names:
+            L = int(t.shape[1]) if t.shape[1] is not None else 0
+            C = int(t.shape[2]) if t.shape[2] is not None else 1
+            state_zero[nm] = np.zeros((1, L, C), dtype=np.float32)
+
+    # Map input-state -> output-state indices (…_next names)
+    out_index_map = {name: idx for idx, name in enumerate(out_names)}
+    state_out_idx = {}
+    for nm in state_in_names:
+        nm_next = nm + "_next"
+        if nm_next in out_index_map:
+            state_out_idx[nm] = out_index_map[nm_next]
+
+    # Knobs fixed (fully wet by default)
+    def _knobs(pa, pr, ir):
+        return {
+            "realtime_knob_pickattack": np.array([[float(pa)]], dtype=np.float32),
+            "realtime_knob_pickreso":   np.array([[float(pr)]], dtype=np.float32),
+            "realtime_knob_ir":         np.array([[float(ir)]], dtype=np.float32),
+            "realtime_knob_drywet":     np.array([[_default_dryness_value()]], dtype=np.float32),
+        }
+
+    # Determine single style value to force for both passes
+    style_mode = str(style_mode).strip().lower()
+    if style_mode in ("pick", "p", "1", "true"):
+        style_val = 1.0
+        print("[check-streaming] Forcing style: pick (1.0)")
+    elif style_mode in ("finger", "f", "0", "false"):
+        style_val = 0.0
+        print("[check-streaming] Forcing style: finger (0.0)")
+    elif style_mode.startswith("prob="):
+        try:
+            style_val = float(style_mode.split("=",1)[1])
+        except Exception:
+            raise ValueError(f"Invalid style_mode '{style_mode}'. Use prob=<float 0..1>.")
+        style_val = float(np.clip(style_val, 0.0, 1.0))
+        print(f"[check-streaming] Forcing style: prob={style_val:.4f}")
+    else:
+        # style_mode == 'pred': compute one global probability on full clip
+        x_b_probe = x_mod[None, :, None].astype(np.float32)
+        probe = {
+            "realtime_piezo_input":         x_b_probe,
+            "realtime_style_true_input":    np.zeros((1,1), dtype=np.float32),
+            "realtime_style_force_input":   np.zeros((1,1), dtype=np.float32),
+            **_knobs(1.0, 1.0, 1.0),
+        }
+        for nm in state_in_names:
+            probe[nm] = state_zero[nm]
+        outs_probe = rt_dyn.predict(probe, batch_size=1, verbose=0)
+        style_val = float(np.asarray(outs_probe[1], dtype=np.float32)[0, 0])
+        style_val = float(np.clip(style_val, 0.0, 1.0))
+        print(f"[check-streaming] Forcing global predicted style prob={style_val:.4f} (as a constant).")
+
+    # Monolithic runner
+    def forward_mono(pa, pr, ir):
+        x_b = x_mod[None, :, None].astype(np.float32)
+        feed = {
+            "realtime_piezo_input": x_b,
+            "realtime_style_true_input":  np.array([[style_val]], dtype=np.float32),
+            "realtime_style_force_input": np.ones((1,1), dtype=np.float32),
+            **_knobs(pa, pr, ir),
+        }
+        for nm in state_in_names:
+            feed[nm] = state_zero[nm]
+        outs = rt_dyn.predict(feed, batch_size=1, verbose=0)
+        return outs[0][0, :, 0]
+
+    # Streaming runner
+    def forward_stream(pa, pr, ir):
+        state_bufs = {k: v.copy() for k, v in state_zero.items()}
+        y_accum = []
+        pos = 0
+        while pos < N:
+            core = min(hop, N - pos)
+            x_block = np.zeros((1, hop, 1), dtype=np.float32)
+            x_block[0, :core, 0] = x_mod[pos:pos+core]
+            feed = {
+                "realtime_piezo_input": x_block,
+                "realtime_style_true_input":  np.array([[style_val]], dtype=np.float32),
+                "realtime_style_force_input": np.ones((1,1), dtype=np.float32),
+                **_knobs(pa, pr, ir),
+            }
+            for nm in state_in_names:
+                feed[nm] = state_bufs[nm]
+            outs = rt_dyn.predict(feed, batch_size=1, verbose=0)
+            y_blk = outs[0][0, :hop, 0]
+            y_accum.append(y_blk[:core])
+            for nm, idx in state_out_idx.items():
+                state_bufs[nm] = outs[idx]
+            pos += core
+        return np.concatenate(y_accum, axis=0)
+
+    # Decide which signals to compare based on --only
+    if only == "full":
+        y_mono = forward_mono(pa=1.0, pr=1.0, ir=1.0)
+        y_stream = forward_stream(pa=1.0, pr=1.0, ir=1.0)
+        label = "full"
+    elif only == "main":
+        y_mono = forward_mono(pa=0.0, pr=0.0, ir=0.0)
+        y_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
+        label = "main"
+    elif only == "ir":
+        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
+        ir_on_mono  = forward_mono(pa=0.0, pr=0.0, ir=1.0)
+        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
+        ir_on_stream= forward_stream(pa=0.0, pr=0.0, ir=1.0)
+        y_mono   = ir_on_mono   - base_mono
+        y_stream = ir_on_stream - base_stream
+        label = "ir"
+    elif only == "pa":
+        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
+        pa_on_mono  = forward_mono(pa=1.0, pr=0.0, ir=0.0)
+        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
+        pa_on_stream= forward_stream(pa=1.0, pr=0.0, ir=0.0)
+        y_mono   = pa_on_mono   - base_mono
+        y_stream = pa_on_stream - base_stream
+        label = "pa"
+    elif only == "pr":
+        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
+        pr_on_mono  = forward_mono(pa=0.0, pr=1.0, ir=0.0)
+        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
+        pr_on_stream= forward_stream(pa=0.0, pr=1.0, ir=0.0)
+        y_mono   = pr_on_mono   - base_mono
+        y_stream = pr_on_stream - base_stream
+        label = "pr"
+    else:
+        raise ValueError(f"Unknown --only='{only}'. Use one of: full, main, ir, pa, pr.")
+
+    # Align lengths and compute metrics
+    n = min(len(y_mono), len(y_stream))
+    y_mono = y_mono[:n]
+    y_stream = y_stream[:n]
+    err = (y_mono - y_stream).astype(np.float32)
+    rms_err = float(np.sqrt(np.mean(err*err) + 1e-12))
+    max_abs = float(np.max(np.abs(err))) if err.size else 0.0
+    rms_ref = float(np.sqrt(np.mean(y_mono*y_mono) + 1e-12))
+    snr = float(20.0 * np.log10((rms_ref + 1e-12) / (rms_err + 1e-12)))
+    corr = _corr(y_mono, y_stream)
+
+    # Write audio
+    out_dir = os.path.join(DEMOS_OUT_DIR, "realtime_streaming_equivalence", f"only_{label}")
+    os.makedirs(out_dir, exist_ok=True)
+    sf.write(os.path.join(out_dir, "mono.wav"),    y_mono,    REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "stream.wav"),  y_stream,  REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "diff.wav"),    err,       REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "source.wav"),  x_mod[:n], REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    sf.write(os.path.join(out_dir, "target.wav"),  y_mod[:n], REALTIME_SAMPLE_RATE, subtype='FLOAT')
+
+    # Report
+    print("=== Streaming equivalence (realtime) ===")
+    print(f"Pair: {os.path.basename(path_src)}")
+    print(f"Length: {n} samples @ 48k, hop={hop}")
+    print(f"Forced style value: {style_val:.6f} (mode='{style_mode}')")
+    print(f"Branch: {label}")
+    print(f"RMS error: {rms_err:.9f}")
+    print(f"Max abs:   {max_abs:.9f}")
+    print(f"SNR:       {snr:.2f} dB")
+    print(f"Corr:      {corr:.6f}")
+    print(f"WAVs written to: {out_dir}")
+
+    # Tolerance (tight)
+    thr_rms = 5e-6
+    thr_max = 5e-6
+    if rms_err <= thr_rms and max_abs <= thr_max:
+        print("✅ PASS: Streaming equals monolithic within numerical tolerance.")
+    else:
+        print("⚠️  WARN: Differences exceed tolerance (inspect diff.wav and metrics).")
+
+def inspect_realtime_heads(use_finetuned=False, sec=None, offset_sec=None, pair_index=None, style="pick", hop=None):
+    assert_has_pairs()
+    if sec is None: sec = float(LONG_DEMO_SEC)
+    if offset_sec is None: offset_sec = float(LONG_DEMO_OFFSET_SEC)
+    if pair_index is None: pair_index = int(LONG_DEMO_PAIR_INDEX)
+    if hop is None: hop = int(REALTIME_TFLITE_T)
+
+    # Pair
+    try:
+        path_src, _ = all_pairs[pair_index]
+    except Exception:
+        raise RuntimeError(f"Invalid pair_index={pair_index}; there are {len(all_pairs)} pair(s).")
+
+    # Load streaming model
+    dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
+    if dpath is None or (not os.path.exists(dpath)):
+        raise FileNotFoundError(f"[inspect-heads] Realtime dynamic model not found at: {dpath}")
+    base = tf.keras.models.load_model(dpath, compile=False)
+
+    # Build tap model (add many internal taps; handle multi-output layers by picking [0])
+    taps = []
+    def add_tap(layer_name, tap_name, child_idx=None):
+        try:
+            t = base.get_layer(layer_name).output
+            if isinstance(t, (list, tuple)):
+                idx = 0 if child_idx is None else int(child_idx)
+                t = t[idx]
+            taps.append(Activation('linear', name=tap_name)(t))
+            return True
+        except Exception:
+            return False
+
+    # Main + mask + user-scaled stems
+    have_main   = add_tap("realtime_main",                    "tap_main")
+    have_mask   = add_tap("realtime_pick_mask_db",            "tap_mask", 0)
+    have_pauser = add_tap("realtime_pickattack_user_gain_mul","tap_pa_user")
+    have_pruser = add_tap("realtime_pickreso_user_gain_mul",  "tap_pr_user")
+    have_iruser = add_tap("realtime_ir_user_gain_mul",        "tap_ir_user")
+
+    # Pick-attack internals
+    have_hfpre  = add_tap("realtime_hf_pre_emph_stream",     "tap_hf_pre", 0)
+    have_pag    = add_tap("realtime_picklearn_gate",         "tap_pa_gate")
+    have_c1     = add_tap("realtime_picklearn_c1",           "tap_pa_c1")
+    have_c2     = add_tap("realtime_picklearn_c2",           "tap_pa_c2")
+    have_paout  = add_tap("realtime_picklearn_out",          "tap_pa_out")
+    have_pas    = add_tap("realtime_pickattack_softclip",    "tap_pa_soft")
+    have_pahp   = add_tap("realtime_pickattack_post_hp",     "tap_pa_posthp", 0)
+
+    # Pick-reso internals
+    have_onset  = add_tap("realtime_pickreso_onset_pulse",   "tap_pr_onset", 0)
+    have_env    = add_tap("realtime_pickreso_ctrl_env",      "tap_pr_env", 0)
+    have_exc    = add_tap("realtime_pickreso_excite",        "tap_pr_excite")
+    have_ds8    = add_tap("realtime_pickreso_ds8",           "tap_pr_ds8", 0)
+    have_modal  = add_tap("realtime_pickreso_modal_lr",      "tap_pr_modal", 0)
+    have_mix    = add_tap("realtime_pickreso_mix",           "tap_pr_mix")
+    have_prs    = add_tap("realtime_pickreso_softclip",      "tap_pr_soft")
+    have_prhp   = add_tap("realtime_pickreso_post_hp",       "tap_pr_posthp", 0)
+
+    tm = tf.keras.models.Model(inputs=base.inputs, outputs=list(base.outputs) + taps, name=base.name + "_debug_taps")
+    # Print current HPF kernels inside the loaded streaming model
+    dump_realtime_hpf_debug(base, sample_rate=REALTIME_SAMPLE_RATE)
+
+    # Names and output map
+    def _bn(t):
+        nm = t.name.split(':')[0]
+        if '/' in nm: nm = nm.split('/', 1)[0]
+        if nm.startswith("serving_default_"): nm = nm[len("serving_default_"):]
+        return nm
+
+    in_tensors = list(tm.inputs)
+    in_names   = [_bn(t) for t in in_tensors]
+    out_names  = _output_names_from_model(tm)
+    out_idx    = {n: i for i, n in enumerate(out_names)}
+
+    # State mapping
+    state_in_names = [n for n in in_names if n.startswith("realtime_state_")]
+    state_out_idx = {}
+    for n in state_in_names:
+        nn = n + "_next"
+        if nn in out_idx:
+            state_out_idx[n] = out_idx[nn]
+
+    state_bufs = {}
+    for t in in_tensors:
+        nm = _bn(t)
+        if nm in state_in_names:
+            L = int(t.shape[1]) if t.shape[1] is not None else 0
+            C = int(t.shape[2]) if t.shape[2] is not None else 1
+            state_bufs[nm] = np.zeros((1, L, C), dtype=np.float32)
+
+    # Read and resample
+    info = sf.info(path_src); file_sr = info.samplerate
+    start  = int(round((offset_sec or 0.0) * file_sr))
+    frames = int(round((sec or LONG_DEMO_SEC) * file_sr))
+    x_blk_2d, _ = sf.read(path_src, start=start, frames=frames, dtype='float32', always_2d=True)
+    x_file = x_blk_2d[:,0]
+    x_mod = x_file if file_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(x_file, file_sr, REALTIME_SAMPLE_RATE)
+    N = len(x_mod)
+
+    # Style force value
+    style_val = 1.0 if str(style).lower().startswith("p") else 0.0
+
+    # Head boosts (linear) and dryness
+    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind="realtime", use_finetuned=use_finetuned)
+    dry = _default_dryness_value()
+
+    def filter_feed(d): return {k: v for k, v in d.items() if k in in_names}
+
+    # Accumulators
+    acc = {nm: [] for nm in ["main","mask","pa_user","pr_user","ir_user",
+                             "hf_pre","pa_gate","pa_c1","pa_c2","pa_out","pa_soft","pa_posthp",
+                             "pr_onset","pr_env","pr_excite","pr_ds8","pr_modal","pr_mix","pr_soft","pr_posthp"]}
+
+    def take(outs, nm, core):
+        i = out_idx.get(nm, None)
+        if i is None or i >= len(outs): return None
+        v = np.asarray(outs[i], dtype=np.float32)
+        if v.ndim == 3: return v[0, :core, 0]
+        if v.ndim == 2: return v[0, :core]
+        return None
+
+    pos = 0
+    while pos < N:
+        core = min(hop, N - pos)
+        xb = np.zeros((1, hop, 1), dtype=np.float32)
+        xb[0, :core, 0] = x_mod[pos:pos+core]
+
+        feed = {
+            "realtime_piezo_input": xb,
+            "realtime_style_true_input":  np.array([[style_val]], np.float32),
+            "realtime_style_force_input": np.ones((1,1), np.float32),
+            "realtime_knob_pickattack":   np.array([[float(pa_lin)]], np.float32),
+            "realtime_knob_pickreso":     np.array([[float(pr_lin)]], np.float32),
+            "realtime_knob_ir":           np.array([[float(ir_lin)]], np.float32),
+            "realtime_knob_drywet":       np.array([[dry]], np.float32),
+        }
+        for n in state_in_names: feed[n] = state_bufs[n]
+        feed = filter_feed(feed)
+
+        outs = tm.predict(feed, batch_size=1, verbose=0)
+
+        # Fill
+        if have_main:   acc["main"].append(take(outs,"tap_main", core))
+        if have_mask:   acc["mask"].append(take(outs,"tap_mask", core))
+        if have_pauser: acc["pa_user"].append(take(outs,"tap_pa_user", core))
+        if have_pruser: acc["pr_user"].append(take(outs,"tap_pr_user", core))
+        if have_iruser: acc["ir_user"].append(take(outs,"tap_ir_user", core))
+
+        if have_hfpre:  acc["hf_pre"].append(take(outs,"tap_hf_pre", core))
+        if have_pag:    acc["pa_gate"].append(take(outs,"tap_pa_gate", core))
+        if have_c1:     acc["pa_c1"].append(take(outs,"tap_pa_c1", core))
+        if have_c2:     acc["pa_c2"].append(take(outs,"tap_pa_c2", core))
+        if have_paout:  acc["pa_out"].append(take(outs,"tap_pa_out", core))
+        if have_pas:    acc["pa_soft"].append(take(outs,"tap_pa_soft", core))
+        if have_pahp:   acc["pa_posthp"].append(take(outs,"tap_pa_posthp", core))
+
+        if have_onset:  acc["pr_onset"].append(take(outs,"tap_pr_onset", core))
+        if have_env:    acc["pr_env"].append(take(outs,"tap_pr_env", core))
+        if have_exc:    acc["pr_excite"].append(take(outs,"tap_pr_excite", core))
+        if have_ds8:    acc["pr_ds8"].append(take(outs,"tap_pr_ds8", core))
+        if have_modal:  acc["pr_modal"].append(take(outs,"tap_pr_modal", core))
+        if have_mix:    acc["pr_mix"].append(take(outs,"tap_pr_mix", core))
+        if have_prs:    acc["pr_soft"].append(take(outs,"tap_pr_soft", core))
+        if have_prhp:   acc["pr_posthp"].append(take(outs,"tap_pr_posthp", core))
+
+        # Advance states present
+        for n, i in state_out_idx.items():
+            if i < len(outs):
+                state_bufs[n] = outs[i]
+
+        pos += core
+
+    # Concatenate
+    for k in list(acc.keys()):
+        parts = [p for p in acc[k] if p is not None]
+        acc[k] = np.concatenate(parts, axis=0) if parts else np.zeros((0,), np.float32)
+
+    def rms(x): 
+        x = np.asarray(x, np.float32)
+        return float(np.sqrt(np.mean(x*x) + 1e-12)) if x.size else 0.0
+    
+        # Offline-apply the same HPF taps to pa_soft/pr_soft and compare RMS to model pa_posthp/pr_posthp
+    try:
+        # Grab canonical conv1d taps (time-reversed) and flip back to 'forward' FIR for lfilter
+        k_pa_rev = _get_minphase_hp_kernel(REALTIME_SAMPLE_RATE,
+                                           PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
+                                           PICK_ATTACK_LOWBAND_PENALTY_ORDER)
+        k_pa_rev = k_pa_rev.numpy() if tf.is_tensor(k_pa_rev) else np.asarray(k_pa_rev, np.float32)
+        b_pa = np.squeeze(k_pa_rev)[::-1].astype(np.float32)  # forward FIR taps
+
+        k_pr_rev = _get_minphase_hp_kernel(REALTIME_SAMPLE_RATE,
+                                           PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+                                           PICK_RESO_LOWBAND_PENALTY_ORDER)
+        k_pr_rev = k_pr_rev.numpy() if tf.is_tensor(k_pr_rev) else np.asarray(k_pr_rev, np.float32)
+        b_pr = np.squeeze(k_pr_rev)[::-1].astype(np.float32)
+
+        y_pa_np = spsig.lfilter(b_pa, [1.0], acc["pa_soft"]) if acc["pa_soft"].size else np.zeros((0,), np.float32)
+        y_pr_np = spsig.lfilter(b_pr, [1.0], acc["pr_soft"]) if acc["pr_soft"].size else np.zeros((0,), np.float32)
+
+        # Align to model’s VALID conv (drop the first L-1 samples)
+        L_pa = int(len(b_pa)); L_pr = int(len(b_pr))
+        y_pa_np_al = y_pa_np[L_pa-1:] if y_pa_np.size > (L_pa-1) else y_pa_np
+        y_pr_np_al = y_pr_np[L_pr-1:] if y_pr_np.size > (L_pr-1) else y_pr_np
+
+        # If lengths mismatch, crop to min for fair RMS
+        def same_len(a, b):
+            n = min(a.size, b.size)
+            return a[:n], b[:n]
+
+        pa_m, pa_np = same_len(acc["pa_posthp"], y_pa_np_al)
+        pr_m, pr_np = same_len(acc["pr_posthp"], y_pr_np_al)
+
+        def _rms(v): 
+            v = np.asarray(v, np.float32)
+            return float(np.sqrt(np.mean(v*v) + 1e-12)) if v.size else 0.0
+
+        print("=== HPF post-debug compare (model vs offline) ===")
+        print(f"pa_posthp: model_RMS={_rms(pa_m):.6f}  offline_RMS={_rms(pa_np):.6f}")
+        print(f"pr_posthp: model_RMS={_rms(pr_m):.6f}  offline_RMS={_rms(pr_np):.6f}")
+
+        # Write offline-filtered signals for listening
+        out_dir = os.path.join(DEMOS_OUT_DIR, "realtime_heads_inspect")
+        os.makedirs(out_dir, exist_ok=True)
+        if pa_np.size:
+            sf.write(os.path.join(out_dir, "pa_posthp_offline.wav"), pa_np, REALTIME_SAMPLE_RATE, subtype='FLOAT')
+        if pr_np.size:
+            sf.write(os.path.join(out_dir, "pr_posthp_offline.wav"), pr_np, REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    except Exception as e:
+        print(f"[hpf/debug] offline compare skipped due to: {e}")
+
+    # Report
+    print("=== Inspect realtime heads (forced style: {} ) ===".format("pick" if (style_val>=0.5) else "finger"))
+    def _fmt(v): return "{:.6f}".format(v)
+    print("Main/IR/Mask:")
+    print("  main={}  ir_user={}".format(_fmt(rms(acc["main"])), _fmt(rms(acc["ir_user"]))))
+    if acc["mask"].size:
+        m = acc["mask"]
+        duty20 = float(np.mean(m > 0.2))
+        duty50 = float(np.mean(m > 0.5))
+        q50 = float(np.quantile(m, 0.50)); q90 = float(np.quantile(m, 0.90)); q99 = float(np.quantile(m, 0.99))
+        print("  mask: mean={} duty>0.2={:.3f} duty>0.5={:.3f} q50={:.3f} q90={:.3f} q99={:.3f}".format(
+            _fmt(float(np.mean(m))), duty20, duty50, q50, q90, q99
+        ))
+
+    print("Pick-attack chain:")
+    print("  hf_pre={}  pa_gate={}  c1={}  c2={}  pa_out={}  pa_soft={}  pa_posthp={}  pa_user={}".format(
+        _fmt(rms(acc["hf_pre"])), _fmt(rms(acc["pa_gate"])), _fmt(rms(acc["pa_c1"])), _fmt(rms(acc["pa_c2"])),
+        _fmt(rms(acc["pa_out"])), _fmt(rms(acc["pa_soft"])), _fmt(rms(acc["pa_posthp"])), _fmt(rms(acc["pa_user"]))
+    ))
+
+    print("Pick-reso chain:")
+    print("  onset={}  env={}  excite={}  ds8={}  modal={}  mix={}  pr_soft={}  pr_posthp={}  pr_user={}".format(
+        _fmt(rms(acc["pr_onset"])), _fmt(rms(acc["pr_env"])), _fmt(rms(acc["pr_excite"])),
+        _fmt(rms(acc["pr_ds8"])), _fmt(rms(acc["pr_modal"])), _fmt(rms(acc["pr_mix"])),
+        _fmt(rms(acc["pr_soft"])), _fmt(rms(acc["pr_posthp"])), _fmt(rms(acc["pr_user"]))
+    ))
+
+    # Write a few WAVs
+    out_dir = os.path.join(DEMOS_OUT_DIR, "realtime_heads_inspect")
+    os.makedirs(out_dir, exist_ok=True)
+    def w(fn, y):
+        if y.size: sf.write(os.path.join(out_dir, fn), y, REALTIME_SAMPLE_RATE, subtype='FLOAT')
+    w("main.wav", acc["main"]); w("mask.wav", acc["mask"])
+    w("pa_gate.wav", acc["pa_gate"]); w("pa_out.wav", acc["pa_out"])
+    w("pa_posthp.wav", acc["pa_posthp"]); w("pa_user.wav", acc["pa_user"])
+    w("pr_onset.wav", acc["pr_onset"]); w("pr_excite.wav", acc["pr_excite"])
+    w("pr_mix.wav", acc["pr_mix"]); w("pr_posthp.wav", acc["pr_posthp"]); w("pr_user.wav", acc["pr_user"])
+    print(f"Written stems to {out_dir}")
+
+@register_keras_serializable()
+def _make_minphase_hp_kernel_exact(sr, cut_hz, numtaps):
     """
-    Single batched TFLite invoke:
-      - Resizes inputs to feed shapes (batch-first).
-      - Returns outputs as numpy arrays (copies).
+    Build an exact-length (numtaps) min-phase high-pass FIR, reversed for tf.nn.conv1d.
+    Ensures odd numtaps (required by firwin HP).
+    Returns shape (numtaps, 1, 1) float32.
     """
-    interp = Interpreter(model_path=model_path)
-    in_details = interp.get_input_details()
-    in_idx = { _norm_name_tf(d["name"]): d["index"] for d in in_details }
+    nt = int(numtaps)
+    if nt < 3:
+        nt = 3
+    if (nt % 2) == 0:
+        nt += 1  # HP requires odd
+    wn = float(cut_hz) / (float(sr) / 2.0)
+    taps = firwin(nt, cutoff=wn, window="hamming", pass_zero=False).astype(np.float32)
+    taps_min = minimum_phase(taps, method="homomorphic").astype(np.float32)
+    k_rev = taps_min[::-1].reshape(nt, 1, 1).astype(np.float32)
+    return k_rev
 
-    # Resize to match batched shapes
-    for k, v in feed_dict.items():
-        key = _norm_name_tf(k)
-        if key in in_idx:
-            arr = np.asarray(v, dtype=np.float32)
-            try:
-                interp.resize_tensor_input(in_idx[key], arr.shape, strict=False)
-            except TypeError:
-                interp.resize_tensor_input(in_idx[key], arr.shape)
-    interp.allocate_tensors()
 
-    # Set tensors
-    for k, v in feed_dict.items():
-        key = _norm_name_tf(k)
-        if key in in_idx:
-            interp.set_tensor(in_idx[key], np.asarray(v, dtype=np.float32, copy=False))
+@register_keras_serializable()
+def _hp_minphase_rev_padded(sr, cut_hz, target_len):
+    """
+    Build conv1d-ready reversed min-phase HPF, exact length target_len.
+    If minimum_phase returns fewer taps, left-pad zeros so reversed taps are right-aligned.
+    Returns (target_len,1,1) float32.
+    """
+    nt = int(target_len)
+    if nt < 3:
+        nt = 3
+    # HPF firwin prefers odd numtaps; keep design odd but do not change target_len
+    design_nt = nt if (nt % 2) == 1 else (nt - 1 if nt > 3 else 3)
+    wn = float(cut_hz) / (float(sr) / 2.0)
+    taps = firwin(design_nt, cutoff=wn, pass_zero=False, window="hamming").astype(np.float32)
+    taps_min = minimum_phase(taps, method="homomorphic").astype(np.float32)
+    k_rev_small = taps_min[::-1].reshape(-1)   # reversed for conv1d
+    M = int(k_rev_small.shape[0])
+    k_full = np.zeros((nt,), dtype=np.float32)
+    if M >= nt:
+        k_full[:] = k_rev_small[-nt:]
+    else:
+        pad = nt - M
+        k_full[pad:] = k_rev_small
+    return k_full.reshape(nt, 1, 1).astype(np.float32)
 
-    # Invoke
-    interp.invoke()
+@register_keras_serializable()
+def _bp_minphase_rev_padded(sr, low_hz, high_hz, target_len):
+    """
+    Build conv1d-ready reversed min-phase BP, exact length target_len.
+    Left-pad zeros if minimum_phase returns fewer taps.
+    Returns (target_len,1,1) float32.
+    """
+    nt = int(target_len)
+    if nt < 3:
+        nt = 3
+    design_nt = nt if (nt % 2) == 1 else (nt - 1 if nt > 3 else 3)
+    nyq = float(sr) / 2.0
+    lo = float(low_hz) / nyq
+    hi = float(high_hz) / nyq
+    taps = firwin(design_nt, [lo, hi], pass_zero=False, window="hamming").astype(np.float32)
+    taps_min = minimum_phase(taps, method="homomorphic").astype(np.float32)
+    k_rev_small = taps_min[::-1].reshape(-1)
+    M = int(k_rev_small.shape[0])
+    k_full = np.zeros((nt,), dtype=np.float32)
+    if M >= nt:
+        k_full[:] = k_rev_small[-nt:]
+    else:
+        pad = nt - M
+        k_full[pad:] = k_rev_small
+    return k_full.reshape(nt, 1, 1).astype(np.float32)
 
-    out_details = interp.get_output_details()
-    outs = []
-    for d in out_details:
-        name = _norm_name_tf(d["name"])
-        val = np.array(interp.get_tensor(d["index"]), dtype=np.float32, copy=True)
-        outs.append((name, val))
+# Replaces earlier force_patch, shape-safe and exact-length padded
+@register_keras_serializable()
+def force_patch_realtime_hpf_kernels(model,
+                                     sample_rate=REALTIME_SAMPLE_RATE,
+                                     pa_cut_hz=2000.0,   # lowered vs 3 kHz (realtime-only)
+                                     pr_cut_hz=PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ,
+                                     verbose=True):
+    """
+    Force-set streaming post-HPF kernels to exact-length, conv1d-ready min-phase taps.
+    """
+    def _patch(lname, cut_hz):
+        try:
+            L = model.get_layer(lname)
+        except Exception:
+            if verbose:
+                print(f"[patch-hpf] WARN: layer '{lname}' not found; skipping.")
+            return False
+        w_old = L.get_weights()
+        if w_old and len(w_old) > 0:
+            L_len = int(w_old[0].shape[0]); out_ch = int(w_old[0].shape[2]); norm_old = float(np.linalg.norm(w_old[0]))
+        else:
+            L_len = int(getattr(L, "kernel_len", 257)); out_ch = int(getattr(L, "out_ch", 1)); norm_old = 0.0
+        k_rev_full = _hp_minphase_rev_padded(int(sample_rate), float(cut_hz), int(L_len))
+        if out_ch != 1:
+            k_rev_full = np.tile(k_rev_full, (1,1,out_ch)).astype(np.float32)
+        L.set_weights([k_rev_full])
+        norm_new = float(np.linalg.norm(L.get_weights()[0])) if L.get_weights() else 0.0
+        if verbose:
+            print(f"[patch-hpf] {lname}: L={L_len} C_out={out_ch} ||old||={norm_old:.6e} → ||new||={norm_new:.6f}")
+        return True
 
-    # Pick audio as largest tensor; style as (B,1) if available, else smallest
-    audio_name, audio_arr = max(outs, key=lambda t: t[1].size)
-    rest = [(n, a) for (n, a) in outs if n != audio_name]
-    style_arr = None
-    for n, a in rest:
-        if a.ndim == 2 and a.shape[1] == 1:
-            style_arr = a
-            break
-    if style_arr is None and rest:
-        style_arr = min(rest, key=lambda t: t[1].size)[1]
-    return audio_arr, style_arr
+    ok_pa = _patch("realtime_pickattack_post_hp", pa_cut_hz)
+    ok_pr = _patch("realtime_pickreso_post_hp",   pr_cut_hz)
+    if verbose and (not ok_pa or not ok_pr):
+        print("[patch-hpf] Note: one or more HPFs were not patched.")
+
+@register_keras_serializable()
+def force_patch_realtime_pickreso_ctrl_bp_kernel(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
+    """
+    Ensure realtime_pickreso_ctrl_bp has a sane exact-length BP kernel.
+    """
+    try:
+        L = model.get_layer("realtime_pickreso_ctrl_bp")
+    except Exception:
+        if verbose:
+            print("[patch-bp] WARN: layer 'realtime_pickreso_ctrl_bp' not found; skipping.")
+        return False
+    w_old = L.get_weights()
+    if w_old and len(w_old) > 0:
+        L_len = int(w_old[0].shape[0]); out_ch = int(w_old[0].shape[2]); norm_old = float(np.linalg.norm(w_old[0]))
+    else:
+        L_len = int(getattr(L, "kernel_len", REALTIME_PICK_RESO_BP_ORDER)); out_ch = int(getattr(L, "out_ch", 1)); norm_old = 0.0
+    low = 0.9 * min(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    high= 1.1 * max(PICK_RESO_MODAL_CENTERS_HZ_REALTIME)
+    k_rev_full = _bp_minphase_rev_padded(int(sample_rate), low, high, int(L_len))
+    if out_ch != 1:
+        k_rev_full = np.tile(k_rev_full, (1,1,out_ch)).astype(np.float32)
+    L.set_weights([k_rev_full])
+    norm_new = float(np.linalg.norm(L.get_weights()[0])) if L.get_weights() else 0.0
+    if verbose:
+        print(f"[patch-bp] realtime_pickreso_ctrl_bp: L={L_len} C_out={out_ch} ||old||={norm_old:.6e} → ||new||={norm_new:.6f}")
+    return True
+
+@register_keras_serializable()
+def force_patch_realtime_pick_scales(model, pa_db=12.0, pr_db=12.0, verbose=True):
+    """
+    Boost fixed scales for realtime pick stems (post-HPF, pre-user).
+    This is a simple calibration so stems sit in mix after we fixed HPFs.
+    """
+    def _set_scale(lname, db):
+        try:
+            L = model.get_layer(lname)
+        except Exception:
+            if verbose: print(f"[patch-scale] WARN: '{lname}' not found; skipping.")
+            return False
+        w = L.get_weights()
+        if not w or len(w[0].shape) != 1:
+            if verbose: print(f"[patch-scale] WARN: '{lname}' has unexpected weights; skipping.")
+            return False
+        old = float(w[0][0]); fac = float(10.0 ** (float(db) / 20.0))
+        w[0][0] = old * fac
+        L.set_weights(w)
+        if verbose:
+            print(f"[patch-scale] {lname}: {old:.6f} * {fac:.3f} → {float(L.get_weights()[0][0]):.6f}")
+        return True
+
+    _set_scale("realtime_pickattack_scale", pa_db)
+    _set_scale("realtime_pickreso_scale",   pr_db)
+
+@register_keras_serializable()
+def dump_realtime_hpf_debug(model, sample_rate=REALTIME_SAMPLE_RATE):
+    """
+    Print kernel stats for the two streaming post-HPF layers and compare
+    against freshly built taps for sanity.
+    """
+    def _get_kernel(m, lname):
+        try:
+            L = m.get_layer(lname)
+            w = L.get_weights()
+            if not w:
+                return None
+            k = np.asarray(w[0], dtype=np.float32).copy()
+            return k.reshape(-1) if k.ndim == 3 else k
+        except Exception:
+            return None
+
+    def _mk_hp(sr, cut, order):
+        k = _get_minphase_hp_kernel(int(sr), float(cut), int(order))
+        k = k.numpy() if tf.is_tensor(k) else np.asarray(k, dtype=np.float32)
+        return k.reshape(-1)
+
+    def _summ(name, k):
+        if k is None:
+            print(f"[hpf/debug] {name}: MISSING")
+            return
+        print(f"[hpf/debug] {name}: shape={k.shape}, L2={float(np.linalg.norm(k)):.6f}, "
+              f"sum={float(np.sum(k)):.6e}, maxabs={float(np.max(np.abs(k))):.6f}")
+        head = ", ".join(f"{v:.6f}" for v in k[:6])
+        tail = ", ".join(f"{v:.6f}" for v in k[-6:])
+        print(f"[hpf/debug] {name}: head=[{head}] ... tail=[{tail}]")
+
+    # Pull current kernels from the loaded streaming model
+    k_pa_m = _get_kernel(model, "realtime_pickattack_post_hp")
+    k_pr_m = _get_kernel(model, "realtime_pickreso_post_hp")
+
+    # Build canonical taps (time-reversed for conv1d)
+    k_pa_ref = _mk_hp(sample_rate, PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ, PICK_ATTACK_LOWBAND_PENALTY_ORDER)
+    k_pr_ref = _mk_hp(sample_rate, PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ, PICK_RESO_LOWBAND_PENALTY_ORDER)
+
+    print("=== HPF kernel debug (streaming realtime) ===")
+    _summ("model.pa_posthp", k_pa_m)
+    _summ("ref.pa_posthp",   k_pa_ref)
+    if k_pa_m is not None:
+        try:
+            cos = float(np.dot(k_pa_m, k_pa_ref) / (np.linalg.norm(k_pa_m) * np.linalg.norm(k_pa_ref) + 1e-12))
+            print(f"[hpf/debug] pa cosine(model, ref) = {cos:.6f}")
+        except Exception:
+            pass
+
+    _summ("model.pr_posthp", k_pr_m)
+    _summ("ref.pr_posthp",   k_pr_ref)
+    if k_pr_m is not None:
+        try:
+            cos = float(np.dot(k_pr_m, k_pr_ref) / (np.linalg.norm(k_pr_m) * np.linalg.norm(k_pr_ref) + 1e-12))
+            print(f"[hpf/debug] pr cosine(model, ref) = {cos:.6f}")
+        except Exception:
+            pass
+    print("============================================")
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -5774,58 +8020,29 @@ def main ():
         args = set(sys.argv[2:])
         do_offline   = ("--realtime-only" not in args)
         do_realtime  = ("--offline-only"  not in args)
+        
+        time_start = time.time()
 
-        # Offline baseline
+        # Offline baseline: load saved dynamic offline model
         if do_offline:
             prepare_and_generate_demo(
                 kind="offline",
                 sample_rate=OFFLINE_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_OFFLINE_OUT_DIR,
-                dynamic_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
-                checkpoint_out_dir=CHECKPOINT_OFFLINE_OUT_DIR,
-                build_model_fn=build_offline_model,
-                use_safe_weight_copy=False
+                dynamic_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
             )
 
-        # Realtime baseline (fixed gate)
+        # Realtime baseline: load saved static T=32 streaming model
         if do_realtime:
             prepare_and_generate_demo(
                 kind="realtime",
                 sample_rate=REALTIME_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_REALTIME_OUT_DIR,
-                dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
-                checkpoint_out_dir=CHECKPOINT_REALTIME_OUT_DIR,
-                build_model_fn=build_realtime_model,
-                build_model_fn_args_dynamic={
-                    'offline': None,
-                    'dynamic_time': True,
-                    'coloreq_trainable': False
-                },
-                use_safe_weight_copy=True
+                dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
             )
-    
-    elif len(sys.argv) > 1 and sys.argv[1] == "--demo-static":
-        print("Generating demo audio from STATIC (self-contained) models...")
-        args = set(sys.argv[2:])
-        do_offline   = ("--realtime-only" not in args)
-        do_realtime  = ("--offline-only"  not in args)
-        use_finetuned = ("--finetuned" in args)
-
-        if do_offline:
-            prepare_and_generate_demo_static_selfcontained(
-                kind="offline",
-                sample_rate=OFFLINE_SAMPLE_RATE,
-                demo_out_dir=LONG_DEMOS_OFFLINE_OUT_DIR,
-                use_finetuned=use_finetuned
-            )
-
-        if do_realtime:
-            prepare_and_generate_demo_static_selfcontained(
-                kind="realtime",
-                sample_rate=REALTIME_SAMPLE_RATE,
-                demo_out_dir=LONG_DEMOS_REALTIME_OUT_DIR,
-                use_finetuned=use_finetuned
-            )
+        
+        time_end = time.time()
+        print(f"✅ Demo generation complete (took {time_end - time_start:.1f} sec).")
         sys.exit(0)
 
     elif len(sys.argv)>1 and sys.argv[1]=="--fine-tune":
@@ -5897,12 +8114,10 @@ def main ():
             os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
             os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME),
             os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME),
-            os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
             os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
             os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME),
             os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME),
             os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME),
-            os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_SELFCONTAINED_MODEL_FILENAME),
             os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
         ]
 
@@ -5915,6 +8130,17 @@ def main ():
                 print(f"Layer: {l.name}, Type: {type(l)}")
             print("-----")
         sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--inspect-realtime":
+        args = set(sys.argv[2:])
+        use_finetuned = ("--finetuned" in args)
+        path = os.path.join(
+            MODELS_REALTIME_OUT_DIR,
+            FINETUNE_REALTIME_STATIC_MODEL_FILENAME if use_finetuned else REALTIME_STATIC_MODEL_FILENAME
+        )
+        print("[inspect-realtime] Loading:", path)
+        m = tf.keras.models.load_model(path, compile=False)
+        _print_model_io_summary(m)
+        sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--export-tflite":
         print("Exporting FP32 TFLite models (offline T=40960, realtime T=32)…")
         export_tflite_all()
@@ -5925,7 +8151,6 @@ def main ():
         do_offline    = ("--realtime-only" not in args)
         do_realtime   = ("--offline-only"  not in args)
         use_finetuned = ("--finetuned"     in args)
-        prefer_t32    = ("--t32" in args) or ("--small" in args)
         do_both       = ("--both" in args)
         
         # Measure the time it takes to do this:
@@ -5941,17 +8166,84 @@ def main ():
                     hop = None
 
         if do_offline:
-            generate_demo_tflite(kind="offline", use_finetuned=use_finetuned, small=False)
+            generate_demo_tflite(kind="offline", use_finetuned=use_finetuned)
 
         if do_realtime:
             if do_both:
                 # T=32 and large demo-T, both
-                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=True,  hop=hop)
-                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=False, hop=None)
+                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, hop=hop)
             else:
-                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, small=prefer_t32, hop=hop)
+                generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, hop=hop)
         time_end = time.time()
         print(f"[TFLite/demo] All done in {time_end - time_start:.1f} seconds.")
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-realtime":
+        migrate_realtime_models_inplace()
+        
+        m = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
+        print([t.name.split(':')[0] for t in m.inputs if 'realtime_knob_' in t.name])
+        # Prints: realtime_knob_pickattack, realtime_knob_pickreso, realtime_knob_ir, realtime_knob_drywet
+        
+        w = m.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
+        print("modal_lr shape:", w.shape, "L2:", float(np.linalg.norm(w)))
+        
+        # Prints: modal_lr shape: (128, 1, 9) L2: 2.606722831726074
+        
+    elif len(sys.argv)>1 and sys.argv[1]=="--check-streaming":
+        # Options:
+        #   --finetuned
+        #   --hop=NNN
+        #   --sec=S
+        #   --offset-sec=S
+        #   --pair-index=K
+        #   --style=pick|finger|pred|prob=<float>
+        #   --only=full|main|ir|pa|pr
+        args = sys.argv[2:]
+        use_finetuned = any(a == "--finetuned" for a in args)
+        hop = None
+        sec = None
+        offset = None
+        pair_idx = None
+        style = "pred"
+        only = "full"
+        for a in args:
+            if a.startswith("--hop="):
+                try: hop = int(a.split("=",1)[1])
+                except: hop = None
+            elif a.startswith("--sec="):
+                try: sec = float(a.split("=",1)[1])
+                except: sec = None
+            elif a.startswith("--offset-sec=") or a.startswith("--offset="):
+                try: offset = float(a.split("=",1)[1])
+                except: offset = None
+            elif a.startswith("--pair-index="):
+                try: pair_idx = int(a.split("=",1)[1])
+                except: pair_idx = None
+            elif a.startswith("--style="):
+                style = a.split("=",1)[1].strip()
+            elif a.startswith("--only="):
+                only = a.split("=",1)[1].strip().lower()
+
+        check_streaming_equivalence_realtime(use_finetuned=use_finetuned,
+                                             hop=hop,
+                                             sec=sec,
+                                             offset_sec=offset,
+                                             pair_index=pair_idx,
+                                             style_mode=style,
+                                             only=only)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--inspect-heads":
+        # Options: --finetuned --sec=S --offset-sec=S --pair-index=K --style=pick|finger --hop=N
+        args = sys.argv[2:]
+        use_finetuned = any(a=="--finetuned" for a in args)
+        sec=None; off=None; idx=None; style="pick"; hop=None
+        for a in args:
+            if a.startswith("--sec="): sec=float(a.split("=",1)[1])
+            elif a.startswith("--offset-sec=") or a.startswith("--offset="): off=float(a.split("=",1)[1])
+            elif a.startswith("--pair-index="): idx=int(a.split("=",1)[1])
+            elif a.startswith("--style="): style=a.split("=",1)[1]
+            elif a.startswith("--hop="): hop=int(a.split("=",1)[1])
+        inspect_realtime_heads(use_finetuned=use_finetuned, sec=sec, offset_sec=off, pair_index=idx, style=style, hop=hop)
         sys.exit(0)
     else:
         print("No command given.")
