@@ -309,6 +309,9 @@ PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ = 3000.0
 PICK_ATTACK_LOWBAND_PENALTY_ORDER     = 513
 PICK_ATTACK_LOWBAND_PENALTY_ALPHA = 1.5
 
+# Smoothing time constant (ms) for pickattack style envelope in streaming graph
+PICK_ATTACK_STYLE_SMOOTH_MS = 2.0
+
 PICK_RESO_LOWBAND_PENALTY_CUTOFF_HZ = 1000.0
 PICK_RESO_LOWBAND_PENALTY_ORDER     = 513
 PICK_RESO_LOWBAND_PENALTY_ALPHA = 1.5
@@ -4327,6 +4330,24 @@ def build_realtime_streaming_model(dynamic_time=False,
     s_style_prev = Input(shape=(1,1), name="realtime_state_style_prev")
     state_inputs.append(s_style_prev)
     style_time, s_style_prev_next = StreamingStyleLerp(name="realtime_style_time_stream")([inp, style_used_scalar, s_style_prev])
+    
+        # NEW: per-sample smoothing of the style envelope for the pickattack head only.
+    # This removes the subtle “zipper/bitcrush” artifact caused by per-hop envelope slope resets.
+    tau_pa = max(1, int(round((PICK_ATTACK_STYLE_SMOOTH_MS / 1000.0) * REALTIME_SAMPLE_RATE)))
+    L_pa   = int(np.clip(np.ceil(3.0 * tau_pa), 8, 1024))  # keep the state small
+    s_style_pa = Input(shape=(L_pa - 1, 1), name="realtime_state_pickattack_style_smooth")
+    state_inputs.append(s_style_pa)
+    k_pa_smooth = _exp_smoothing_kernel(tau_pa, scale=3.0, Lmax=L_pa)
+    style_time_pa, s_style_pa_n = StreamFixedFIR(
+        kernel_len=L_pa,
+        out_ch=1,
+        weight_name="exp_smooth_taps",
+        trainable_kernel=False,
+        taps_init=k_pa_smooth,
+        name="realtime_pickattack_style_smooth"
+    )([style_time, s_style_pa])
+    state_outputs.append(Activation('linear', name="realtime_state_pickattack_style_smooth_next")(s_style_pa_n))
+    
     state_outputs.append(Activation('linear', name="realtime_state_style_prev_next")(s_style_prev_next))
     inv_style_time = Lambda(invert, name="realtime_invert_style_time")(style_time)
 
@@ -4491,7 +4512,7 @@ def build_realtime_streaming_model(dynamic_time=False,
 
     x_pa_out = Conv1D(1, 1, padding="same", name="realtime_picklearn_out")(x_pa2)
     # NEW: gate with smoothed time envelope
-    xg = Multiply(name="realtime_pickattack_gated")([x_pa_out, style_time])
+    xg = Multiply(name="realtime_pickattack_gated")([x_pa_out, style_time_pa])
     xg = SoftClip1D(drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickattack_softclip")(xg)
 
     # Fade-in ramp to suppress startup pop
