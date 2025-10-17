@@ -87,5 +87,5 @@ cmake --build . && ./stream_audio_cpp --tflite <model.tflite> --input-device <id
 E.g.:
 
 ```
-./stream_audio_cpp --tflite ../../out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite --input-device 1 --output-device 2 --blocksize 32
+cmake --build . && ./stream_audio_cpp --tflite ../../out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite --input-device 4 --output-device 4 --blocksize 32
 ```

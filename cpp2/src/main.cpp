@@ -620,6 +620,42 @@ void inferenceThread(InferCtx ctx) {
 
   float styleP = 0.0f;
 
+  // Track last printed knob values to print on changes (as pressing 'p')
+  float prev_pa  = gKnobs.pickAttack_dB.load();
+  float prev_pr  = gKnobs.pickReso_dB.load();
+  float prev_ir  = gKnobs.ir_dB.load();
+  float prev_wet = gKnobs.wet_pct.load();
+  int   prev_mode = gStyleMode.load();
+
+  auto stylePredWord = [&](float p, int styleMode)->const char* {
+    if (styleMode == static_cast<int>(StyleMode::ForcePick))   return "PICK (forced)";
+    if (styleMode == static_cast<int>(StyleMode::ForceFinger)) return "FINGER (forced)";
+    return (p >= 0.5f) ? "PICK" : "FINGER";
+  };
+
+  auto printKnobStatus = [&](const char* tag){
+    int sm = gStyleMode.load();
+    const char* pred = stylePredWord(styleP, sm);
+    std::cout << (tag ? tag : "[UI]") << " PA=" << gKnobs.pickAttack_dB.load() << " dB  "
+              << "PR=" << gKnobs.pickReso_dB.load()   << " dB  "
+              << "IR=" << gKnobs.ir_dB.load()         << " dB  "
+              << "Wet="<< gKnobs.wet_pct.load()       << " %  "
+              << "Pred=" << pred << "  "
+              << "Mode=" << styleModeName(sm) << "\n";
+  };
+
+  auto checkAndReportKnobChanges = [&](){
+    float pa  = gKnobs.pickAttack_dB.load();
+    float pr  = gKnobs.pickReso_dB.load();
+    float ir  = gKnobs.ir_dB.load();
+    float wet = gKnobs.wet_pct.load();
+    int   sm  = gStyleMode.load();
+    if (pa != prev_pa || pr != prev_pr || ir != prev_ir || wet != prev_wet || sm != prev_mode) {
+      printKnobStatus("[UI]");
+      prev_pa = pa; prev_pr = pr; prev_ir = ir; prev_wet = wet; prev_mode = sm;
+    }
+  };
+
   // Wait for at least one hop of input
   while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
     std::this_thread::yield();
@@ -685,6 +721,9 @@ void inferenceThread(InferCtx ctx) {
       ctx.sh->out.push(yT.data(), hop);
       auto t1 = std::chrono::steady_clock::now();
 
+      // Print knob status whenever any knob changed (same info as pressing 'p')
+      checkAndReportKnobChanges();
+
       double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
       static auto   last_report = t1;
       static double sum_proc = 0.0;
@@ -694,8 +733,9 @@ void inferenceThread(InferCtx ctx) {
         double avg_proc = sum_proc / double(cnt);
         double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
         double total_ms = avg_proc + io_ms;
+        int sm = gStyleMode.load();
         std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  style_p≈"<<styleP << "  mode="<<styleModeName(gStyleMode.load()) << "\n";
+                  << "  pred="<<stylePredWord(styleP, sm)<<"  mode="<<styleModeName(sm) << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
@@ -727,6 +767,9 @@ void inferenceThread(InferCtx ctx) {
       do_invoke_windowed(win.data());
       ctx.sh->out.push(yT.data() + (T - hop), hop);
 
+      // Print knob status whenever any knob changed (same info as pressing 'p')
+      checkAndReportKnobChanges();
+
       auto t1 = std::chrono::steady_clock::now();
       double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
 
@@ -738,8 +781,9 @@ void inferenceThread(InferCtx ctx) {
         double avg_proc = sum_proc / double(cnt);
         double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
         double total_ms = avg_proc + io_ms;
+        int sm = gStyleMode.load();
         std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  style_p≈"<<styleP << "  mode="<<styleModeName(gStyleMode.load()) << "\n";
+                  << "  pred="<<stylePredWord(styleP, sm)<<"  mode="<<styleModeName(sm) << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
