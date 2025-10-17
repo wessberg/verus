@@ -2,15 +2,11 @@
   stream_tflite.cpp
   Realtime PortAudio streamer using TensorFlow Lite (LiteRT) model windows.
 
-  - Preserves macOS HAL buffer size control (sets hardware buffer = --blocksize).
-  - Inference schedule: left = T - hop, core = hop, right = 0 (like your Python runner).
-  - Knobs via keys:
-      b = bypass toggle
-      q/a = pick attack +1/-1 dB
-      w/s = pick reso   +1/-1 dB
-      e/d = IR          +1/-1 dB
-      r/f = wet         +5/-5 %
-      p   = print knob values
+  Updated for streaming/stateful realtime TFLite (T=32):
+    - Detects realtime_state_* inputs at runtime.
+    - If streaming: feeds/updates states via a packed bundle + splits outputs, and
+      schedules true streaming blocks (first 'hop' samples filled, rest zeros).
+    - If not streaming: falls back to original windowed schedule (left=T-hop).
 
   Build notes (example):
     clang++ -O3 -std=c++17 stream_tflite.cpp -o streamer_tflite \
@@ -40,6 +36,7 @@
 #include <sys/stat.h>
 #include <unordered_map>
 #include <string>
+#include <algorithm>
 
 #include <pthread/qos.h>
 #include <Accelerate/Accelerate.h>
@@ -172,14 +169,20 @@ static void listDevices(const std::vector<DeviceInfo> &devices) {
   }
 }
 
-// ────────────────────── NAME NORMALIZATION ─────────────────────
+// ────────────────────── NAME/DTYPE HELPERS ─────────────────────
 static inline std::string normName(const char* n) {
   std::string s = n ? std::string(n) : std::string();
   if (s.rfind("serving_default_", 0) == 0)
     s = s.substr(std::strlen("serving_default_"));
   auto pos = s.find(':');
   if (pos != std::string::npos) s = s.substr(0, pos);
+  // Remove TF scope prefixes like "StatefulPartitionedCall/..."
+  auto slash = s.find_last_of('/');
+  if (slash != std::string::npos) s = s.substr(slash+1);
   return s;
+}
+static inline bool isIntType(TfLiteType t) {
+  return (t == kTfLiteInt32 || t == kTfLiteInt64 || t == kTfLiteUInt8 || t == kTfLiteInt16);
 }
 
 // ───────────────────────── TFLITE WRAPPER ─────────────────────────
@@ -200,11 +203,12 @@ public:
     interp_->SetNumThreads(1);
 
     #ifdef TFLITE_WITH_XNNPACK
-        // XNNPACK delegate
+      {
         TfLiteXNNPackDelegateOptions opt = TfLiteXNNPackDelegateOptionsDefault();
         opt.num_threads = 1; // keep real-time friendly
         xnnpack_ = TfLiteXNNPackDelegateCreate(&opt);
         if (xnnpack_) interp_->ModifyGraphWithDelegate(xnnpack_);
+      }
     #endif
 
     if (interp_->AllocateTensors() != kTfLiteOk) {
@@ -223,7 +227,7 @@ public:
     }
 
     // Required inputs
-    in_piezo_ = findInput("realtime_piezo_input");
+    in_piezo_   = findInput("realtime_piezo_input");
     in_st_true_ = findInput("realtime_style_true_input");
     in_st_force_= findInput("realtime_style_force_input");
     in_knob_pa_ = findInput("realtime_knob_pickattack");
@@ -232,67 +236,65 @@ public:
     in_knob_dw_ = findInput("realtime_knob_drywet");
 
     // Determine T
-    auto* tin = interp_->tensor(in_piezo_);
-    if (tin->dims->size != 3 || tin->dims->data[0] != 1 || tin->dims->data[2] != 1) {
-      std::cerr<<"[TFLite] Unexpected piezo input shape; want [1,T,1]\n";
+    auto* tin = (in_piezo_ >= 0) ? interp_->tensor(in_piezo_) : nullptr;
+    if (!tin || tin->dims->size < 2) {
+      std::cerr<<"[TFLite] Unexpected/no piezo input; want [1,T,1]\n";
+      std::exit(1);
+    }
+    if (tin->dims->size == 3 && (tin->dims->data[0] != 1 || tin->dims->data[2] != 1)) {
+      std::cerr<<"[TFLite] Unexpected piezo shape; want [1,T,1]\n";
       std::exit(1);
     }
     T_ = tin->dims->data[1];
 
-    // Outputs: prefer named, else pick by size
-    out_audio_ = findOutputPrefer({"realtime_audio_out"});
-    out_style_ = findOutputPrefer({"realtime_style_prob_out"});
+    // Discover streaming states by input names
+    discoverStateInputs();
 
-    if (out_audio_ < 0) {
-      // largest output is audio
-      size_t best = 0;
-      for (auto &kv : out_map_) {
-        auto* t = interp_->tensor(kv.second);
-        size_t sz = 1;
-        for (int i = 0; i < t->dims->size; ++i) sz *= t->dims->data[i];
-        if (sz > best) { best = sz; out_audio_ = kv.second; }
-      }
-    }
-    if (out_style_ < 0) {
-      // choose a smallest second output or any [1,1]
-      for (auto &kv : out_map_) {
-        auto* t = interp_->tensor(kv.second);
-        if (t->dims->size == 2 && t->dims->data[0] == 1 && t->dims->data[1] == 1) {
-          out_style_ = kv.second; break;
-        }
-      }
-      if (out_style_ < 0) {
-        // fallback: pick any non-audio
-        for (auto &kv : out_map_) if (kv.second != out_audio_) { out_style_ = kv.second; break; }
-      }
-    }
+    // Pick outputs by shape/dtype
+    classifyOutputsByShape();
 
+    // Basic checks for required non-state I/O
     if (in_piezo_ < 0 || out_audio_ < 0 || in_st_true_ < 0 || in_st_force_ < 0 ||
         in_knob_pa_ < 0 || in_knob_pr_ < 0 || in_knob_ir_ < 0 || in_knob_dw_ < 0) {
       std::cerr << "[TFLite] Missing required I/O tensors (check model names)\n";
       std::exit(1);
     }
 
-    std::cout<<"[TFLite] Ready. T="<<T_<<"\n";
+    std::cout<<"[TFLite] Ready. T="<<T_<<"  streaming="<<(isStreaming()?"true":"false")
+             <<"  states="<<stateSlots_.size()<<"\n";
   }
 
   ~TFLiteRealtime() {
   #ifdef TFLITE_WITH_XNNPACK
       if (xnnpack_) TfLiteXNNPackDelegateDelete(xnnpack_);
   #endif
-    }
+  }
 
   int T() const { return T_; }
+  bool isStreaming() const { return !stateSlots_.empty(); }
 
-  // Invoke on a [T] mono window. Outputs [T] mono audio and style prob.
-  void invoke(const float* inWindow, float* outWindow, float &styleProb,
-              float pa_lin, float pr_lin, float ir_lin, float dry_frac,
-              float style_true, float style_force) {
-    // Set inputs
+  // Reset state buffers (zeros); call before starting stream
+  void resetStates() {
+    for (auto &s : stateSlots_) {
+      std::fill(s.buf.begin(), s.buf.end(), 0.0f);
+    }
+  }
+
+  // STREAMING invoke:
+  //   - coreLen samples are at the start of 'inBlock' (size >= coreLen),
+  //     we fill the first coreLen of [1,T,1] and zero the remainder.
+  //   - Returns the full T-length output block; caller will use first coreLen samples.
+  void invokeStreamingBlock(const float* inBlockCore, int coreLen,
+                            float* outBlockT, float &styleProb,
+                            float pa_lin, float pr_lin, float ir_lin, float dry_frac,
+                            float style_true, float style_force)
+  {
+    // Prepare piezo [1,T,1]
     float* pz = interp_->typed_tensor<float>(in_piezo_);
-    for (int t = 0; t < T_; ++t) pz[t] = inWindow[t];
+    std::fill(pz, pz + T_, 0.0f);
+    if (coreLen > 0) std::memcpy(pz, inBlockCore, sizeof(float) * std::min(coreLen, T_));
 
-    // Scalars: [1,1]
+    // Scalars [1,1]
     *interp_->typed_tensor<float>(in_st_true_)  = style_true;
     *interp_->typed_tensor<float>(in_st_force_) = style_force;
 
@@ -301,43 +303,262 @@ public:
     *interp_->typed_tensor<float>(in_knob_ir_) = ir_lin;
     *interp_->typed_tensor<float>(in_knob_dw_) = dry_frac;
 
+    // Feed state inputs (if streaming)
+    if (isStreaming()) {
+      for (auto &s : stateSlots_) {
+        float* dst = interp_->typed_tensor<float>(s.input_idx);
+        // Input shape is [1, L, C]; buf holds L*C contiguous floats
+        std::memcpy(dst, s.buf.data(), sizeof(float) * s.len());
+      }
+    }
+
     if (interp_->Invoke() != kTfLiteOk) {
       std::cerr << "[TFLite] Invoke failed\n";
-      std::memset(outWindow, 0, sizeof(float) * T_);
+      std::memset(outBlockT, 0, sizeof(float) * T_);
       styleProb = 0.0f;
       return;
     }
 
+    // Audio
     const float* y = interp_->typed_tensor<float>(out_audio_);
-    auto* st = interp_->tensor(out_style_);
-    float s = 0.0f;
-    if (st && st->type == kTfLiteFloat32) {
-      if (st->dims->size == 2 && st->dims->data[0] == 1 && st->dims->data[1] == 1) {
-        s = *interp_->typed_tensor<float>(out_style_);
-      } else {
-        s = interp_->typed_tensor<float>(out_style_)[0];
+    std::memcpy(outBlockT, y, sizeof(float) * T_);
+
+    // Style prob (2D [1,1] preferred)
+    styleProb = 0.0f;
+    if (out_style_ >= 0) {
+      auto* st = interp_->tensor(out_style_);
+      if (st && st->type == kTfLiteFloat32) {
+        if (st->dims->size == 2 && st->dims->data[0] == 1 && st->dims->data[1] == 1) {
+          styleProb = *interp_->typed_tensor<float>(out_style_);
+        } else {
+          styleProb = interp_->typed_tensor<float>(out_style_)[0];
+        }
       }
     }
-    std::memcpy(outWindow, y, sizeof(float) * T_);
-    styleProb = s;
+
+    // Update states from packed bundle (if present)
+    if (isStreaming() && out_bundle_ >= 0) {
+      const TfLiteTensor* bt = interp_->tensor(out_bundle_);
+      const float* bundle = interp_->typed_tensor<float>(out_bundle_);
+      int total = 1;
+      for (int i = 0; i < bt->dims->size; ++i) total *= bt->dims->data[i];
+      if (out_splits_ >= 0) {
+        // With splits vector
+        const TfLiteTensor* sp = interp_->tensor(out_splits_);
+        std::vector<int> lens;
+        if (sp->type == kTfLiteInt32) {
+          const int32_t* p = interp_->typed_tensor<int32_t>(out_splits_);
+          int N = 1;
+          for (int i=0;i<sp->dims->size;i++) N *= sp->dims->data[i];
+          for (int i=0;i<N;i++) lens.push_back((int)p[i]);
+        } else if (sp->type == kTfLiteInt64) {
+          const int64_t* p = interp_->typed_tensor<int64_t>(out_splits_);
+          int N = 1;
+          for (int i=0;i<sp->dims->size;i++) N *= sp->dims->data[i];
+          for (int i=0;i<N;i++) lens.push_back((int)p[i]);
+        } else {
+          lens.clear();
+        }
+        // Normalize splits to 1xN
+        if (sp->dims->size == 2 && sp->dims->data[0] == 1) {
+          // ok
+        } else if (sp->dims->size == 1) {
+          // already flattened
+        }
+        // Update in lexicographic order (same order we built stateSlots_)
+        size_t offset = 0;
+        for (size_t i = 0; i < stateSlots_.size(); ++i) {
+          int need = (i < lens.size()) ? lens[i] : stateSlots_[i].len();
+          int have = std::max(0, std::min(need, total - (int)offset));
+          if (have > 0) {
+            std::memcpy(stateSlots_[i].buf.data(), bundle + offset, sizeof(float) * std::min(have, stateSlots_[i].len()));
+          }
+          offset += have;
+        }
+      } else {
+        // No splits: slice by expected L*C in lexicographic order
+        size_t offset = 0;
+        for (auto &s : stateSlots_) {
+          int have = std::max(0, std::min(s.len(), total - (int)offset));
+          if (have > 0) {
+            std::memcpy(s.buf.data(), bundle + offset, sizeof(float) * have);
+          }
+          offset += have;
+        }
+      }
+    }
+  }
+
+  // WINDOWED invoke (legacy non-streaming model): pass full [1,T,1] window.
+  void invokeWindowed(const float* inWindowT, float* outWindowT, float &styleProb,
+                      float pa_lin, float pr_lin, float ir_lin, float dry_frac,
+                      float style_true, float style_force)
+  {
+    float* pz = interp_->typed_tensor<float>(in_piezo_);
+    std::memcpy(pz, inWindowT, sizeof(float) * T_);
+
+    *interp_->typed_tensor<float>(in_st_true_)  = style_true;
+    *interp_->typed_tensor<float>(in_st_force_) = style_force;
+    *interp_->typed_tensor<float>(in_knob_pa_)  = pa_lin;
+    *interp_->typed_tensor<float>(in_knob_pr_)  = pr_lin;
+    *interp_->typed_tensor<float>(in_knob_ir_)  = ir_lin;
+    *interp_->typed_tensor<float>(in_knob_dw_)  = dry_frac;
+
+    if (interp_->Invoke() != kTfLiteOk) {
+      std::cerr << "[TFLite] Invoke failed\n";
+      std::memset(outWindowT, 0, sizeof(float) * T_);
+      styleProb = 0.0f;
+      return;
+    }
+    const float* y = interp_->typed_tensor<float>(out_audio_);
+    std::memcpy(outWindowT, y, sizeof(float) * T_);
+
+    styleProb = 0.0f;
+    if (out_style_ >= 0) {
+      auto* st = interp_->tensor(out_style_);
+      if (st && st->type == kTfLiteFloat32) {
+        if (st->dims->size == 2 && st->dims->data[0] == 1 && st->dims->data[1] == 1) {
+          styleProb = *interp_->typed_tensor<float>(out_style_);
+        } else {
+          styleProb = interp_->typed_tensor<float>(out_style_)[0];
+        }
+      }
+    }
   }
 
 private:
+  struct StateSlot {
+    std::string name;
+    int input_idx = -1;
+    int L = 0;
+    int C = 1;
+    std::vector<float> buf;
+    int len() const { return L * C; }
+  };
+
   int findInput(const std::string& name) const {
     auto it = in_map_.find(name);
     if (it != in_map_.end()) return it->second;
-    // fallback: try with/without serving_default prefix already stripped by normName
     for (auto &kv : in_map_) {
       if (kv.first == name) return kv.second;
     }
     return -1;
   }
-  int findOutputPrefer(const std::vector<std::string>& prefer) const {
-    for (auto &n : prefer) {
-      auto it = out_map_.find(n);
-      if (it != out_map_.end()) return it->second;
+
+  void discoverStateInputs() {
+    // Collect realtime_state_* inputs and sort them lexicographically by name
+    std::vector<StateSlot> tmp;
+    for (auto &kv : in_map_) {
+      const std::string& nm = kv.first;
+      if (nm.rfind("realtime_state_", 0) == 0) {
+        int idx = kv.second;
+        const TfLiteTensor* t = interp_->tensor(idx);
+        if (!t || t->dims->size < 2) continue;
+        StateSlot s;
+        s.name = nm;
+        s.input_idx = idx;
+        // Expect shape [1, L, C] or [1, L]
+        if (t->dims->size == 3) {
+          s.L = t->dims->data[1];
+          s.C = t->dims->data[2];
+        } else if (t->dims->size == 2) {
+          s.L = t->dims->data[1];
+          s.C = 1;
+        } else {
+          continue;
+        }
+        s.buf.resize(std::max(1, s.L*s.C), 0.0f);
+        tmp.push_back(std::move(s));
+      }
     }
-    return -1;
+    std::sort(tmp.begin(), tmp.end(), [](const StateSlot& a, const StateSlot& b){
+      return a.name < b.name;
+    });
+    stateSlots_.swap(tmp);
+  }
+
+  void classifyOutputsByShape() {
+    out_audio_ = -1;
+    out_style_ = -1;
+    out_bundle_ = -1;
+    out_splits_ = -1;
+
+    // Pick audio = only 3D float output (prefer)
+    size_t bestAudioTotal = 0;
+    for (auto &kv : out_map_) {
+      int idx = kv.second;
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (!t) continue;
+      int dims = t->dims ? t->dims->size : 0;
+      if (t->type == kTfLiteFloat32 && dims == 3) {
+        size_t total = 1;
+        for (int i=0;i<dims;i++) total *= t->dims->data[i];
+        if (total > bestAudioTotal) {
+          bestAudioTotal = total;
+          out_audio_ = idx;
+        }
+      }
+    }
+    // Style = 2D [1,1] float (prefer)
+    for (auto &kv : out_map_) {
+      int idx = kv.second;
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (!t) continue;
+      if (t->type == kTfLiteFloat32 && t->dims && t->dims->size == 2 &&
+          t->dims->data[0] == 1 && t->dims->data[1] == 1) {
+        out_style_ = idx; break;
+      }
+    }
+    // Bundle = largest 2D float (excluding (1,1))
+    size_t bestBundleTotal = 0;
+    for (auto &kv : out_map_) {
+      int idx = kv.second;
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (!t || t->type != kTfLiteFloat32 || !t->dims) continue;
+      int dims = t->dims->size;
+      if (dims == 2) {
+        int r = t->dims->data[0], c = t->dims->data[1];
+        if (!(r == 1 && c == 1)) {
+          size_t total = (size_t)r * (size_t)c;
+          if (total > bestBundleTotal) {
+            bestBundleTotal = total;
+            out_bundle_ = idx;
+          }
+        }
+      }
+    }
+    // Splits = (1, Nstates) int or (Nstates,) int
+    for (auto &kv : out_map_) {
+      int idx = kv.second;
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (!t || !t->dims || !isIntType(t->type)) continue;
+      int dims = t->dims->size;
+      int N = 1;
+      for (int i=0;i<dims;i++) N *= t->dims->data[i];
+      if (N == (int)stateSlots_.size()) {
+        out_splits_ = idx; break;
+      }
+    }
+
+    // Fallbacks if missing
+    if (out_audio_ < 0) {
+      // Largest tensor as audio fallback
+      size_t best = 0;
+      for (auto &kv : out_map_) {
+        auto* t = interp_->tensor(kv.second);
+        if (!t || !t->dims) continue;
+        size_t sz = 1;
+        for (int i = 0; i < t->dims->size; ++i) sz *= t->dims->data[i];
+        if (sz > best) { best = sz; out_audio_ = kv.second; }
+      }
+    }
+    if (out_style_ < 0) {
+      for (auto &kv : out_map_) {
+        auto* t = interp_->tensor(kv.second);
+        if (!t) continue;
+        if (t->type == kTfLiteFloat32) { out_style_ = kv.second; break; }
+      }
+    }
   }
 
   std::unique_ptr<tflite::FlatBufferModel> model_;
@@ -350,8 +571,10 @@ private:
 
   std::unordered_map<std::string, int> in_map_, out_map_;
   int in_piezo_=-1, in_st_true_=-1, in_st_force_=-1, in_knob_pa_=-1, in_knob_pr_=-1, in_knob_ir_=-1, in_knob_dw_=-1;
-  int out_audio_=-1, out_style_=-1;
+  int out_audio_=-1, out_style_=-1, out_bundle_=-1, out_splits_=-1;
   int T_ = 0;
+
+  std::vector<StateSlot> stateSlots_;
 };
 
 // ───────────────────────── UTIL ─────────────────────────
@@ -391,28 +614,28 @@ void inferenceThread(InferCtx ctx) {
     std::cerr << "[inference] Error: blocksize/hop ("<<hop<<") must be <= T ("<<T<<")\n";
     gStopFlag = true; return;
   }
-  const int left = T - hop; // schedule: left, core, right=0
 
-  std::vector<float> win(T, 0.0f), y(T, 0.0f);
+  std::vector<float> xhop(hop, 0.0f);
+  std::vector<float> yT(T, 0.0f);
 
-  // pre-fill left context with zeros; wait enough input for first core
+  float styleP = 0.0f;
+
+  // Wait for at least one hop of input
   while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
     std::this_thread::yield();
   if (gStopFlag) return;
 
-  std::vector<float> xhop(hop);
+  // Streaming vs windowed
+  const bool streaming = rt.isStreaming();
+  if (streaming) {
+    rt.resetStates();
+  }
+
+  // Warm/start
   size_t got = ctx.sh->in.pop(xhop.data(), hop);
-  if (got < (size_t)hop)
-    std::fill(xhop.begin()+got, xhop.end(), 0.0f);
+  if (got < (size_t)hop) std::fill(xhop.begin()+got, xhop.end(), 0.0f);
 
-  // First window: place core at [left : left+hop)
-  // left context is zeros initially
-  std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
-
-  float styleP = 0.0f;
-
-  auto do_invoke = [&](const float* inBuf) {
-    // Read knobs atomically
+  auto do_invoke_streaming = [&](const float* coreBuf, int coreLen){
     float pa_lin = db2lin(gKnobs.pickAttack_dB.load());
     float pr_lin = db2lin(gKnobs.pickReso_dB.load());
     float ir_lin = db2lin(gKnobs.ir_dB.load());
@@ -420,54 +643,105 @@ void inferenceThread(InferCtx ctx) {
     float dryFrac= 1.0f - (wet / 100.0f);
 
     int sm = gStyleMode.load();
-    float st_true = 0.0f, st_force = 0.0f; // AUTO default
+    float st_true = 0.0f, st_force = 0.0f;
     if (sm == static_cast<int>(StyleMode::ForcePick))   { st_true = 1.0f; st_force = 1.0f; }
     if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
 
-    rt.invoke(inBuf, y.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
+    rt.invokeStreamingBlock(coreBuf, coreLen, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
   };
 
-  // Warm invoke
-  do_invoke(win.data());
-  // push core region
-  ctx.sh->out.push(y.data() + left, hop);
+  auto do_invoke_windowed = [&](const float* windowT){
+    float pa_lin = db2lin(gKnobs.pickAttack_dB.load());
+    float pr_lin = db2lin(gKnobs.pickReso_dB.load());
+    float ir_lin = db2lin(gKnobs.ir_dB.load());
+    float wet    = clampf(gKnobs.wet_pct.load(), 0.0f, 100.0f);
+    float dryFrac= 1.0f - (wet / 100.0f);
 
-  // steady-state
-  while (!gStopFlag) {
-    // Wait next hop
-    while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
-      std::this_thread::yield();
-    if (gStopFlag) break;
+    int sm = gStyleMode.load();
+    float st_true = 0.0f, st_force = 0.0f;
+    if (sm == static_cast<int>(StyleMode::ForcePick))   { st_true = 1.0f; st_force = 1.0f; }
+    if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
 
-    size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
-    if (got2 < (size_t)hop)
-      std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
+    rt.invokeWindowed(windowT, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
+  };
 
-    auto t0 = std::chrono::steady_clock::now();
+  if (streaming) {
+    // True streaming: feed first 'hop' samples at [0:hop], zeros for the rest, no overlap.
+    do_invoke_streaming(xhop.data(), hop);
+    ctx.sh->out.push(yT.data(), hop);
 
-    // Slide window left by hop; append new hop at end
-    if (left > 0) std::memmove(win.data(), win.data()+hop, sizeof(float)*(T-hop));
-    std::memcpy(win.data() + (T - hop), xhop.data(), sizeof(float)*hop);
+    while (!gStopFlag) {
+      // Wait next hop
+      while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
+        std::this_thread::yield();
+      if (gStopFlag) break;
 
-    do_invoke(win.data());
+      size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
+      if (got2 < (size_t)hop)
+        std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
-    // Push out core region (last hop)
-    ctx.sh->out.push(y.data() + (T - hop), hop);
+      auto t0 = std::chrono::steady_clock::now();
+      do_invoke_streaming(xhop.data(), hop);
+      ctx.sh->out.push(yT.data(), hop);
+      auto t1 = std::chrono::steady_clock::now();
 
-    auto t1 = std::chrono::steady_clock::now();
-    double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+      static auto   last_report = t1;
+      static double sum_proc = 0.0;
+      static size_t cnt = 0;
+      sum_proc += proc_ms; ++cnt;
+      if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
+        double avg_proc = sum_proc / double(cnt);
+        double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
+        double total_ms = avg_proc + io_ms;
+        std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
+                  << "  style_p≈"<<styleP << "  mode="<<styleModeName(gStyleMode.load()) << "\n";
+        last_report = t1; sum_proc = 0.0; cnt = 0;
+      }
+    }
+  } else {
+    // Legacy windowed schedule: left = T - hop, core = hop, right = 0
+    const int left = T - hop;
+    std::vector<float> win(T, 0.0f);
 
-    static auto   last_report = t1;
-    static double sum_proc = 0.0;
-    static size_t cnt = 0;
-    sum_proc += proc_ms; ++cnt;
-    if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
-      double avg_proc = sum_proc / double(cnt);
-      double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
-      double total_ms = avg_proc + io_ms;
-      std::cerr << "[inference] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                << "  style_p≈"<<styleP << "  mode="<<styleModeName(gStyleMode.load()) << "\n";
-      last_report = t1; sum_proc = 0.0; cnt = 0;
+    // First window: place core at [left : left+hop)
+    std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
+    do_invoke_windowed(win.data());
+    ctx.sh->out.push(yT.data() + left, hop);
+
+    while (!gStopFlag) {
+      while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
+        std::this_thread::yield();
+      if (gStopFlag) break;
+
+      size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
+      if (got2 < (size_t)hop)
+        std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
+
+      auto t0 = std::chrono::steady_clock::now();
+
+      // Slide window left by hop; append new hop at end
+      if (left > 0) std::memmove(win.data(), win.data()+hop, sizeof(float)*(T-hop));
+      std::memcpy(win.data() + (T - hop), xhop.data(), sizeof(float)*hop);
+
+      do_invoke_windowed(win.data());
+      ctx.sh->out.push(yT.data() + (T - hop), hop);
+
+      auto t1 = std::chrono::steady_clock::now();
+      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+
+      static auto   last_report = t1;
+      static double sum_proc = 0.0;
+      static size_t cnt = 0;
+      sum_proc += proc_ms; ++cnt;
+      if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
+        double avg_proc = sum_proc / double(cnt);
+        double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
+        double total_ms = avg_proc + io_ms;
+        std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
+                  << "  style_p≈"<<styleP << "  mode="<<styleModeName(gStyleMode.load()) << "\n";
+        last_report = t1; sum_proc = 0.0; cnt = 0;
+      }
     }
   }
 }
@@ -578,7 +852,7 @@ static void setMacHardwareBufferSize(const DeviceInfo& paDev, int blockSize, boo
 
 // ───────────────────────── MAIN ─────────────────────────
 int main(int argc, char** argv) {
-  int  blockSize = 16; // keep small; must be <= T
+  int  blockSize = 16; // must be <= T
   int  inDevId = -1, outDevId = -1;
   std::string tflitePath;
 
@@ -660,39 +934,39 @@ int main(int argc, char** argv) {
 
   // Keyboard thread for bypass + knobs
   std::thread kbThread([&](){
-  std::cout<<"[MAIN] Keys: b=Bypass  q/a=PA +/‑1dB  w/s=PR +/‑1dB  e/d=IR +/‑1dB  r/f=Wet +/‑5%  t=Style mode (auto→pick→finger)  p=print\n";
-  while (!gStopFlag) {
-    int c = getchar();
-    if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
-    if (c=='b'||c=='B') {
-      bool now = !gBypass.load(); gBypass.store(now);
-      shared.out.r.store(shared.out.w.load(std::memory_order_relaxed), std::memory_order_relaxed);
-      std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
-    } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -24.0f, 24.0f) ); }
-      else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -24.0f, 24.0f) ); }
-      else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -24.0f, 24.0f) ); }
-      else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -24.0f, 24.0f) ); }
-      else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -24.0f, 24.0f) ); }
-      else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -24.0f, 24.0f) ); }
-      else if (c=='r') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()+5.0f, 0.0f, 100.0f) ); }
-      else if (c=='f') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()-5.0f, 0.0f, 100.0f) ); }
-      else if (c=='t') {
-        int cur = gStyleMode.load();
-        int next = (cur == static_cast<int>(StyleMode::Auto)) ? static_cast<int>(StyleMode::ForcePick)
-                   : (cur == static_cast<int>(StyleMode::ForcePick)) ? static_cast<int>(StyleMode::ForceFinger)
-                   : static_cast<int>(StyleMode::Auto);
-        gStyleMode.store(next);
-        std::cout<<"[UI] Style mode = "<<styleModeName(next)<<"\n";
-      }
-      else if (c=='p') {
-        std::cout<<"[UI] PA="<<gKnobs.pickAttack_dB.load()<<" dB  "
-                 <<"PR="<<gKnobs.pickReso_dB.load()<<" dB  "
-                 <<"IR="<<gKnobs.ir_dB.load()<<" dB  "
-                 <<"Wet="<<gKnobs.wet_pct.load()<<" %  "
-                 <<"Style="<<styleModeName(gStyleMode.load())<<"\n";
-      }
-  }
-});
+    std::cout<<"[MAIN] Keys: b=Bypass  q/a=PA +/‑1dB  w/s=PR +/‑1dB  e/d=IR +/‑1dB  r/f=Wet +/‑5%  t=Style mode (auto→pick→finger)  p=print\n";
+    while (!gStopFlag) {
+      int c = getchar();
+      if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+      if (c=='b'||c=='B') {
+        bool now = !gBypass.load(); gBypass.store(now);
+        shared.out.r.store(shared.out.w.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
+      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -24.0f, 24.0f) ); }
+        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -24.0f, 24.0f) ); }
+        else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -24.0f, 24.0f) ); }
+        else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -24.0f, 24.0f) ); }
+        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -24.0f, 24.0f) ); }
+        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -24.0f, 24.0f) ); }
+        else if (c=='r') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()+5.0f, 0.0f, 100.0f) ); }
+        else if (c=='f') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()-5.0f, 0.0f, 100.0f) ); }
+        else if (c=='t') {
+          int cur = gStyleMode.load();
+          int next = (cur == static_cast<int>(StyleMode::Auto)) ? static_cast<int>(StyleMode::ForcePick)
+                     : (cur == static_cast<int>(StyleMode::ForcePick)) ? static_cast<int>(StyleMode::ForceFinger)
+                     : static_cast<int>(StyleMode::Auto);
+          gStyleMode.store(next);
+          std::cout<<"[UI] Style mode = "<<styleModeName(next)<<"\n";
+        }
+        else if (c=='p') {
+          std::cout<<"[UI] PA="<<gKnobs.pickAttack_dB.load()<<" dB  "
+                   <<"PR="<<gKnobs.pickReso_dB.load()<<" dB  "
+                   <<"IR="<<gKnobs.ir_dB.load()<<" dB  "
+                   <<"Wet="<<gKnobs.wet_pct.load()<<" %  "
+                   <<"Style="<<styleModeName(gStyleMode.load())<<"\n";
+        }
+    }
+  });
 
   PaStream *stream = nullptr;
   err = Pa_OpenStream(&stream, &ip, &op, sampleRate, (unsigned long)blockSize, paNoFlag, paCallback, &shared);

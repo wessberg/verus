@@ -415,11 +415,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 0.2
+DEMO_SEC        = 2.0
 DEMO_OFFSET_SEC = 0.2
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 0.2
+LONG_DEMO_SEC        = 2.0
 LONG_DEMO_OFFSET_SEC = 0.2
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -1379,7 +1379,7 @@ class StreamingRealtimeIrDownsampleFIR(tf.keras.layers.Layer):
     If use_ir_prototype=True, use the exact same taps as the non-streaming IR branch
     (global _ir_fir_kernel), guaranteeing equivalence for the IR path.
       inputs: [x (B,T,1), state (B,L-1,1)]
-      outputs: [y_ds (B, floor(T/N), 1), state_next (B,L-1,1)]
+      outputs: [y_ds (B, ceil(T/N), 1), state_next (B,L-1,1)]
     """
     def __init__(self, factor=REALTIME_IR_DOWNSAMPLE_FACTOR, kernel_size=REALTIME_IR_FIR_SIZE, use_ir_prototype=False, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
@@ -1406,9 +1406,20 @@ class StreamingRealtimeIrDownsampleFIR(tf.keras.layers.Layer):
         super().build(input_shape)
 
     def call(self, inputs):
+        # Inputs are [x_fullrate, state] where state has (L-1) previous full-rate samples
         x, state = inputs  # x: (B,T,1), state: (B,L-1,1)
+        # Concatenate state + new hop
         x_cat = tf.concat([state, x], axis=1)  # (B, L-1+T, 1)
-        y = tf.nn.conv1d(x_cat, filters=self.kernel, stride=self.factor, padding='VALID')  # (B, floor(T/N), 1)
+        # Strided causal conv (decimator)
+        y_full = tf.nn.conv1d(x_cat, filters=self.kernel, stride=self.factor, padding='VALID')  # (B, ?, 1)
+
+        # Keep only the "new" low-rate samples for this hop:
+        # n_new = ceil(T/factor)
+        T = tf.shape(x)[1]
+        n_new = tf.cast((T + self.factor - 1) // self.factor, tf.int32)
+        y = y_full[:, -n_new:, :]  # (B, n_new, 1)
+
+        # Next state is last (L-1) full-rate samples
         s_next = x_cat[:, - (tf.shape(self.kernel)[0] - 1):, :]
         return [y, s_next]
 
@@ -5852,6 +5863,340 @@ def run_render_stems_realtime(use_finetuned=False, prefer_static=False):
                                            hop=REALTIME_TFLITE_T,
                                            use_finetuned=use_finetuned)
 
+
+def _stems_tflite_outdir(kind, use_finetuned=False):
+    base = STEMS_FINETUNE_REALTIME_OUT_DIR if (use_finetuned and kind == "realtime") else \
+           STEMS_FINETUNE_OFFLINE_OUT_DIR  if (use_finetuned and kind == "offline")  else \
+           STEMS_REALTIME_OUT_DIR          if (kind == "realtime")                   else \
+           STEMS_OFFLINE_OUT_DIR
+    out_dir = os.path.join(base, "tflite")
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+def _make_knobs_for_kind(kind, pa=None, pr=None, ir=None, dry=None, use_finetuned=False):
+    # Start from defaults, then override linear gains
+    knobs = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
+    if kind == "realtime":
+        if pa is not None: knobs["realtime_knob_pickattack"] = np.array([[float(pa)]], dtype=np.float32)
+        if pr is not None: knobs["realtime_knob_pickreso"]   = np.array([[float(pr)]], dtype=np.float32)
+        if ir is not None: knobs["realtime_knob_ir"]         = np.array([[float(ir)]], dtype=np.float32)
+        if dry is not None:knobs["realtime_knob_drywet"]     = np.array([[float(dry)]], dtype=np.float32)
+    else:
+        if pa is not None: knobs["offline_knob_pickattack"]  = np.array([[float(pa)]], dtype=np.float32)
+        if pr is not None: knobs["offline_knob_pickreso"]    = np.array([[float(pr)]], dtype=np.float32)
+        if dry is not None:knobs["offline_knob_drywet"]      = np.array([[float(dry)]], dtype=np.float32)
+        # No IR branch in offline graph
+    return knobs
+
+def _tflite_schedule(kind, runner, T_fixed, core_len=None):
+    """
+    Decide left/core/right schedule for a single pass.
+    Returns dict with keys: is_stream, T_fixed, left, core, right.
+    """
+    is_stream = runner.is_streaming()
+    if is_stream:
+        if core_len is None:
+            core_len = T_fixed
+        return {"is_stream": True, "T_fixed": T_fixed, "left": 0, "core": int(core_len), "right": 0}
+    # Windowed (offline TFLite, or any non-streaming)
+    if core_len is None:
+        core_len = max(1, min(T_fixed // 2, 8192 if kind == "offline" else 512))
+    lc_m, rc_m = compute_streaming_ctx_constants(kind)
+    left_this  = min(int(lc_m), max(0, T_fixed - 1))
+    right_this = min(int(rc_m), max(0, T_fixed - 1 - left_this))
+    if (T_fixed - left_this - right_this) < core_len:
+        need = core_len - (T_fixed - left_this - right_this)
+        r_dec = min(right_this, need); right_this -= r_dec; need -= r_dec
+        if need > 0:
+            l_dec = min(left_this, need); left_this -= l_dec
+    return {"is_stream": False, "T_fixed": T_fixed, "left": int(left_this), "core": int(core_len), "right": int(right_this)}
+
+def _tflite_run_full_audio(runner, kind, x_mod, sample_rate, style_mode, knobs, fixed_hop=None):
+    """
+    Run one full pass and return mono audio vector.
+    style_mode: dict with keys:
+      - mode = 'pred' or 'forced'
+      - value = None (pred) or float scalar in [0,1] (forced)
+    knobs: dict of knob tensors keyed by model input name
+    """
+    # Determine T/hop
+    piezo_key = f"{kind}_piezo_input"
+    T_fixed = runner.input_length_T(piezo_key)
+    sched = _tflite_schedule(kind, runner, T_fixed, core_len=(fixed_hop if runner.is_streaming() else None))
+    is_stream = sched["is_stream"]
+    core_len  = sched["core"]
+    left      = sched["left"]
+    right     = sched["right"]
+
+    # Ensure we start with zero states for streaming
+    if runner.is_streaming():
+        runner.reset_states()
+
+    # Build per-pass constant style inputs
+    if style_mode["mode"] == "pred":
+        st_true  = np.zeros((1,1), dtype=np.float32)
+        st_force = np.zeros((1,1), dtype=np.float32)
+    else:
+        v = float(np.clip(style_mode.get("value", 0.0), 0.0, 1.0))
+        st_true  = np.array([[v]], dtype=np.float32)
+        st_force = np.ones((1,1), dtype=np.float32)
+
+    # Output buffers, also return style probability average on 'pred'
+    y_full = []
+    prob_sum = 0.0
+    prob_count = 0
+
+    pos = 0
+    N = len(x_mod)
+    while pos < N:
+        core = min(core_len, N - pos)
+        x_in = np.zeros((1, T_fixed, 1), dtype=np.float32)
+        if is_stream:
+            x_in[0, :core, 0] = x_mod[pos:pos+core]
+        else:
+            # left / core / right
+            ltake = min(left, pos)
+            rtake = min(right, N - (pos + core))
+            if ltake > 0:
+                x_in[0, left - ltake:left, 0] = x_mod[pos - ltake:pos]
+            x_in[0, left:left + core, 0] = x_mod[pos:pos + core]
+            if rtake > 0:
+                xs = pos + core; xe = xs + rtake
+                x_in[0, left + core:left + core + rtake, 0] = x_mod[xs:xe]
+
+        # Make feed
+        feed = {piezo_key: x_in}
+        if kind == "realtime":
+            feed["realtime_style_true_input"]  = st_true
+            feed["realtime_style_force_input"] = st_force
+        else:
+            feed["offline_style_true_input"]  = st_true
+            feed["offline_style_force_input"] = st_force
+        for k, v in knobs.items():
+            feed[k] = v.astype(np.float32, copy=False)
+
+        y_pred, s_pred = runner.invoke(feed)
+
+        if is_stream:
+            y_core = y_pred[0, :core, 0]
+        else:
+            y_core = y_pred[0, left:left + core, 0]
+
+        y_full.append(np.asarray(y_core, dtype=np.float32))
+        if style_mode["mode"] == "pred":
+            prob_sum   += float(np.asarray(s_pred, dtype=np.float32)[0, 0]) * float(core)
+            prob_count += core
+
+        pos += core
+
+    y = np.concatenate(y_full, axis=0) if y_full else np.zeros((0,), np.float32)
+    avg_prob = (prob_sum / float(prob_count)) if prob_count > 0 else None
+    return y, avg_prob
+
+def render_isolated_stems_tflite(kind, use_finetuned=False, hop=None):
+    """
+    Render stems from the TFLite model using difference-of-passes for:
+      - main core
+      - pickattack
+      - pickreso
+      - IR (realtime only)
+    For both predicted style and forced pick/finger.
+    Writes WAVs under out/demos/stems/<kind>/tflite/.
+    """
+    assert kind in ("offline", "realtime")
+    # Choose pair
+    if use_finetuned:
+        path_src = os.path.join(FINETUNE_SRC_DIR, "source.wav")
+        path_tgt = os.path.join(FINETUNE_SRC_DIR, "target.wav")
+    else:
+        assert_has_pairs()
+        path_src, path_tgt = all_pairs[DEMO_PAIR_INDEX]
+
+    # Style flag for display (only used to decide if forced pass is written)
+    if "pick" in path_src:
+        style_true_flag = 1.0
+    elif "finger" in path_src:
+        style_true_flag = 0.0
+    else:
+        style_true_flag = None
+
+    # Sample rate and TFLite path
+    sr = OFFLINE_SAMPLE_RATE if (kind == "offline") else REALTIME_SAMPLE_RATE
+    tflite_path = _select_tflite_demo_paths(kind=kind, use_finetuned=use_finetuned)
+    if not os.path.exists(tflite_path):
+        print(f"[stems/tflite] TFLite not found at {tflite_path}. Run --export-tflite first.")
+        return
+    print(f"[stems/tflite] Using: {tflite_path}")
+
+    # Read/resample audio
+    info = sf.info(path_src)
+    file_sr = info.samplerate
+    start = int(round(LONG_DEMO_OFFSET_SEC * file_sr))
+    frames = int(round(LONG_DEMO_SEC * file_sr))
+    x_blk_2d, _ = sf.read(path_src, start=start, frames=frames, dtype='float32', always_2d=True)
+    y_blk_2d, _ = sf.read(path_tgt, start=start, frames=frames, dtype='float32', always_2d=True)
+    x_file = x_blk_2d[:, 0]; y_file = y_blk_2d[:, 0]
+    x_mod = x_file if file_sr == sr else resample_to_model_sr(x_file, file_sr, sr)
+    y_mod = y_file if file_sr == sr else resample_to_model_sr(y_file, file_sr, sr)
+
+    # Runner and default knobs
+    runner = TFLiteRunner(tflite_path)
+    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind=kind, use_finetuned=use_finetuned)
+    dry_frac = 0.0  # fully wet for stems
+    base_knobs = _make_knobs_for_kind(kind, pa=pa_lin, pr=pr_lin, ir=(ir_lin if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+
+    # Helper to build per-pass knob dicts
+    def knobs_main_only():
+        return _make_knobs_for_kind(kind, pa=0.0, pr=0.0, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+    def knobs_ir_only():
+        return _make_knobs_for_kind(kind, pa=0.0, pr=0.0, ir=(ir_lin if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+    def knobs_pa_only():
+        return _make_knobs_for_kind(kind, pa=pa_lin, pr=0.0, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+    def knobs_pr_only():
+        return _make_knobs_for_kind(kind, pa=0.0, pr=pr_lin, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+
+    # Small helpers
+    def finalize(sig, headroom_db=1.0, dc_remove=True):
+        s = np.asarray(sig, np.float32)
+        if s.size == 0: return s
+        if dc_remove: s = s - float(np.mean(s))
+        peak = float(np.max(np.abs(s)) + 1e-12)
+        ceiling = 10.0 ** (-float(headroom_db) / 20.0)
+        if peak > ceiling: s = s * (ceiling / peak)
+        return s
+    def rms(x):
+        x = np.asarray(x, np.float32)
+        return float(np.sqrt(np.mean(x*x) + 1e-12)) if x.size else 0.0
+
+    out_dir = _stems_tflite_outdir(kind, use_finetuned=use_finetuned)
+    # Writers per pass
+    def open_writers(pass_key):
+        w = {}
+        if pass_key == "pred":
+            w["src"]  = sf.SoundFile(os.path.join(out_dir, "piezo_source.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+            w["tgt"]  = sf.SoundFile(os.path.join(out_dir, "mic_target.wav"),   mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+            w["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_predicted_tflite.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        elif pass_key == "forced_pick":
+            w["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_forced_pick_tflite.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        else:
+            w["full"] = sf.SoundFile(os.path.join(out_dir, "pred_full_forced_finger_tflite.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        # Stems
+        suffix = "" if pass_key == "pred" else ("_forced_pick" if pass_key == "forced_pick" else "_forced_finger")
+        w["main"]      = sf.SoundFile(os.path.join(out_dir, f"stem_main_core_only{'' if pass_key=='pred' else suffix}_tflite.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        w["pickattack"]= sf.SoundFile(os.path.join(out_dir, f"stem_pickattack_only{'' if pass_key=='pred' else suffix}_tflite.wav"), mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        w["pickreso"]  = sf.SoundFile(os.path.join(out_dir, f"stem_pickreso_only{'' if pass_key=='pred' else suffix}_tflite.wav"),   mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        if kind == "realtime":
+            w["ir"]    = sf.SoundFile(os.path.join(out_dir, f"stem_ir_lowpass{'' if pass_key=='pred' else suffix}_tflite.wav"),      mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        w["sum"]       = sf.SoundFile(os.path.join(out_dir, f"pred_full_sumcheck{'' if pass_key=='pred' else suffix}_tflite.wav"),   mode='w', samplerate=sr, channels=1, subtype='FLOAT')
+        return w
+    def close_all(w):
+        for v in w.values():
+            try: v.close()
+            except: pass
+
+    passes = [
+        ("pred",         {"mode":"pred",   "value": None}),
+        ("forced_pick",  {"mode":"forced", "value": 1.0}),
+        ("forced_finger",{"mode":"forced", "value": 0.0})
+    ]
+
+    for key, sty in passes:
+        if key != "pred" and style_true_flag is None:
+            # No ground truth → skip forced variants unless explicitly desired
+            # We still render both by request; remove this guard if you want skip
+            pass
+
+        w = open_writers(key)
+
+        # Full mix
+        y_full, p_avg = _tflite_run_full_audio(runner, kind, x_mod, sr, style_mode=sty, knobs=base_knobs, fixed_hop=hop)
+        w["full"].write(y_full)
+
+        # main core only
+        y_main, _ = _tflite_run_full_audio(runner, kind, x_mod, sr, style_mode=sty, knobs=knobs_main_only(), fixed_hop=hop)
+        # main+IR only (realtime)
+        if kind == "realtime":
+            y_m_ir, _ = _tflite_run_full_audio(runner, kind, x_mod, sr, style_mode=sty, knobs=knobs_ir_only(), fixed_hop=hop)
+            y_ir = y_m_ir - y_main
+        else:
+            y_ir = np.zeros_like(y_main)
+
+        # main+PA only
+        y_m_pa, _ = _tflite_run_full_audio(runner, kind, x_mod, sr, style_mode=sty, knobs=knobs_pa_only(), fixed_hop=hop)
+        y_pa = y_m_pa - y_main
+
+        # main+PR only
+        y_m_pr, _ = _tflite_run_full_audio(runner, kind, x_mod, sr, style_mode=sty, knobs=knobs_pr_only(), fixed_hop=hop)
+        y_pr = y_m_pr - y_main
+
+        # Finalize stems (DC remove + headroom) and write
+        main_f = finalize(y_main)
+        pa_f   = finalize(y_pa)
+        pr_f   = finalize(y_pr)
+        if kind == "realtime":
+            ir_f = finalize(y_ir)
+        else:
+            ir_f = np.zeros_like(main_f)
+
+        if key == "pred":
+            w["src"].write(x_mod); w["tgt"].write(y_mod)
+
+        w["main"].write(main_f)
+        w["pickattack"].write(pa_f)
+        w["pickreso"].write(pr_f)
+        if kind == "realtime":
+            w["ir"].write(ir_f)
+
+        # Sumcheck
+        y_sum = main_f + pa_f + pr_f + (ir_f if kind == "realtime" else 0.0)
+        y_sum = np.clip(y_sum, -1.0, 1.0)
+        w["sum"].write(y_sum)
+
+        # Log
+        if key == "pred" and p_avg is not None:
+            lbl = "pick" if p_avg > STYLE_FLAG_PROB_THRESHOLD else "finger"
+            print(f"[stems/tflite][pred] avg style={lbl} ({p_avg:.4f})")
+        print(f"[stems/tflite][{key}] RMS main={rms(main_f):.6f} pa={rms(pa_f):.6f} pr={rms(pr_f):.6f}" + (f" ir={rms(ir_f):.6f}" if kind=="realtime" else ""))
+
+        close_all(w)
+
+    print(f"✅ TFLite stems ({kind}) written to {out_dir}")
+
+def run_render_stems_tflite(args):
+    """
+    CLI front-end: --render-stems-tflite [--offline-only|--realtime-only] [--finetuned] [--both|--all] [--hop=N]
+    """
+    # Parse flags from args list (strings)
+    argset = set(args)
+    do_offline   = ("--realtime-only" not in argset)
+    do_realtime  = ("--offline-only"  not in argset)
+    use_finetuned = ("--finetuned"    in argset)
+    do_both       = ("--both"         in argset) or ("--all" in argset)
+
+    # Optional hop
+    hop = None
+    for a in list(argset):
+        if a.startswith("--hop="):
+            try:
+                hop = int(a.split("=",1)[1])
+            except Exception:
+                hop = None
+
+    # Render
+    if do_offline:
+        if do_both:
+            render_isolated_stems_tflite("offline", use_finetuned=False, hop=None)
+            render_isolated_stems_tflite("offline", use_finetuned=True,  hop=None)
+        else:
+            render_isolated_stems_tflite("offline", use_finetuned=use_finetuned, hop=None)
+
+    if do_realtime:
+        if do_both:
+            render_isolated_stems_tflite("realtime", use_finetuned=False, hop=hop)
+            render_isolated_stems_tflite("realtime", use_finetuned=True,  hop=hop)
+        else:
+            render_isolated_stems_tflite("realtime", use_finetuned=use_finetuned, hop=hop)
+
 def train_shared(
     kind,
     seg_len,
@@ -6664,21 +7009,27 @@ class PackStatesBundle(tf.keras.layers.Layer):
 
 
 @register_keras_serializable()
-def build_realtime_streaming_export_for_tflite(rt_stream_model):
+def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
     """
     Export wrapper for streaming realtime model that:
       - Emits audio (B,T,1) and style (B,1)
-      - Packs all realtime_state_*_next into a single bundle (B, sum(L_i*C_i))
+      - Packs all realtime_state_*_next into a single 2D bundle (B, sum(L_i*C_i))
       - Emits splits (1, N_states) int32 equal to DECLARED state-input lengths (L_i*C_i)
-    For each state, the flattened *_next is LEFT-padded or TAIL-cropped to the declared length,
-    so sum(splits) == bundle length by construction, and the most-recent tail stays intact.
+
+    strict:
+      - If True, raise if any '*_next' cannot be found in the model outputs.
+      - If False, pad missing states with zeros (legacy behavior).
     """
     import re
+    import numpy as np
+    import tensorflow as tf
 
     def norm_tensor_name(t):
         nm = t.name.split(':')[0]
-        if '/' in nm: nm = nm.split('/', 1)[0]
-        if nm.startswith("serving_default_"): nm = nm[len("serving_default_"):]
+        if '/' in nm:
+            nm = nm.split('/', 1)[0]
+        if nm.startswith("serving_default_"):
+            nm = nm[len("serving_default_"):]
         return nm
 
     def producer_layer_name(t):
@@ -6720,7 +7071,8 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model):
     out_by_prod = {}
     for t in outs:
         pn = producer_layer_name(t)
-        if pn: out_by_prod[pn] = t
+        if pn:
+            out_by_prod[pn] = t
     out_by_name = {norm_tensor_name(t): t for t in outs}
 
     flat_list = []
@@ -6729,28 +7081,33 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model):
 
     for (nm, expected_len) in state_in_meta:
         nm_next = nm + "_next"
-        t = out_by_prod.get(nm_next)
+
+        # Important: avoid boolean 'or' with KerasTensor; check None explicitly
+        t = out_by_prod.get(nm_next, None)
         if t is None:
-            t = out_by_name.get(nm_next)
+            t = out_by_name.get(nm_next, None)
+
         if t is None:
-            # relaxed match: strip trailing _<num>
+            # relaxed match: strip trailing _<num> from producer names
             base_map_prod = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_prod.items()}
-            t = base_map_prod.get(nm_next)
-        if t is None:
-            base_map_name = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_name.items()}
-            t = base_map_name.get(nm_next)
+            t = base_map_prod.get(nm_next, None)
+            if t is None:
+                base_map_name = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_name.items()}
+                t = base_map_name.get(nm_next, None)
 
         exp_len = int(expected_len)
 
         if t is None:
-            # No *_next found: synthesize (B, exp_len) zeros
+            missing.append(nm_next)
+            if strict:
+                continue
+            # Legacy behavior: synthesize zeros (B,exp_len)
             z = tf.keras.layers.Lambda(
                 lambda a, e=exp_len: tf.tile(tf.zeros((1, e), dtype=tf.float32),
                                              [tf.shape(a)[0], 1]),
                 name=f"{nm}_zeros")(audio)
             flat_list.append(z)
             declared_lengths.append(exp_len)
-            missing.append(nm)
             continue
 
         # Flatten (B,L,C) -> (B,L*C)
@@ -6765,7 +7122,7 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model):
 
         delta = exp_len - got_len
         if delta > 0:
-            # LEFT-pad zeros to preserve the most recent tail alignment
+            # LEFT-pad zeros to preserve most recent tail alignment
             flat_fixed = tf.keras.layers.Lambda(
                 lambda f, d=delta: tf.concat(
                     [tf.zeros((tf.shape(f)[0], d), dtype=f.dtype), f], axis=1),
@@ -6780,6 +7137,12 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model):
 
         flat_list.append(flat_fixed)
         declared_lengths.append(exp_len)
+
+    if strict and missing:
+        miss_str = "\n  - ".join(missing)
+        raise ValueError(f"[export/tflite] Missing '*_next' outputs for {len(missing)} state(s):\n  - {miss_str}\n"
+                         "Export cannot proceed safely. Ensure every realtime_state_* input has a corresponding "
+                         "'*_next' tensor in the model outputs.")
 
     # Concatenate all fixed-length flats; splits from declared (input) sizes
     if flat_list:
@@ -6802,22 +7165,20 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model):
         name=rt_stream_model.name + "_tflite_export"
     )
 
-    # Debug log
+    # Debug summary
     try:
         total = int(np.sum(lens_np))
-        print("[export/tflite] Streaming realtime (export wrapper, LEFT-padded to declared sizes):")
-        print(f"  states discovered: {len(state_in_meta)}")
-        print("  order: LEXICOGRAPHIC by state input name")
+        print("[export/tflite] Streaming realtime export wrapper")
+        print(f"  states discovered: {len(state_in_meta)} (lex order by input name)")
         for (nm, exp_len) in state_in_meta:
-            flag = "" if nm not in missing else " (MISSING_NEXT → zeros)"
+            flag = "" if (nm + "_next") not in missing else " (MISSING_NEXT)"
             print(f"    - {nm:<40} len={exp_len:<6d}{flag}")
-        def st(x):
-            s = getattr(x, "shape", None)
-            return tuple(int(d) if d is not None else None for d in s)
         print("[export/tflite] outputs:")
-        for t in export.outputs:
-            print("  -", t.name.split(':')[0], "shape=", st(t))
+        for t_ in export.outputs:
+            print("  -", t_.name.split(':')[0], "shape=", t_.shape)
         print(f"[export/tflite] sum(splits)={total}")
+        if missing and not strict:
+            print(f"[export/tflite] WARNING: {len(missing)} state(s) had MISSING_NEXT and were zero-padded in bundle.")
     except Exception:
         pass
 
@@ -6883,7 +7244,7 @@ def verify_tflite_bundle_file(path, strict=True):
     Chooses bundle/splits by SHAPE and DTYPE (robust to generic names and duplicate 'StatefulPartitionedCall' bases).
     """
     try:
-        intr = tf.lite.Interpreter(model_path=path)
+        intr = Interpreter(model_path=path)
         intr.allocate_tensors()
     except Exception as e:
         raise RuntimeError(f"[verify] Failed to open {path}: {e}")
@@ -7847,6 +8208,13 @@ class TFLiteRunner:
             splits = self._pick_splits_from_outs(outs_list)
             if bundle is not None:
                 self._update_states_from_bundle(bundle, splits=splits)
+
+                if self._is_streaming:
+                    total_states = len(self.state_in_names)
+                    updated = int(getattr(self, "_last_state_updates_count", 0))
+                    if updated != total_states:
+                        self._warn_throttled('bundle_partial_update',
+                            f"[TFLiteRunner] bundle updated {updated}/{total_states} states (check export wiring).")
 
         # Name-based per-state mapping is skipped (generic TFLite names).
         # Ordered fallback [audio, style, states...]
@@ -8876,6 +9244,14 @@ def main ():
                 run_render_stems_realtime(use_finetuned=True,  prefer_static=prefer_static_rt)
             else:
                 run_render_stems_realtime(use_finetuned=do_finetuned, prefer_static=prefer_static_rt)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--render-stems-tflite":
+        # Same options as --render-stems:
+        #   --offline-only / --realtime-only
+        #   --finetuned
+        #   --both | --all
+        #   --hop=N  (for realtime streaming hop)
+        run_render_stems_tflite(sys.argv[2:])
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--print-layers":
         
