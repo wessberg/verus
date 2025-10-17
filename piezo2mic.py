@@ -330,7 +330,7 @@ FINETUNE_OFFLINE_STATIC_MODEL_FILENAME  = "piezo2mic_finetuned_offline.keras"
 FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME = "piezo2mic_finetuned_offline_dynamic.keras"
 
 OFFLINE_TFLITE_T = 40960
-REALTIME_TFLITE_T = 6144 * 4
+REALTIME_TFLITE_T = 32
 OFFLINE_TFLITE_FP32_FILENAME = f"piezo2mic_baseline_offline_t{OFFLINE_TFLITE_T}_fp32.tflite"
 REALTIME_TFLITE_FP32_FILENAME = f"piezo2mic_baseline_realtime_t{REALTIME_TFLITE_T}_fp32.tflite"
 FINETUNE_OFFLINE_TFLITE_FP32_FILENAME = f"piezo2mic_finetuned_offline_t{OFFLINE_TFLITE_T}_fp32.tflite"
@@ -415,12 +415,12 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 2
-DEMO_OFFSET_SEC = 0
+DEMO_SEC        = 0.2
+DEMO_OFFSET_SEC = 0.2
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 2
-LONG_DEMO_OFFSET_SEC = 0
+LONG_DEMO_SEC        = 0.2
+LONG_DEMO_OFFSET_SEC = 0.2
 LONG_DEMO_PAIR_INDEX = 0
 
 PICK_SRC_DIR   = "./input/pick/source"
@@ -706,6 +706,40 @@ class StreamingScalarEMA(tf.keras.layers.Layer):
         cfg = super().get_config()
         cfg.update({"alpha": self.alpha})
         return cfg
+
+@register_keras_serializable()
+class StreamingStyleLerp(tf.keras.layers.Layer):
+    """
+    Expand a per-hop style scalar into a per-sample envelope by linearly
+    interpolating from the previous-hop scalar to the current-hop scalar.
+
+    Inputs:
+      [ref (B,T,1), style_scalar (B,1), s_prev (B,1,1)]
+    Outputs:
+      [style_time (B,T,1), s_next (B,1,1)]
+    """
+    def call(self, inputs):
+        ref, style_scalar, s_prev = inputs
+        T = tf.shape(ref)[1]
+
+        # prev/current scalars shaped (B,)
+        prev = tf.squeeze(s_prev, axis=[1, 2])
+        curr = tf.squeeze(style_scalar, axis=-1)
+
+        # r: (1,T) in [0,1], use (T-1) so last sample == curr
+        denom = tf.maximum(tf.cast(T - 1, ref.dtype), tf.constant(1.0, dtype=ref.dtype))
+        r = tf.cast(tf.range(T), ref.dtype)[None, :] / denom
+
+        # y[n] = prev + r[n]*(curr - prev)
+        delta = curr - prev
+        y = prev[:, None] + r * delta[:, None]     # (B,T)
+        y3 = y[:, :, None]                         # (B,T,1)
+
+        s_next = tf.reshape(curr, (-1, 1, 1))      # (B,1,1)
+        return [y3, s_next]
+
+    def get_config(self):
+        return super().get_config()
     
 @register_keras_serializable()
 class PickResoDownsampleFIR(Layer):
@@ -2631,24 +2665,68 @@ def compute_coloreq_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RAT
         print(f"[coloreq] LC = {LC} samples ({ms:.3f} ms)")
     return int(LC)
 
-def _select_stems_model_path(kind, use_finetuned=False):
-
+def _select_stems_model_path(kind, use_finetuned=False, prefer_static=False):
+    """
+    Select a saved Keras model filepath for stems/demos.
+    - kind: 'offline' or 'realtime'
+    - use_finetuned: prefer finetuned artifacts if present
+    - prefer_static: if True, prefer 'static' artifacts; else prefer 'dynamic' artifacts
+      Note: realtime static is the streaming T={REALTIME_TFLITE_T} graph; offline static uses fixed T train graph.
+    """
     if kind == "offline":
-        finetuned = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
-        baseline  = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+        # Offline artifacts
+        finetuned_dyn  = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
+        finetuned_stat = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
+        baseline_dyn   = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+        baseline_stat  = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+
+        if use_finetuned:
+            if prefer_static and os.path.exists(finetuned_stat):
+                return finetuned_stat
+            if os.path.exists(finetuned_dyn):
+                return finetuned_dyn
+            # fallback to baseline if finetuned missing
+            if prefer_static and os.path.exists(baseline_stat):
+                return baseline_stat
+            if os.path.exists(baseline_dyn):
+                return baseline_dyn
+            return None
+
+        # baseline
+        if prefer_static and os.path.exists(baseline_stat):
+            return baseline_stat
+        if os.path.exists(baseline_dyn):
+            return baseline_dyn
+        return None
+
     elif kind == "realtime":
-        finetuned = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
-        baseline  = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        # Realtime artifacts (streaming)
+        finetuned_dyn  = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_DYNAMIC_MODEL_FILENAME)
+        finetuned_stat = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
+        baseline_dyn   = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME)
+        baseline_stat  = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+
+        if use_finetuned:
+            if prefer_static and os.path.exists(finetuned_stat):
+                return finetuned_stat
+            if os.path.exists(finetuned_dyn):
+                return finetuned_dyn
+            # fallback to baseline if finetuned missing
+            if prefer_static and os.path.exists(baseline_stat):
+                return baseline_stat
+            if os.path.exists(baseline_dyn):
+                return baseline_dyn
+            return None
+
+        # baseline
+        if prefer_static and os.path.exists(baseline_stat):
+            return baseline_stat
+        if os.path.exists(baseline_dyn):
+            return baseline_dyn
+        return None
+
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
-
-    if use_finetuned and os.path.exists(finetuned):
-        return finetuned
-    
-    if os.path.exists(baseline):
-        return baseline
-
-    return None
 
 @register_keras_serializable()
 def pre_emphasis(x, alpha=HP_PRE_EMPHASIS_HF):
@@ -4209,13 +4287,13 @@ def build_realtime_streaming_model(dynamic_time=False,
     knob_ir_in = Input(shape=(1,), name="realtime_knob_ir")
     knob_dw_in = Input(shape=(1,), name="realtime_knob_drywet")
 
-    # Style head (unchanged)
+    # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
     style_logit = Dense(1, name="realtime_style_logit")(cls)
     style_prob  = Activation("sigmoid", name="realtime_style_prob")(style_logit)
 
-    # Streaming EMA for style (unchanged)
+    # EMA of per-hop style prob
     s_style = Input(shape=(1,1), name="realtime_state_style_ema")
     state_inputs.append(s_style)
     s_style_flat = Reshape((1,), name="realtime_state_style_ema_flat")(s_style)
@@ -4223,15 +4301,25 @@ def build_realtime_streaming_model(dynamic_time=False,
     s_style_next = Reshape((1,1), name="realtime_state_style_ema_expand")(s_style_next_flat)
     state_outputs.append(Activation('linear', name="realtime_state_style_ema_next")(s_style_next))
 
+    # Select predicted vs true style
     one_minus_force   = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
     style_used_scalar = Add(name="realtime_style_used_scalar")([
         Multiply(name="realtime_style_pred_part")([one_minus_force, style_prob_ema]),
         Multiply(name="realtime_style_true_part")([style_force_in, style_true_in]),
     ])
+
+    # Broadcast style scalar for FiLM, keep as scalar for time envelope
     style_scalar_b3 = Reshape((1, 1), name="realtime_style_scalar_broadcast")(style_used_scalar)
     style_embed     = Dense(REALTIME_EMBED_DIM, activation="linear", name="realtime_style_embed")(style_used_scalar)
 
-    # Main stack (unchanged)
+    # NEW: per-sample style_time via streaming linear interpolation between hops
+    s_style_prev = Input(shape=(1,1), name="realtime_state_style_prev")
+    state_inputs.append(s_style_prev)
+    style_time, s_style_prev_next = StreamingStyleLerp(name="realtime_style_time_stream")([inp, style_used_scalar, s_style_prev])
+    state_outputs.append(Activation('linear', name="realtime_state_style_prev_next")(s_style_prev_next))
+    inv_style_time = Lambda(invert, name="realtime_invert_style_time")(style_time)
+
+    # Main stack
     BC = ZeroBias()
     x = Conv1D(REALTIME_FILTERS, 1, padding="same", name="realtime_init_pw", bias_constraint=BC)(inp)
     for i in range(REALTIME_PRE_BLOCKS):
@@ -4274,12 +4362,13 @@ def build_realtime_streaming_model(dynamic_time=False,
 
     out_pick   = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_pick")(x)
     out_finger = Conv1D(1, 1, padding="same", bias_constraint=BC, name="realtime_final_finger")(x)
-    inv_style  = Lambda(invert, name="realtime_invert_style")(style_scalar_b3)
-    pick_c     = Multiply(name="realtime_pick_contrib")([style_scalar_b3, out_pick])
-    finger_c   = Multiply(name="realtime_finger_contrib")([inv_style,     out_finger])
+
+    # NEW: gate main with smoothed time envelope
+    pick_c     = Multiply(name="realtime_pick_contrib")([style_time, out_pick])
+    finger_c   = Multiply(name="realtime_finger_contrib")([inv_style_time, out_finger])
     y_main     = Add(name="realtime_main")([pick_c, finger_c])
 
-    # IR branch: use exact prototype taps for DS to ensure equivalence
+    # IR branch (streaming)
     s_ir_ds = Input(shape=(REALTIME_IR_FIR_SIZE - 1, 1), name="realtime_state_ir_ds")
     state_inputs.append(s_ir_ds)
     ir_ds, s_ir_ds_next = StreamingRealtimeIrDownsampleFIR(
@@ -4362,13 +4451,13 @@ def build_realtime_streaming_model(dynamic_time=False,
         Activation('linear', name="realtime_state_pickmask_prev_next")(s_prev_n),
     ]
 
-    # Pre-emphasis state (unchanged)
+    # Pre-emphasis
     s_pre = Input(shape=(1,1), name="realtime_state_preemph")
     state_inputs.append(s_pre)
     hf_in, s_pre_next = PreEmphasisStream(alpha=HP_PRE_EMPHASIS_HF, name="realtime_hf_pre_emph_stream")([inp, s_pre])
     state_outputs.append(Activation('linear', name="realtime_state_preemph_next")(s_pre_next))
 
-        # Pick-attack tiny CNN streaming (LeakyReLU to avoid dead branch)
+    # Pick-attack tiny CNN (smoothed style gating)
     x_pa = Multiply(name="realtime_picklearn_gate")([hf_in, mask])
 
     pad_c1 = (7 - 1) * 1
@@ -4390,10 +4479,11 @@ def build_realtime_streaming_model(dynamic_time=False,
     state_outputs.append(s_c2n)
 
     x_pa_out = Conv1D(1, 1, padding="same", name="realtime_picklearn_out")(x_pa2)
-    xg = Multiply(name="realtime_pickattack_gated")([x_pa_out, style_scalar_b3])
+    # NEW: gate with smoothed time envelope
+    xg = Multiply(name="realtime_pickattack_gated")([x_pa_out, style_time])
     xg = SoftClip1D(drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE, limit=0.98, name="realtime_pickattack_softclip")(xg)
 
-    # NEW: streaming fade-in to suppress HPF startup pop (≈ 3 ms)
+    # Fade-in ramp to suppress startup pop
     s_pa_ramp = Input(shape=(1,1), name="realtime_state_pickattack_ramp")
     state_inputs.append(s_pa_ramp)
     ramp_pa, s_pa_ramp_n = StreamingLinearRamp(ramp_len=int(0.003 * REALTIME_SAMPLE_RATE),
@@ -4401,7 +4491,7 @@ def build_realtime_streaming_model(dynamic_time=False,
     state_outputs.append(Activation('linear', name="realtime_state_pickattack_ramp_next")(s_pa_ramp_n))
     xg = Multiply(name="realtime_pickattack_ramp_apply")([xg, ramp_pa])
 
-    # Pick-attack post HPF (exact-length taps, 2 kHz cutoff for realtime)
+    # Post-HPF + scale + limit
     s_hp_pa = Input(shape=(PICK_ATTACK_LOWBAND_PENALTY_ORDER - 1, 1), name="realtime_state_pickattack_posthp")
     state_inputs.append(s_hp_pa)
     L_pa = int(PICK_ATTACK_LOWBAND_PENALTY_ORDER)
@@ -4414,7 +4504,7 @@ def build_realtime_streaming_model(dynamic_time=False,
     limit_lin = 10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0)
     y_pa = SoftClip1D(drive=PICK_LIMITER_DRIVE, limit=limit_lin, name="realtime_pickattack_limit")(y_pa)
 
-    # Pick-reso streaming
+    # Pick-reso streaming (smoothed style gating)
     s_on_prev = Input(shape=(1,1), name="realtime_state_pickreso_onset_prev")
     state_inputs.append(s_on_prev)
     onset, s_on_prev_n = StreamingDiffPos(name="realtime_pickreso_onset_stream")([mask, s_on_prev])
@@ -4441,14 +4531,17 @@ def build_realtime_streaming_model(dynamic_time=False,
     state_outputs.append(Activation('linear', name="realtime_state_pickreso_ctrl_bp_next")(s_bp_n))
     amp_raw = Abs1D()(bp_out)
 
-    s_env2_len = int(np.clip(np.ceil(3.0 * max(1, int(round(3.0/1000.0 * REALTIME_SAMPLE_RATE)))), 8, 256))
+    # 3 ms time constant in samples
+    tau_env2 = max(1, int(round((3.0 / 1000.0) * REALTIME_SAMPLE_RATE)))
+    # FIR length ≈ 3 × tau, clipped to [8, 256]
+    s_env2_len = int(np.clip(np.ceil(3.0 * tau_env2), 8, 256))
+
     s_env2 = Input(shape=(s_env2_len - 1, 1), name="realtime_state_pickreso_ctrl_env")
     state_inputs.append(s_env2)
-    tau_env2 = max(1, int(round((3.0/1000.0) * REALTIME_SAMPLE_RATE)))
     k_env2 = _exp_smoothing_kernel(tau_env2, scale=4.0, Lmax=s_env2_len)
     amp, s_env2_n = StreamFixedFIR(kernel_len=s_env2_len, out_ch=1, weight_name="exp_smooth_taps",
-                                   trainable_kernel=False, taps_init=k_env2,
-                                   name="realtime_pickreso_ctrl_env")([amp_raw, s_env2])
+                                trainable_kernel=False, taps_init=k_env2,
+                                name="realtime_pickreso_ctrl_env")([amp_raw, s_env2])
     state_outputs.append(Activation('linear', name="realtime_state_pickreso_ctrl_env_next")(s_env2_n))
     amp = Lambda(clip_01x4, name="realtime_pickreso_ctrl_gain")(amp)
 
@@ -4482,7 +4575,8 @@ def build_realtime_streaming_model(dynamic_time=False,
     state_outputs.append(Activation('linear', name="realtime_state_pickreso_interp_next")(s_interp_n))
     mixed = MatchTimeToRef(name="realtime_pickreso_matchlen")([up, inp])
 
-    xg_reso = Multiply(name="realtime_pickreso_gated")([mixed, style_scalar_b3])
+    # NEW: gate with smoothed style envelope
+    xg_reso = Multiply(name="realtime_pickreso_gated")([mixed, style_time])
 
     s_hp_reso = Input(shape=(PICK_RESO_LOWBAND_PENALTY_ORDER - 1, 1), name="realtime_state_pickreso_posthp")
     state_inputs.append(s_hp_reso)
@@ -4497,7 +4591,7 @@ def build_realtime_streaming_model(dynamic_time=False,
     y_reso = SoftClip1D(drive=PICK_LIMITER_DRIVE, limit=10.0 ** (-PICK_LIMITER_HEADROOM_DB / 20.0), name="realtime_pickreso_limit")(y_reso)
     y_reso = IrScale(init=1.0, name="realtime_pickreso_calib")(y_reso)
 
-    # Mix stems and coloreq (unchanged)
+    # Mix stems and coloreq
     pickattack = apply_runtime_gain(y_pa, knob_pa_in, name="realtime_pickattack_user_gain")
     pickreso   = apply_runtime_gain(y_reso, knob_pr_in, name="realtime_pickreso_user_gain")
     ir         = apply_runtime_gain(ir,   knob_ir_in,   name="realtime_ir_user_gain")
@@ -5079,7 +5173,7 @@ def render_isolated_stems_realtime_runtime(model,
                                            sample_rate,
                                            sec=LONG_DEMO_SEC,
                                            offset_sec=LONG_DEMO_OFFSET_SEC,
-                                           hop=1024,
+                                           hop=REALTIME_TFLITE_T,
                                            use_finetuned=False):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -5726,7 +5820,7 @@ def run_render_stems_offline(use_finetuned=False):
                           use_finetuned=use_finetuned)
 
 
-def run_render_stems_realtime(use_finetuned=False):
+def run_render_stems_realtime(use_finetuned=False, prefer_static=False):
     print("[stems/realtime] run_render_stems_realtime (runtime streaming path)")
     sample_rate = REALTIME_SAMPLE_RATE
 
@@ -5737,23 +5831,25 @@ def run_render_stems_realtime(use_finetuned=False):
         assert_has_pairs()
         src, tgt = all_pairs[DEMO_PAIR_INDEX]
 
-    dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
+    dpath = _select_stems_model_path(kind="realtime",
+                                     use_finetuned=bool(use_finetuned),
+                                     prefer_static=bool(prefer_static))
     if dpath is None:
-        print("[stems/realtime] No realtime dynamic models found."); sys.exit(1)
+        print("[stems/realtime] No realtime models found."); sys.exit(1)
     print("[stems/realtime] Using:", dpath)
-    realtime_dyn = tf.keras.models.load_model(dpath, compile=False)
+    realtime_m = tf.keras.models.load_model(dpath, compile=False)
 
     out_dir = STEMS_FINETUNE_REALTIME_OUT_DIR if use_finetuned else STEMS_REALTIME_OUT_DIR
 
     # Use the runtime streaming renderer that taps post‑knob heads
-    render_isolated_stems_realtime_runtime(model=realtime_dyn,
+    render_isolated_stems_realtime_runtime(model=realtime_m,
                                            path_src=src,
                                            path_tgt=tgt,
                                            out_dir=out_dir,
                                            sample_rate=sample_rate,
                                            sec=LONG_DEMO_SEC,
                                            offset_sec=LONG_DEMO_OFFSET_SEC,
-                                           hop=1024,
+                                           hop=REALTIME_TFLITE_T,
                                            use_finetuned=use_finetuned)
 
 def train_shared(
@@ -6403,23 +6499,32 @@ def generate_demo(model, kind, out_dir, sample_rate, prediction_name="demo_pred"
     else:
         print(f"✅ Demo saved to {style_pred_path}.")
         
-def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, demo_out_dir):
+def prepare_and_generate_demo(kind, sample_rate, dynamic_model_filepath, demo_out_dir, prefer_static=False):
     """
     For demos, only load saved artifacts:
-      - offline: dynamic offline model (non-streaming)
-      - realtime: static T=32 streaming model (self-contained)
-    This function never builds graphs.
+      - offline: dynamic offline model (non-streaming) by default; if prefer_static=True and static exists, use it
+      - realtime: static T=32 streaming model (self-contained) is preferred; prefer_static=True is recommended
+    This function never builds graphs; it loads saved .keras models and runs generate_demo.
     """
     # Prefer saved artifacts by kind
     prefer = None
     if kind == "offline":
-        cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
-        if os.path.exists(cand):
-            prefer = cand
+        if prefer_static:
+            cand = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+            if os.path.exists(cand):
+                prefer = cand
+        if prefer is None:
+            cand_dyn = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+            if os.path.exists(cand_dyn):
+                prefer = cand_dyn
+
     elif kind == "realtime":
+        # Realtime demo expects streaming T=32 model
         cand = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
         if os.path.exists(cand):
             prefer = cand
+        # If prefer_static=False and caller passed a concrete path, we will use fallback below,
+        # but note generate_demo(realtime) enforces static T=32.
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
 
@@ -6543,6 +6648,389 @@ def _wrap_fixed_T_for_tflite(dyn_model, kind, T_fixed):
     else:
         raise ValueError("kind must be 'offline' or 'realtime'")
     return export
+@register_keras_serializable()
+class PackStatesBundle(tf.keras.layers.Layer):
+    """
+    Concatenate all streaming 'next state' tensors into a single 2D bundle:
+      inputs: list of (B, L_i, C_i)
+      output: (B, sum_i (L_i*C_i))
+    """
+    def call(self, states_list):
+        flats = [tf.reshape(s, [tf.shape(s)[0], -1]) for s in states_list]
+        return tf.concat(flats, axis=1)
+
+    def get_config(self):
+        return super().get_config()
+
+
+@register_keras_serializable()
+def build_realtime_streaming_export_for_tflite(rt_stream_model):
+    """
+    Export wrapper for streaming realtime model that:
+      - Emits audio (B,T,1) and style (B,1)
+      - Packs all realtime_state_*_next into a single bundle (B, sum(L_i*C_i))
+      - Emits splits (1, N_states) int32 equal to DECLARED state-input lengths (L_i*C_i)
+    For each state, the flattened *_next is LEFT-padded or TAIL-cropped to the declared length,
+    so sum(splits) == bundle length by construction, and the most-recent tail stays intact.
+    """
+    import re
+
+    def norm_tensor_name(t):
+        nm = t.name.split(':')[0]
+        if '/' in nm: nm = nm.split('/', 1)[0]
+        if nm.startswith("serving_default_"): nm = nm[len("serving_default_"):]
+        return nm
+
+    def producer_layer_name(t):
+        kh = getattr(t, "_keras_history", None)
+        try:
+            layer = kh[0] if isinstance(kh, (tuple, list)) else getattr(kh, "layer", None)
+            return getattr(layer, "name", None)
+        except Exception:
+            return None
+
+    # Audio/style
+    try:
+        audio = rt_stream_model.get_layer("realtime_drywet_mix").output
+    except Exception:
+        audio = rt_stream_model.outputs[0]
+    try:
+        style = rt_stream_model.get_layer("realtime_style_prob").output
+    except Exception:
+        if len(rt_stream_model.outputs) > 1:
+            style = rt_stream_model.outputs[1]
+        else:
+            style = tf.keras.layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], 1), tf.float32),
+                                           name="realtime_style_prob")(audio)
+
+    # Declared states (inputs) in lexicographic order with expected flattened lengths
+    inputs = list(rt_stream_model.inputs)
+    in_names = [norm_tensor_name(t) for t in inputs]
+    state_in_meta = []
+    for t in inputs:
+        nm = norm_tensor_name(t)
+        if nm.startswith("realtime_state_"):
+            L = int(t.shape[1]) if t.shape[1] is not None else 0
+            C = int(t.shape[2]) if t.shape[2] is not None else 1
+            state_in_meta.append((nm, L * C))
+    state_in_meta.sort(key=lambda p: p[0])
+
+    # Map outputs by producer layer and normalized tensor name
+    outs = list(rt_stream_model.outputs)
+    out_by_prod = {}
+    for t in outs:
+        pn = producer_layer_name(t)
+        if pn: out_by_prod[pn] = t
+    out_by_name = {norm_tensor_name(t): t for t in outs}
+
+    flat_list = []
+    declared_lengths = []
+    missing = []
+
+    for (nm, expected_len) in state_in_meta:
+        nm_next = nm + "_next"
+        t = out_by_prod.get(nm_next)
+        if t is None:
+            t = out_by_name.get(nm_next)
+        if t is None:
+            # relaxed match: strip trailing _<num>
+            base_map_prod = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_prod.items()}
+            t = base_map_prod.get(nm_next)
+        if t is None:
+            base_map_name = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_name.items()}
+            t = base_map_name.get(nm_next)
+
+        exp_len = int(expected_len)
+
+        if t is None:
+            # No *_next found: synthesize (B, exp_len) zeros
+            z = tf.keras.layers.Lambda(
+                lambda a, e=exp_len: tf.tile(tf.zeros((1, e), dtype=tf.float32),
+                                             [tf.shape(a)[0], 1]),
+                name=f"{nm}_zeros")(audio)
+            flat_list.append(z)
+            declared_lengths.append(exp_len)
+            missing.append(nm)
+            continue
+
+        # Flatten (B,L,C) -> (B,L*C)
+        flat = tf.keras.layers.Flatten(name=f"{nm}_flatten")(t)
+
+        got_len = flat.shape[1]
+        if got_len is None:
+            Ls = t.shape[1] or 0
+            Cs = t.shape[2] or 1
+            got_len = int(Ls) * int(Cs)
+        got_len = int(got_len)
+
+        delta = exp_len - got_len
+        if delta > 0:
+            # LEFT-pad zeros to preserve the most recent tail alignment
+            flat_fixed = tf.keras.layers.Lambda(
+                lambda f, d=delta: tf.concat(
+                    [tf.zeros((tf.shape(f)[0], d), dtype=f.dtype), f], axis=1),
+                name=f"{nm}_padleft")(flat)
+        elif delta < 0:
+            # Tail-crop to keep most recent samples
+            flat_fixed = tf.keras.layers.Lambda(
+                lambda f, e=exp_len: f[:, -e:],
+                name=f"{nm}_tailcrop")(flat)
+        else:
+            flat_fixed = flat
+
+        flat_list.append(flat_fixed)
+        declared_lengths.append(exp_len)
+
+    # Concatenate all fixed-length flats; splits from declared (input) sizes
+    if flat_list:
+        bundle = tf.keras.layers.Concatenate(axis=1, name="realtime_states_bundle_out")(flat_list)
+    else:
+        bundle = tf.keras.layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], 1), tf.float32),
+                                        name="realtime_states_bundle_out")(audio)
+
+    lens_np = np.array(declared_lengths, dtype=np.int32).reshape(1, -1)
+    splits = tf.keras.layers.Lambda(lambda _: tf.constant(lens_np, dtype=tf.int32),
+                                    name="realtime_states_splits_out")(audio)
+
+    # Final named outputs
+    y_out = tf.keras.layers.Activation('linear', name="realtime_audio_out")(audio)
+    s_out = tf.keras.layers.Activation('linear', name="realtime_style_prob_out")(style)
+
+    export = tf.keras.models.Model(
+        inputs=inputs,
+        outputs=[y_out, s_out, bundle, splits],
+        name=rt_stream_model.name + "_tflite_export"
+    )
+
+    # Debug log
+    try:
+        total = int(np.sum(lens_np))
+        print("[export/tflite] Streaming realtime (export wrapper, LEFT-padded to declared sizes):")
+        print(f"  states discovered: {len(state_in_meta)}")
+        print("  order: LEXICOGRAPHIC by state input name")
+        for (nm, exp_len) in state_in_meta:
+            flag = "" if nm not in missing else " (MISSING_NEXT → zeros)"
+            print(f"    - {nm:<40} len={exp_len:<6d}{flag}")
+        def st(x):
+            s = getattr(x, "shape", None)
+            return tuple(int(d) if d is not None else None for d in s)
+        print("[export/tflite] outputs:")
+        for t in export.outputs:
+            print("  -", t.name.split(':')[0], "shape=", st(t))
+        print(f"[export/tflite] sum(splits)={total}")
+    except Exception:
+        pass
+
+    return export
+
+def _inspect_tflite_file(path):
+    try:
+        intr = Interpreter(model_path=path)
+        intr.allocate_tensors()
+        outs = intr.get_output_details()
+        ins  = intr.get_input_details()
+        out_list = [(str(d["name"]), tuple(int(x) for x in d["shape"])) for d in outs]
+        in_list  = [(str(d["name"]), tuple(int(x) for x in d["shape"])) for d in ins]
+        print("[TFLite/inspect] Inputs:")
+        for n, s in in_list:
+            print("  ", n, s)
+        print("[TFLite/inspect] Outputs:")
+        for n, s in out_list:
+            print("  ", n, s)
+        return in_list, out_list
+    except Exception as e:
+        print(f"[TFLite/inspect] Could not inspect TFLite file: {e}")
+        return [], []
+
+
+def _validate_tflite_outputs_by_shape(kind, outs, T_fixed=None):
+    shapes = [s for (_, s) in outs]
+    if kind == "offline":
+        if len(shapes) != 2:
+            raise RuntimeError(f"[TFLite/export] OFFLINE expected 2 outputs but found {len(shapes)}: {outs}")
+        n3d = [s for s in shapes if len(s) == 3]
+        n2d = [s for s in shapes if len(s) == 2]
+        if len(n3d) != 1 or len(n2d) != 1:
+            raise RuntimeError(f"[TFLite/export] OFFLINE expected [3D audio, 2D style] but got: {outs}")
+        return True
+
+    # realtime
+    if not (3 <= len(shapes) <= 4):
+        raise RuntimeError(f"[TFLite/export] REALTIME expected 3 or 4 outputs (audio, style, bundle[, splits]) but found {len(shapes)}: {outs}")
+
+    three_d = [s for s in shapes if len(s) == 3]
+    two_d   = [s for s in shapes if len(s) == 2]
+
+    if len(three_d) != 1 or len(two_d) < 2:
+        raise RuntimeError(f"[TFLite/export] REALTIME expected [3D audio, 2D style, 2D bundle] but got: {outs}")
+
+    if (1,1) not in two_d:
+        print(f"[TFLite/export] WARNING: REALTIME style not found as (1,1); got 2D shapes {two_d}. Continuing.")
+
+    non_trivial_2d = [s for s in two_d if s != (1,1)]
+    if not non_trivial_2d:
+        raise RuntimeError("[TFLite/export] REALTIME bundle appears missing (no 2D output other than (1,1)).")
+    if T_fixed is not None and three_d[0][1] != int(T_fixed):
+        print(f"[TFLite/export] WARNING: REALTIME audio T={three_d[0][1]} != fixed T={T_fixed}. Continuing.")
+    return True
+
+def verify_tflite_bundle_file(path, strict=True):
+    """
+    Inspect a realtime TFLite and verify:
+      - 4 outputs: audio (3D), style (1,1), bundle (2D float), splits (2D int)
+      - sum(splits) == bundle length
+      - sum(L*C of 'realtime_state_*' inputs) == bundle length (optional; exporter may omit states with len=0)
+    Chooses bundle/splits by SHAPE and DTYPE (robust to generic names and duplicate 'StatefulPartitionedCall' bases).
+    """
+    try:
+        intr = tf.lite.Interpreter(model_path=path)
+        intr.allocate_tensors()
+    except Exception as e:
+        raise RuntimeError(f"[verify] Failed to open {path}: {e}")
+
+    ins  = intr.get_input_details()
+    outs = intr.get_output_details()
+
+    # Streaming state inputs
+    state_inputs = []
+    for d in ins:
+        nm = str(d["name"])
+        if b"realtime_state_" in d["name"] if isinstance(d["name"], bytes) else "realtime_state_" in nm:
+            state_inputs.append(d)
+    exp_sum = 0
+    for d in state_inputs:
+        s = tuple(int(x) for x in d["shape"])
+        L = s[1] if len(s) > 1 else 0
+        C = s[2] if len(s) > 2 else 1
+        exp_sum += (L * C)
+
+    # Pick outputs by shape/dtype
+    def is_int(arr_dtype):
+        return np.issubdtype(arr_dtype, np.integer)
+
+    # Run once so get_tensor works for all consts
+    intr.invoke()
+
+    audio_detail = None
+    bundle_detail = None
+    splits_detail = None
+
+    # Audio = only 3D output
+    for d in outs:
+        shp = tuple(int(x) for x in d["shape"])
+        if len(shp) == 3:
+            audio_detail = d
+            break
+
+    # Bundle = largest 2D float output (excluding (1,1))
+    best_total = -1
+    for d in outs:
+        shp = tuple(int(x) for x in d["shape"])
+        if len(shp) == 2 and shp != (1,1):
+            arr = intr.get_tensor(d["index"])
+            if arr.dtype == np.float32:
+                total = int(np.prod(shp))
+                if total > best_total:
+                    best_total = total
+                    bundle_detail = d
+
+    # Splits = (1,N) or (N,) integer vector where N == #states
+    n_states = len(state_inputs)
+    for d in outs:
+        shp = tuple(int(x) for x in d["shape"])
+        if len(shp) == 2 and shp[0] == 1 and shp[1] == n_states:
+            arr = intr.get_tensor(d["index"])
+            if is_int(arr.dtype):
+                splits_detail = d
+                break
+    if splits_detail is None:
+        for d in outs:
+            shp = tuple(int(x) for x in d["shape"])
+            if (len(shp) == 1 and shp[0] == n_states) or (len(shp) == 2 and shp == (n_states,1)):
+                arr = intr.get_tensor(d["index"])
+                if is_int(arr.dtype):
+                    splits_detail = d
+                    break
+
+    # Print a summary
+    print("[verify] TFLite:", path)
+    print(f"[verify] inputs(states): {n_states} expected bundle len: {exp_sum}")
+    for d in state_inputs[:8]:
+        print(f"  in: {d['name']} {tuple(int(x) for x in d['shape'])}")
+    if len(state_inputs) > 8:
+        print(f"  ... {len(state_inputs)-8} more")
+
+    print("[verify] outputs:")
+    for d in outs:
+        print(f"  out: {d['name']} {tuple(int(x) for x in d['shape'])}")
+
+    if bundle_detail is None or splits_detail is None:
+        msg = "[verify] Missing bundle or splits (by shape). Exporter likely failed to pack states."
+        if strict: raise RuntimeError(msg)
+        print("WARN:", msg)
+        return
+
+    b = intr.get_tensor(bundle_detail["index"])
+    if b.ndim == 2:
+        bundle_len = int(np.prod(b.shape[1:]))
+    elif b.ndim == 1:
+        bundle_len = int(b.shape[0])
+    else:
+        bundle_len = int(b.size)
+    print(f"[verify] bundle len (tensor): {bundle_len}")
+
+    s = intr.get_tensor(splits_detail["index"])
+    s = s.reshape(1, -1).astype(np.int32, copy=False)
+    s_sum = int(np.sum(s))
+    s_cnt = int(s.shape[1])
+    print(f"[verify] splits count: {s_cnt}, sum(splits): {s_sum}")
+
+    if s_cnt != n_states:
+        msg = f"[verify] splits count ({s_cnt}) != #state inputs ({n_states})"
+        if strict: raise RuntimeError(msg)
+        print("WARN:", msg)
+
+    if s_sum != bundle_len:
+        msg = f"[verify] sum(splits) ({s_sum}) != bundle len ({bundle_len})"
+        if strict: raise RuntimeError(msg)
+        print("WARN:", msg)
+
+    if exp_sum != bundle_len:
+        msg = f"[verify] sum(L*C of inputs) ({exp_sum}) != bundle len ({bundle_len})"
+        if strict: raise RuntimeError(msg)
+        print("WARN:", msg)
+    else:
+        print("[verify] OK: bundle matches streaming state sizes.")
+
+def _convert_keras_to_tflite_fp32_checked(model, out_path, validate_kind=None, T_fixed=None):
+    """
+    Convert Keras model to FP32 TFLite, write to out_path, then inspect and validate by SHAPES.
+    validate_kind: 'offline' or 'realtime' or None (skip validation).
+    """
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.inference_input_type = tf.float32
+    converter.inference_output_type = tf.float32
+    try:
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
+        tflm = converter.convert()
+    except Exception as e:
+        print(f"[TFLite] Builtin conversion failed ({e}); retrying with SELECT_TF_OPS…")
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+        converter.inference_input_type = tf.float32
+        converter.inference_output_type = tf.float32
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.SELECT_TF_OPS
+        ]
+        tflm = converter.convert()
+
+    with open(out_path, "wb") as f:
+        f.write(tflm)
+    print(f"✅ Saved FP32 TFLite: {out_path}")
+
+    if validate_kind:
+        _, outs = _inspect_tflite_file(out_path)
+        _validate_tflite_outputs_by_shape(validate_kind, outs, T_fixed=T_fixed)
 
 def _convert_keras_to_tflite_fp32(model, out_path):
     """
@@ -6588,8 +7076,8 @@ def _build_dyn_model_for_export(kind):
 def _export_one_tflite(kind, static_src_path, out_tflite_path, T_fixed):
     """
     Export a single FP32 TFLite for a given 'kind' from a static Keras model.
-    - offline: wrap teacherless runtime graph to fixed T
-    - realtime: convert the self-contained STREAMING graph at fixed T (state I/O preserved)
+    - offline: wrap fixed‑T and validate [3D audio, 2D style]
+    - realtime: wrap streaming and validate [3D audio, 2D style, 2D bundle]
     """
     if not os.path.exists(static_src_path):
         print(f"[TFLite/export] Missing source model: {static_src_path}")
@@ -6603,62 +7091,77 @@ def _export_one_tflite(kind, static_src_path, out_tflite_path, T_fixed):
         copy_weights_by_name(dyn, static_m, verbose=True)
 
         export = _wrap_fixed_T_for_tflite(dyn, kind="offline", T_fixed=T_fixed)
-        _convert_keras_to_tflite_fp32(export, out_tflite_path)
+        _convert_keras_to_tflite_fp32_checked(export, out_tflite_path, validate_kind="offline", T_fixed=T_fixed)
         return True
 
-    # kind == "realtime": export streaming/stateful graph with fixed T
+    # kind == "realtime"
     print(f"[TFLite/export] Loading realtime streaming static: {static_src_path}")
     rt_static = tf.keras.models.load_model(static_src_path, compile=False)
 
     T_fixed = int(T_fixed)
-    if T_fixed == int(REALTIME_TFLITE_T):
-        # Already T=32 streaming: convert as-is
-        _convert_keras_to_tflite_fp32(rt_static, out_tflite_path)
-        return True
+    t_in = None
+    try:
+        t_in = int(rt_static.inputs[0].shape[1]) if rt_static.inputs else None
+    except Exception:
+        t_in = None
+    if (t_in is not None) and (t_in not in (T_fixed,)):
+        rt_fixedT = build_realtime_streaming_model(static_T=T_fixed)
+        copy_weights_by_name(rt_fixedT, rt_static, verbose=True)
+        rt_static = rt_fixedT
 
-    # Rebuild streaming with desired fixed T and copy weights by name
-    rt_fixedT = build_realtime_streaming_model(static_T=T_fixed)
-    copy_weights_by_name(rt_fixedT, rt_static, verbose=True)
-    _convert_keras_to_tflite_fp32(rt_fixedT, out_tflite_path)
+    export = build_realtime_streaming_export_for_tflite(rt_static)
+
+    # Write to a distinct filename to avoid confusion with older files
+    base, ext = os.path.splitext(out_tflite_path)
+    _convert_keras_to_tflite_fp32_checked(export, out_tflite_path, validate_kind="realtime", T_fixed=T_fixed)
+    print(f"✅ Saved realtime TFLite: {out_tflite_path}")
     return True
 
 def export_tflite_all():
-    # OFFLINE (unchanged)
+    # OFFLINE
     offline_static_src = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
     offline_tflite_out = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_TFLITE_FP32_FILENAME)
-    _export_one_tflite(kind="offline",
+    ok_off = _export_one_tflite(kind="offline",
                        static_src_path=offline_static_src,
                        out_tflite_path=offline_tflite_out,
                        T_fixed=OFFLINE_TFLITE_T)
 
     offline_ft_src = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
     offline_ft_out = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_TFLITE_FP32_FILENAME)
+    ok_off_ft = False
     if os.path.exists(offline_ft_src):
-        _export_one_tflite(kind="offline",
+        ok_off_ft = _export_one_tflite(kind="offline",
                            static_src_path=offline_ft_src,
                            out_tflite_path=offline_ft_out,
                            T_fixed=OFFLINE_TFLITE_T)
     else:
         print(f"[TFLite/export] Skipping finetuned OFFLINE (not found): {offline_ft_src}")
 
-    # REALTIME (streaming/stateful)
+    # REALTIME baseline
     rt_static_src = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
-    rt_tflite_out      = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_FILENAME)
-
-    _export_one_tflite(kind="realtime",
+    rt_tflite_out = os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_FILENAME)
+    ok_rt = _export_one_tflite(kind="realtime",
                        static_src_path=rt_static_src,
                        out_tflite_path=rt_tflite_out,
                        T_fixed=REALTIME_TFLITE_T)
 
+    # REALTIME finetuned
     rt_ft_static_src = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_STATIC_MODEL_FILENAME)
-    rt_ft_out      = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_FILENAME)
+    rt_ft_out = os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_FILENAME)
+    ok_rt_ft = False
     if os.path.exists(rt_ft_static_src):
-        _export_one_tflite(kind="realtime",
+        ok_rt_ft = _export_one_tflite(kind="realtime",
                            static_src_path=rt_ft_static_src,
                            out_tflite_path=rt_ft_out,
                            T_fixed=REALTIME_TFLITE_T)
     else:
         print(f"[TFLite/export] Skipping finetuned REALTIME (not found): {rt_ft_static_src}")
+
+    print("\n[TFLite/export] Summary:")
+    print(f"  offline baseline exported: {ok_off}")
+    print(f"  offline finetuned exported: {ok_off_ft}")
+    print(f"  realtime baseline exported: {ok_rt} -> {rt_tflite_out if ok_rt else '(old file may still exist!)'}")
+    print(f"  realtime finetuned exported: {ok_rt_ft} -> {rt_ft_out if ok_rt_ft else '(old file may still exist!)'}")
 
 def _sum_rf(kernel, dilations):
     return (int(kernel) - 1) * sum(int(d) for d in dilations)
@@ -6746,36 +7249,52 @@ def _select_tflite_demo_paths(kind, use_finetuned=False):
 def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
                            style_true_flag=None, use_finetuned=False, out_dir=".",
                            fixed_hop=None):
+    """
+    TFLite demo runner.
+    - Streaming: T=hop, left=0, right=0; TFLiteRunner keeps states.
+    - Otherwise: windowed schedule.
+    """
     os.makedirs(out_dir, exist_ok=True)
+
+    if kind == "realtime" and tflite_runner.is_streaming() and not tflite_runner.has_bundle():
+        print("⚠️  [TFLite/demo] This realtime TFLite does not expose 'realtime_states_bundle_out' by name; "
+              "the runner will try to find the bundle by shape. If you still hear artifacts, re-run --export-tflite.")
+
     piezo_key = f"{kind}_piezo_input"
     T_fixed = tflite_runner.input_length_T(piezo_key)
 
-    lc_m, rc_m = compute_streaming_ctx_constants(kind)
+    is_stream = tflite_runner.is_streaming()
 
-    # Choose left/core/right for each call
     if fixed_hop is not None:
         core_len = int(fixed_hop)
         if core_len < 1 or core_len > T_fixed:
             raise ValueError(f"fixed_hop must be in [1, {T_fixed}], got {fixed_hop}")
-        # Exact pedal-style schedule: use all remaining as left context, no right look-ahead for realtime
-        left_this  = T_fixed - core_len
-        right_this = 0
-        print(f"[TFLite/demo] fixed_hop={core_len} → left={left_this}, core={core_len}, right={right_this}")
     else:
-        # Default policy (existing behavior): use model ctx but keep a reasonable core
-        desired_core = max(1, min(T_fixed // 2, 8192 if kind == "offline" else 512))
+        core_len = T_fixed if is_stream else max(1, min(T_fixed // 2, 8192 if kind == "offline" else 512))
+
+    if is_stream:
+        print(f"[TFLite/demo] STREAMING: T={T_fixed}, hop={core_len}, left=0, right=0")
+        left_this, right_this = 0, 0
+    else:
+        lc_m, rc_m = compute_streaming_ctx_constants(kind)
         left_this  = min(int(lc_m), max(0, T_fixed - 1))
         right_this = min(int(rc_m), max(0, T_fixed - 1 - left_this))
-        core_len   = T_fixed - left_this - right_this
-        if core_len < desired_core:
-            need = desired_core - core_len
+        if (T_fixed - left_this - right_this) < core_len:
+            need = core_len - (T_fixed - left_this - right_this)
             r_dec = min(right_this, need); right_this -= r_dec; need -= r_dec
             if need > 0:
-                l_dec = min(left_this, need); left_this -= l_dec; need -= l_dec
-            core_len = T_fixed - left_this - right_this
-        print(f"[TFLite/demo] auto schedule: T={T_fixed} lc={lc_m} rc={rc_m} → left={left_this}, core={core_len}, right={right_this}")
+                l_dec = min(left_this, need); left_this -= l_dec
+        print(f"[TFLite/demo] WINDOWED: T={T_fixed}, left={left_this}, core={core_len}, right={right_this}")
 
     knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
+    
+    # DEBUG: isolate main path only (no IR, no pick branches; fully wet)
+    #if kind == "realtime":
+        #knob_feeds["realtime_knob_ir"]         = np.array([[0.0]], dtype=np.float32)
+        #knob_feeds["realtime_knob_pickattack"] = np.array([[0.0]], dtype=np.float32)
+        #knob_feeds["realtime_knob_pickreso"]   = np.array([[0.0]], dtype=np.float32)
+        #knob_feeds["realtime_knob_drywet"]     = np.array([[0.0]], dtype=np.float32)
+    
     style_pred_path = os.path.join(out_dir, "demo_pred_style_pred_tflite.wav")
     style_true_path = os.path.join(out_dir, "demo_pred_style_true_tflite.wav")
 
@@ -6797,44 +7316,68 @@ def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
     prob_count = 0
     N = len(x_mod)
 
-    while pos < N:
-        core = min(core_len, N - pos)
-        ltake = min(left_this, pos)
-        rtake = min(right_this, N - (pos + core))
+    # Helper to run one pass (predicted style or forced style)
+    def run_pass(force_style=None):
+        nonlocal pos, prob_sum, prob_count
 
-        x_in = np.zeros((1, T_fixed, 1), dtype=np.float32)
-        if ltake > 0:
-            x_in[0, left_this - ltake:left_this, 0] = x_mod[pos - ltake:pos]
-        x_in[0, left_this:left_this + core, 0] = x_mod[pos:pos + core]
-        if rtake > 0:
-            xs = pos + core; xe = xs + rtake
-            x_in[0, left_this + core:left_this + core + rtake, 0] = x_mod[xs:xe]
+        # Reset globals
+        pos = 0
+        if tflite_runner.is_streaming():
+            tflite_runner.reset_states()
 
-        base_feed = {k: v.astype(np.float32) for k, v in knob_feeds.items()}
-        base_feed[f"{kind}_piezo_input"]       = x_in
-        base_feed[f"{kind}_style_true_input"]  = np.zeros((1,1), np.float32)
-        base_feed[f"{kind}_style_force_input"] = np.zeros((1,1), np.float32)
+        while pos < N:
+            core = min(core_len, N - pos)
 
-        y_pred, s_pred = tflite_runner.invoke(base_feed)
-        y_core = y_pred[0, left_this:left_this + core, 0]
-        w_pred.write(y_core)
+            x_in = np.zeros((1, T_fixed, 1), dtype=np.float32)
+            if is_stream:
+                # stream: fill the first 'core' samples, leave the rest zeros
+                x_in[0, :core, 0] = x_mod[pos:pos + core]
+            else:
+                # windowed: left/core/right fill
+                ltake = min(left_this, pos)
+                rtake = min(right_this, N - (pos + core))
+                if ltake > 0:
+                    x_in[0, left_this - ltake:left_this, 0] = x_mod[pos - ltake:pos]
+                x_in[0, left_this:left_this + core, 0] = x_mod[pos:pos + core]
+                if rtake > 0:
+                    xs = pos + core; xe = xs + rtake
+                    x_in[0, left_this + core:left_this + core + rtake, 0] = x_mod[xs:xe]
 
-        prob_sum   += float(np.asarray(s_pred, dtype=np.float32)[0, 0]) * float(core)
-        prob_count += core
+            base_feed = {k: v.astype(np.float32) for k, v in knob_feeds.items()}
+            base_feed[f"{kind}_piezo_input"] = x_in
 
-        if w_true is not None:
-            tf_feed = dict(base_feed)
-            tf_feed[f"{kind}_style_true_input"]  = np.array([[float(style_true_flag)]], dtype=np.float32)
-            tf_feed[f"{kind}_style_force_input"] = np.ones((1,1), dtype=np.float32)
-            y_true_pred, _ = tflite_runner.invoke(tf_feed)
-            y_true_core = y_true_pred[0, left_this:left_this + core, 0]
-            w_true.write(y_true_core)
+            if force_style is None:
+                base_feed[f"{kind}_style_true_input"]  = np.zeros((1,1), np.float32)
+                base_feed[f"{kind}_style_force_input"] = np.zeros((1,1), np.float32)
+            else:
+                base_feed[f"{kind}_style_true_input"]  = np.array([[float(force_style)]], dtype=np.float32)
+                base_feed[f"{kind}_style_force_input"] = np.ones((1,1), dtype=np.float32)
 
-        w_src.write(x_mod[pos:pos + core])
-        if w_tgt is not None:
-            w_tgt.write(y_mod[pos:pos + core])
+            y_pred, s_pred = tflite_runner.invoke(base_feed)
 
-        pos += core
+            if is_stream:
+                y_core = y_pred[0, :core, 0]
+            else:
+                y_core = y_pred[0, left_this:left_this + core, 0]
+
+            if force_style is None:
+                w_pred.write(y_core)
+                prob_sum   += float(np.asarray(s_pred, dtype=np.float32)[0, 0]) * float(core)
+                prob_count += core
+            else:
+                w_true.write(y_core)
+
+            w_src.write(x_mod[pos:pos + core])
+            if w_tgt is not None:
+                w_tgt.write(y_mod[pos:pos + core])
+
+            pos += core
+
+    # Predicted-style pass
+    run_pass(force_style=None)
+    # Forced-style pass if we have a ground truth style
+    if style_true_flag is not None:
+        run_pass(force_style=style_true_flag)
 
     w_src.close()
     if w_tgt is not None: w_tgt.close()
@@ -6845,152 +7388,537 @@ def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
         p = prob_sum / float(prob_count)
         label = 'pick' if p > STYLE_FLAG_PROB_THRESHOLD else 'finger'
         print(f"✅ TFLite demo written to {style_pred_path}. Predicted style (avg): {label} ({p:.4f})")
-
+    
 class TFLiteRunner:
     """
     Robust TFLite runner for ai_edge_litert:
-      - Prefer SignatureRunner (serving_default). Handles generic output names by shape.
-      - Fall back to raw tensor API if signature is not available.
-      - Always returns copies of outputs to avoid interpreter buffer aliasing.
-      - Normalizes audio to [B,T,1] and style to [B,1].
+      - Uses a single packed bundle + splits (lengths) to update states.
+      - Finds bundle and splits by SHAPE (not by name), so it survives TFLite's generic output names.
+      - Splits order: lexicographic state-input name order, independent of TFLite input reordering.
+      - Falls back to declared vs lex-sorted order if splits are absent.
+      - Ensures the 3D piezo block is fed even if input names are generic.
+      - Throttles noisy warnings.
+      - Deep-copies outputs to avoid internal buffer aliasing.
     """
-    def __init__(self, model_path):
+    def __init__(self, model_path, debug=True):
+        self.debug = bool(debug)
         self.interp = Interpreter(model_path=model_path)
         self.interp.allocate_tensors()
 
-        # Try signature runner first
-        self.use_sig = False
-        self.sig_runner = None
-        self.sig_inputs = set()
-        try:
-            sigs = self.interp.get_signature_list()
-            if isinstance(sigs, dict) and sigs:
-                sig_key = "serving_default" if "serving_default" in sigs else next(iter(sigs.keys()))
-                self.sig_runner = self.interp.get_signature_runner(sig_key)
-                # Note: keys here are just names; shapes are not provided in this dict
-                self.sig_inputs = set(sigs[sig_key].get("inputs", []))
-                self.use_sig = True
-        except Exception:
-            self.use_sig = False
-
-        # Keep raw details for T and legacy fallback
+        # Cache IO
         self.inp_details = self.interp.get_input_details()
         self.out_details = self.interp.get_output_details()
-        self.in_map = { self._norm_name(d["name"]): d["index"] for d in self.inp_details }
-        self.out_map = { self._norm_name(d["name"]): d["index"] for d in self.out_details }
+        self._in_details_by_idx  = {d["index"]: d for d in self.inp_details}
+        self._out_details_by_idx = {d["index"]: d for d in self.out_details}
 
-    def _norm_name(self, n):
-        n = n.split(":")[0]
+        # Name maps (normalized) for inputs only; outputs have generic names, so we avoid name maps for them.
+        self.in_map = { self._norm_name_input(d["name"]): d["index"] for d in self.inp_details }
+        self._in_details_by_name  = { self._norm_name_input(d["name"]): d for d in self.inp_details }
+
+        # Kind
+        self._kind = "realtime" if any("realtime_piezo_input" in k for k in self.in_map.keys()) else (
+                     "offline"  if any("offline_piezo_input"  in k for k in self.in_map.keys()) else "unknown")
+
+        # Streaming discovery
+        self._discover_stream_states()
+
+        # Expected bundle length = sum(L*C) over state inputs (from TFLite input shapes)
+        self._expected_bundle_len = 0
+        for nm in self.state_in_names:
+            dinfo = self._in_details_by_name.get(nm, None)
+            if dinfo is None:
+                continue
+            shp = tuple(int(x) for x in dinfo["shape"])
+            L = shp[1] if len(shp) > 1 else 0
+            C = shp[2] if len(shp) > 2 else 1
+            self._expected_bundle_len += (L * C)
+
+        # Shape-based discovery for bundle and splits
+        # Bundle: 2D output with largest total length (excluding (1,1))
+        # Splits: 2D output (1, N_states) or (N_states,) if TFLite flattens, prefer exact row-major (1,N)
+        self._shape_bundle_candidate_name = None
+        self._shape_splits_candidate_name = None
+        self._shape_bundle_len = 0
+        self._shape_splits_len = 0
+        self._shape_splits_count = 0
+
+        # Evaluate outputs by shape without relying on names
+        for d in self.out_details:
+            nm = str(d["name"])  # keep raw (unique)
+            shp = tuple(int(x) for x in d["shape"])
+            if len(shp) == 2:
+                if shp != (1, 1):
+                    total = int(shp[0] * shp[1])
+                    # Candidate for bundle: pick the largest 2D (excluding style)
+                    if total > self._shape_bundle_len:
+                        self._shape_bundle_len = total
+                        self._shape_bundle_candidate_name = nm
+                # Candidate for splits: (1, N_states)
+                if shp[0] == 1 and shp[1] == len(self.state_in_names):
+                    self._shape_splits_candidate_name = nm
+                    self._shape_splits_len = int(shp[1])
+                    self._shape_splits_count = int(shp[1])
+            elif len(shp) == 1:
+                # Sometimes TFLite can collapse (1,N) to (N,), accept that too for splits
+                if shp[0] == len(self.state_in_names) and self._shape_splits_candidate_name is None:
+                    self._shape_splits_candidate_name = nm
+                    self._shape_splits_len = int(shp[0])
+                    self._shape_splits_count = int(shp[0])
+
+        # Fallback ordered indices: [audio, style] + states... (very rare)
+        self._ordered_state_out_idx = {}
+        if self._is_streaming:
+            for i, nm in enumerate(self.state_in_names):
+                self._ordered_state_out_idx[nm] = 2 + i
+
+        # Precompute lex-sorted name list for robust splitting
+        self.state_in_names_sorted = sorted(list(self.state_in_names))
+
+        # Dynamic decision for bundle splitting order ('declared' or 'sorted')
+        self._bundle_order_mode = None
+
+        # Throttled warnings
+        self._warn_counts = {}
+        self._piezo_fallback_logged = False
+
+        self._print_io_summary()
+
+        # Quick self test (zero-input)
+        try:
+            self._quick_self_test()
+        except Exception as e:
+            print(f"[TFLiteRunner] Self-test skipped: {e}")
+
+    # ------------- helpers -------------
+    def _norm_name_input(self, n):
+        """
+        Normalize input tensor names:
+          - Strip ':0' suffix
+          - Drop 'serving_default_' prefix
+          - Remove TF scope prefixes ending with '/'
+        """
+        n = str(n)
+        # Strip ':0' or ':<num>'
+        if ":" in n:
+            n = n.split(":", 1)[0]
         if n.startswith("serving_default_"):
             n = n[len("serving_default_"):]
+        # Remove any leading scopes like 'StatefulPartitionedCall/...'
+        if "/" in n:
+            n = n.split("/")[-1]
         return n
 
+    def _discover_stream_states(self):
+        # Input names in interpreter-declared order (normalized)
+        in_order_names = [ self._norm_name_input(d["name"]) for d in self.inp_details ]
+        self.state_in_names = [n for n in in_order_names if n.startswith("realtime_state_")]
+
+        # Name-based output map (unreliable with generic TFLite names) → leave empty
+        self.state_out_map = {}
+        self._is_streaming = len(self.state_in_names) > 0
+
+        # Allocate zero states by input shapes
+        self._state = {}
+        self._state_shapes = {}
+        for nm in self.state_in_names:
+            dinfo = self._in_details_by_name.get(nm, None)
+            if dinfo is None:
+                continue
+            shp = tuple(int(x) for x in dinfo["shape"])
+            if len(shp) != 3:
+                shp = (1, shp[1] if len(shp) > 1 else 0, 1)
+            self._state[nm] = np.zeros(shp, dtype=np.float32)
+            self._state_shapes[nm] = shp
+
+    def _print_io_summary(self, max_layer_names=48):
+        print("== TFLite IO Summary ==")
+        print(f"  kind: {self._kind}")
+        print(f"  inputs ({len(self.inp_details)}):")
+        for d in self.inp_details:
+            nm = self._norm_name_input(d["name"])
+            shp = tuple(int(x) for x in d["shape"])
+            print(f"    {nm:<48} shape={shp}")
+        print(f"  outputs ({len(self.out_details)}):")
+        for d in self.out_details:
+            nm = str(d["name"])
+            shp = tuple(int(x) for x in d["shape"])
+            print(f"    {nm:<48} shape={shp}")
+        print(f"  streaming: {self._is_streaming} (states={len(self.state_in_names)})")
+        if self._is_streaming:
+            bundle_note = "present(by shape)" if self._shape_bundle_candidate_name is not None else "absent"
+            splits_note = "present(by shape)" if self._shape_splits_candidate_name is not None else "absent"
+            print(f"  expected bundle length: {self._expected_bundle_len}")
+            print(f"  packed bundle: {bundle_note}")
+            print(f"  splits vector: {splits_note}")
+            print("  state inputs (in declared order):")
+            for nm in self.state_in_names[:max_layer_names]:
+                shp = tuple(int(x) for x in self._in_details_by_name[nm]["shape"])
+                print(f"    {nm:<48} shape={shp}")
+            if len(self.state_in_names) > max_layer_names:
+                print(f"    ... {len(self.state_in_names)-max_layer_names} more")
+        print("========================")
+
+    def is_streaming(self):
+        return bool(self._is_streaming)
+
+    def has_bundle(self):
+        # A bundle is considered present if shape-based candidate exists
+        return bool(self._shape_bundle_candidate_name)
+
+    def reset_states(self):
+        for k in self._state.keys():
+            self._state[k].fill(0.0)
+
     def input_length_T(self, piezo_key):
-        key = self._norm_name(piezo_key)
-        if key not in self.in_map and piezo_key in self.in_map:
-            key = piezo_key
-        if key not in self.in_map:
-            # fallback to first input
-            return int(self.inp_details[0]["shape"][1])
-        idx = self.in_map[key]
-        details_by_idx = {d["index"]: d for d in self.inp_details}
-        return int(details_by_idx[idx]["shape"][1])
+        # Prefer named piezo input if present
+        if piezo_key in self.in_map:
+            shp = self._in_details_by_name[piezo_key]["shape"]
+            if len(shp) >= 2:
+                return int(shp[1])
+        # Fallback: any 3D input
+        for d in self.inp_details:
+            shp = d["shape"]
+            if len(shp) == 3 and shp[1] > 0:
+                return int(shp[1])
+        # Last resort: first input second dim
+        return int(self.inp_details[0]["shape"][1])
+
+    def _piezo_T_from_feed(self, feed):
+        for k, v in feed.items():
+            # feed keys already normalized by caller (we normalize below too)
+            nk = self._norm_name_input(k)
+            if "piezo_input" in nk:
+                arr = np.asarray(v)
+                if arr.ndim >= 2:
+                    return int(arr.shape[1])
+        for v in feed.values():
+            arr = np.asarray(v)
+            if arr.ndim == 3:
+                return int(arr.shape[1])
+        return None
 
     def _normalize_audio_style(self, audio, style):
-        # Ensure we detach from interpreter buffers (copy=True)
         a = np.array(audio, dtype=np.float32, copy=True)
         s = np.array(style, dtype=np.float32, copy=True)
-
-        # Audio -> [B,T,1]
         if a.ndim == 1:
             a = a[None, :, None]
         elif a.ndim == 2:
             a = a[:, :, None]
         elif a.ndim >= 4:
             a = a.reshape((a.shape[0], a.shape[1], -1))[:, :, :1]
-
-        # Style -> [B,1]
         if s.ndim == 0:
-            s = s.reshape((1,1))
+            s = s.reshape((1, 1))
         elif s.ndim == 1:
             s = s.reshape((1, -1))[:, :1]
         elif s.ndim >= 3:
             s = s.reshape((s.shape[0], -1))[:, :1]
         return a, s
 
+    def _select_audio_style(self, outs_list, T_cur):
+        # Prefer 3D as audio (match T if possible), 2D(1,1) as style
+        three_d = [(n,a) for (n,a) in outs_list if np.asarray(a).ndim == 3]
+        two_d   = [(n,a) for (n,a) in outs_list if np.asarray(a).ndim == 2]
+
+        audio = None
+        if three_d:
+            cand = [t for t in three_d if (T_cur is None or int(np.asarray(t[1]).shape[1]) == int(T_cur))]
+            audio = (cand or three_d)[0][1]
+        else:
+            # Fallback to largest tensor
+            audio = max(outs_list, key=lambda t: np.asarray(t[1]).size)[1]
+
+        style = None
+        for (n,a) in two_d:
+            arr = np.asarray(a)
+            if arr.shape == (1,1):
+                style = arr
+                break
+        if style is None:
+            style = np.zeros((1,1), dtype=np.float32)
+        return audio, style
+
+    def _pick_bundle_from_outs(self, outs_list):
+        # Choose 2D float32 output with largest length, excluding (1,1)
+        best = None
+        best_len = 0
+        for (n, a) in outs_list:
+            arr = np.asarray(a)
+            if arr.ndim == 2 and arr.dtype == np.float32 and tuple(arr.shape) != (1, 1):
+                total = int(np.prod(arr.shape))
+                if total > best_len:
+                    best_len = total
+                    best = arr
+        # Fallback: any 2D (non (1,1))
+        if best is None:
+            for (n, a) in outs_list:
+                arr = np.asarray(a)
+                if arr.ndim == 2 and tuple(arr.shape) != (1, 1):
+                    total = int(np.prod(arr.shape))
+                    if total > best_len:
+                        best_len = total
+                        best = arr
+        return best
+
+    def _pick_splits_from_outs(self, outs_list):
+        # Choose a (1,N_states) or (N_states,) integer vector; cast to int32
+        target = len(self.state_in_names)
+        # Prefer (1, target) int
+        for (n, a) in outs_list:
+            arr = np.asarray(a)
+            if arr.ndim == 2 and arr.shape == (1, target) and np.issubdtype(arr.dtype, np.integer):
+                return arr.astype(np.int32, copy=False)
+        # Fallback: (target,) or (target,1) int
+        for (n, a) in outs_list:
+            arr = np.asarray(a)
+            if ((arr.ndim == 1 and arr.shape[0] == target) or
+                (arr.ndim == 2 and arr.shape == (target, 1))) and np.issubdtype(arr.dtype, np.integer):
+                return arr.reshape(1, -1).astype(np.int32, copy=False)
+        return None
+
+    def _warn_throttled(self, key, msg, first_n=3, every=200):
+        c = self._warn_counts.get(key, 0)
+        self._warn_counts[key] = c + 1
+        if c < first_n or (every > 0 and (c % every) == 0):
+            print(msg)
+
+    def _try_update_bundle_with_order(self, names_order, bundle_vec, lengths=None):
+        """
+        Attempt to update states using a given names_order (list of names),
+        bundle_vec flattened (1,N) or (N,), and optional 'lengths' (1,M) int32.
+        If lengths is None, it will slice by TFLite input shapes.
+        Returns (updated_count, consumed_len).
+        """
+        vec = np.asarray(bundle_vec, dtype=np.float32)
+        if vec.ndim == 2:
+            vec = vec[0]
+        elif vec.ndim >= 3:
+            vec = vec.reshape(vec.shape[0], -1)[0]
+
+        offset = 0
+        updated = 0
+        for idx, nm in enumerate(names_order):
+            shp = self._state_shapes.get(nm, (1,0,1))
+            if lengths is not None:
+                lens = np.asarray(lengths).astype(np.int64)
+                if lens.ndim == 2:
+                    lens = lens[0]
+                need = int(lens[idx]) if idx < lens.size else 0
+            else:
+                need = int(shp[1] * shp[2])
+
+            if need <= 0:
+                # Missing '_next' on exporter side or zero-size state: skip
+                continue
+
+            if offset + need > vec.size:
+                self._warn_throttled('bundle_short',
+                    f"⚠️  [TFLiteRunner] bundle too short for state '{nm}': need {need}, have {max(0, vec.size - offset)}")
+                break
+
+            seg = vec[offset:offset+need].reshape((1, int(shp[1]), int(shp[2]))).astype(np.float32, copy=False)
+            self._state[nm] = seg
+            offset += need
+            updated += 1
+
+        return updated, offset
+
+    def _update_states_from_bundle(self, bundle, splits=None):
+        """
+        Update states from bundle. If 'splits' (lengths) is present, prefer lexicographic ORDER with those lengths.
+        Else auto-try declared order then sorted; cache whichever works best.
+        """
+        # With splits: use lexicographic order deterministically
+        if splits is not None:
+            try:
+                ss = np.asarray(splits)
+                total = int(np.sum(ss))
+                if self.debug:
+                    print(f"[TFLiteRunner] Using bundle with splits: sum={total}, expected≈{self._expected_bundle_len}")
+                # If total != expected, we still proceed; zeros in splits indicate missing '_next' states.
+            except Exception:
+                pass
+            updated, _ = self._try_update_bundle_with_order(self.state_in_names_sorted, bundle, lengths=splits)
+            self._last_state_updates_count = updated
+            self._bundle_order_mode = 'sorted'
+            if updated != len(self.state_in_names):
+                self._warn_throttled('bundle_partial_sorted',
+                    f"⚠️  [TFLiteRunner] bundle (with splits) updated {updated}/{len(self.state_in_names)} states.")
+            else:
+                if self.debug:
+                    print(f"[TFLiteRunner] bundle (with splits) updated all {updated} states.")
+            return updated
+
+        # No splits: reuse mode if already decided
+        if self._bundle_order_mode == 'declared':
+            upd, _ = self._try_update_bundle_with_order(self.state_in_names, bundle, lengths=None)
+            self._last_state_updates_count = upd
+            return upd
+        if self._bundle_order_mode == 'sorted':
+            upd, _ = self._try_update_bundle_with_order(self.state_in_names_sorted, bundle, lengths=None)
+            self._last_state_updates_count = upd
+            return upd
+
+        # First-time: try declared then sorted
+        upd_decl, _ = self._try_update_bundle_with_order(self.state_in_names, bundle, lengths=None)
+        upd_sort, _ = self._try_update_bundle_with_order(self.state_in_names_sorted, bundle, lengths=None)
+
+        if upd_sort > upd_decl:
+            self._bundle_order_mode = 'sorted'
+            self._last_state_updates_count = upd_sort
+            if upd_sort != len(self.state_in_names):
+                self._warn_throttled('bundle_partial_sorted',
+                    f"⚠️  [TFLiteRunner] bundle updated {upd_sort}/{len(self.state_in_names)} states with sorted order.")
+            else:
+                if self.debug:
+                    print(f"[TFLiteRunner] bundle updated all {upd_sort} states (sorted order).")
+            return upd_sort
+        else:
+            self._bundle_order_mode = 'declared'
+            self._last_state_updates_count = upd_decl
+            if upd_decl != len(self.state_in_names):
+                self._warn_throttled('bundle_partial_decl',
+                    f"⚠️  [TFLiteRunner] bundle updated {upd_decl}/{len(self.state_in_names)} states with declared order.")
+            else:
+                if self.debug:
+                    print(f"[TFLiteRunner] bundle updated all {upd_decl} states (declared order).")
+            return upd_decl
+
+    # ------------- inference -------------
     def invoke(self, feed_dict):
-        # 1) Signature path (preferred)
-        if self.use_sig and (self.sig_runner is not None):
-            # Build feed by signature input names (accept exact or normalized names)
-            sig_feed = {}
-            for k, v in feed_dict.items():
-                if k in self.sig_inputs:
-                    sig_feed[k] = v.astype(np.float32, copy=False)
-                else:
-                    nk = self._norm_name(k)
-                    if nk in self.sig_inputs:
-                        sig_feed[nk] = v.astype(np.float32, copy=False)
+        # Normalize feed and inject states if missing
+        feed = { self._norm_name_input(k): np.asarray(v, np.float32, order="C") for k, v in feed_dict.items() }
+        if self._is_streaming:
+            for nm in self.state_in_names:
+                if nm not in feed:
+                    feed[nm] = self._state[nm]
 
-            outs = self.sig_runner(**sig_feed)  # dict with keys like 'output_0','output_1'
-            if not isinstance(outs, dict) or not outs:
-                raise RuntimeError("Signature runner returned no outputs.")
+        T_cur = self._piezo_T_from_feed(feed)
 
-            # Pick audio/style by shape/size (names may be generic)
-            items = list(outs.items())
-            audio_name, audio_arr = max(items, key=lambda t: t[1].size)
-            rest = [(n, a) for (n, a) in items if n != audio_name]
-            if not rest:
-                raise RuntimeError("No secondary output found for style prob in signature outputs.")
-            # Prefer a (1,1) tensor for style if present, else smallest
-            style_arr = None
-            for n, a in rest:
-                aa = np.asarray(a)
-                if aa.ndim == 2 and aa.shape == (1,1):
-                    style_arr = a
-                    break
-            if style_arr is None:
-                style_arr = min(rest, key=lambda t: t[1].size)[1]
+        # Set inputs by name; remember whether the 3D piezo was actually set
+        set_piezo = False
+        piezo_block = None
 
-            return self._normalize_audio_style(audio_arr, style_arr)
+        # Try to remember any 3D array from the feed (expected to be the piezo block)
+        for v in feed.values():
+            arr = np.asarray(v)
+            if arr.ndim == 3 and (T_cur is None or int(arr.shape[1]) == int(T_cur)):
+                piezo_block = arr
+                break
 
-        # 2) Legacy tensor path
-        return self._invoke_by_tensors(feed_dict)
-
-    def _invoke_by_tensors(self, feed_dict):
-        # Set tensors
-        for k, v in feed_dict.items():
-            nm = self._norm_name(k)
+        for k, v in feed.items():
+            nm = self._norm_name_input(k)
             if nm in self.in_map:
-                self.interp.set_tensor(self.in_map[nm], v.astype(np.float32, copy=False))
+                idx = self.in_map[nm]
+                # Track if this is the 3D piezo feed
+                shp = tuple(int(x) for x in self._in_details_by_idx[idx]["shape"])
+                if len(shp) == 3 and np.asarray(v).ndim == 3 and (T_cur is None or int(v.shape[1]) == int(T_cur)):
+                    set_piezo = True
+                self.interp.set_tensor(idx, v)
 
-        # Invoke
+        # Fallback mapping: if we didn't set any 3D piezo by name, map the 3D block by shape
+        if (not set_piezo) and (piezo_block is not None):
+            for d in self.inp_details:
+                nm_raw = str(d["name"])
+                shp = tuple(int(x) for x in d["shape"])
+                if len(shp) == 3 and (T_cur is None or shp[1] == T_cur or shp[1] == -1) and shp[2] == 1:
+                    try:
+                        self.interp.set_tensor(d["index"], piezo_block)
+                        if not self._piezo_fallback_logged:
+                            print(f"[TFLiteRunner] Mapped 3D piezo block to unnamed input '{nm_raw}' shape={shp} (fallback by shape).")
+                            self._piezo_fallback_logged = True
+                        break
+                    except Exception:
+                        continue
+
         self.interp.invoke()
 
-        # Gather outputs (copy immediately to break buffer aliasing)
-        outs = []
+        # Deep-copy outputs
+        outs_list = []
         for d in self.out_details:
             idx = d["index"]
-            name = self._norm_name(d["name"])
-            val = np.array(self.interp.get_tensor(idx), dtype=np.float32, copy=True)
-            outs.append((name, val))
+            name = str(d["name"])
+            val = np.copy(self.interp.get_tensor(idx))
+            outs_list.append((name, val))
+        self._last_state_updates_count = 0
 
-        if not outs:
-            raise RuntimeError("TFLite model has no outputs.")
+        # Try packed bundle path first (by shape)
+        if self._is_streaming:
+            bundle = self._pick_bundle_from_outs(outs_list)
+            splits = self._pick_splits_from_outs(outs_list)
+            if bundle is not None:
+                self._update_states_from_bundle(bundle, splits=splits)
 
-        audio_name, audio_arr = max(outs, key=lambda t: t[1].size)
-        rest = [(n, a) for (n, a) in outs if n != audio_name]
-        if not rest:
-            raise RuntimeError("No secondary output found for style prob (model exposes only one graph output).")
+        # Name-based per-state mapping is skipped (generic TFLite names).
+        # Ordered fallback [audio, style, states...]
+        if self._is_streaming and self._last_state_updates_count < len(self.state_in_names):
+            for in_nm in self.state_in_names:
+                idx = self._ordered_state_out_idx.get(in_nm, None)
+                if idx is None or idx >= len(outs_list):
+                    continue
+                cand = outs_list[idx][1]
+                want = self._state_shapes.get(in_nm, None)
+                if (want is None) or (tuple(cand.shape) == tuple(want)):
+                    self._state[in_nm] = np.array(cand, dtype=np.float32, copy=True)
+            self._last_state_updates_count = len(self.state_in_names)
 
-        style_arr = None
-        for n, a in rest:
-            if a.ndim == 2 and a.shape == (1,1):
-                style_arr = a
-                break
-        if style_arr is None:
-            style_arr = min(rest, key=lambda t: t[1].size)[1]
+        if self._is_streaming and self._last_state_updates_count == 0:
+            self._warn_throttled('no_state_update',
+                "⚠️  [TFLiteRunner] WARNING: states did NOT update; expect tonal/bitcrushed noise. "
+                "Ensure your realtime TFLite includes a states bundle and (optionally) a splits vector.")
 
+        # Select audio/style from outs_list
+        audio_arr, style_arr = self._select_audio_style(outs_list, T_cur)
         return self._normalize_audio_style(audio_arr, style_arr)
+
+    def _prepare_default_feed(self, T):
+        feed = {}
+        piezo_key = "realtime_piezo_input" if self._kind == "realtime" else "offline_piezo_input"
+        if piezo_key in self.in_map:
+            feed[piezo_key] = np.zeros((1, int(T), 1), dtype=np.float32)
+
+        st_true = "realtime_style_true_input" if self._kind == "realtime" else "offline_style_true_input"
+        st_force= "realtime_style_force_input" if self._kind == "realtime" else "offline_style_force_input"
+        if st_true in self.in_map:  feed[st_true]  = np.zeros((1,1), np.float32)
+        if st_force in self.in_map: feed[st_force] = np.zeros((1,1), np.float32)
+
+        for d in self.inp_details:
+            nm = self._norm_name_input(d["name"])
+            if "knob_" in nm:
+                val = 1.0
+                if "drywet" in nm:
+                    try:
+                        val = float(_default_dryness_value())
+                    except Exception:
+                        val = 0.0
+                feed[nm] = np.array([[val]], dtype=np.float32)
+
+        if self._is_streaming:
+            for nm in self.state_in_names:
+                feed[nm] = self._state[nm]
+        return feed
+
+    def _quick_self_test(self):
+        if not self._is_streaming:
+            return
+        T = None
+        # Try to get T from piezo input
+        for d in self.inp_details:
+            nm = self._norm_name_input(d["name"])
+            if "piezo_input" in nm:
+                shp = d["shape"]
+                T = int(shp[1]) if len(shp) > 1 else None
+                break
+        if T is None:
+            # Try any 3D input
+            for d in self.inp_details:
+                shp = tuple(int(x) for x in d["shape"])
+                if len(shp) == 3 and shp[1] > 0:
+                    T = shp[1]
+                    break
+        if T is None or T <= 0:
+            return
+        feed = self._prepare_default_feed(T)
+        _ = self.invoke(feed)
 
 def generate_demo_tflite(kind, use_finetuned=False, out_dir=None, hop=None):
     """
@@ -7047,59 +7975,6 @@ def generate_demo_tflite(kind, use_finetuned=False, out_dir=None, hop=None):
                            x_mod=x_mod, y_mod=y_mod, style_true_flag=style_true_flag,
                            use_finetuned=use_finetuned, out_dir=out_dir,
                            fixed_hop=hop)
-
-def _seed_pick_heads_from_legacy(rt_stream_model, legacy_rt_model, verbose=True):
-    """
-    Seed streaming pick heads from a legacy (non-streaming) realtime model:
-      - realtime_pickreso_modal_lr: from legacy realtime_pickreso_modal (full-rate) by decimation,
-        or from legacy realtime_pickreso_modal_lr if already present there.
-      - realtime_picklearn_* layers explicitly copied if copy-by-name ever missed them.
-    Leaves layers untouched if sources are not found.
-    """
-    # 1) Seed pick-reso modal bank
-    k_lr = None
-
-    # If legacy had the legacy full-rate modal bank, decimate it
-    k_full = _extract_trained_modal_kernel_rt(legacy_rt_model, legacy_name="realtime_pickreso_modal")
-    if k_full is not None:
-        try:
-            k_lr = _decimate_modal_kernels(k_full, factor=REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR)
-            if verbose:
-                print(f"[seed] Decimated legacy 'realtime_pickreso_modal' -> low-rate kernel with shape {k_lr.shape}")
-        except Exception as e:
-            if verbose:
-                print(f"[seed] Could not decimate legacy full-rate modal kernels: {e}")
-
-    # Otherwise try to get already-lowrate kernels from legacy
-    if k_lr is None:
-        try:
-            k_lr = legacy_rt_model.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
-            if verbose:
-                print(f"[seed] Reused legacy 'realtime_pickreso_modal_lr' weights with shape {k_lr.shape}")
-        except Exception:
-            k_lr = None
-
-    # Set into streaming model if both present
-    if k_lr is not None:
-        try:
-            rt_stream_model.get_layer("realtime_pickreso_modal_lr").set_weights([k_lr.astype(np.float32)])
-            if verbose:
-                w0 = rt_stream_model.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
-                print(f"[seed] Set streaming 'realtime_pickreso_modal_lr' weights; ||W||={float(np.linalg.norm(w0)):.6f}")
-        except Exception as e:
-            if verbose:
-                print(f"[seed] Could not set 'realtime_pickreso_modal_lr' in streaming model: {e}")
-
-    # 2) Ensure the tiny pick-attack CNN is copied (paranoia)
-    for lname in ("realtime_picklearn_c1", "realtime_picklearn_c2", "realtime_picklearn_out"):
-        try:
-            w = legacy_rt_model.get_layer(lname).get_weights()
-            rt_stream_model.get_layer(lname).set_weights(w)
-            if verbose:
-                s = sum(np.sum(np.abs(a)) for a in w)
-                print(f"[seed] Copied weights for {lname}; L1 sum={float(s):.6f}")
-        except Exception:
-            pass
 
 def migrate_realtime_models_inplace():
     # Destination paths
@@ -7902,27 +8777,35 @@ def main ():
         args = set(sys.argv[2:])
         do_offline   = ("--realtime-only" not in args)
         do_realtime  = ("--offline-only"  not in args)
-        
+
+        # New flags:
+        # --static-realtime or --static: force realtime static (T=32) artifact (default already static)
+        # --static-offline: force offline static artifact (if present)
+        prefer_static_rt  = ("--static-realtime" in args) or ("--static" in args)
+        prefer_static_off = ("--static-offline" in args)
+
         time_start = time.time()
 
-        # Offline baseline: load saved dynamic offline model
+        # Offline baseline: load saved offline model (dynamic by default unless --static-offline)
         if do_offline:
             prepare_and_generate_demo(
                 kind="offline",
                 sample_rate=OFFLINE_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_OFFLINE_OUT_DIR,
-                dynamic_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+                dynamic_model_filepath=os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME),
+                prefer_static=prefer_static_off
             )
 
-        # Realtime baseline: load saved static T=32 streaming model
+        # Realtime baseline: load saved static T=32 streaming model (default); --static/-realtime keeps it explicit
         if do_realtime:
             prepare_and_generate_demo(
                 kind="realtime",
                 sample_rate=REALTIME_SAMPLE_RATE,
                 demo_out_dir=LONG_DEMOS_REALTIME_OUT_DIR,
-                dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME)
+                dynamic_model_filepath=os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME),
+                prefer_static=prefer_static_rt
             )
-        
+
         time_end = time.time()
         print(f"✅ Demo generation complete (took {time_end - time_start:.1f} sec).")
         sys.exit(0)
@@ -7953,12 +8836,14 @@ def main ():
         if realtime_dyn is not None:
             generate_fine_tune_demo(model=realtime_dyn, kind="realtime", sample_rate=REALTIME_SAMPLE_RATE)
         sys.exit(0)
-    elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":        
+    elif len(sys.argv)>1 and sys.argv[1]=="--render-stems":
         # Flags (can be combined):
-        # --finetuned        → finetuned dynamic models (if present)
+        # --finetuned        → finetuned dynamic/static models (if present)
         # --both             → baseline + finetuned
-        # --all              → baseline + finetuned + learned-pick
+        # --all              → baseline + finetuned
         # --offline-only / --realtime-only limits branches
+        # New:
+        # --static or --static-realtime → force realtime STATIC T=32 model for stems
         args = set(sys.argv[2:])
 
         do_offline   = ("--realtime-only" not in args)
@@ -7966,6 +8851,9 @@ def main ():
         do_finetuned = ("--finetuned"     in args)
         do_both      = ("--both"          in args)
         do_all       = ("--all"           in args)
+
+        # New static realtime selector
+        prefer_static_rt = ("--static-realtime" in args) or ("--static" in args)
 
         # OFFLINE: baseline or finetuned (existing behavior)
         if do_offline:
@@ -7978,17 +8866,16 @@ def main ():
             else:
                 run_render_stems_offline(use_finetuned=do_finetuned)
 
-        # REALTIME: baseline / finetuned / learned-pick
+        # REALTIME: baseline / finetuned; prefer static T=32 if requested
         if do_realtime:
             if do_all:
-                run_render_stems_realtime(use_finetuned=False)
-                run_render_stems_realtime(use_finetuned=True)
+                run_render_stems_realtime(use_finetuned=False, prefer_static=prefer_static_rt)
+                run_render_stems_realtime(use_finetuned=True,  prefer_static=prefer_static_rt)
             elif do_both:
-                run_render_stems_realtime(use_finetuned=False)
-                run_render_stems_realtime(use_finetuned=True)
+                run_render_stems_realtime(use_finetuned=False, prefer_static=prefer_static_rt)
+                run_render_stems_realtime(use_finetuned=True,  prefer_static=prefer_static_rt)
             else:
-                # single selection
-                run_render_stems_realtime(use_finetuned=do_finetuned)
+                run_render_stems_realtime(use_finetuned=do_finetuned, prefer_static=prefer_static_rt)
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--print-layers":
         
@@ -8023,7 +8910,42 @@ def main ():
         m = tf.keras.models.load_model(path, compile=False)
         _print_model_io_summary(m)
         sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--inspect-tflite-file":
+        if len(sys.argv) < 3:
+            print("Usage: --inspect-tflite-file <path.tflite>"); sys.exit(1)
+        path = sys.argv[2]
+        _inspect_tflite_file(path)
+        try:
+            verify_tflite_bundle_file(path, strict=False)
+        except Exception as e:
+            print("verify_tflite_bundle_file (non-strict) raised:", e)
+        sys.exit(0)
+
+    elif len(sys.argv)>1 and sys.argv[1]=="--inspect-tflite-all":
+        # Convenience: check both baseline and finetuned realtime TFLite files if present
+        paths = [
+            os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_TFLITE_FP32_FILENAME),
+            os.path.join(MODELS_REALTIME_OUT_DIR, FINETUNE_REALTIME_TFLITE_FP32_FILENAME),
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                print("\n=== Inspecting:", p, "===")
+                _inspect_tflite_file(p)
+                try:
+                    verify_tflite_bundle_file(p, strict=False)
+                except Exception as e:
+                    print("verify_tflite_bundle_file (non-strict) raised:", e)
+            else:
+                print("\n=== Missing:", p, "===")
+        sys.exit(0)
+    
     elif len(sys.argv)>1 and sys.argv[1]=="--export-tflite":
+        
+        # load the streaming model to use for conversion
+        #m = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_STATIC_MODEL_FILENAME), compile=False)
+        #debug_streaming_state_lengths(m)
+        
+        
         print("Exporting FP32 TFLite models (offline T=40960, realtime T=32)…")
         export_tflite_all()
         sys.exit(0)
