@@ -72,6 +72,54 @@ static inline const char* styleModeName(int m) {
   }
 }
 
+std::atomic<bool> gGuidedAuto(false);
+
+// Round up to next power of two
+static inline size_t nextPow2(size_t x) { size_t p=1; while (p<x) p<<=1; return p; }
+
+// Rolling weighted average over a circular buffer of fixed power-of-two capacity
+struct ProbWindow {
+  std::vector<float> pbuf;
+  std::vector<float> wbuf;
+  size_t mask = 0;
+  size_t pos  = 0;
+  double sumP = 0.0;   // sum of p*w
+  double sumW = 0.0;   // sum of w
+
+  void init(size_t capPow2) {
+    size_t cap = capPow2 ? capPow2 : 1;
+    pbuf.assign(cap, 0.5f);
+    wbuf.assign(cap, 0.0f);
+    mask = cap - 1;
+    pos  = 0;
+    sumP = 0.0;
+    sumW = 0.0;
+  }
+  void reset() {
+    std::fill(pbuf.begin(), pbuf.end(), 0.5f);
+    std::fill(wbuf.begin(), wbuf.end(), 0.0f);
+    pos  = 0;
+    sumP = 0.0;
+    sumW = 0.0;
+  }
+  // push one sample with weight (e.g., coreLen)
+  void push(float p, float w) {
+    const size_t i = pos & mask;
+    // remove old
+    sumP -= double(pbuf[i]) * double(wbuf[i]);
+    sumW -= double(wbuf[i]);
+    // insert new
+    pbuf[i] = p;
+    wbuf[i] = std::max(0.0f, w);
+    sumP += double(pbuf[i]) * double(wbuf[i]);
+    sumW += double(wbuf[i]);
+    ++pos;
+  }
+  float mean() const {
+    return (sumW > 1e-9 ? float(sumP / sumW) : 0.5f);
+  }
+};
+
 // UI knobs (atomic so audio thread reads lock-free)
 struct Knobs {
   std::atomic<float> pickAttack_dB{0.0f};
@@ -187,6 +235,23 @@ static inline bool isIntType(TfLiteType t) {
 
 // ───────────────────────── TFLITE WRAPPER ─────────────────────────
 class TFLiteRealtime {
+public:
+  float getStyleEma() const {
+    int idx = findStateSlotIndex("realtime_state_style_ema");
+    if (idx < 0) return std::numeric_limits<float>::quiet_NaN();
+    const StateSlot& s = stateSlots_[idx];
+    if (s.buf.empty()) return std::numeric_limits<float>::quiet_NaN();
+    // state is [1,1,1] flattened
+    return s.buf[0];
+  }
+
+private:
+  int findStateSlotIndex(const std::string& name) const {
+    for (size_t i = 0; i < stateSlots_.size(); ++i) {
+      if (stateSlots_[i].name == name) return static_cast<int>(i);
+    }
+    return -1;
+  }
 public:
   explicit TFLiteRealtime(const std::string& modelPath) {
     model_ = tflite::FlatBufferModel::BuildFromFile(modelPath.c_str());
@@ -478,88 +543,105 @@ private:
   }
 
   void classifyOutputsByShape() {
-    out_audio_ = -1;
-    out_style_ = -1;
-    out_bundle_ = -1;
-    out_splits_ = -1;
+  out_audio_  = -1;
+  out_style_  = -1;
+  out_bundle_ = -1;
+  out_splits_ = -1;
 
-    // Pick audio = only 3D float output (prefer)
-    size_t bestAudioTotal = 0;
-    for (auto &kv : out_map_) {
-      int idx = kv.second;
-      TfLiteTensor* t = interp_->tensor(idx);
-      if (!t) continue;
-      int dims = t->dims ? t->dims->size : 0;
-      if (t->type == kTfLiteFloat32 && dims == 3) {
-        size_t total = 1;
-        for (int i=0;i<dims;i++) total *= t->dims->data[i];
-        if (total > bestAudioTotal) {
-          bestAudioTotal = total;
-          out_audio_ = idx;
-        }
-      }
-    }
-    // Style = 2D [1,1] float (prefer)
-    for (auto &kv : out_map_) {
-      int idx = kv.second;
-      TfLiteTensor* t = interp_->tensor(idx);
-      if (!t) continue;
-      if (t->type == kTfLiteFloat32 && t->dims && t->dims->size == 2 &&
-          t->dims->data[0] == 1 && t->dims->data[1] == 1) {
-        out_style_ = idx; break;
-      }
-    }
-    // Bundle = largest 2D float (excluding (1,1))
-    size_t bestBundleTotal = 0;
-    for (auto &kv : out_map_) {
-      int idx = kv.second;
-      TfLiteTensor* t = interp_->tensor(idx);
-      if (!t || t->type != kTfLiteFloat32 || !t->dims) continue;
-      int dims = t->dims->size;
-      if (dims == 2) {
-        int r = t->dims->data[0], c = t->dims->data[1];
-        if (!(r == 1 && c == 1)) {
-          size_t total = (size_t)r * (size_t)c;
-          if (total > bestBundleTotal) {
-            bestBundleTotal = total;
-            out_bundle_ = idx;
-          }
-        }
-      }
-    }
-    // Splits = (1, Nstates) int or (Nstates,) int
-    for (auto &kv : out_map_) {
-      int idx = kv.second;
-      TfLiteTensor* t = interp_->tensor(idx);
-      if (!t || !t->dims || !isIntType(t->type)) continue;
-      int dims = t->dims->size;
-      int N = 1;
-      for (int i=0;i<dims;i++) N *= t->dims->data[i];
-      if (N == (int)stateSlots_.size()) {
-        out_splits_ = idx; break;
-      }
-    }
+  size_t bestAudioTotal  = 0;
+  size_t bestBundleTotal = 0;
 
-    // Fallbacks if missing
-    if (out_audio_ < 0) {
-      // Largest tensor as audio fallback
-      size_t best = 0;
-      for (auto &kv : out_map_) {
-        auto* t = interp_->tensor(kv.second);
-        if (!t || !t->dims) continue;
-        size_t sz = 1;
-        for (int i = 0; i < t->dims->size; ++i) sz *= t->dims->data[i];
-        if (sz > best) { best = sz; out_audio_ = kv.second; }
-      }
-    }
-    if (out_style_ < 0) {
-      for (auto &kv : out_map_) {
-        auto* t = interp_->tensor(kv.second);
-        if (!t) continue;
-        if (t->type == kTfLiteFloat32) { out_style_ = kv.second; break; }
+  // 1) Audio = 3D float (prefer [1,T,1]); pick the largest 3D if multiple
+  for (int idx : interp_->outputs()) {
+    TfLiteTensor* t = interp_->tensor(idx);
+    if (!t || !t->dims) continue;
+    if (t->type == kTfLiteFloat32 && t->dims->size == 3) {
+      size_t total = 1;
+      for (int i = 0; i < t->dims->size; ++i) total *= t->dims->data[i];
+      if (total > bestAudioTotal) {
+        bestAudioTotal = total;
+        out_audio_ = idx;
       }
     }
   }
+
+  // 2) Style = 2D float (1,1) if present
+  for (int idx : interp_->outputs()) {
+    TfLiteTensor* t = interp_->tensor(idx);
+    if (!t || !t->dims) continue;
+    if (t->type == kTfLiteFloat32 && t->dims->size == 2 &&
+        t->dims->data[0] == 1 && t->dims->data[1] == 1) {
+      out_style_ = idx;
+      break;
+    }
+  }
+
+  // 3) Bundle = largest 2D float (excluding (1,1))
+  for (int idx : interp_->outputs()) {
+    TfLiteTensor* t = interp_->tensor(idx);
+    if (!t || !t->dims) continue;
+    if (t->type == kTfLiteFloat32 && t->dims->size == 2) {
+      int r = t->dims->data[0], c = t->dims->data[1];
+      if (!(r == 1 && c == 1)) {
+        size_t total = static_cast<size_t>(r) * static_cast<size_t>(c);
+        if (total > bestBundleTotal) {
+          bestBundleTotal = total;
+          out_bundle_ = idx;
+        }
+      }
+    }
+  }
+
+  // 4) Splits = int vector (1,Nstates) or (Nstates,)
+  const int nStates = static_cast<int>(stateSlots_.size());
+  for (int idx : interp_->outputs()) {
+    TfLiteTensor* t = interp_->tensor(idx);
+    if (!t || !t->dims) continue;
+    if (!isIntType(t->type)) continue;
+    int dims = t->dims->size;
+    if (dims == 2 && t->dims->data[0] == 1 && t->dims->data[1] == nStates) {
+      out_splits_ = idx;
+      break;
+    }
+    if (dims == 1 && t->dims->data[0] == nStates) {
+      out_splits_ = idx;
+      break;
+    }
+  }
+
+  // Fallbacks if something still missing:
+  if (out_audio_ < 0) {
+    // pick any 3D float
+    for (int idx : interp_->outputs()) {
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (t && t->type == kTfLiteFloat32 && t->dims && t->dims->size == 3) {
+        out_audio_ = idx;
+        break;
+      }
+    }
+    if (out_audio_ < 0) {
+      // as a last resort, choose the largest tensor
+      size_t best = 0;
+      for (int idx : interp_->outputs()) {
+        TfLiteTensor* t = interp_->tensor(idx);
+        if (!t || !t->dims) continue;
+        size_t total = 1;
+        for (int i = 0; i < t->dims->size; ++i) total *= t->dims->data[i];
+        if (total > best) { best = total; out_audio_ = idx; }
+      }
+    }
+  }
+  if (out_style_ < 0) {
+    // choose any small 2D/1D float tensor
+    for (int idx : interp_->outputs()) {
+      TfLiteTensor* t = interp_->tensor(idx);
+      if (t && t->type == kTfLiteFloat32 && t->dims && t->dims->size <= 2) {
+        out_style_ = idx;
+        break;
+      }
+    }
+  }
+}
 
   std::unique_ptr<tflite::FlatBufferModel> model_;
   std::unique_ptr<tflite::Interpreter>     interp_;
@@ -594,7 +676,6 @@ struct InferCtx {
 };
 
 void inferenceThread(InferCtx ctx) {
-  // QoS boost
 #if defined(__APPLE__)
   #ifdef QOS_CLASS_AUDIO
     pthread_set_qos_class_self_np(QOS_CLASS_AUDIO, 0);
@@ -607,7 +688,7 @@ void inferenceThread(InferCtx ctx) {
 #endif
 
   TFLiteRealtime rt(ctx.modelPath);
-  const int T = rt.T();
+  const int T   = rt.T();
   const int hop = ctx.hop;
 
   if (hop > T) {
@@ -615,43 +696,59 @@ void inferenceThread(InferCtx ctx) {
     gStopFlag = true; return;
   }
 
+  // Make sure we run with hop == T for best behavior (classifier looks over full T)
+  if (hop != T) {
+    std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<"). Consider --blocksize "<<T<<" for best style stability.\n";
+  }
+
   std::vector<float> xhop(hop, 0.0f);
   std::vector<float> yT(T, 0.0f);
+  float styleP = 0.0f;  // raw per-hop style tensor
 
-  float styleP = 0.0f;
+  // 5-second rolling window of style prob (weighted by coreLen)
+  const double windowSec = 2.0;
+  size_t hopsInWindow = std::max<size_t>(1, (size_t)std::ceil(windowSec * double(ctx.sampleRate) / double(hop)));
+  ProbWindow probWin;
+  probWin.init(nextPow2(hopsInWindow + 8));
 
-  // Track last printed knob values to print on changes (as pressing 'p')
+  // Stabilized display probability = blend(avg_5s, current_ema)
+  const float kStabBlend = 0.7f;  // larger → more weight to long window
+  float stable_for_next  = 0.5f;  // used if guided-auto feeds model (one-hop lag)
+
+  // Track last printed knob values
   float prev_pa  = gKnobs.pickAttack_dB.load();
   float prev_pr  = gKnobs.pickReso_dB.load();
   float prev_ir  = gKnobs.ir_dB.load();
   float prev_wet = gKnobs.wet_pct.load();
-  int   prev_mode = gStyleMode.load();
+  int   prev_mode= gStyleMode.load();
 
-  auto stylePredWord = [&](float p, int styleMode)->const char* {
+  auto pickOrFinger = [&](float p, int styleMode)->const char* {
     if (styleMode == static_cast<int>(StyleMode::ForcePick))   return "PICK (forced)";
     if (styleMode == static_cast<int>(StyleMode::ForceFinger)) return "FINGER (forced)";
-    return (p >= 0.5f) ? "PICK" : "FINGER";
+    return (p >= 0.60f) ? "PICK" : "FINGER"; // slightly conservative UI threshold
   };
 
-  auto printKnobStatus = [&](const char* tag){
+  auto printKnobStatus = [&](const char* tag, float dispP){
     int sm = gStyleMode.load();
-    const char* pred = stylePredWord(styleP, sm);
     std::cout << (tag ? tag : "[UI]") << " PA=" << gKnobs.pickAttack_dB.load() << " dB  "
               << "PR=" << gKnobs.pickReso_dB.load()   << " dB  "
               << "IR=" << gKnobs.ir_dB.load()         << " dB  "
               << "Wet="<< gKnobs.wet_pct.load()       << " %  "
-              << "Pred=" << pred << "  "
-              << "Mode=" << styleModeName(sm) << "\n";
+              << "Pred P=" << dispP << "  "
+              << "Pred=" << pickOrFinger(dispP, sm) << "  "
+              << "Mode=" << styleModeName(sm)
+              << (gGuidedAuto.load() ? "  (Guided AUTO ON)" : "")
+              << "\n";
   };
 
-  auto checkAndReportKnobChanges = [&](){
+  auto checkAndReportKnobChanges = [&](float dispP){
     float pa  = gKnobs.pickAttack_dB.load();
     float pr  = gKnobs.pickReso_dB.load();
     float ir  = gKnobs.ir_dB.load();
     float wet = gKnobs.wet_pct.load();
     int   sm  = gStyleMode.load();
     if (pa != prev_pa || pr != prev_pr || ir != prev_ir || wet != prev_wet || sm != prev_mode) {
-      printKnobStatus("[UI]");
+      printKnobStatus("[UI]", dispP);
       prev_pa = pa; prev_pr = pr; prev_ir = ir; prev_wet = wet; prev_mode = sm;
     }
   };
@@ -661,68 +758,108 @@ void inferenceThread(InferCtx ctx) {
     std::this_thread::yield();
   if (gStopFlag) return;
 
-  // Streaming vs windowed
   const bool streaming = rt.isStreaming();
   if (streaming) {
     rt.resetStates();
   }
 
-  // Warm/start
+  // Initial hop
   size_t got = ctx.sh->in.pop(xhop.data(), hop);
   if (got < (size_t)hop) std::fill(xhop.begin()+got, xhop.end(), 0.0f);
 
-  auto do_invoke_streaming = [&](const float* coreBuf, int coreLen){
-    float pa_lin = db2lin(gKnobs.pickAttack_dB.load());
-    float pr_lin = db2lin(gKnobs.pickReso_dB.load());
-    float ir_lin = db2lin(gKnobs.ir_dB.load());
-    float wet    = clampf(gKnobs.wet_pct.load(), 0.0f, 100.0f);
+  // Helpers to call TFLite for one block
+  auto do_invoke_streaming = [&](const float* coreBuf, int coreLen, float guidedStableForAuto){
+    float pa_lin = std::pow(10.0f, gKnobs.pickAttack_dB.load() / 20.0f);
+    float pr_lin = std::pow(10.0f, gKnobs.pickReso_dB.load()   / 20.0f);
+    float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
+    float wet    = std::max(0.0f, std::min(100.0f, gKnobs.wet_pct.load()));
     float dryFrac= 1.0f - (wet / 100.0f);
 
     int sm = gStyleMode.load();
     float st_true = 0.0f, st_force = 0.0f;
     if (sm == static_cast<int>(StyleMode::ForcePick))   { st_true = 1.0f; st_force = 1.0f; }
     if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
+    if (sm == static_cast<int>(StyleMode::Auto) && gGuidedAuto.load()) {
+      st_true  = std::max(0.0f, std::min(1.0f, guidedStableForAuto));
+      st_force = 1.0f; // override model’s internal style with 5s-stabilized prob
+    }
 
     rt.invokeStreamingBlock(coreBuf, coreLen, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
   };
 
-  auto do_invoke_windowed = [&](const float* windowT){
-    float pa_lin = db2lin(gKnobs.pickAttack_dB.load());
-    float pr_lin = db2lin(gKnobs.pickReso_dB.load());
-    float ir_lin = db2lin(gKnobs.ir_dB.load());
-    float wet    = clampf(gKnobs.wet_pct.load(), 0.0f, 100.0f);
+  auto do_invoke_windowed = [&](const float* windowT, float guidedStableForAuto){
+    float pa_lin = std::pow(10.0f, gKnobs.pickAttack_dB.load() / 20.0f);
+    float pr_lin = std::pow(10.0f, gKnobs.pickReso_dB.load()   / 20.0f);
+    float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
+    float wet    = std::max(0.0f, std::min(100.0f, gKnobs.wet_pct.load()));
     float dryFrac= 1.0f - (wet / 100.0f);
 
     int sm = gStyleMode.load();
     float st_true = 0.0f, st_force = 0.0f;
     if (sm == static_cast<int>(StyleMode::ForcePick))   { st_true = 1.0f; st_force = 1.0f; }
     if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
+    if (sm == static_cast<int>(StyleMode::Auto) && gGuidedAuto.load()) {
+      st_true  = std::max(0.0f, std::min(1.0f, guidedStableForAuto));
+      st_force = 1.0f;
+    }
 
     rt.invokeWindowed(windowT, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
   };
 
+  // First block
   if (streaming) {
-    // True streaming: feed first 'hop' samples at [0:hop], zeros for the rest, no overlap.
-    do_invoke_streaming(xhop.data(), hop);
+    do_invoke_streaming(xhop.data(), hop, stable_for_next);
     ctx.sh->out.push(yT.data(), hop);
+    // Update 5s window with EMA (or raw) from this hop
+    float emaP = rt.getStyleEma();
+    float pHop = std::isfinite(emaP) ? emaP : styleP;
+    probWin.push(pHop, float(hop));
+    float pAvg5 = probWin.mean();
+    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+    stable_for_next = dispP;
+    checkAndReportKnobChanges(dispP);
+  } else {
+    // Legacy windowed: left = T - hop, right=0
+    const int left = T - hop;
+    std::vector<float> win(T, 0.0f);
+    std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
+    do_invoke_windowed(win.data(), stable_for_next);
+    ctx.sh->out.push(yT.data() + left, hop);
+    float emaP = rt.getStyleEma();
+    float pHop = std::isfinite(emaP) ? emaP : styleP;
+    probWin.push(pHop, float(hop));
+    float pAvg5 = probWin.mean();
+    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+    stable_for_next = dispP;
+    checkAndReportKnobChanges(dispP);
+  }
 
+  // Main loop
+  if (streaming) {
     while (!gStopFlag) {
-      // Wait next hop
       while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
         std::this_thread::yield();
       if (gStopFlag) break;
 
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
-      if (got2 < (size_t)hop)
-        std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
+      if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
       auto t0 = std::chrono::steady_clock::now();
-      do_invoke_streaming(xhop.data(), hop);
-      ctx.sh->out.push(yT.data(), hop);
-      auto t1 = std::chrono::steady_clock::now();
 
-      // Print knob status whenever any knob changed (same info as pressing 'p')
-      checkAndReportKnobChanges();
+      // Use the previous stabilized prob for guided AUTO (one-hop lag)
+      do_invoke_streaming(xhop.data(), hop, stable_for_next);
+      ctx.sh->out.push(yT.data(), hop);
+
+      // Update rolling 5s window and stabilized display prob
+      float emaP = rt.getStyleEma();
+      float pHop = std::isfinite(emaP) ? emaP : styleP;
+      probWin.push(pHop, float(hop));
+      float pAvg5 = probWin.mean();
+      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+      stable_for_next = dispP;
+
+      auto t1 = std::chrono::steady_clock::now();
+      checkAndReportKnobChanges(dispP);
 
       double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
       static auto   last_report = t1;
@@ -735,28 +872,23 @@ void inferenceThread(InferCtx ctx) {
         double total_ms = avg_proc + io_ms;
         int sm = gStyleMode.load();
         std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  pred="<<stylePredWord(styleP, sm)<<"  mode="<<styleModeName(sm) << "\n";
+                  << "  Pred5s=" << pAvg5 << "  DispP=" << dispP
+                  << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
+                  << (gGuidedAuto.load() ? "  (Guided)" : "")
+                  << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
   } else {
-    // Legacy windowed schedule: left = T - hop, core = hop, right = 0
     const int left = T - hop;
     std::vector<float> win(T, 0.0f);
-
-    // First window: place core at [left : left+hop)
-    std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
-    do_invoke_windowed(win.data());
-    ctx.sh->out.push(yT.data() + left, hop);
-
     while (!gStopFlag) {
       while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
         std::this_thread::yield();
       if (gStopFlag) break;
 
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
-      if (got2 < (size_t)hop)
-        std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
+      if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
       auto t0 = std::chrono::steady_clock::now();
 
@@ -764,15 +896,20 @@ void inferenceThread(InferCtx ctx) {
       if (left > 0) std::memmove(win.data(), win.data()+hop, sizeof(float)*(T-hop));
       std::memcpy(win.data() + (T - hop), xhop.data(), sizeof(float)*hop);
 
-      do_invoke_windowed(win.data());
+      do_invoke_windowed(win.data(), stable_for_next);
       ctx.sh->out.push(yT.data() + (T - hop), hop);
 
-      // Print knob status whenever any knob changed (same info as pressing 'p')
-      checkAndReportKnobChanges();
+      float emaP = rt.getStyleEma();
+      float pHop = std::isfinite(emaP) ? emaP : styleP;
+      probWin.push(pHop, float(hop));
+      float pAvg5 = probWin.mean();
+      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+      stable_for_next = dispP;
 
       auto t1 = std::chrono::steady_clock::now();
-      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+      checkAndReportKnobChanges(dispP);
 
+      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
       static auto   last_report = t1;
       static double sum_proc = 0.0;
       static size_t cnt = 0;
@@ -783,7 +920,10 @@ void inferenceThread(InferCtx ctx) {
         double total_ms = avg_proc + io_ms;
         int sm = gStyleMode.load();
         std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  pred="<<stylePredWord(styleP, sm)<<"  mode="<<styleModeName(sm) << "\n";
+                  << "  Pred5s=" << pAvg5 << "  DispP=" << dispP
+                  << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
+                  << (gGuidedAuto.load() ? "  (Guided)" : "")
+                  << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
@@ -896,7 +1036,7 @@ static void setMacHardwareBufferSize(const DeviceInfo& paDev, int blockSize, boo
 
 // ───────────────────────── MAIN ─────────────────────────
 int main(int argc, char** argv) {
-  int  blockSize = 16; // must be <= T
+  int  blockSize = 32; // must be <= T
   int  inDevId = -1, outDevId = -1;
   std::string tflitePath;
 
@@ -978,7 +1118,19 @@ int main(int argc, char** argv) {
 
   // Keyboard thread for bypass + knobs
   std::thread kbThread([&](){
-    std::cout<<"[MAIN] Keys: b=Bypass  q/a=PA +/‑1dB  w/s=PR +/‑1dB  e/d=IR +/‑1dB  r/f=Wet +/‑5%  t=Style mode (auto→pick→finger)  p=print\n";
+
+  std::cout
+    << "[MAIN] Keys: "
+    << "b=Bypass  "
+    << "q/a=PA +/-1dB  "
+    << "w/s=PR +/-1dB  "
+    << "e/d=IR +/-1dB  "
+    << "r/f=Wet +/-5%  "
+    << "t=Style mode (auto→pick→finger)  "
+    << "g=Guided AUTO on/off  "
+    << "p=print"
+    << "\n";
+
     while (!gStopFlag) {
       int c = getchar();
       if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
@@ -1008,6 +1160,12 @@ int main(int argc, char** argv) {
                    <<"IR="<<gKnobs.ir_dB.load()<<" dB  "
                    <<"Wet="<<gKnobs.wet_pct.load()<<" %  "
                    <<"Style="<<styleModeName(gStyleMode.load())<<"\n";
+        }
+
+        else if (c=='g' || c=='G') {
+          bool now = !gGuidedAuto.load();
+          gGuidedAuto.store(now);
+          std::cout << "[UI] Guided AUTO style " << (now ? "ON (model style overridden by 5s-stabilized prob)" : "OFF") << "\n";
         }
     }
   });
