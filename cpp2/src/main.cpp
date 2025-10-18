@@ -60,8 +60,10 @@
 // ───────────────────────── GLOBALS/FLAGS ─────────────────────────
 // Rolling window of style prob (weighted by coreLen)
 const double windowSec = 2.0;
+const double maxKnobDbChange = 32.0f;
 
 std::atomic<bool> gStopFlag(false), gBypass(false);
+std::atomic<uint64_t> gBypassEpoch{0};
 void signalHandler(int){ gStopFlag = true; }
 
 enum class StyleMode : int { Auto = 0, ForcePick = 1, ForceFinger = 2 };
@@ -135,6 +137,730 @@ struct Knobs {
 static double gIOInputLatencySec  = 0.0;
 static double gIOOutputLatencySec = 0.0;
 static int    PROCESSING_LOGGING_WAIT_SEC = 2;
+
+
+
+
+
+
+
+
+
+
+// ───────────────────────── KNOB WEB UI (SEPARATE WINDOW VIA BROWSER) ─────────────────────────
+// Add these functions anywhere after the globals (they reference gKnobs, gStyleMode, gBypass, gGuidedAuto).
+// Call StartKnobWebUI(8088); from main() after printing the "Keys" help (e.g., right before opening PA stream).
+// Optionally call StopKnobWebUI() during shutdown (it also stops automatically when gStopFlag is set).
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+
+static std::atomic<bool> gWebUIRunning{false};
+static std::atomic<bool> gWebUIShouldStop{false};
+static int gWebUIListenFd = -1;
+static std::thread gWebUIThread;
+
+static inline void ui_writeAll(int fd, const char* data, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ssize_t n = ::send(fd, data + off, len - off, 0);
+    if (n <= 0) return;
+    off += size_t(n);
+  }
+}
+static inline void ui_writeAllStr(int fd, const std::string& s) {
+  ui_writeAll(fd, s.data(), s.size());
+}
+
+static std::string ui_styleModeName_jsonsafe() {
+  int m = gStyleMode.load();
+  const char* n = styleModeName(m);
+  std::string s = "\"";
+  for (const char* p = n; *p; ++p) {
+    char c = *p;
+    if (c=='"' || c=='\\') { s.push_back('\\'); s.push_back(c); }
+    else s.push_back(c);
+  }
+  s.push_back('"');
+  return s;
+}
+
+static std::string ui_htmlIndex() {
+  // Self-contained HTML+CSS+JS "guitar-pedal" knobs UI
+  static const char* kHtml = R"HTML(<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Streamer Knobs</title>
+<style>
+  :root {
+    --bg: #16181d;
+    --panel: #21242c;
+    --accent: #ffcc00;
+    --accent2: #00d1ff;
+    --text: #eaeef3;
+    --muted: #9aa3ad;
+    --btn: #2a2f3a;
+    --btnOn: #355c3b;
+    --btnOff: #533c3c;
+  }
+  html, body {
+    margin:0; padding:0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    user-select: none;
+  }
+  .wrap {
+    display:flex; flex-direction:column; align-items:center; gap:14px; padding: 14px;
+  }
+  .row { display:flex; gap:16px; flex-wrap: wrap; align-items:center; justify-content:center; }
+  .pedal {
+    background: linear-gradient(180deg, #2a2f3a, #1b1f26);
+    border-radius: 16px;
+    box-shadow: 0 10px 24px rgba(0,0,0,0.35), inset 0 2px 0 rgba(255,255,255,0.05);
+    padding: 14px 16px;
+    display:flex; gap:18px; align-items:center; justify-content:center; flex-wrap: wrap;
+  }
+  .knob {
+    width: 130px; height: 170px; display:flex; flex-direction:column; align-items:center; justify-content:flex-start;
+    background: rgba(255,255,255,0.02); border-radius: 12px; padding: 8px 10px;
+  }
+  .knob canvas { width: 110px; height: 110px; image-rendering: crisp-edges; }
+  .knob .label { font-size: 13px; color: var(--muted); margin-top: 6px; letter-spacing: 0.5px; }
+  .knob .value { font-size: 16px; margin-top: 4px; }
+  .btn {
+    background: var(--btn); color: var(--text);
+    border: 1px solid rgba(255,255,255,0.06); border-radius: 10px;
+    padding: 10px 14px; cursor: pointer; transition: transform 0.02s ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.25), inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn.on { background: #2f4634; border-color: rgba(0,255,128,0.2); }
+  .btn.off{ background: #3f2a2a; border-color: rgba(255,64,64,0.2); }
+  .seg { display:flex; gap:8px; background: #14171d; border-radius: 10px; padding: 6px; border: 1px solid rgba(255,255,255,0.06); }
+  .seg .segbtn {
+    padding: 8px 12px; cursor: pointer; border-radius: 8px; color: var(--muted);
+    border: 1px solid transparent; background: transparent;
+  }
+  .seg .segbtn.active {
+    background: #283145; border-color: rgba(0,128,255,0.4); color: var(--text);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.05);
+  }
+  .title { font-size: 18px; font-weight: 600; color: var(--muted); letter-spacing: 0.6px; }
+  .small { font-size: 12px; color: var(--muted); }
+  .grid { display:grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(180px,1fr)); width: 100%; max-width: 900px; }
+  .panel {
+    background: var(--panel); border-radius: 12px; padding: 12px; border: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 8px 18px rgba(0,0,0,0.28), inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .status { display:flex; gap: 14px; align-items:center; flex-wrap: wrap; }
+  .status .kv { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row"><div class="title">Realtime Streamer Controls</div></div>
+
+  <div class="row pedal">
+    <div class="knob">
+      <canvas id="knob_pa" width="110" height="110"></canvas>
+      <div class="label">Pick Attack</div>
+      <div class="value"><span id="val_pa">0</span> dB</div>
+    </div>
+    <div class="knob">
+      <canvas id="knob_pr" width="110" height="110"></canvas>
+      <div class="label">Pick Resonance</div>
+      <div class="value"><span id="val_pr">0</span> dB</div>
+    </div>
+    <div class="knob">
+      <canvas id="knob_ir" width="110" height="110"></canvas>
+      <div class="label">IR Gain</div>
+      <div class="value"><span id="val_ir">0</span> dB</div>
+    </div>
+    <div class="knob">
+      <canvas id="knob_wet" width="110" height="110"></canvas>
+      <div class="label">Wet</div>
+      <div class="value"><span id="val_wet">100</span> %</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div class="row">
+        <div class="seg" id="modeSeg">
+          <div class="segbtn" data-mode="0">AUTO</div>
+          <div class="segbtn" data-mode="1">FORCE_PICK</div>
+          <div class="segbtn" data-mode="2">FORCE_FINGER</div>
+        </div>
+        <div class="btn" id="btnGuided">Guided AUTO: OFF</div>
+        <div class="btn" id="btnBypass">Bypass: OFF</div>
+      </div>
+      <div class="row status" style="margin-top:10px;">
+        <div class="kv">Mode: <span id="modeName">AUTO</span></div>
+        <div class="kv">Guided: <span id="guidedState">OFF</span></div>
+        <div class="kv">Bypass: <span id="bypassState">OFF</span></div>
+        <div class="small">(Console prints show current playing style and telemetry.)</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const DB_MAX = __MAX_DB__;
+function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
+function lerp(a,b,t){ return a + (b-a)*t; }
+
+class Knob {
+  constructor(canvas, opts){
+    this.c = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.min = opts.min;
+    this.max = opts.max;
+    this.step = opts.step || 1;
+    this.value = opts.value || 0;
+    this.onchange = opts.onchange || function(){};
+    this.oninput  = opts.oninput || function(){};
+    this.displayEl= opts.displayEl;
+    this.prec = opts.prec || 0;
+    this.dragging = false;
+    this.lastY = 0;
+    this.sens = opts.sens || 0.5;
+    this.color = opts.color || '#ffcc00';
+
+    this.draw();
+    this.c.addEventListener('mousedown', e => this.startDrag(e));
+    window.addEventListener('mousemove', e => this.moveDrag(e));
+    window.addEventListener('mouseup', e => this.endDrag(e));
+    this.c.addEventListener('wheel', e => this.onWheel(e), {passive:false});
+    this.c.addEventListener('dblclick', e => this.onDoubleClick(e));
+    window.addEventListener('resize', () => this.draw());
+  }
+  set(v, fire=true){
+    const nv = Math.round(clamp(v, this.min, this.max)/this.step)*this.step;
+    if (nv !== this.value){
+      this.value = nv;
+      if (this.displayEl) this.displayEl.textContent = nv.toFixed(this.prec);
+      this.draw();
+      if (fire) this.onchange(this.value);
+    } else {
+      this.draw();
+      if (fire) this.oninput(this.value);
+    }
+  }
+  startDrag(e){
+    e.preventDefault();
+    this.dragging = true;
+    this.lastY = e.clientY;
+    this.startVal = this.value;
+  }
+  moveDrag(e){
+    if (!this.dragging) return;
+    const dy = this.lastY - e.clientY;
+    this.lastY = e.clientY;
+    const delta = dy * this.sens * (this.max - this.min) / 200.0;
+    this.set(this.value + delta, true);
+  }
+  endDrag(e){
+    if (!this.dragging) return;
+    this.dragging = false;
+  }
+  onWheel(e){
+    e.preventDefault();
+    const delta = (e.deltaY < 0 ? this.step : -this.step);
+    this.set(this.value + delta, true);
+  }
+  onDoubleClick(e){
+    // reset to default
+    const defv = (this.min === 0 && this.max === 100) ? 100 : 0;
+    this.set(defv, true);
+  }
+  draw(){
+    const ctx = this.ctx;
+    const w = this.c.width, h = this.c.height;
+    ctx.clearRect(0,0,w,h);
+    const cx = w/2, cy = h/2, R = Math.min(w,h)/2 - 6;
+
+    // base circle
+    const g = ctx.createLinearGradient(0,0,0,h);
+    g.addColorStop(0, '#3b4454');
+    g.addColorStop(1, '#1e232c');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI*2);
+    ctx.fill();
+
+    // ring background
+    ctx.strokeStyle = '#13161b';
+    ctx.lineWidth = 12;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R-8, Math.PI*0.7, Math.PI*2.3);
+    ctx.stroke();
+
+    // map value to angle
+    const t = (this.value - this.min) / (this.max - this.min);
+    const ang = lerp(Math.PI*0.7, Math.PI*2.3, t);
+
+    // value arc
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth = 12;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.arc(cx, cy, R-8, Math.PI*0.7, ang);
+    ctx.stroke();
+
+    // ticks
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(Math.PI*0.7);
+    const ticks = 12;
+    for (let i=0;i<=ticks;i++){
+      const a = (Math.PI*1.6) * (i/ticks);
+      ctx.save();
+      ctx.rotate(a);
+      ctx.fillStyle = i/ticks <= t ? this.color : '#303742';
+      ctx.fillRect(R-18, -1, 10, 2);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // pointer
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.rotate(ang);
+    ctx.fillStyle = '#0c0f13';
+    ctx.fillRect(R-22, -3, 14, 6);
+    ctx.restore();
+
+    // center cap
+    const g2 = ctx.createRadialGradient(cx,cy,2, cx,cy, R/2);
+    g2.addColorStop(0, '#232a33');
+    g2.addColorStop(1, '#0f1318');
+    ctx.fillStyle = g2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R/2.2, 0, Math.PI*2);
+    ctx.fill();
+
+    // subtle highlight
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx,cy,R-5, -Math.PI*0.35, Math.PI*0.35);
+    ctx.stroke();
+  }
+}
+
+const el = (id)=>document.getElementById(id);
+const $modeSeg = document.getElementById('modeSeg');
+const $btnGuided = el('btnGuided');
+const $btnBypass = el('btnBypass');
+
+const kb = {
+  pa: new Knob(el('knob_pa'), {
+    min: -DB_MAX, max: DB_MAX, step: 1, value: 0, prec: 0, displayEl: el('val_pa'), color: '#ffcc00',
+    onchange: (v)=> sendSet({pa:v})
+  }),
+  pr: new Knob(el('knob_pr'), {
+    min: -DB_MAX, max: DB_MAX, step: 1, value: 0, prec: 0, displayEl: el('val_pr'), color: '#ff7f50',
+    onchange: (v)=> sendSet({pr:v})
+  }),
+  ir: new Knob(el('knob_ir'), {
+    min: -DB_MAX, max: DB_MAX, step: 1, value: 0, prec: 0, displayEl: el('val_ir'), color: '#7ee787',
+    onchange: (v)=> sendSet({ir:v})
+  }),
+  wet: new Knob(el('knob_wet'), {
+    min: 0, max: 100, step: 1, value: 100, prec: 0, displayEl: el('val_wet'), color: '#00d1ff',
+    onchange: (v)=> sendSet({wet:v})
+  }),
+};
+
+function sendSet(obj) {
+  const params = new URLSearchParams();
+  if ('pa' in obj) params.set('pa', obj.pa);
+  if ('pr' in obj) params.set('pr', obj.pr);
+  if ('ir' in obj) params.set('ir', obj.ir);
+  if ('wet' in obj) params.set('wet', obj.wet);
+  fetch('/set?' + params.toString()).catch(()=>{});
+}
+
+function setMode(m) {
+  fetch('/mode?v='+m).catch(()=>{});
+}
+function setGuided(on) {
+  fetch('/guided?v='+(on?1:0)).catch(()=>{});
+}
+function setBypass(on) {
+  fetch('/bypass?v='+(on?1:0)).catch(()=>{});
+}
+
+$modeSeg.querySelectorAll('.segbtn').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const v = parseInt(btn.dataset.mode,10);
+    setMode(v);
+  });
+});
+
+$btnGuided.addEventListener('click', ()=>{
+  const isOn = $btnGuided.classList.contains('on');
+  setGuided(!isOn);
+});
+$btnBypass.addEventListener('click', ()=>{
+  const isOn = $btnBypass.classList.contains('on');
+  setBypass(!isOn);
+});
+
+function applyStatus(s){
+  if (typeof s !== 'object') return;
+  kb.pa.set(s.pickAttack_dB, false);
+  kb.pr.set(s.pickReso_dB, false);
+  kb.ir.set(s.ir_dB, false);
+  kb.wet.set(s.wet_pct, false);
+
+  // seg
+  $modeSeg.querySelectorAll('.segbtn').forEach(b=>{
+    if (parseInt(b.dataset.mode,10) === s.mode) b.classList.add('active');
+    else b.classList.remove('active');
+  });
+
+  el('modeName').textContent = s.modeName;
+  el('guidedState').textContent = s.guidedAuto ? 'ON' : 'OFF';
+  el('bypassState').textContent = s.bypass ? 'ON' : 'OFF';
+
+  $btnGuided.textContent = 'Guided AUTO: ' + (s.guidedAuto?'ON':'OFF');
+  $btnGuided.classList.toggle('on', !!s.guidedAuto);
+  $btnGuided.classList.toggle('off', !s.guidedAuto);
+
+  $btnBypass.textContent = 'Bypass: ' + (s.bypass?'ON':'OFF');
+  $btnBypass.classList.toggle('on', !!s.bypass);
+  $btnBypass.classList.toggle('off', !s.bypass);
+}
+
+async function poll(){
+  try{
+    const r = await fetch('/status?ts=' + Date.now());
+    const s = await r.json();
+    applyStatus(s);
+  } catch (e) {}
+}
+setInterval(poll, 150);
+poll();
+</script>
+</body>
+</html>)HTML";
+  return std::string(kHtml);
+}
+
+static std::string ui_jsonStatus() {
+  std::ostringstream oss;
+  oss.setf(std::ios::fixed); oss<<std::setprecision(3);
+  oss<<"{";
+  oss<<"\"pickAttack_dB\":"<< gKnobs.pickAttack_dB.load() <<",";
+  oss<<"\"pickReso_dB\":"<< gKnobs.pickReso_dB.load() <<",";
+  oss<<"\"ir_dB\":"      << gKnobs.ir_dB.load()        <<",";
+  oss<<"\"wet_pct\":"    << gKnobs.wet_pct.load()      <<",";
+  oss<<"\"bypass\":"     << (gBypass.load()?1:0)       <<",";
+  oss<<"\"mode\":"       << gStyleMode.load()          <<",";
+  oss<<"\"modeName\":"   << ui_styleModeName_jsonsafe() <<",";
+  oss<<"\"guidedAuto\":" << (gGuidedAuto.load()?1:0);
+  oss<<"}";
+  return oss.str();
+}
+
+static inline std::string ui_httpHeader(const char* status, const char* mime, size_t contentLen, bool nocache=false) {
+  std::ostringstream oss;
+  oss<<"HTTP/1.1 "<<status<<"\r\n";
+  oss<<"Connection: close\r\n";
+  if (mime) oss<<"Content-Type: "<<mime<<"\r\n";
+  oss<<"Content-Length: "<<contentLen<<"\r\n";
+  if (nocache) {
+    oss<<"Cache-Control: no-cache, no-store, must-revalidate\r\n";
+    oss<<"Pragma: no-cache\r\n";
+    oss<<"Expires: 0\r\n";
+  }
+  oss<<"\r\n";
+  return oss.str();
+}
+
+static inline std::string ui_urlDecode(const std::string& s) {
+  std::string out; out.reserve(s.size());
+  for (size_t i=0;i<s.size();++i){
+    char c = s[i];
+    if (c=='%') {
+      if (i+2 < s.size()) {
+        int hi = std::isdigit(s[i+1]) ? s[i+1]-'0' : (std::tolower(s[i+1])-'a'+10);
+        int lo = std::isdigit(s[i+2]) ? s[i+2]-'0' : (std::tolower(s[i+2])-'a'+10);
+        if (hi>=0 && hi<16 && lo>=0 && lo<16) {
+          out.push_back(char(hi*16 + lo));
+          i+=2; continue;
+        }
+      }
+      out.push_back('%');
+    } else if (c=='+') out.push_back(' ');
+    else out.push_back(c);
+  }
+  return out;
+}
+
+static inline std::unordered_map<std::string,std::string> ui_parseQuery(const std::string& q) {
+  std::unordered_map<std::string,std::string> m;
+  size_t i=0;
+  while (i<q.size()){
+    size_t amp = q.find('&', i);
+    std::string kv = q.substr(i, amp==std::string::npos ? std::string::npos : amp-i);
+    size_t eq = kv.find('=');
+    if (eq == std::string::npos) {
+      m[ui_urlDecode(kv)] = "";
+    } else {
+      m[ui_urlDecode(kv.substr(0,eq))] = ui_urlDecode(kv.substr(eq+1));
+    }
+    if (amp==std::string::npos) break;
+    i = amp+1;
+  }
+  return m;
+}
+
+static inline void ui_handleSet(const std::unordered_map<std::string,std::string>& q) {
+  auto getf = [&](const char* k, float &dst, float lo, float hi){
+    auto it = q.find(k);
+    if (it != q.end()) {
+      try {
+        float v = std::stof(it->second);
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        dst = v;
+      } catch (...) {}
+    }
+  };
+  float pa = gKnobs.pickAttack_dB.load();
+  float pr = gKnobs.pickReso_dB.load();
+  float ir = gKnobs.ir_dB.load();
+  float wt = gKnobs.wet_pct.load();
+  getf("pa", pa, -maxKnobDbChange, maxKnobDbChange);
+  getf("pr", pr, -maxKnobDbChange, maxKnobDbChange);
+  getf("ir", ir, -maxKnobDbChange, maxKnobDbChange);
+  getf("wet", wt, 0.0f, 100.0f);
+  gKnobs.pickAttack_dB.store(pa);
+  gKnobs.pickReso_dB.store(pr);
+  gKnobs.ir_dB.store(ir);
+  gKnobs.wet_pct.store(wt);
+}
+
+static inline void ui_handleMode(const std::unordered_map<std::string,std::string>& q) {
+  auto it = q.find("v");
+  if (it != q.end()) {
+    try {
+      int v = std::stoi(it->second);
+      if (v < 0) v = 0; if (v > 2) v = 2;
+      gStyleMode.store(v);
+    } catch (...) {}
+  }
+}
+static inline void ui_handleGuided(const std::unordered_map<std::string,std::string>& q) {
+  auto it = q.find("v");
+  if (it != q.end()) {
+    gGuidedAuto.store(it->second=="1" || it->second=="true" || it->second=="on");
+  }
+}
+
+static inline void ui_handleBypass(const std::unordered_map<std::string,std::string>& q) {
+  auto it = q.find("v");
+  if (it != q.end()) {
+    bool on = (it->second=="1" || it->second=="true" || it->second=="on");
+    bool prev = gBypass.exchange(on, std::memory_order_acq_rel);
+    if (on != prev) {
+      gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+  }
+}
+
+static inline void ui_replaceAll(std::string &s, const std::string& from, const std::string& to) {
+  if (from.empty()) return;
+  size_t pos = 0;
+  while ((pos = s.find(from, pos)) != std::string::npos) {
+    s.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+}
+
+static void ui_handleClient(int cfd) {
+  // Read basic HTTP request (up to headers end). Limit to 16KB
+  std::string req; req.resize(0);
+  char buf[4096];
+  int headerEnd = -1;
+  for (;;) {
+    ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+    if (n <= 0) break;
+    req.append(buf, buf+n);
+    // find \r\n\r\n
+    size_t pos = req.find("\r\n\r\n");
+    if (pos != std::string::npos) { headerEnd = int(pos + 4); break; }
+    if (req.size() > 16384) break;
+  }
+  if (headerEnd < 0) {
+    std::string h = ui_httpHeader("400 Bad Request", "text/plain; charset=utf-8", 0);
+    ui_writeAllStr(cfd, h);
+    return;
+  }
+  // Parse request line
+  size_t lineEnd = req.find("\r\n");
+  if (lineEnd == std::string::npos) {
+    std::string h = ui_httpHeader("400 Bad Request", "text/plain; charset=utf-8", 0);
+    ui_writeAllStr(cfd, h);
+    return;
+  }
+  std::string firstLine = req.substr(0, lineEnd);
+  std::istringstream iss(firstLine);
+  std::string method, uri, ver;
+  iss >> method >> uri >> ver;
+  std::string path = uri, query;
+  size_t qpos = uri.find('?');
+  if (qpos != std::string::npos) { path = uri.substr(0,qpos); query = uri.substr(qpos+1); }
+
+  // Routes
+  if (method == "GET" && (path == "/" || path == "/index.html")) {
+    std::string body = ui_htmlIndex();
+    ui_replaceAll(body, "__MAX_DB__", std::to_string(maxKnobDbChange));
+    std::string h = ui_httpHeader("200 OK", "text/html; charset=utf-8", body.size());
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else if (method == "GET" && path == "/status") {
+    std::string body = ui_jsonStatus();
+    std::string h = ui_httpHeader("200 OK", "application/json; charset=utf-8", body.size(), true);
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else if (method == "GET" && path == "/set") {
+    auto q = ui_parseQuery(query);
+    ui_handleSet(q);
+    std::string body = "{\"ok\":1}";
+    std::string h = ui_httpHeader("200 OK", "application/json; charset=utf-8", body.size(), true);
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else if (method == "GET" && path == "/mode") {
+    auto q = ui_parseQuery(query);
+    ui_handleMode(q);
+    std::string body = "{\"ok\":1}";
+    std::string h = ui_httpHeader("200 OK", "application/json; charset=utf-8", body.size(), true);
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else if (method == "GET" && path == "/guided") {
+    auto q = ui_parseQuery(query);
+    ui_handleGuided(q);
+    std::string body = "{\"ok\":1}";
+    std::string h = ui_httpHeader("200 OK", "application/json; charset=utf-8", body.size(), true);
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else if (method == "GET" && path == "/bypass") {
+    auto q = ui_parseQuery(query);
+    ui_handleBypass(q);
+    std::string body = "{\"ok\":1}";
+    std::string h = ui_httpHeader("200 OK", "application/json; charset=utf-8", body.size(), true);
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  } else {
+    std::string body = "Not Found";
+    std::string h = ui_httpHeader("404 Not Found", "text/plain; charset=utf-8", body.size());
+    ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
+  }
+}
+
+static void ui_tryOpenBrowser(uint16_t port) {
+#if defined(__APPLE__)
+  std::string cmd = "open http://127.0.0.1:" + std::to_string(port) + "/";
+  std::system(cmd.c_str());
+#elif defined(_WIN32)
+  std::string url = "http://127.0.0.1:" + std::to_string(port) + "/";
+  std::string cmd = "start " + url;
+  std::system(cmd.c_str());
+#else
+  std::string cmd = "xdg-open http://127.0.0.1:" + std::to_string(port) + " >/dev/null 2>&1 &";
+  std::system(cmd.c_str());
+#endif
+}
+
+static void KnobWebUIServerLoop(uint16_t port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { std::cerr<<"[UI] socket() failed\n"; return; }
+  gWebUIListenFd = fd;
+
+  int yes = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+  addr.sin_port = htons(port);
+
+  if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    std::cerr<<"[UI] bind("<<port<<") failed\n";
+    ::close(fd); gWebUIListenFd = -1; return;
+  }
+  if (::listen(fd, 8) < 0) {
+    std::cerr<<"[UI] listen() failed\n";
+    ::close(fd); gWebUIListenFd = -1; return;
+  }
+
+  std::cout<<"[UI] Web UI on http://127.0.0.1:"<<port<<"/  (opens in your browser)\n";
+  ui_tryOpenBrowser(port);
+
+  // Accept loop
+  while (!gStopFlag.load() && !gWebUIShouldStop.load()) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    timeval tv; tv.tv_sec = 0; tv.tv_usec = 200000;
+    int rv = ::select(fd+1, &rfds, nullptr, nullptr, &tv);
+    if (rv > 0 && FD_ISSET(fd, &rfds)) {
+      sockaddr_in cli{}; socklen_t cl = sizeof(cli);
+      int cfd = ::accept(fd, (struct sockaddr*)&cli, &cl);
+      if (cfd >= 0) {
+        ui_handleClient(cfd);
+        ::shutdown(cfd, SHUT_RDWR);
+        ::close(cfd);
+      }
+    }
+  }
+  ::close(fd);
+  gWebUIListenFd = -1;
+}
+
+static void StartKnobWebUI(uint16_t port) {
+  if (gWebUIRunning.load()) return;
+  gWebUIShouldStop.store(false);
+  gWebUIRunning.store(true);
+  gWebUIThread = std::thread([port](){
+    // Lower priority for UI thread
+#if defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
+    KnobWebUIServerLoop(port);
+    gWebUIRunning.store(false);
+  });
+}
+
+static void StopKnobWebUI() {
+  gWebUIShouldStop.store(true);
+  if (gWebUIListenFd >= 0) {
+    // poke the accept()
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s >= 0) {
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      addr.sin_port = htons( (uint16_t) ( (gWebUIListenFd>=0) ? 0 : 0 ) ); // not used
+      // Best-effort connect to wake; we don't know bound port in this snippet, so rely on ShouldStop and select timeout
+      ::close(s);
+    }
+  }
+  if (gWebUIThread.joinable()) gWebUIThread.join();
+}
+
+
+
+
+
+
+
+
+
+
+
+
 
 // ───────────────────────── RING BUFFER ─────────────────────────
 struct RingBuffer {
@@ -704,6 +1430,7 @@ void inferenceThread(InferCtx ctx) {
     std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<"). Consider --blocksize "<<T<<" for best style stability.\n";
   }
 
+  uint64_t lastBypassEpoch = gBypassEpoch.load(std::memory_order_acquire);
   std::vector<float> xhop(hop, 0.0f);
   std::vector<float> yT(T, 0.0f);
   float styleP = 0.0f;  // raw per-hop style tensor
@@ -763,6 +1490,19 @@ void inferenceThread(InferCtx ctx) {
   if (streaming) {
     rt.resetStates();
   }
+
+  auto onBypassEdgeIfAny = [&](){
+    uint64_t cur = gBypassEpoch.load(std::memory_order_acquire);
+    if (cur != lastBypassEpoch) {
+      lastBypassEpoch = cur;
+      if (streaming) {
+        rt.resetStates();
+      }
+      probWin.reset();
+      // Drop any queued processed audio to be extra safe
+      ctx.sh->out.r.store(ctx.sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
+    }
+  };
 
   // Initial hop
   size_t got = ctx.sh->in.pop(xhop.data(), hop);
@@ -845,6 +1585,9 @@ void inferenceThread(InferCtx ctx) {
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
       if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
+      // Reset state/rings on bypass edge
+      onBypassEdgeIfAny();
+
       auto t0 = std::chrono::steady_clock::now();
 
       // Use the previous stabilized prob for guided AUTO (one-hop lag)
@@ -891,6 +1634,9 @@ void inferenceThread(InferCtx ctx) {
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
       if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
+      // Reset state/rings on bypass edge
+      onBypassEdgeIfAny();
+
       auto t0 = std::chrono::steady_clock::now();
 
       // Slide window left by hop; append new hop at end
@@ -932,10 +1678,11 @@ void inferenceThread(InferCtx ctx) {
 }
 
 // ───────────────────────── PA CALLBACK ─────────────────────────
+
 static int paCallback(const void *inputBuffer,
                       void *outputBuffer,
                       unsigned long framesPerBuffer,
-                      const PaStreamCallbackTimeInfo *,
+                      const PaStreamCallbackTimeInfo *timeInfo,
                       PaStreamCallbackFlags,
                       void *userData)
 {
@@ -944,9 +1691,32 @@ static int paCallback(const void *inputBuffer,
   auto *out= static_cast<float*>(outputBuffer);
   size_t hop = framesPerBuffer;
 
+  // Update measured E2E latency using PA's hardware timestamps.
+  if (timeInfo) {
+    static double s_prevInputAdcTime = 0.0;
+    s_prevInputAdcTime = timeInfo->inputBufferAdcTime;
+
+    // Bypass edge detection: drop all queued audio immediately on any toggle.
+    static uint64_t s_lastBypassEpoch = 0;
+    static bool s_lastBypass = false;
+    uint64_t curEpoch = gBypassEpoch.load(std::memory_order_acquire);
+    bool curBypass = gBypass.load(std::memory_order_relaxed);
+    if (curEpoch != s_lastBypassEpoch || curBypass != s_lastBypass) {
+      sh->in.r.store(sh->in.w.load(std::memory_order_acquire), std::memory_order_release);
+      sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
+      // Reset measurement to avoid reporting garbage around toggle
+      s_prevInputAdcTime = 0.0;
+      s_lastBypassEpoch = curEpoch;
+      s_lastBypass = curBypass;
+    }
+  }
+
   if (in) sh->in.push(in, hop);
 
-  if (gBypass.load()) {
+  if (gBypass.load(std::memory_order_relaxed)) {
+    // While bypass is ON, ensure the processed output ring stays empty
+    sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
+
     if (in) {
       for (size_t i=0;i<hop;i++){
         float v = in[i];
@@ -1136,15 +1906,19 @@ int main(int argc, char** argv) {
       int c = getchar();
       if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
       if (c=='b'||c=='B') {
-        bool now = !gBypass.load(); gBypass.store(now);
-        shared.out.r.store(shared.out.w.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        bool now = !gBypass.load(std::memory_order_relaxed);
+        bool prev = gBypass.exchange(now, std::memory_order_acq_rel);
+        gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);
+        // Drop all queued audio immediately
+        shared.in.r.store(shared.in.w.load(std::memory_order_acquire), std::memory_order_release);
+        shared.out.r.store(shared.out.w.load(std::memory_order_acquire), std::memory_order_release);
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
-      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -24.0f, 24.0f) ); }
-        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -24.0f, 24.0f) ); }
-        else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -24.0f, 24.0f) ); }
-        else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -24.0f, 24.0f) ); }
-        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -24.0f, 24.0f) ); }
-        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -24.0f, 24.0f) ); }
+      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+        else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+        else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
         else if (c=='r') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()+5.0f, 0.0f, 100.0f) ); }
         else if (c=='f') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()-5.0f, 0.0f, 100.0f) ); }
         else if (c=='t') {
@@ -1170,6 +1944,8 @@ int main(int argc, char** argv) {
         }
     }
   });
+
+  StartKnobWebUI(8088);
 
   PaStream *stream = nullptr;
   err = Pa_OpenStream(&stream, &ip, &op, sampleRate, (unsigned long)blockSize, paNoFlag, paCallback, &shared);
@@ -1199,6 +1975,9 @@ int main(int argc, char** argv) {
   while (!gStopFlag) Pa_Sleep(100);
 
   std::cout<<"[MAIN] Stopping…\n";
+
+  StopKnobWebUI();
+
   Pa_StopStream(stream);
   Pa_CloseStream(stream);
   Pa_Terminate();
