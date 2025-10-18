@@ -58,6 +58,9 @@
 #endif
 
 // ───────────────────────── GLOBALS/FLAGS ─────────────────────────
+// Rolling window of style prob (weighted by coreLen)
+const double windowSec = 2.0;
+
 std::atomic<bool> gStopFlag(false), gBypass(false);
 void signalHandler(int){ gStopFlag = true; }
 
@@ -705,8 +708,6 @@ void inferenceThread(InferCtx ctx) {
   std::vector<float> yT(T, 0.0f);
   float styleP = 0.0f;  // raw per-hop style tensor
 
-  // 5-second rolling window of style prob (weighted by coreLen)
-  const double windowSec = 2.0;
   size_t hopsInWindow = std::max<size_t>(1, (size_t)std::ceil(windowSec * double(ctx.sampleRate) / double(hop)));
   ProbWindow probWin;
   probWin.init(nextPow2(hopsInWindow + 8));
@@ -814,8 +815,8 @@ void inferenceThread(InferCtx ctx) {
     float emaP = rt.getStyleEma();
     float pHop = std::isfinite(emaP) ? emaP : styleP;
     probWin.push(pHop, float(hop));
-    float pAvg5 = probWin.mean();
-    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+    float pAvgWindowSec = probWin.mean();
+    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
     stable_for_next = dispP;
     checkAndReportKnobChanges(dispP);
   } else {
@@ -828,8 +829,8 @@ void inferenceThread(InferCtx ctx) {
     float emaP = rt.getStyleEma();
     float pHop = std::isfinite(emaP) ? emaP : styleP;
     probWin.push(pHop, float(hop));
-    float pAvg5 = probWin.mean();
-    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+    float pAvgWindowSec = probWin.mean();
+    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
     stable_for_next = dispP;
     checkAndReportKnobChanges(dispP);
   }
@@ -850,12 +851,12 @@ void inferenceThread(InferCtx ctx) {
       do_invoke_streaming(xhop.data(), hop, stable_for_next);
       ctx.sh->out.push(yT.data(), hop);
 
-      // Update rolling 5s window and stabilized display prob
+      // Update rolling {windowSec}s window and stabilized display prob
       float emaP = rt.getStyleEma();
       float pHop = std::isfinite(emaP) ? emaP : styleP;
       probWin.push(pHop, float(hop));
-      float pAvg5 = probWin.mean();
-      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+      float pAvgWindowSec = probWin.mean();
+      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
       stable_for_next = dispP;
 
       auto t1 = std::chrono::steady_clock::now();
@@ -872,7 +873,7 @@ void inferenceThread(InferCtx ctx) {
         double total_ms = avg_proc + io_ms;
         int sm = gStyleMode.load();
         std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  Pred5s=" << pAvg5 << "  DispP=" << dispP
+                  << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
                   << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
                   << (gGuidedAuto.load() ? "  (Guided)" : "")
                   << "\n";
@@ -902,8 +903,8 @@ void inferenceThread(InferCtx ctx) {
       float emaP = rt.getStyleEma();
       float pHop = std::isfinite(emaP) ? emaP : styleP;
       probWin.push(pHop, float(hop));
-      float pAvg5 = probWin.mean();
-      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvg5;
+      float pAvgWindowSec = probWin.mean();
+      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
       stable_for_next = dispP;
 
       auto t1 = std::chrono::steady_clock::now();
@@ -920,7 +921,7 @@ void inferenceThread(InferCtx ctx) {
         double total_ms = avg_proc + io_ms;
         int sm = gStyleMode.load();
         std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  Pred5s=" << pAvg5 << "  DispP=" << dispP
+                  << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
                   << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
                   << (gGuidedAuto.load() ? "  (Guided)" : "")
                   << "\n";
@@ -1165,7 +1166,7 @@ int main(int argc, char** argv) {
         else if (c=='g' || c=='G') {
           bool now = !gGuidedAuto.load();
           gGuidedAuto.store(now);
-          std::cout << "[UI] Guided AUTO style " << (now ? "ON (model style overridden by 5s-stabilized prob)" : "OFF") << "\n";
+          std::cout << "[UI] Guided AUTO style " << (now ? "ON (model style overridden by " + std::to_string(windowSec) + "s-stabilized prob)" : "OFF") << "\n";
         }
     }
   });
