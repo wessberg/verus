@@ -122,7 +122,7 @@ np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 # On/off flags
-DISABLE_SCALE_BOOSTS = False
+DISABLE_DEMO_SCALE_BOOSTS = False
 
 EPOCHS      = 40
 OFFLINE_FINETUNE_EPOCHS = 10
@@ -237,11 +237,11 @@ OFFLINE_FILM_BETA_MAG   = 0.05
 OFFLINE_PICK_RESO_BP_ORDER = 257
 REALTIME_PICK_RESO_BP_ORDER = 257
 
-OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
-REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
+OFFLINE_PICK_RESO_DEMO_BOOST_DB    = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 8.0
+REALTIME_PICK_RESO_DEMO_BOOST_DB   = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 38.0
 
-FINETUNE_OFFLINE_PICK_RESO_BOOST_DB    = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
-FINETUNE_REALTIME_PICK_RESO_BOOST_DB   = 0.0 if DISABLE_SCALE_BOOSTS else 8.0
+FINETUNE_OFFLINE_PICK_RESO_DEMO_BOOST_DB    = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 8.0
+FINETUNE_REALTIME_PICK_RESO_DEMO_BOOST_DB   = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 8.0
 
 
 # Frequencies chosen to cover the “weird” pick resonances roughly in 0.7–2.2 kHz.
@@ -375,8 +375,8 @@ REALTIME_PICK_RESO_DOWNSAMPLE_FACTOR = 8
 REALTIME_PICK_RESO_DS_TAPS           = 33
 REALTIME_PICK_RESO_INTERP_TAPS       = 65
 
-REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
-FINETUNE_REALTIME_IR_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 0.0
+REALTIME_IR_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 0.0
+FINETUNE_REALTIME_IR_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 0.0
 
 REALTIME_LP_ORDER   = 257 
 
@@ -386,13 +386,62 @@ MIN_LR     = 1e-6
 LR_PATIENCE = 8
 LR_PLATEAU_PATIENCE = 5
 
-OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 38.0
-REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 24.0
+OFFLINE_PICK_ATTACK_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 38.0
+REALTIME_PICK_ATTACK_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 24.0
 
-FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
-FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB = 0.0 if DISABLE_SCALE_BOOSTS else 32.0
+FINETUNE_OFFLINE_PICK_ATTACK_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 32.0
+FINETUNE_REALTIME_PICK_ATTACK_DEMO_BOOST_DB = 0.0 if DISABLE_DEMO_SCALE_BOOSTS else 32.0
 
-KNOB_DEFAULT_WET_PCT = 100.0
+KNOB_DEFAULT_PICK_ATTACK_SCALE = 1.0
+KNOB_DEFAULT_PICK_RESO_SCALE = 1.0
+KNOB_DEFAULT_IR_SCALE = 1.0
+KNOB_DEFAULT_DRY_PCT = 0.0
+KNOB_DEFAULT_OUT_GAIN = 1.0
+KNOB_DEFAULT_PHASE_INVERT = 0.0
+KNOB_DEFAULT_LOW_CUT_HZ = 20.0
+KNOB_DEFAULT_LOW_CUT_SLOPE_DB_PER_OCT = 6.0
+KNOB_DEFAULT_LOW_SHELF_GAIN_DB = 0.0
+KNOB_DEFAULT_LOW_SHELF_HZ = 200.0
+KNOB_DEFAULT_LOW_SHELF_SLOPE_DB_PER_OCT = 12.0
+KNOB_DEFAULT_MID_GAIN_DB = 0.0
+KNOB_DEFAULT_MID_HZ = 1000.0
+KNOB_DEFAULT_MID_Q = 1.0
+KNOB_DEFAULT_HIGH_SHELF_GAIN_DB = 0.0
+KNOB_DEFAULT_HIGH_SHELF_HZ = 4000.0
+KNOB_DEFAULT_HIGH_SHELF_SLOPE_DB_PER_OCT = 12.0
+
+def _common_knob_defaults():
+    return {
+        "dry_pct": KNOB_DEFAULT_DRY_PCT,
+        "outgain": KNOB_DEFAULT_OUT_GAIN,
+        "phaseinv": KNOB_DEFAULT_PHASE_INVERT,
+        "lc_hz": KNOB_DEFAULT_LOW_CUT_HZ,
+        "lc_slope": KNOB_DEFAULT_LOW_CUT_SLOPE_DB_PER_OCT,
+        "ls_gain_db": KNOB_DEFAULT_LOW_SHELF_GAIN_DB,
+        "ls_hz": KNOB_DEFAULT_LOW_SHELF_HZ,
+        "ls_slope": KNOB_DEFAULT_LOW_SHELF_SLOPE_DB_PER_OCT,
+        "mid_gain_db": KNOB_DEFAULT_MID_GAIN_DB,
+        "mid_hz": KNOB_DEFAULT_MID_HZ,
+        "mid_q": KNOB_DEFAULT_MID_Q,
+        "hs_gain_db": KNOB_DEFAULT_HIGH_SHELF_GAIN_DB,
+        "hs_hz": KNOB_DEFAULT_HIGH_SHELF_HZ,
+        "hs_slope": KNOB_DEFAULT_HIGH_SHELF_SLOPE_DB_PER_OCT,
+        "pickattack": KNOB_DEFAULT_PICK_ATTACK_SCALE,
+        "pickreso": KNOB_DEFAULT_PICK_RESO_SCALE
+    }
+
+def realtime_knob_defaults():
+    d = _common_knob_defaults()
+    return {
+        **d,
+        "ir": KNOB_DEFAULT_IR_SCALE
+    }
+
+def offline_knob_defaults():
+    d = _common_knob_defaults()
+    return {
+        **d
+    }
 
 # Broad bands for tone shaping. Use tighter set at 48k, extended top at 96k.
 
@@ -418,11 +467,11 @@ COLOREQ_BANDS_OFFLINE_BODY = [
 SHUFFLE_BUF         = 1000
 CHUNK_SEC           = 5
 
-DEMO_SEC        = 2.0
+DEMO_SEC        = 10.0
 DEMO_OFFSET_SEC = 0.2
 DEMO_PAIR_INDEX = 0
 
-LONG_DEMO_SEC        = 2.0
+LONG_DEMO_SEC        = 10.0
 LONG_DEMO_OFFSET_SEC = 0.2
 LONG_DEMO_PAIR_INDEX = 0
 
@@ -468,14 +517,241 @@ STEMS_FINETUNE_OUT_DIR = os.path.join(STEMS_OUT_DIR, "finetune")
 STEMS_FINETUNE_OFFLINE_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "offline")
 STEMS_FINETUNE_REALTIME_OUT_DIR = os.path.join(STEMS_FINETUNE_OUT_DIR, "realtime")
 
-def _default_dryness_value():
-    # Clamp to [0,1] and convert wet% -> dry fraction
-    try:
-        w = float(KNOB_DEFAULT_WET_PCT)
-    except Exception:
-        w = 100.0
-    w = max(0.0, min(100.0, w))
-    return float(1.0 - (w / 100.0))
+# ───────── Master EQ grids (small, efficient) ─────────
+MASTER_EQ_SLOPES_DBPOCT = [6.0, 12.0, 24.0, 36.0]  # minimal set
+MASTER_EQ_SLOPE2ORDER = { 6.0: 33, 12.0: 65, 24.0: 129, 36.0: 193 }
+
+def _eq_grids_for_sr(sr):
+    sr = int(sr)
+    nyq = 0.5 * sr
+    # LC useful up to ~300 Hz
+    lc_freqs = np.array([20, 30, 40, 60, 80, 100, 150, 200, 300], dtype=np.float32)
+    # Low-shelf corners
+    ls_freqs = np.array([80, 120, 180, 260, 380, 560, 800], dtype=np.float32)
+    # High-shelf corners (cap a bit below Nyquist)
+    hi_max = min(16000.0, nyq - 2000.0)
+    hs_freqs = np.array([2000, 3500, 5000, 7000, 10000, hi_max], dtype=np.float32)
+    # Mid centers
+    mid_centers = np.array([300, 500, 800, 1200, 1800, 2600, 3800, 5200], dtype=np.float32)
+    # Mid Qs
+    mid_qs = np.array([0.5, 0.7, 1.0, 1.4, 2.0], dtype=np.float32)
+    return {
+        "lc_freqs": lc_freqs,
+        "ls_freqs": ls_freqs,
+        "hs_freqs": hs_freqs,
+        "mid_centers": mid_centers,
+        "mid_qs": mid_qs,
+        "slopes": np.array(MASTER_EQ_SLOPES_DBPOCT, dtype=np.float32)
+    }
+
+_eq_bank_cache = {}
+
+def _hp_bank_kernel(sr, freqs, slopes):
+    """
+    Build (L_max,1,K) reversed min-phase HPF taps (cross-correlation kernel).
+    Slope controls filter order; shorter orders are left-padded to L_max so all channels share length.
+    """
+    Lmax = max(MASTER_EQ_SLOPE2ORDER[float(s)] for s in slopes)
+    ks = []
+    for f in freqs:
+        for s in slopes:
+            L = MASTER_EQ_SLOPE2ORDER[float(s)]
+            k_small = _hp_minphase_rev_padded(sr, float(f), L)  # (L,1,1)
+            if L < Lmax:
+                pad = Lmax - L
+                k_full = np.pad(np.asarray(k_small).reshape(L,1,1), ((pad,0),(0,0),(0,0)), mode='constant')
+            else:
+                k_full = np.asarray(k_small, np.float32)
+            ks.append(np.asarray(k_full, np.float32))
+    K3 = np.concatenate(ks, axis=2)  # (Lmax,1,K)
+    return K3.astype(np.float32)
+
+def _lp_bank_kernel(sr, freqs, slopes):
+    """
+    Build (L_max,1,K) reversed linear-phase LPF taps (cross-correlation kernel).
+    Slope controls filter order.
+    """
+    Lmax = max(MASTER_EQ_SLOPE2ORDER[float(s)] for s in slopes)
+    ks = []
+    for f in freqs:
+        for s in slopes:
+            L = MASTER_EQ_SLOPE2ORDER[float(s)]
+            # pad to Lmax
+            k_small = _lp_rev_padded(sr, float(f), L)  # (L,1,1)
+            if L < Lmax:
+                pad = Lmax - L
+                k_full = np.pad(k_small.reshape(L,1,1), ((pad,0),(0,0),(0,0)), mode='constant')
+            else:
+                k_full = k_small
+            ks.append(np.asarray(k_full, np.float32))
+    K3 = np.concatenate(ks, axis=2)  # (Lmax,1,K)
+    return K3.astype(np.float32)
+
+def _bp_bank_kernel(sr, centers, qs, order=129):
+    """
+    Build (order,1,K) reversed min-phase BP taps (cross-correlation kernel).
+    Band edges from simple BW = f0/Q around f0 (clamped to [20, nyq-200]).
+    """
+    nyq = 0.5 * float(sr)
+    L = int(order)
+    ks = []
+    for f0 in centers:
+        f0 = float(f0)
+        for q in qs:
+            q = float(q)
+            bw = max(10.0, f0 / max(q, 1e-3))
+            f1 = max(20.0, f0 - 0.5 * bw)
+            f2 = min(nyq - 200.0, f0 + 0.5 * bw)
+            if f2 <= f1 + 20.0:
+                f2 = f1 + 20.0
+            k = _bp_minphase_rev_padded(sr, f1, f2, L)  # (L,1,1)
+            ks.append(np.asarray(k, np.float32))
+    K3 = np.concatenate(ks, axis=2)  # (L,1,K)
+    return K3.astype(np.float32)
+
+def _get_eq_kernels(sr):
+    """
+    Returns dict of 3D kernels (L,1,K) for LC_HP, LS_LP, HS_HP, MID_BP given sr.
+    Cached.
+    """
+    global _eq_bank_cache
+    sr = int(sr)
+    key = ("eqbanks", sr)
+    if key in _eq_bank_cache:
+        return _eq_bank_cache[key]
+    g = _eq_grids_for_sr(sr)
+    K_lc = _hp_bank_kernel(sr, g["lc_freqs"], g["slopes"])
+    K_ls = _lp_bank_kernel(sr, g["ls_freqs"], g["slopes"])
+    K_hs = _hp_bank_kernel(sr, g["hs_freqs"], g["slopes"])
+    K_md = _bp_bank_kernel(sr, g["mid_centers"], g["mid_qs"], order=129)
+    _eq_bank_cache[key] = {"lc_hp": K_lc, "ls_lp": K_ls, "hs_hp": K_hs, "mid_bp": K_md}
+    return _eq_bank_cache[key]
+
+def _weights_lc(w_cut_hz, w_slope_db):
+    # Narrow LC frequency blending so the selected cutoff dominates the FIR bank.
+    # The old alpha=0.002 was far too broad across Hz; this concentrates weights near the chosen cutoff.
+    g = _eq_grids_for_sr(REALTIME_SAMPLE_RATE)
+    wf = gaussian_weights_1d(w_cut_hz, g["lc_freqs"], alpha=0.05)       # was 0.002
+    ws = gaussian_weights_1d(w_slope_db, g["slopes"], alpha=0.20)       # was 0.08
+    return outer_weights(wf, ws)
+
+def _weights_ls(w_cut_hz, w_slope_db):
+    g = _eq_grids_for_sr(REALTIME_SAMPLE_RATE)
+    wf = gaussian_weights_1d(w_cut_hz, g["ls_freqs"], alpha=0.002)
+    ws = gaussian_weights_1d(w_slope_db, g["slopes"], alpha=0.08)
+    return outer_weights(wf, ws)
+
+def _weights_hs(w_cut_hz, w_slope_db):
+    g = _eq_grids_for_sr(REALTIME_SAMPLE_RATE)
+    wf = gaussian_weights_1d(w_cut_hz, g["hs_freqs"], alpha=0.002)
+    ws = gaussian_weights_1d(w_slope_db, g["slopes"], alpha=0.08)
+    return outer_weights(wf, ws)
+
+def _weights_mid(w_center_hz, w_q):
+    g = _eq_grids_for_sr(REALTIME_SAMPLE_RATE)
+    wf = gaussian_weights_1d(w_center_hz, g["mid_centers"], alpha=0.002)
+    wq = gaussian_weights_1d(w_q, g["mid_qs"], alpha=2.0)  # Q in [0.5..2.0], steeper blend
+    return outer_weights(wf, wq)
+
+def _apply_weighted_firbank_nonstream(x, taps_3d, w_flat, name_prefix):
+    """
+    x: (B,T,1), taps_3d: (L,1,K), w_flat: (B,K) → y: (B,T,1)
+    """
+    yk = FixedFIRBank(taps_3d, name=f"{name_prefix}_firbank")(x)     # (B,T,K)
+    # Expand (B,K) -> (B,1,K) without tf.shape: use -1 to infer K
+    w3 = Reshape((1, -1), name=f"{name_prefix}_w_expand")(w_flat)    # (B,1,K)
+    prod = Multiply(name=f"{name_prefix}_weighted")([yk, w3])        # (B,T,K)
+    y = ReduceSumAxis2Layer(keepdims=True, name=f"{name_prefix}_mix")(prod)
+    return y
+
+def _apply_weighted_firbank_stream(x, state_in, taps_3d, w_flat, name_prefix):
+    """
+    Streaming: taps_3d: (L,1,K), state_in: (B,L-1,1) → returns (y (B,T,1), state_next)
+    """
+    L = int(taps_3d.shape[0])
+    K = int(taps_3d.shape[2])
+    fir = StreamFixedFIR(kernel_len=L, out_ch=K, weight_name="firbank_taps",
+                         trainable_kernel=False, taps_init=taps_3d, name=f"{name_prefix}_fir")
+    yk, sN = fir([x, state_in])                                      # (B,T,K)
+    # Expand (B,K) -> (B,1,K) without tf.shape: use -1 to infer K
+    w3 = Reshape((1, -1), name=f"{name_prefix}_w_expand")(w_flat)    # (B,1,K)
+    prod = Multiply(name=f"{name_prefix}_weighted")([yk, w3])        # (B,T,K)
+    y = ReduceSumAxis2Layer(keepdims=True, name=f"{name_prefix}_mix")(prod)
+    return y, sN
+
+def apply_master_eq_nonstream(y_in,
+                              sr,
+                              knob_lc_hz, knob_lc_slope,
+                              knob_ls_gain_db, knob_ls_hz, knob_ls_slope,
+                              knob_mid_gain_db, knob_mid_hz, knob_mid_q,
+                              knob_hs_gain_db, knob_hs_hz, knob_hs_slope,
+                              name_prefix):
+    sr = int(sr)
+    banks = _get_eq_kernels(sr)
+
+    # LC: pure HPF
+    w_lc = _weights_lc(knob_lc_hz, knob_lc_slope)
+    y1 = _apply_weighted_firbank_nonstream(y_in, banks["lc_hp"], w_lc, name_prefix=f"{name_prefix}_lc")
+
+    # Low shelf
+    g_ls = db_to_lin_scalar(clamp_scalar(knob_ls_gain_db, -18.0, 18.0))
+    g_ls_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_ls_gain_minus1")(g_ls)
+    w_ls = _weights_ls(knob_ls_hz, knob_ls_slope)
+    lpf_mix = _apply_weighted_firbank_nonstream(y1, banks["ls_lp"], w_ls, name_prefix=f"{name_prefix}_ls")
+    y2 = Add(name=f"{name_prefix}_ls_sum")([y1, Multiply(name=f"{name_prefix}_ls_gain_term")([lpf_mix, g_ls_m1])])
+
+    # Mid bell
+    g_mid = db_to_lin_scalar(clamp_scalar(knob_mid_gain_db, -18.0, 18.0))
+    g_mid_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_mid_gain_minus1")(g_mid)
+    w_md = _weights_mid(knob_mid_hz, knob_mid_q)
+    bpf_mix = _apply_weighted_firbank_nonstream(y2, banks["mid_bp"], w_md, name_prefix=f"{name_prefix}_mid")
+    y3 = Add(name=f"{name_prefix}_mid_sum")([y2, Multiply(name=f"{name_prefix}_mid_gain_term")([bpf_mix, g_mid_m1])])
+
+    # High shelf
+    g_hs = db_to_lin_scalar(clamp_scalar(knob_hs_gain_db, -18.0, 18.0))
+    g_hs_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_hs_gain_minus1")(g_hs)
+    w_hs = _weights_hs(knob_hs_hz, knob_hs_slope)
+    hpf_mix = _apply_weighted_firbank_nonstream(y3, banks["hs_hp"], w_hs, name_prefix=f"{name_prefix}_hs")
+    y4 = Add(name=f"{name_prefix}_hs_sum")([y3, Multiply(name=f"{name_prefix}_hs_gain_term")([hpf_mix, g_hs_m1])])
+    return y4
+
+def apply_master_eq_stream(y_in,
+                           sr,
+                           knob_lc_hz, knob_lc_slope,
+                           knob_ls_gain_db, knob_ls_hz, knob_ls_slope,
+                           knob_mid_gain_db, knob_mid_hz, knob_mid_q,
+                           knob_hs_gain_db, knob_hs_hz, knob_hs_slope,
+                           state_lc, state_ls, state_mid, state_hs,
+                           name_prefix):
+    sr = int(sr)
+    banks = _get_eq_kernels(sr)
+
+    # LC
+    w_lc = _weights_lc(knob_lc_hz, knob_lc_slope)
+    y1, sLcN = _apply_weighted_firbank_stream(y_in, state_lc, banks["lc_hp"], w_lc, name_prefix=f"{name_prefix}_lc")
+
+    # Low shelf
+    g_ls = db_to_lin_scalar(clamp_scalar(knob_ls_gain_db, -18.0, 18.0))
+    g_ls_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_ls_gain_minus1")(g_ls)
+    w_ls = _weights_ls(knob_ls_hz, knob_ls_slope)
+    lpf_mix, sLsN = _apply_weighted_firbank_stream(y1, state_ls, banks["ls_lp"], w_ls, name_prefix=f"{name_prefix}_ls")
+    y2 = Add(name=f"{name_prefix}_ls_sum")([y1, Multiply(name=f"{name_prefix}_ls_gain_term")([lpf_mix, g_ls_m1])])
+
+    # Mid
+    g_mid = db_to_lin_scalar(clamp_scalar(knob_mid_gain_db, -18.0, 18.0))
+    g_mid_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_mid_gain_minus1")(g_mid)
+    w_md = _weights_mid(knob_mid_hz, knob_mid_q)
+    bpf_mix, sMdN = _apply_weighted_firbank_stream(y2, state_mid, banks["mid_bp"], w_md, name_prefix=f"{name_prefix}_mid")
+    y3 = Add(name=f"{name_prefix}_mid_sum")([y2, Multiply(name=f"{name_prefix}_mid_gain_term")([bpf_mix, g_mid_m1])])
+
+    # High shelf
+    g_hs = db_to_lin_scalar(clamp_scalar(knob_hs_gain_db, -18.0, 18.0))
+    g_hs_m1 = AddScalarLayer(-1.0, name=f"{name_prefix}_hs_gain_minus1")(g_hs)
+    w_hs = _weights_hs(knob_hs_hz, knob_hs_slope)
+    hpf_mix, sHsN = _apply_weighted_firbank_stream(y3, state_hs, banks["hs_hp"], w_hs, name_prefix=f"{name_prefix}_hs")
+    y4 = Add(name=f"{name_prefix}_hs_sum")([y3, Multiply(name=f"{name_prefix}_hs_gain_term")([hpf_mix, g_hs_m1])])
+
+    return y4, sLcN, sLsN, sMdN, sHsN
 
 def hp_cutoff_for_sr(sr):
     sr = int(sr)
@@ -639,20 +915,6 @@ def _decimate_modal_kernels(kernel_full_rev, factor=REALTIME_PICK_RESO_DOWNSAMPL
             K_low[:, 0, m] *= (orig_l2 / low_l2)
 
     return K_low.astype(np.float32)
-
-def _extract_trained_modal_kernel_rt(old_model, legacy_name="realtime_pickreso_modal"):
-    """
-    Return the trained full-rate modal kernel from an old (legacy) realtime model
-    if present; otherwise None.
-    """
-    try:
-        L = old_model.get_layer(legacy_name)
-        W = L.get_weights()
-        if W and isinstance(W[0], np.ndarray):
-            return W[0].astype(np.float32)
-    except Exception:
-        pass
-    return None
 
 @register_keras_serializable()
 class StreamingLinearRamp(tf.keras.layers.Layer):
@@ -1757,6 +2019,7 @@ class DemoCallback(Callback):
         self.demos_out_dir = demo_checkpoints_out_dir
         self.use_safe_weight_copy = use_safe_weight_copy
         os.makedirs(self.demos_out_dir, exist_ok=True)
+        self._state_zero_feeds = {}
 
     def set_model(self, model):
         self.static_model = model
@@ -1767,6 +2030,16 @@ class DemoCallback(Callback):
             copy_weights_by_name(self.dynamic_model, self.static_model)
         else:
             self.dynamic_model.set_weights(self.static_model.get_weights())
+
+        # Prebuild zero feeds for realtime streaming states (if any)
+        self._state_zero_feeds = {}
+        for t in self.dynamic_model.inputs:
+            nm = t.name.split(':')[0].split('/')[-1]
+            if nm.startswith("realtime_state_"):
+                # Expect shape (None, L-1, C); batch=1 here
+                s1 = int(t.shape[1]) if t.shape[1] is not None else 0
+                s2 = int(t.shape[2]) if t.shape[2] is not None else 1
+                self._state_zero_feeds[nm] = np.zeros((1, s1, s2), dtype=np.float32)
 
     def on_epoch_end(self, epoch, logs=None):
         if epoch % self.every != 0:
@@ -1816,7 +2089,7 @@ class DemoCallback(Callback):
         x_demo = x_mod[None, :, None]
 
         # Knobs
-        knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=False)
+        knob_feeds = prepare_demo_knob_feeds(kind=kind, use_finetuned=False)
 
         # Predicted-style pass
         dummy_style = np.zeros((1, 1), dtype=np.float32)
@@ -1827,10 +2100,14 @@ class DemoCallback(Callback):
             f"{kind}_style_force_input": force_zero,
         }
         base_feed.update(knob_feeds)
+        # Add streaming states (zeros) if required
+        base_feed.update(self._state_zero_feeds)
         feed = filter_feed(base_feed)
 
-        y_inf_style_pred, style_pred_out = self.dynamic_model.predict(feed, batch_size=1, verbose=0)
-        y_inf_style_pred = y_inf_style_pred[0, :, 0]
+        pred_outs = self.dynamic_model.predict(feed, batch_size=1, verbose=0)
+        # First two outputs are always [audio, style_prob]; the rest are states
+        y_inf_style_pred = np.asarray(pred_outs[0], dtype=np.float32)[0, :, 0]
+        style_pred_out = np.asarray(pred_outs[1], dtype=np.float32)
         style_pred = float(style_pred_out[0, 0])
         style_pred_name = 'pick' if style_pred > STYLE_FLAG_PROB_THRESHOLD else 'finger'
 
@@ -1844,9 +2121,10 @@ class DemoCallback(Callback):
                 f"{kind}_style_force_input": force_one,
             }
             tf_feed.update(knob_feeds)
+            tf_feed.update(self._state_zero_feeds)
             feed_true = filter_feed(tf_feed)
-            y_inf_style_true, _ = self.dynamic_model.predict(feed_true, batch_size=1, verbose=0)
-            y_inf_style_true = y_inf_style_true[0, :, 0]
+            outs_true = self.dynamic_model.predict(feed_true, batch_size=1, verbose=0)
+            y_inf_style_true = np.asarray(outs_true[0], dtype=np.float32)[0, :, 0]
             style_true_name = 'pick' if self.style_true_flag >= STYLE_FLAG_PROB_THRESHOLD else 'finger'
         else:
             y_inf_style_true = None
@@ -1860,9 +2138,7 @@ class DemoCallback(Callback):
         if y_inf_style_true is not None:
             sf.write(os.path.join(epoch_dir,"demo_pred_style_true.wav"), y_inf_style_true, self.sample_rate, subtype='FLOAT')
 
-        print(f"[DemoCallback] epoch {epoch+1}: predicted style={style_pred_name}, true style={style_true_name}, written to {epoch_dir}")
-
-        
+        print(f"[DemoCallback] epoch {epoch+1}: predicted style={style_pred_name}, true style={style_true_name}, written to {epoch_dir}") 
 
 # ────────────────────────────── LOSSES ───────────────────────────────────────
 
@@ -2602,6 +2878,29 @@ def compute_pickreso_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RA
         print("[pickreso] no recognizable branch; LC=0")
     return 0
 
+def compute_mastereq_left_context_realtime(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=False):
+    """
+    Streaming: master EQ is four serial FIR banks; LC is the sum of (L-1) of each serial FIR.
+    We look for StreamFixedFIR layers named:
+      - realtime_master_lc_fir
+      - realtime_master_ls_fir
+      - realtime_master_mid_fir
+      - realtime_master_hs_fir
+    """
+    names = ["realtime_master_lc_fir", "realtime_master_ls_fir", "realtime_master_mid_fir", "realtime_master_hs_fir"]
+    LC_sum = 0
+    for nm in names:
+        try:
+            l = model.get_layer(nm)
+            L = int(getattr(l, "kernel_len", None) or l.kernel.shape[0])
+            LC_sum += max(0, L - 1)
+        except Exception:
+            pass
+    if verbose:
+        ms = 1000.0 * LC_sum / float(sample_rate)
+        print(f"[master-eq] LC sum = {LC_sum} samples ({ms:.3f} ms)")
+    return int(LC_sum)
+
 def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, verbose=True):
     """
     Max left context across realtime branches that feed the final sum:
@@ -2617,8 +2916,9 @@ def compute_realtime_streaming_context(model, sample_rate=REALTIME_SAMPLE_RATE, 
     lc_reso = compute_pickreso_left_context_realtime(model, sample_rate, verbose=False)
     lc_patt = compute_pickattack_left_context_realtime(model, sample_rate, verbose=False)
     lc_col  = compute_coloreq_left_context_realtime(model, sample_rate, verbose=False)
+    lc_meq = compute_mastereq_left_context_realtime(model, sample_rate, verbose=False)
 
-    left_ctx = max(lc_main, lc_ir, lc_reso, lc_patt, lc_col)
+    left_ctx = max(lc_main, lc_ir, lc_reso, lc_patt, lc_col, lc_meq)
 
     if verbose:
         def as_ms(samples):
@@ -2975,7 +3275,7 @@ def generate_demo_from_files(model,
                              resample_margin_ms=50.0,
                              use_finetuned=False):
     os.makedirs(out_dir, exist_ok=True)
-    knob_feeds = _prepare_knob_feeds(kind, use_finetuned=use_finetuned)
+    knob_feeds = prepare_demo_knob_feeds(kind, use_finetuned=use_finetuned)
 
     info = sf.info(path_src)
     file_sr = info.samplerate
@@ -3616,6 +3916,211 @@ def lowband_error_penalty(y_true, y_pred, sample_rate,
     return tf.abs(lp_err)
 
 @register_keras_serializable()
+class GaussianWeights1DLayer(tf.keras.layers.Layer):
+    def __init__(self, centers, alpha=0.002, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self._centers_np = np.asarray(centers, dtype=np.float32).reshape(1, -1)
+        self.alpha = float(alpha)
+
+    def build(self, input_shape):
+        self.centers = self.add_weight(
+            name="centers",
+            shape=self._centers_np.shape,
+            initializer=tf.keras.initializers.Constant(self._centers_np),
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, knob_scalar):
+        # knob_scalar: (B,1), centers: (1,N)
+        x = tf.abs(knob_scalar - self.centers)            # (B,N)
+        w = tf.exp(-self.alpha * x)                       # (B,N)
+        w = w / (tf.reduce_sum(w, axis=1, keepdims=True) + 1e-8)
+        return w
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({
+            "centers": self._centers_np.tolist(),
+            "alpha": self.alpha
+        })
+        return cfg
+
+
+@register_keras_serializable()
+class OuterWeightsLayer(tf.keras.layers.Layer):
+    def call(self, inputs):
+        w_a, w_b = inputs  # w_a: (B,Na), w_b: (B,Nb)
+        a = tf.expand_dims(w_a, axis=2)  # (B,Na,1)
+        b = tf.expand_dims(w_b, axis=1)  # (B,1,Nb)
+        w = a * b                        # (B,Na,Nb)
+        shape = tf.shape(w)
+        return tf.reshape(w, [shape[0], shape[1] * shape[2]])  # (B, Na*Nb)
+
+
+@register_keras_serializable()
+class ClampScalarLayer(tf.keras.layers.Layer):
+    def __init__(self, lo, hi, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.lo = float(lo)
+        self.hi = float(hi)
+
+    def call(self, x):
+        return tf.clip_by_value(x, self.lo, self.hi)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"lo": self.lo, "hi": self.hi})
+        return cfg
+
+
+@register_keras_serializable()
+class DbToLinScalarLayer(tf.keras.layers.Layer):
+    def call(self, x):
+        return tf.pow(10.0, x / 20.0)
+
+
+@register_keras_serializable()
+class AddScalarLayer(tf.keras.layers.Layer):
+    def __init__(self, value, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.value = float(value)
+
+    def call(self, x):
+        return x + self.value
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"value": self.value})
+        return cfg
+
+
+@register_keras_serializable()
+class ReduceSumAxis2Layer(tf.keras.layers.Layer):
+    def __init__(self, keepdims=True, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.keepdims = bool(keepdims)
+
+    def call(self, x):
+        return tf.reduce_sum(x, axis=2, keepdims=self.keepdims)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"keepdims": self.keepdims})
+        return cfg
+
+
+@register_keras_serializable()
+def gaussian_weights_1d(knob_scalar, centers, alpha=0.002):
+    return GaussianWeights1DLayer(centers=centers, alpha=alpha)(knob_scalar)
+
+@register_keras_serializable()
+def outer_weights(w_a, w_b):
+    return OuterWeightsLayer()([w_a, w_b])
+
+@register_keras_serializable()
+def clamp_scalar(x, lo, hi):
+    return ClampScalarLayer(lo=lo, hi=hi)(x)
+
+@register_keras_serializable()
+def db_to_lin_scalar(x):
+    return DbToLinScalarLayer()(x)
+
+@register_keras_serializable()
+def phase_polarity_gain(switch01):
+    """
+    switch01: (B,1), 0 → +1, 1 → -1. 
+    """
+    s = tf.clip_by_value(switch01, 0.0, 1.0)
+    return 1.0 - 2.0 * s
+
+@register_keras_serializable()
+def _lp_rev_padded(sr, cut_hz, target_len, window='hamming'):
+    """
+    Build a linear-phase LPF (reversed taps for conv1d), exact length target_len.
+    """
+    nt = int(target_len)
+    if nt < 3:
+        nt = 3
+    wn = float(cut_hz) / (float(sr) / 2.0)
+    taps = firwin(nt, cutoff=wn, window=window, pass_zero=True).astype(np.float32)
+    taps = taps / np.maximum(np.sum(taps), 1e-12)
+    k_rev = taps[::-1].reshape(nt, 1, 1).astype(np.float32)
+    return k_rev
+
+@register_keras_serializable()
+class FixedFIRBank(tf.keras.layers.Layer):
+    """
+    Non-streaming, fixed FIR bank: taps shape (L,1,K) reversed for conv1d (cross-correlation).
+    Outputs (B,T,K). Left-padded by (L-1).
+
+    Keras-serialization-friendly:
+      - taps_3d is optional. If absent, we create a zero-initialized (L,1,K) kernel and rely on
+        weight restoration from the saved model. This allows load_model to succeed even when only
+        L and K are present in config (the usual case).
+      - If taps_3d is provided (during graph construction), we use it as the initializer.
+    """
+    def __init__(self, taps_3d=None, L=None, K=None, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self._taps_init = None
+        # L and K may be None when building brand-new layers; they are present when deserializing
+        self.L = None if L is None else int(L)
+        self.K = None if K is None else int(K)
+
+        if taps_3d is not None:
+            k = np.asarray(taps_3d, dtype=np.float32)
+            if k.ndim != 3 or k.shape[1] != 1:
+                raise ValueError(f"taps_3d must have shape (L,1,K); got {k.shape}")
+            self._taps_init = k
+            self.L = int(k.shape[0])
+            self.K = int(k.shape[2])
+
+    def build(self, input_shape):
+        if self._taps_init is not None:
+            shape = self._taps_init.shape
+            initializer = tf.keras.initializers.Constant(self._taps_init)
+        else:
+            # When loading from a saved model, weights will be restored after construction.
+            # Create a kernel with the correct shape so weight loading can succeed.
+            if self.L is None or self.K is None:
+                # As a last resort, default to (3,1,1) (will be overwritten by weight loading).
+                L = 3 if self.L is None else int(self.L)
+                K = 1 if self.K is None else int(self.K)
+            else:
+                L = int(self.L)
+                K = int(self.K)
+            shape = (L, 1, K)
+            initializer = tf.keras.initializers.Zeros()
+
+        self.kernel = self.add_weight(
+            name="firbank_taps",
+            shape=shape,
+            initializer=initializer,
+            trainable=False
+        )
+        super().build(input_shape)
+
+    def call(self, x):
+        # x: (B,T,1) → pad left by (L-1)
+        pad = tf.shape(self.kernel)[0] - 1
+        x_pad = tf.pad(x, [[0, 0], [pad, 0], [0, 0]])
+        return tf.nn.conv1d(x_pad, filters=self.kernel, stride=1, padding='VALID')
+
+    def compute_output_shape(self, input_shape):
+        b, t, _ = input_shape
+        k = self.K if self.K is not None else (int(self.kernel.shape[2]) if hasattr(self, "kernel") else None)
+        return (b, t, k)
+
+    def get_config(self):
+        # We only need to serialize L and K. taps are stored as weights.
+        cfg = super().get_config()
+        cfg.update({
+            "L": self.L,
+            "K": self.K
+        })
+        return cfg
+
+@register_keras_serializable()
 class TileStyle(Layer):
     def call(self, inputs):
         style_scalar, ref = inputs
@@ -3743,39 +4248,126 @@ def _db_to_lin(db):
 def _resolve_demo_knobs(kind, use_finetuned=False):
     # Return (pickattack_lin, pickreso_lin, ir_lin)
     if kind == "offline":
+        defaults = offline_knob_defaults()
         if use_finetuned:
-            pa_db = FINETUNE_OFFLINE_PICK_ATTACK_BOOST_DB
-            pr_db = FINETUNE_OFFLINE_PICK_RESO_BOOST_DB
+            return {
+                **defaults,
+                "pickattack": _db_to_lin(FINETUNE_OFFLINE_PICK_ATTACK_DEMO_BOOST_DB),
+                "pickreso": _db_to_lin(FINETUNE_OFFLINE_PICK_RESO_DEMO_BOOST_DB)
+            }
         else:
-            pa_db = OFFLINE_PICK_ATTACK_BOOST_DB
-            pr_db = OFFLINE_PICK_RESO_BOOST_DB
-        ir_db = 0.0  # no IR branch in offline graph
+            return {
+                **defaults,
+                "pickattack": _db_to_lin(OFFLINE_PICK_ATTACK_DEMO_BOOST_DB),
+                "pickreso": _db_to_lin(OFFLINE_PICK_RESO_DEMO_BOOST_DB)
+            }
     else:
+        defaults = realtime_knob_defaults()
         if use_finetuned:
-            pa_db = FINETUNE_REALTIME_PICK_ATTACK_BOOST_DB
-            pr_db = FINETUNE_REALTIME_PICK_RESO_BOOST_DB
-            ir_db = FINETUNE_REALTIME_IR_BOOST_DB
+            return {
+                **defaults,
+                "pickattack": _db_to_lin(FINETUNE_REALTIME_PICK_ATTACK_DEMO_BOOST_DB),
+                "pickreso": _db_to_lin(FINETUNE_REALTIME_PICK_RESO_DEMO_BOOST_DB),
+                "ir": _db_to_lin(FINETUNE_REALTIME_IR_DEMO_BOOST_DB)
+            }
         else:
-            pa_db = REALTIME_PICK_ATTACK_BOOST_DB
-            pr_db = REALTIME_PICK_RESO_BOOST_DB
-            ir_db = REALTIME_IR_BOOST_DB
+            return {
+                **defaults,
+                "pickattack": _db_to_lin(REALTIME_PICK_ATTACK_DEMO_BOOST_DB),
+                "pickreso": _db_to_lin(REALTIME_PICK_RESO_DEMO_BOOST_DB),
+                "ir": _db_to_lin(REALTIME_IR_DEMO_BOOST_DB)
+            }
 
-    return (_db_to_lin(pa_db), _db_to_lin(pr_db), _db_to_lin(ir_db))
+def prepare_training_knob_feeds(kind, piezo_input, style_true, style_force):
+    b = tf.shape(piezo_input)[0]
+    
+    if kind == "offline":
+        knobs = offline_knob_defaults()
+        return {
+            'offline_piezo_input': piezo_input,
+            'offline_style_true_input': style_true,
+            'offline_style_force_input': style_force,
+            'offline_knob_pickattack': tf.ones((b,1), tf.float32) * knobs["pickattack"],
+            'offline_knob_pickreso':   tf.ones((b,1), tf.float32) * knobs["pickreso"],
+            'offline_knob_drywet':     tf.ones((b,1), tf.float32) * knobs["dry_pct"],
+            'offline_knob_outgain':    tf.ones((b,1), tf.float32) * knobs["outgain"],
+            'offline_knob_phaseinv':   tf.ones((b,1), tf.float32) * knobs["phaseinv"],
+            'offline_knob_lc_hz':      tf.ones((b,1), tf.float32) * knobs["lc_hz"],
+            'offline_knob_lc_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["lc_slope"],
+            'offline_knob_ls_gain_db': tf.ones((b,1), tf.float32) * knobs["ls_gain_db"],
+            'offline_knob_ls_hz':      tf.ones((b,1), tf.float32) * knobs["ls_hz"],
+            'offline_knob_ls_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["ls_slope"],
+            'offline_knob_mid_gain_db': tf.ones((b,1), tf.float32) * knobs["mid_gain_db"],
+            'offline_knob_mid_hz':      tf.ones((b,1), tf.float32) * knobs["mid_hz"],
+            'offline_knob_mid_q':       tf.ones((b,1), tf.float32) * knobs["mid_q"],
+            'offline_knob_hs_gain_db':  tf.ones((b,1), tf.float32) * knobs["hs_gain_db"],
+            'offline_knob_hs_hz':       tf.ones((b,1), tf.float32) * knobs["hs_hz"],
+            'offline_knob_hs_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["hs_slope"],
+        }
+    else:
+        knobs = realtime_knob_defaults()
+        return {
+            'realtime_piezo_input': piezo_input,
+            'realtime_style_true_input': style_true,
+            'realtime_style_force_input': style_force,
+            'realtime_knob_pickattack': tf.ones((b,1), tf.float32) * knobs["pickattack"],
+            'realtime_knob_pickreso':   tf.ones((b,1), tf.float32) * knobs["pickreso"],
+            'realtime_knob_ir':         tf.ones((b,1), tf.float32) * knobs["ir"],
+            'realtime_knob_drywet':     tf.ones((b,1), tf.float32) * knobs["dry_pct"],
+            'realtime_knob_outgain':    tf.ones((b,1), tf.float32) * knobs["outgain"],
+            'realtime_knob_phaseinv':   tf.ones((b,1), tf.float32) * knobs["phaseinv"],
+            'realtime_knob_lc_hz':      tf.ones((b,1), tf.float32) * knobs["lc_hz"],
+            'realtime_knob_lc_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["lc_slope"],
+            'realtime_knob_ls_gain_db': tf.ones((b,1), tf.float32) * knobs["ls_gain_db"],
+            'realtime_knob_ls_hz':      tf.ones((b,1), tf.float32) * knobs["ls_hz"],
+            'realtime_knob_ls_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["ls_slope"],
+            'realtime_knob_mid_gain_db': tf.ones((b,1), tf.float32) * knobs["mid_gain_db"],
+            'realtime_knob_mid_hz':      tf.ones((b,1), tf.float32) * knobs["mid_hz"],
+            'realtime_knob_mid_q':       tf.ones((b,1), tf.float32) * knobs["mid_q"],
+            'realtime_knob_hs_gain_db':  tf.ones((b,1), tf.float32) * knobs["hs_gain_db"],
+            'realtime_knob_hs_hz':       tf.ones((b,1), tf.float32) * knobs["hs_hz"],
+            'realtime_knob_hs_slope_dbpoct': tf.ones((b,1), tf.float32) * knobs["hs_slope"],
+        }
 
-def _prepare_knob_feeds(kind, use_finetuned=False):
-    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind, use_finetuned=use_finetuned)
-    dry_frac = _default_dryness_value()
+def prepare_demo_knob_feeds(kind, use_finetuned=False, pickattack=None, pickreso=None, ir=None):
+    knobs = _resolve_demo_knobs(kind, use_finetuned=use_finetuned)
 
     feeds = {}
     if kind == "realtime":
-        feeds["realtime_knob_pickattack"] = np.array([[pa_lin]], dtype=np.float32)
-        feeds["realtime_knob_pickreso"]   = np.array([[pr_lin]], dtype=np.float32)
-        feeds["realtime_knob_ir"]         = np.array([[ir_lin]], dtype=np.float32)
-        feeds["realtime_knob_drywet"]     = np.array([[dry_frac]], dtype=np.float32)
+        feeds["realtime_knob_pickattack"] = np.array([[pickattack if pickattack is not None else knobs["pickattack"]]], dtype=np.float32)
+        feeds["realtime_knob_pickreso"]   = np.array([[pickreso if pickreso is not None else knobs["pickreso"]]], dtype=np.float32)
+        feeds["realtime_knob_ir"]         = np.array([[ir if ir is not None else knobs["ir"]]], dtype=np.float32)
+        feeds["realtime_knob_drywet"]     = np.array([[knobs["dry_pct"]]], dtype=np.float32)
+        feeds["realtime_knob_outgain"]    = np.array([[knobs["outgain"]]], dtype=np.float32)
+        feeds["realtime_knob_phaseinv"]   = np.array([[knobs["phaseinv"]]], dtype=np.float32)
+        feeds["realtime_knob_lc_hz"]      = np.array([[knobs["lc_hz"]]], dtype=np.float32)
+        feeds["realtime_knob_lc_slope_dbpoct"] = np.array([[knobs["lc_slope"]]], dtype=np.float32)
+        feeds["realtime_knob_ls_gain_db"] = np.array([[knobs["ls_gain_db"]]], dtype=np.float32)
+        feeds["realtime_knob_ls_hz"]      = np.array([[knobs["ls_hz"]]], dtype=np.float32)
+        feeds["realtime_knob_ls_slope_dbpoct"] = np.array([[knobs["ls_slope"]]], dtype=np.float32)
+        feeds["realtime_knob_mid_gain_db"]= np.array([[knobs["mid_gain_db"]]], dtype=np.float32)
+        feeds["realtime_knob_mid_hz"]     = np.array([[knobs["mid_hz"]]], dtype=np.float32)
+        feeds["realtime_knob_mid_q"]      = np.array([[knobs["mid_q"]]], dtype=np.float32)
+        feeds["realtime_knob_hs_gain_db"] = np.array([[knobs["hs_gain_db"]]], dtype=np.float32)
+        feeds["realtime_knob_hs_hz"]      = np.array([[knobs["hs_hz"]]], dtype=np.float32)
+        feeds["realtime_knob_hs_slope_dbpoct"] = np.array([[knobs["hs_slope"]]], dtype=np.float32)
     elif kind == "offline":
-        feeds["offline_knob_pickattack"]  = np.array([[pa_lin]], dtype=np.float32)
-        feeds["offline_knob_pickreso"]    = np.array([[pr_lin]], dtype=np.float32)
-        feeds["offline_knob_drywet"]      = np.array([[dry_frac]], dtype=np.float32)
+        feeds["offline_knob_pickattack"]  = np.array([[pickattack if pickattack is not None else knobs["pickattack"]]], dtype=np.float32)
+        feeds["offline_knob_pickreso"]    = np.array([[pickreso if pickreso is not None else knobs["pickreso"]]], dtype=np.float32)
+        feeds["offline_knob_drywet"]      = np.array([[knobs["dry_pct"]]], dtype=np.float32)
+        feeds["offline_knob_outgain"]     = np.array([[knobs["outgain"]]], dtype=np.float32)
+        feeds["offline_knob_phaseinv"]    = np.array([[knobs["phaseinv"]]], dtype=np.float32)
+        feeds["offline_knob_lc_hz"]       = np.array([[knobs["lc_hz"]]], dtype=np.float32)
+        feeds["offline_knob_lc_slope_dbpoct"] = np.array([[knobs["lc_slope"]]], dtype=np.float32)
+        feeds["offline_knob_ls_gain_db"]  = np.array([[knobs["ls_gain_db"]]], dtype=np.float32)
+        feeds["offline_knob_ls_hz"]       = np.array([[knobs["ls_hz"]]], dtype=np.float32)
+        feeds["offline_knob_ls_slope_dbpoct"] = np.array([[knobs["ls_slope"]]], dtype=np.float32)
+        feeds["offline_knob_mid_gain_db"] = np.array([[knobs["mid_gain_db"]]], dtype=np.float32)
+        feeds["offline_knob_mid_hz"]      = np.array([[knobs["mid_hz"]]], dtype=np.float32)
+        feeds["offline_knob_mid_q"]       = np.array([[knobs["mid_q"]]], dtype=np.float32)
+        feeds["offline_knob_hs_gain_db"]  = np.array([[knobs["hs_gain_db"]]], dtype=np.float32)
+        feeds["offline_knob_hs_hz"]       = np.array([[knobs["hs_hz"]]], dtype=np.float32)
+        feeds["offline_knob_hs_slope_dbpoct"] = np.array([[knobs["hs_slope"]]], dtype=np.float32)
     return feeds
 
 @register_keras_serializable()
@@ -4020,6 +4612,27 @@ def build_offline_model(dynamic_time=False,
     style_true_in  = Input(shape=(1,), name="offline_style_true_input")
     style_force_in = Input(shape=(1,), name="offline_style_force_input")
 
+    # New master control knobs (post-drywet)
+    # Output/phase
+    knob_outgain = Input(shape=(1,), name="offline_knob_outgain")
+    knob_phaseinv= Input(shape=(1,), name="offline_knob_phaseinv")
+    # LC
+    knob_lc_hz     = Input(shape=(1,), name="offline_knob_lc_hz")
+    knob_lc_slope  = Input(shape=(1,), name="offline_knob_lc_slope_dbpoct")
+    # LS
+    knob_ls_gain_db= Input(shape=(1,), name="offline_knob_ls_gain_db")
+    knob_ls_hz     = Input(shape=(1,), name="offline_knob_ls_hz")
+    knob_ls_slope  = Input(shape=(1,), name="offline_knob_ls_slope_dbpoct")
+    # MID
+    knob_mid_gain_db=Input(shape=(1,), name="offline_knob_mid_gain_db")
+    knob_mid_hz     = Input(shape=(1,), name="offline_knob_mid_hz")
+    knob_mid_q      = Input(shape=(1,), name="offline_knob_mid_q")
+    # HS
+    knob_hs_gain_db= Input(shape=(1,), name="offline_knob_hs_gain_db")
+    knob_hs_hz     = Input(shape=(1,), name="offline_knob_hs_hz")
+    knob_hs_slope  = Input(shape=(1,), name="offline_knob_hs_slope_dbpoct")
+
+    # Style
     cls         = Conv1D(16,3, padding="same", activation="relu", name="offline_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="offline_style_gap")(cls)
     style_logit = Dense(1, name="offline_style_logit")(cls)
@@ -4062,7 +4675,7 @@ def build_offline_model(dynamic_time=False,
     finger_c    = Multiply(name="offline_finger_contrib")([inv_style,   main_finger])
     main_core   = Add(name="offline_main_core")([pick_c, finger_c])
 
-    # Analytic pick mask
+    # Analytic pick mask and heads (unchanged)
     mask = _pick_mask_engine(inp,
                              thr_db=OFFLINE_PICK_MASK_THRESHOLD_DB,
                              knee_db=OFFLINE_PICK_MASK_KNEE_DB,
@@ -4079,62 +4692,68 @@ def build_offline_model(dynamic_time=False,
                              smooth_release_ms=OFFLINE_PICK_MASK_SMOOTH_RELEASE_MS,
                              prefix="offline")
 
-    # HF pre-emphasis for pickattack head
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="offline_hf_pre_emph")(inp)
-
-    # Style‑gated pick stems (now POST-HPF inside the heads)
-    pickattack, pa_pen = _pick_attack(
-        "offline", hf_in, mask, style_time,
-        filters=16,
-        sample_rate=OFFLINE_SAMPLE_RATE,
-        softclip_drive=OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE,
-        lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
-        lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
-        lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER
-    )
+    pickattack, pa_pen = _pick_attack("offline", hf_in, mask, style_time, filters=16,
+                                      sample_rate=OFFLINE_SAMPLE_RATE,
+                                      softclip_drive=OFFLINE_PICK_ATTACK_SOFTCLIP_DRIVE,
+                                      lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
+                                      lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
+                                      lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER)
     pickreso, pr_pen = _reson_learn_offline(inp, mask, style_time)
-    
-    knob_pa_in = Input(shape=(1,), name="offline_knob_pickattack")  # linear gain
-    knob_pr_in = Input(shape=(1,), name="offline_knob_pickreso")    # linear gain
+
+    knob_pa_in = Input(shape=(1,), name="offline_knob_pickattack")
+    knob_pr_in = Input(shape=(1,), name="offline_knob_pickreso")
     knob_dw_in = Input(shape=(1,), name="offline_knob_drywet")
 
-    # Multiply knobs post-limit/post-HPF so user gain doesn't re-open headroom or subsonics.
     pickattack = apply_runtime_gain(pickattack, knob_pa_in, name="offline_pickattack_user_gain")
     pickreso   = apply_runtime_gain(pickreso,   knob_pr_in, name="offline_pickreso_user_gain")
 
-    # Mix (no bus HPF)
     out_prehp = Add(name="offline_with_picklearn_prehp")([main_core, pickattack, pickreso])
-
-    # Tie penalty nodes so add_loss is kept (attach to post-no-op signal)
     out_prehp = LossTether(name="offline_pick_lowband_penalties")([out_prehp, pa_pen, pr_pen])
 
-    # Final tone shaping (cannot re-introduce subsonics; first band starts at 80 Hz)
-    out = add_coloreq(out_prehp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
-                      name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
+    # ColorEQ inside model (pre dry/wet) retained
+    out_col = add_coloreq(out_prehp, bands=COLOREQ_BANDS_OFFLINE_BODY, sample_rate=OFFLINE_SAMPLE_RATE,
+                          name_prefix="offline_coloreq", order=97, trainable_scales=bool(coloreq_trainable))
 
-    # dry/wet mixer (dry = piezo input)
-    wet_gain   = Lambda(invert, name="offline_wet_from_drywet")(knob_dw_in)           # (B,1)
-    wet_scaled = apply_runtime_gain(out,    wet_gain,       name="offline_wet_gain")  # (B,T,1)
-    dry_scaled = apply_runtime_gain(inp,    knob_dw_in,     name="offline_dry_gain")  # (B,T,1)
-    out = Add(name="offline_drywet_mix")([wet_scaled, dry_scaled])
+    # Dry/wet mix
+    wet_gain   = Lambda(invert, name="offline_wet_from_drywet")(knob_dw_in)
+    wet_scaled = apply_runtime_gain(out_col, wet_gain,   name="offline_wet_gain")
+    dry_scaled = apply_runtime_gain(inp,     knob_dw_in, name="offline_dry_gain")
+    y_mix      = Add(name="offline_drywet_mix")([wet_scaled, dry_scaled])
 
+    # Master EQ (after dry/wet)
+    y_eq = apply_master_eq_nonstream(
+        y_mix,
+        sr=OFFLINE_SAMPLE_RATE,
+        knob_lc_hz=knob_lc_hz, knob_lc_slope=knob_lc_slope,
+        knob_ls_gain_db=knob_ls_gain_db, knob_ls_hz=knob_ls_hz, knob_ls_slope=knob_ls_slope,
+        knob_mid_gain_db=knob_mid_gain_db, knob_mid_hz=knob_mid_hz, knob_mid_q=knob_mid_q,
+        knob_hs_gain_db=knob_hs_gain_db, knob_hs_hz=knob_hs_hz, knob_hs_slope=knob_hs_slope,
+        name_prefix="offline_master"
+    )
 
-    return tf.keras.models.Model(inputs=[inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_dw_in], outputs=[out, style_prob], name=name)
+    # Phase invert
+    phase_gain = Lambda(phase_polarity_gain, name="offline_phase_invert_gain")(knob_phaseinv)
+    y_phi = apply_runtime_gain(y_eq, phase_gain, name="offline_phase_invert")
+
+    # Output gain
+    y_out = apply_runtime_gain(y_phi, knob_outgain, name="offline_output_gain")
+
+    inputs_list = [inp, style_true_in, style_force_in,
+                   knob_pa_in, knob_pr_in, knob_dw_in,
+                   knob_outgain, knob_phaseinv,
+                   knob_lc_hz, knob_lc_slope,
+                   knob_ls_gain_db, knob_ls_hz, knob_ls_slope,
+                   knob_mid_gain_db, knob_mid_hz, knob_mid_q,
+                   knob_hs_gain_db, knob_hs_hz, knob_hs_slope]
+
+    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_out, style_prob], name=name)
 
 @register_keras_serializable()
 def build_realtime_training_model(offline=None,
                         dynamic_time=False,
                         name="piezo2mic_realtime",
                         coloreq_trainable=False):
-    """
-    Realtime NON-streaming graph.
-    - If 'offline' is provided: builds KD training graph (extra teacher input).
-    - If 'offline' is None: builds teacherless (self-contained) NON-streaming graph.
-    This function no longer supports a streaming flag.
-
-    For streaming self-contained models (static T=32 or dynamic time),
-    use build_realtime_streaming_model(...) below.
-    """
     T   = None if dynamic_time else REALTIME_SEG_LEN
     inp = Input(shape=(T,1), name="realtime_piezo_input")
 
@@ -4144,12 +4763,28 @@ def build_realtime_training_model(offline=None,
 
     style_true_in  = Input(shape=(1,), name="realtime_style_true_input")
     style_force_in = Input(shape=(1,), name="realtime_style_force_input")
-    
-    knob_pa_in = Input(shape=(1,), name="realtime_knob_pickattack")  # linear gain
-    knob_pr_in = Input(shape=(1,), name="realtime_knob_pickreso")    # linear gain
-    knob_ir_in = Input(shape=(1,), name="realtime_knob_ir")          # linear gain
+
+    # New master control knobs (post-drywet)
+    knob_outgain = Input(shape=(1,), name="realtime_knob_outgain")
+    knob_phaseinv= Input(shape=(1,), name="realtime_knob_phaseinv")
+    knob_lc_hz     = Input(shape=(1,), name="realtime_knob_lc_hz")
+    knob_lc_slope  = Input(shape=(1,), name="realtime_knob_lc_slope_dbpoct")
+    knob_ls_gain_db= Input(shape=(1,), name="realtime_knob_ls_gain_db")
+    knob_ls_hz     = Input(shape=(1,), name="realtime_knob_ls_hz")
+    knob_ls_slope  = Input(shape=(1,), name="realtime_knob_ls_slope_dbpoct")
+    knob_mid_gain_db=Input(shape=(1,), name="realtime_knob_mid_gain_db")
+    knob_mid_hz     = Input(shape=(1,), name="realtime_knob_mid_hz")
+    knob_mid_q      = Input(shape=(1,), name="realtime_knob_mid_q")
+    knob_hs_gain_db= Input(shape=(1,), name="realtime_knob_hs_gain_db")
+    knob_hs_hz     = Input(shape=(1,), name="realtime_knob_hs_hz")
+    knob_hs_slope  = Input(shape=(1,), name="realtime_knob_hs_slope_dbpoct")
+
+    knob_pa_in = Input(shape=(1,), name="realtime_knob_pickattack")
+    knob_pr_in = Input(shape=(1,), name="realtime_knob_pickreso")
+    knob_ir_in = Input(shape=(1,), name="realtime_knob_ir")
     knob_dw_in = Input(shape=(1,), name="realtime_knob_drywet")
 
+    # Style head
     cls         = Conv1D(16, 3, padding="same", activation="relu", name="realtime_style_conv")(inp)
     cls         = GlobalAveragePooling1D(name="realtime_style_gap")(cls)
     style_logit = Dense(1, name="realtime_style_logit")(cls)
@@ -4157,15 +4792,54 @@ def build_realtime_training_model(offline=None,
 
     style_pred_source = style_prob
     if offline is not None:
-        teacher = offline; teacher.trainable = False
+        teacher = offline
+        teacher.trainable = False
+
+        # Build a 2‑output wrapper for the teacher
         audio_out, style_prob_out = teacher.outputs
-        teacher_combo = tf.keras.Model(inputs=teacher.inputs, outputs=[audio_out, style_prob_out],
-                                       name="offline_teacher_combo")
-        combo = teacher_combo([offline_inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_dw_in])
-        offline_style_prob = combo[1]
-        style_pred_source = BlendScalar(init_alpha=REALTIME_STYLE_BLEND_INIT,
-                                        trainable=REALTIME_STYLE_BLEND_TRAINABLE,
-                                        name="realtime_style_blend")([style_prob, offline_style_prob])
+        teacher_combo = tf.keras.Model(
+            inputs=teacher.inputs,
+            outputs=[audio_out, style_prob_out],
+            name="offline_teacher_combo"
+        )
+
+        # IMPORTANT: feed inputs in the exact order of build_offline_model(inputs_list)
+        teacher_inputs = [
+            offline_inp,                # offline_piezo_input
+            style_true_in,              # offline_style_true_input
+            style_force_in,             # offline_style_force_input
+
+            knob_pa_in,                 # offline_knob_pickattack
+            knob_pr_in,                 # offline_knob_pickreso
+            knob_dw_in,                 # offline_knob_drywet
+
+            knob_outgain,               # offline_knob_outgain
+            knob_phaseinv,              # offline_knob_phaseinv
+
+            knob_lc_hz,                 # offline_knob_lc_hz
+            knob_lc_slope,              # offline_knob_lc_slope_dbpoct
+
+            knob_ls_gain_db,            # offline_knob_ls_gain_db
+            knob_ls_hz,                 # offline_knob_ls_hz
+            knob_ls_slope,              # offline_knob_ls_slope_dbpoct
+
+            knob_mid_gain_db,           # offline_knob_mid_gain_db
+            knob_mid_hz,                # offline_knob_mid_hz
+            knob_mid_q,                 # offline_knob_mid_q
+
+            knob_hs_gain_db,            # offline_knob_hs_gain_db
+            knob_hs_hz,                 # offline_knob_hs_hz
+            knob_hs_slope               # offline_knob_hs_slope_dbpoct
+        ]
+
+        teacher_audio, offline_style_prob = teacher_combo(teacher_inputs)
+
+        # Blend student style prob with teacher’s style prob
+        style_pred_source = BlendScalar(
+            init_alpha=REALTIME_STYLE_BLEND_INIT,
+            trainable=REALTIME_STYLE_BLEND_TRAINABLE,
+            name="realtime_style_blend"
+        )([style_prob, offline_style_prob])
 
     one_minus_force = Lambda(invert, name="realtime_one_minus_force")(style_force_in)
     style_used_scalar = Add(name="realtime_style_used_scalar")([
@@ -4225,7 +4899,7 @@ def build_realtime_training_model(offline=None,
                       name="realtime_ir_interp")(ir)
     ir = MatchTimeToRef(name="realtime_ir_matchlen")([ir, inp])
 
-    # Analytic pick mask
+    # Pick mask and heads (unchanged)
     mask = _pick_mask_engine(inp,
                              thr_db=REALTIME_PICK_MASK_THRESHOLD_DB,
                              knee_db=REALTIME_PICK_MASK_KNEE_DB,
@@ -4241,43 +4915,56 @@ def build_realtime_training_model(offline=None,
                              smooth_attack_ms=REALTIME_PICK_MASK_SMOOTH_ATTACK_MS,
                              smooth_release_ms=REALTIME_PICK_MASK_SMOOTH_RELEASE_MS,
                              prefix="realtime")
-
     hf_in = Lambda(pre_emphasis, arguments={'alpha': HP_PRE_EMPHASIS_HF}, name="realtime_hf_pre_emph")(inp)
-
-    # Pick-attack and pick-reso (POST-HPF inside heads)
-    pickattack, pa_pen = _pick_attack(
-        "realtime", hf_in, mask, style_scalar_b3,
-        filters=16,
-        sample_rate=REALTIME_SAMPLE_RATE,
-        softclip_drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE,
-        lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
-        lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
-        lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER,
-    )
+    pickattack, pa_pen = _pick_attack("realtime", hf_in, mask, style_scalar_b3,
+                                      filters=16, sample_rate=REALTIME_SAMPLE_RATE,
+                                      softclip_drive=REALTIME_PICK_ATTACK_SOFTCLIP_DRIVE,
+                                      lowband_penalty_alpha=PICK_ATTACK_LOWBAND_PENALTY_ALPHA,
+                                      lowband_penalty_cutoff_hz=PICK_ATTACK_LOWBAND_PENALTY_CUTOFF_HZ,
+                                      lowband_penalty_order=PICK_ATTACK_LOWBAND_PENALTY_ORDER)
     pickreso, pr_pen = _reson_learn_realtime(inp, mask, style_scalar_b3)
 
-    # Apply knobs post-limit/post-HPF
     pickattack = apply_runtime_gain(pickattack, knob_pa_in, name="realtime_pickattack_user_gain")
     pickreso   = apply_runtime_gain(pickreso,   knob_pr_in, name="realtime_pickreso_user_gain")
     ir         = apply_runtime_gain(ir,         knob_ir_in, name="realtime_ir_user_gain")
 
-    # Sum and color EQ
     y_prehp  = Add(name="realtime_with_picklearn_prehp")([y_main, ir, pickattack, pickreso])
     y_prehp  = LossTether(name="realtime_pick_lowband_penalties")([y_prehp, pa_pen, pr_pen])
 
     y_wet = add_coloreq(y_prehp, bands=COLOREQ_BANDS_REALTIME_BODY, sample_rate=REALTIME_SAMPLE_RATE,
                         name_prefix="realtime_coloreq", order=65, trainable_scales=bool(coloreq_trainable))
-    
     wet_gain   = Lambda(invert, name="realtime_wet_from_drywet")(knob_dw_in)
     wet_scaled = apply_runtime_gain(y_wet,  wet_gain,    name="realtime_wet_gain")
     dry_scaled = apply_runtime_gain(inp,    knob_dw_in,  name="realtime_dry_gain")
-    y_final    = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
+    y_mix      = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
+
+    # Master EQ (non-streaming) after dry/wet
+    y_eq = apply_master_eq_nonstream(
+        y_mix,
+        sr=REALTIME_SAMPLE_RATE,
+        knob_lc_hz=knob_lc_hz, knob_lc_slope=knob_lc_slope,
+        knob_ls_gain_db=knob_ls_gain_db, knob_ls_hz=knob_ls_hz, knob_ls_slope=knob_ls_slope,
+        knob_mid_gain_db=knob_mid_gain_db, knob_mid_hz=knob_mid_hz, knob_mid_q=knob_mid_q,
+        knob_hs_gain_db=knob_hs_gain_db, knob_hs_hz=knob_hs_hz, knob_hs_slope=knob_hs_slope,
+        name_prefix="realtime_master"
+    )
+
+    # Phase invert + Output gain
+    phase_gain = Lambda(phase_polarity_gain, name="realtime_phase_invert_gain")(knob_phaseinv)
+    y_phi = apply_runtime_gain(y_eq, phase_gain, name="realtime_phase_invert")
+    y_out = apply_runtime_gain(y_phi, knob_outgain, name="realtime_output_gain")
 
     inputs_list = [inp, style_true_in, style_force_in]
     if offline_inp is not None:
         inputs_list = [inp, offline_inp, style_true_in, style_force_in]
-    inputs_list += [knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in]
-    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_final, style_prob], name=name)
+    inputs_list += [knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in,
+                    knob_outgain, knob_phaseinv,
+                    knob_lc_hz, knob_lc_slope,
+                    knob_ls_gain_db, knob_ls_hz, knob_ls_slope,
+                    knob_mid_gain_db, knob_mid_hz, knob_mid_q,
+                    knob_hs_gain_db, knob_hs_hz, knob_hs_slope]
+
+    return tf.keras.models.Model(inputs=inputs_list, outputs=[y_out, style_prob], name=name)
 
 @register_keras_serializable()
 def build_realtime_streaming_model(dynamic_time=False,
@@ -4645,14 +5332,70 @@ def build_realtime_streaming_model(dynamic_time=False,
     y_prehp = LossTether(name="realtime_pick_lowband_penalties_stream")([y_prehp])
     y_wet = Add(name="realtime_coloreq_sum")(y_terms)
 
+    # New master knobs
+    knob_outgain = Input(shape=(1,), name="realtime_knob_outgain")
+    knob_phaseinv= Input(shape=(1,), name="realtime_knob_phaseinv")
+    knob_lc_hz     = Input(shape=(1,), name="realtime_knob_lc_hz")
+    knob_lc_slope  = Input(shape=(1,), name="realtime_knob_lc_slope_dbpoct")
+    knob_ls_gain_db= Input(shape=(1,), name="realtime_knob_ls_gain_db")
+    knob_ls_hz     = Input(shape=(1,), name="realtime_knob_ls_hz")
+    knob_ls_slope  = Input(shape=(1,), name="realtime_knob_ls_slope_dbpoct")
+    knob_mid_gain_db=Input(shape=(1,), name="realtime_knob_mid_gain_db")
+    knob_mid_hz     = Input(shape=(1,), name="realtime_knob_mid_hz")
+    knob_mid_q      = Input(shape=(1,), name="realtime_knob_mid_q")
+    knob_hs_gain_db= Input(shape=(1,), name="realtime_knob_hs_gain_db")
+    knob_hs_hz     = Input(shape=(1,), name="realtime_knob_hs_hz")
+    knob_hs_slope  = Input(shape=(1,), name="realtime_knob_hs_slope_dbpoct")
+
     wet_gain   = Lambda(invert, name="realtime_wet_from_drywet")(knob_dw_in)
     wet_scaled = apply_runtime_gain(y_wet,  wet_gain,    name="realtime_wet_gain")
     dry_scaled = apply_runtime_gain(inp,    knob_dw_in,  name="realtime_dry_gain")
-    y_final    = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
+    y_mix      = Add(name="realtime_drywet_mix")([wet_scaled, dry_scaled])
 
-    inputs_list  = [inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in]
+    # Streaming master EQ states
+    K_lc = _get_eq_kernels(REALTIME_SAMPLE_RATE)["lc_hp"].shape[0]
+    K_ls = _get_eq_kernels(REALTIME_SAMPLE_RATE)["ls_lp"].shape[0]
+    K_md = _get_eq_kernels(REALTIME_SAMPLE_RATE)["mid_bp"].shape[0]
+    K_hs = _get_eq_kernels(REALTIME_SAMPLE_RATE)["hs_hp"].shape[0]
+
+    s_eq_lc  = Input(shape=(K_lc - 1, 1), name="realtime_state_master_lc")
+    s_eq_ls  = Input(shape=(K_ls - 1, 1), name="realtime_state_master_ls")
+    s_eq_mid = Input(shape=(K_md - 1, 1), name="realtime_state_master_mid")
+    s_eq_hs  = Input(shape=(K_hs - 1, 1), name="realtime_state_master_hs")
+    state_inputs += [s_eq_lc, s_eq_ls, s_eq_mid, s_eq_hs]
+
+    # Streaming master EQ
+    y_eq, sLcN, sLsN, sMdN, sHsN = apply_master_eq_stream(
+        y_mix,
+        sr=REALTIME_SAMPLE_RATE,
+        knob_lc_hz=knob_lc_hz, knob_lc_slope=knob_lc_slope,
+        knob_ls_gain_db=knob_ls_gain_db, knob_ls_hz=knob_ls_hz, knob_ls_slope=knob_ls_slope,
+        knob_mid_gain_db=knob_mid_gain_db, knob_mid_hz=knob_mid_hz, knob_mid_q=knob_mid_q,
+        knob_hs_gain_db=knob_hs_gain_db, knob_hs_hz=knob_hs_hz, knob_hs_slope=knob_hs_slope,
+        state_lc=s_eq_lc, state_ls=s_eq_ls, state_mid=s_eq_mid, state_hs=s_eq_hs,
+        name_prefix="realtime_master"
+    )
+    state_outputs += [
+        Activation('linear', name="realtime_state_master_lc_next")(sLcN),
+        Activation('linear', name="realtime_state_master_ls_next")(sLsN),
+        Activation('linear', name="realtime_state_master_mid_next")(sMdN),
+        Activation('linear', name="realtime_state_master_hs_next")(sHsN),
+    ]
+
+    # Phase invert + Output gain
+    phase_gain = Lambda(phase_polarity_gain, name="realtime_phase_invert_gain")(knob_phaseinv)
+    y_phi = apply_runtime_gain(y_eq, phase_gain, name="realtime_phase_invert")
+    y_out = apply_runtime_gain(y_phi, knob_outgain, name="realtime_output_gain")
+
+    inputs_list  = [inp, style_true_in, style_force_in, knob_pa_in, knob_pr_in, knob_ir_in, knob_dw_in,
+                    knob_outgain, knob_phaseinv,
+                    knob_lc_hz, knob_lc_slope,
+                    knob_ls_gain_db, knob_ls_hz, knob_ls_slope,
+                    knob_mid_gain_db, knob_mid_hz, knob_mid_q,
+                    knob_hs_gain_db, knob_hs_hz, knob_hs_slope]
     inputs_list += state_inputs + coloreq_states_in
-    outputs_list = [y_final, style_prob] + state_outputs + coloreq_states_out
+
+    outputs_list = [y_out, style_prob] + state_outputs + coloreq_states_out
 
     return tf.keras.models.Model(inputs=inputs_list, outputs=outputs_list, name=name)
 
@@ -4720,51 +5463,44 @@ def add_shared_random_gain_dual(db_lo=-24.0, db_hi=+12.0):
 @register_keras_serializable()
 def add_sw_offline(x, y):
     y_audio, style_flag = y
-    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    b = tf.shape(x)[0];
+    T = tf.shape(x)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)
     force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
     style_force = force_mask
+    
+    inputs = prepare_training_knob_feeds(
+        kind="offline",
+        piezo_input=x,
+        style_true=style_true,
+        style_force=style_force
+    )
 
-    # Default knob values for training: PA/PR unity; dry = default dryness
-    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
-    inputs = {
-        'offline_piezo_input': x,
-        'offline_style_true_input': style_true,
-        'offline_style_force_input': style_force,
-        'offline_knob_pickattack': tf.ones((b,1), tf.float32),
-        'offline_knob_pickreso':   tf.ones((b,1), tf.float32),
-        'offline_knob_drywet':     tf.ones((b,1), tf.float32) * dry_default,
-    }
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
     return inputs, outputs, (sw_audio, sw_style)
-
 
 @register_keras_serializable()
 def add_sw_realtime(x, y):
     y_audio, style_flag = y
-    b = tf.shape(x)[0]; T = tf.shape(x)[1]
+    b = tf.shape(x)[0];
+    T = tf.shape(x)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)
-
     force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
     style_force = force_mask
 
-    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
-    inputs = {
-        'realtime_piezo_input': x,
-        'realtime_style_true_input': style_true,
-        'realtime_style_force_input': style_force,
-        'realtime_knob_pickattack': tf.ones((b,1), tf.float32),
-        'realtime_knob_pickreso':   tf.ones((b,1), tf.float32),
-        'realtime_knob_ir':         tf.ones((b,1), tf.float32),
-        'realtime_knob_drywet':     tf.ones((b,1), tf.float32) * dry_default,
-    }
+    inputs = prepare_training_knob_feeds(
+        kind="realtime",
+        piezo_input=x,
+        style_true=style_true,
+        style_force=style_force
+    )
+
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
     return inputs, outputs, (sw_audio, sw_style)
-
 
 @register_keras_serializable()
 def add_sw_realtime_dual_nf(x, y):
@@ -4774,18 +5510,19 @@ def add_sw_realtime_dual_nf(x, y):
     T_realtime = tf.shape(x_realtime)[1]
     style_true  = tf.zeros((b, 1), dtype=tf.float32)
     style_force = tf.zeros((b, 1), dtype=tf.float32)
-
-    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
+    
+    base_inputs = prepare_training_knob_feeds(
+        kind="realtime",
+        piezo_input=x_realtime,
+        style_true=style_true,
+        style_force=style_force
+    )
+    
     inputs = {
-        'realtime_piezo_input':         x_realtime,
-        'realtime_offline_piezo_input': x_offline,
-        'realtime_style_true_input':    style_true,
-        'realtime_style_force_input':   style_force,
-        'realtime_knob_pickattack':     tf.ones((b,1), tf.float32),
-        'realtime_knob_pickreso':       tf.ones((b,1), tf.float32),
-        'realtime_knob_ir':             tf.ones((b,1), tf.float32),
-        'realtime_knob_drywet':         tf.ones((b,1), tf.float32) * dry_default,
+        **base_inputs,
+        'realtime_offline_piezo_input': x_offline
     }
+    
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
     sw_style = tf.zeros_like(style_true, dtype=tf.float32)
@@ -4796,23 +5533,24 @@ def add_sw_realtime_dual_nf(x, y):
 def add_sw_realtime_dual(x, y):
     x_realtime, x_offline = x
     y_audio, style_flag = y
-    b = tf.shape(x_realtime)[0]; T_realtime = tf.shape(x_realtime)[1]
+    b = tf.shape(x_realtime)[0];
+    T_realtime = tf.shape(x_realtime)[1]
     style_true  = tf.expand_dims(style_flag, axis=-1)
-
     force_mask = tf.cast(tf.random.uniform((b,1)) < 0.5, tf.float32)
     style_force = force_mask
 
-    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
+    base_inputs = prepare_training_knob_feeds(
+        kind="realtime",
+        piezo_input=x_realtime,
+        style_true=style_true,
+        style_force=style_force
+    )
+    
     inputs = {
-        'realtime_piezo_input':         x_realtime,
-        'realtime_offline_piezo_input': x_offline,
-        'realtime_style_true_input':    style_true,
-        'realtime_style_force_input':   style_force,
-        'realtime_knob_pickattack':     tf.ones((b,1), tf.float32),
-        'realtime_knob_pickreso':       tf.ones((b,1), tf.float32),
-        'realtime_knob_ir':             tf.ones((b,1), tf.float32),
-        'realtime_knob_drywet':         tf.ones((b,1), tf.float32) * dry_default,
+        **base_inputs,
+        'realtime_offline_piezo_input': x_offline
     }
+    
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T_realtime, 1), dtype=tf.float32)
     sw_style = tf.ones_like(style_true, dtype=tf.float32)
@@ -4827,16 +5565,13 @@ def add_sw_offline_finetune_nf(x, y):
 
     style_true  = tf.zeros((b, 1), dtype=tf.float32)
     style_force = tf.zeros((b, 1), dtype=tf.float32)
-
-    dry_default = tf.constant(_default_dryness_value(), dtype=tf.float32)
-    inputs = {
-        'offline_piezo_input':        x,
-        'offline_style_true_input':   style_true,
-        'offline_style_force_input':  style_force,
-        'offline_knob_pickattack':    tf.ones((b,1), tf.float32),
-        'offline_knob_pickreso':      tf.ones((b,1), tf.float32),
-        'offline_knob_drywet':        tf.ones((b,1), tf.float32) * dry_default,
-    }
+    
+    inputs = prepare_training_knob_feeds(
+        kind="offline",
+        piezo_input=x,
+        style_true=style_true,
+        style_force=style_force
+    )
 
     outputs = (y_audio, style_true)
     sw_audio = tf.ones((b, T, 1), dtype=tf.float32)
@@ -5135,59 +5870,6 @@ def build_offline_debug_model(model):
 
     return tf.keras.Model(inputs=model.inputs, outputs=outs, name="offline_debug_model")
 
-def build_realtime_debug_model(model):
-    used = set([l.name for l in model.layers])
-
-    def unique_alias(base):
-        root = f"dbg_{base}"
-        name = root
-        k = 1
-        while name in used:
-            name = f"{root}_{k}"
-            k += 1
-        used.add(name)
-        return name
-
-    outs = []
-
-    def add(alias, lname):
-        try:
-            t = model.get_layer(lname).output
-        except Exception:
-            return
-        outs.append(Activation("linear", name=unique_alias(alias))(t))
-
-    # Main/full mix AFTER dry/wet so stems 'full' respects knob
-    add("y_pred", "realtime_drywet_mix")
-
-    # Useful stems/features
-    add("main_core",   "realtime_main")
-    add("main_pick",   "realtime_pick_contrib")
-    add("main_finger", "realtime_finger_contrib")
-    add("ir_only",     "realtime_ir_user_gain_mul")
-    add("pickreso",    "realtime_pickreso_user_gain_mul")
-    add("pickattack",  "realtime_pickattack_user_gain_mul")
-    add("style_pred",  "realtime_style_prob")
-    add("mask",        "realtime_pick_mask_db")
-    add("style_time",  "realtime_style_scalar_broadcast")
-
-    # Also expose all streaming state outputs so the renderer can advance state.
-    # These are already named uniquely inside the base model.
-    for l in model.layers:
-        nm = l.name
-        if nm.startswith("realtime_state_") and nm.endswith("_next"):
-            try:
-                outs.append(model.get_layer(nm).output)
-            except Exception:
-                pass
-
-    return tf.keras.Model(inputs=model.inputs, outputs=outs, name="realtime_debug_model")
-
-def _rms(x):
-    x = np.asarray(x, dtype=np.float32)
-    if x.size == 0: return 0.0
-    return float(np.sqrt(np.mean(x*x) + 1e-12))
-
 def _corr(a, b):
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
@@ -5270,37 +5952,26 @@ def render_isolated_stems_realtime_runtime(model,
             C = int(t.shape[2]) if t.shape[2] is not None else 1
             state_bufs[nm] = np.zeros((1, L, C), dtype=np.float32)
 
-    # Knobs
-    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind="realtime", use_finetuned=use_finetuned)
-    dry_default = _default_dryness_value()
-    def knobs(pa, pr, ir, dry=dry_default):
-        return {
-            "realtime_knob_pickattack": np.array([[float(pa)]], dtype=np.float32),
-            "realtime_knob_pickreso":   np.array([[float(pr)]], dtype=np.float32),
-            "realtime_knob_ir":         np.array([[float(ir)]], dtype=np.float32),
-            "realtime_knob_drywet":     np.array([[float(dry)]], dtype=np.float32),
-        }
     def filter_feed(d): return {k: v for k, v in d.items() if k in in_names}
 
+    knobs = prepare_demo_knob_feeds(kind="realtime", use_finetuned=use_finetuned)
+
     # Single-pass streamer
-    def run_stream(style_true=None, style_force=False, pa=None, pr=None, ir=None):
+    def run_stream(style_true=None, style_force=False):
         for k in state_bufs: state_bufs[k].fill(0.0)
         pos, N = 0, len(x_mod)
         y_full = []; y_main = []; y_pa = []; y_pr = []; y_ir = []
         st_true  = np.zeros((1,1), np.float32) if style_true is None else np.array([[float(style_true)]], np.float32)
         st_force = np.zeros((1,1), np.float32) if not style_force else np.ones((1,1), np.float32)
-        pa_val = pa if pa is not None else pa_lin
-        pr_val = pr if pr is not None else pr_lin
-        ir_val = ir if ir is not None else ir_lin
 
         while pos < N:
             core = min(hop, N - pos)
             xb = np.zeros((1, hop, 1), np.float32); xb[0, :core, 0] = x_mod[pos:pos+core]
             feed = {
+                **knobs,
                 "realtime_piezo_input": xb,
                 "realtime_style_true_input":  st_true,
-                "realtime_style_force_input": st_force,
-                **knobs(pa=pa_val, pr=pr_val, ir=ir_val, dry=dry_default)
+                "realtime_style_force_input": st_force
             }
             for n in state_in_names: feed[n] = state_bufs[n]
             outs = tap_model.predict(filter_feed(feed), batch_size=1, verbose=0)
@@ -5419,7 +6090,7 @@ def render_isolated_stems(debug_model,
                           resample_margin_ms=50.0,
                           use_finetuned=False):
     os.makedirs(out_dir, exist_ok=True)
-    knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
+    knob_feeds = prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned)
 
     info = sf.info(path_src)
     file_sr = info.samplerate
@@ -5894,21 +6565,6 @@ def _stems_tflite_outdir(kind, use_finetuned=False):
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
-def _make_knobs_for_kind(kind, pa=None, pr=None, ir=None, dry=None, use_finetuned=False):
-    # Start from defaults, then override linear gains
-    knobs = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
-    if kind == "realtime":
-        if pa is not None: knobs["realtime_knob_pickattack"] = np.array([[float(pa)]], dtype=np.float32)
-        if pr is not None: knobs["realtime_knob_pickreso"]   = np.array([[float(pr)]], dtype=np.float32)
-        if ir is not None: knobs["realtime_knob_ir"]         = np.array([[float(ir)]], dtype=np.float32)
-        if dry is not None:knobs["realtime_knob_drywet"]     = np.array([[float(dry)]], dtype=np.float32)
-    else:
-        if pa is not None: knobs["offline_knob_pickattack"]  = np.array([[float(pa)]], dtype=np.float32)
-        if pr is not None: knobs["offline_knob_pickreso"]    = np.array([[float(pr)]], dtype=np.float32)
-        if dry is not None:knobs["offline_knob_drywet"]      = np.array([[float(dry)]], dtype=np.float32)
-        # No IR branch in offline graph
-    return knobs
-
 def _tflite_schedule(kind, runner, T_fixed, core_len=None):
     """
     Decide left/core/right schedule for a single pass.
@@ -6062,19 +6718,16 @@ def render_isolated_stems_tflite(kind, use_finetuned=False, hop=None):
 
     # Runner and default knobs
     runner = TFLiteRunner(tflite_path)
-    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind=kind, use_finetuned=use_finetuned)
-    dry_frac = 0.0  # fully wet for stems
-    base_knobs = _make_knobs_for_kind(kind, pa=pa_lin, pr=pr_lin, ir=(ir_lin if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
 
     # Helper to build per-pass knob dicts
     def knobs_main_only():
-        return _make_knobs_for_kind(kind, pa=0.0, pr=0.0, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+        return prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned, pickattack=0.0, pickreso=0.0, ir=0.0)
     def knobs_ir_only():
-        return _make_knobs_for_kind(kind, pa=0.0, pr=0.0, ir=(ir_lin if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+        return prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned, pickattack=0.0, pickreso=0.0)
     def knobs_pa_only():
-        return _make_knobs_for_kind(kind, pa=pa_lin, pr=0.0, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+        return prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned, pickreso=0.0, ir=0.0)
     def knobs_pr_only():
-        return _make_knobs_for_kind(kind, pa=0.0, pr=pr_lin, ir=(0.0 if kind=="realtime" else None), dry=dry_frac, use_finetuned=use_finetuned)
+        return prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned, pickattack=0.0, ir=0.0)
 
     # Small helpers
     def finalize(sig, headroom_db=1.0, dc_remove=True):
@@ -6089,6 +6742,7 @@ def render_isolated_stems_tflite(kind, use_finetuned=False, hop=None):
         x = np.asarray(x, np.float32)
         return float(np.sqrt(np.mean(x*x) + 1e-12)) if x.size else 0.0
 
+    base_knobs = prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned)
     out_dir = _stems_tflite_outdir(kind, use_finetuned=use_finetuned)
     # Writers per pass
     def open_writers(pass_key):
@@ -6776,7 +7430,10 @@ def generate_demo(model, kind, out_dir, sample_rate, prediction_name="demo_pred"
             if nm_next in out_index_map:
                 state_out_indices[nm] = out_index_map[nm_next]
 
-    knob_feeds = _prepare_knob_feeds(kind="realtime", use_finetuned=False)
+    def filter_feed(d):
+        return {k: v for k, v in d.items() if k in in_names}
+
+    knob_feeds = prepare_demo_knob_feeds(kind="realtime", use_finetuned=False)
 
     def run_one_pass(force_style=None):
         pos = 0
@@ -6800,20 +7457,24 @@ def generate_demo(model, kind, out_dir, sample_rate, prediction_name="demo_pred"
             x_block = np.zeros((1, hop, 1), dtype=np.float32)
             x_block[0, :core, 0] = x_mod[pos:pos + core].astype(np.float32, copy=False)
 
+            # Build the feed with ALL realtime knobs
             feed = {
                 "realtime_piezo_input": x_block,
-                "realtime_style_true_input": st_true,
+                "realtime_style_true_input":  st_true,
                 "realtime_style_force_input": st_force,
-                "realtime_knob_pickattack": knob_feeds["realtime_knob_pickattack"],
-                "realtime_knob_pickreso":   knob_feeds["realtime_knob_pickreso"],
-                "realtime_knob_ir":         knob_feeds["realtime_knob_ir"],
-                "realtime_knob_drywet":     knob_feeds["realtime_knob_drywet"],
             }
-            # Attach states by input name
+            # Merge all knob tensors (includes outgain, phaseinv, and EQ knobs)
+            feed.update(knob_feeds)
+
+            # Attach all streaming states
             for nm in state_in_names:
                 feed[nm] = state_bufs[nm]
 
+            # Optional: filter to exactly the model’s inputs (avoids surprises if names ever differ)
+            feed = filter_feed(feed)
+
             outs = model.predict(feed, batch_size=1, verbose=0)
+
             # Ordered: y=outs[0], style=outs[1]
             y_arr = outs[0]
             s_arr = outs[1]
@@ -6835,7 +7496,7 @@ def generate_demo(model, kind, out_dir, sample_rate, prediction_name="demo_pred"
                 prob_sum   += s_prob * float(core)
                 prob_count += core
 
-            # Update states (ordered or name-based)
+            # Update states (ordered or name-based, as your existing code does)
             for nm in state_in_names:
                 idx = state_out_indices.get(nm, None)
                 if idx is None:
@@ -6980,19 +7641,43 @@ def _wrap_fixed_T_for_tflite(dyn_model, kind, T_fixed):
         k_pa = Input(shape=(1,),       name="offline_knob_pickattack")
         k_pr = Input(shape=(1,),       name="offline_knob_pickreso")
         k_dw = Input(shape=(1,),       name="offline_knob_drywet")
-        y, s = dyn_model([inp, st_t, st_f, k_pa, k_pr, k_dw])
+        # New master knobs
+        k_og  = Input(shape=(1,), name="offline_knob_outgain")
+        k_pi  = Input(shape=(1,), name="offline_knob_phaseinv")
+        k_lc_h= Input(shape=(1,), name="offline_knob_lc_hz")
+        k_lc_s= Input(shape=(1,), name="offline_knob_lc_slope_dbpoct")
+        k_ls_g= Input(shape=(1,), name="offline_knob_ls_gain_db")
+        k_ls_h= Input(shape=(1,), name="offline_knob_ls_hz")
+        k_ls_s= Input(shape=(1,), name="offline_knob_ls_slope_dbpoct")
+        k_md_g= Input(shape=(1,), name="offline_knob_mid_gain_db")
+        k_md_h= Input(shape=(1,), name="offline_knob_mid_hz")
+        k_md_q= Input(shape=(1,), name="offline_knob_mid_q")
+        k_hs_g= Input(shape=(1,), name="offline_knob_hs_gain_db")
+        k_hs_h= Input(shape=(1,), name="offline_knob_hs_hz")
+        k_hs_s= Input(shape=(1,), name="offline_knob_hs_slope_dbpoct")
 
-        # Give outputs stable, exported names without raw TF ops
+        y, s = dyn_model([inp, st_t, st_f, k_pa, k_pr, k_dw,
+                          k_og, k_pi, k_lc_h, k_lc_s,
+                          k_ls_g, k_ls_h, k_ls_s,
+                          k_md_g, k_md_h, k_md_q,
+                          k_hs_g, k_hs_h, k_hs_s])
+
         y = Activation('linear', name="offline_audio_out")(y)
         s = Activation('linear', name="offline_style_prob_out")(s)
 
         export = tf.keras.Model(
-            inputs=[inp, st_t, st_f, k_pa, k_pr, k_dw],
+            inputs=[inp, st_t, st_f, k_pa, k_pr, k_dw,
+                    k_og, k_pi, k_lc_h, k_lc_s,
+                    k_ls_g, k_ls_h, k_ls_s,
+                    k_md_g, k_md_h, k_md_q,
+                    k_hs_g, k_hs_h, k_hs_s],
             outputs=[y, s],
             name=dyn_model.name + "_tflite_export"
         )
+        return export
 
     elif kind == "realtime":
+        # unchanged path in your code (kept here intact)
         inp  = Input(shape=(T_fixed,1), name="realtime_piezo_input")
         st_t = Input(shape=(1,),       name="realtime_style_true_input")
         st_f = Input(shape=(1,),       name="realtime_style_force_input")
@@ -7000,47 +7685,40 @@ def _wrap_fixed_T_for_tflite(dyn_model, kind, T_fixed):
         k_pr = Input(shape=(1,),       name="realtime_knob_pickreso")
         k_ir = Input(shape=(1,),       name="realtime_knob_ir")
         k_dw = Input(shape=(1,),       name="realtime_knob_drywet")
-        y, s = dyn_model([inp, st_t, st_f, k_pa, k_pr, k_ir, k_dw])
-
-        # Give outputs stable, exported names without raw TF ops
+        # Master knobs
+        k_og  = Input(shape=(1,), name="realtime_knob_outgain")
+        k_pi  = Input(shape=(1,), name="realtime_knob_phaseinv")
+        k_lc_h= Input(shape=(1,), name="realtime_knob_lc_hz")
+        k_lc_s= Input(shape=(1,), name="realtime_knob_lc_slope_dbpoct")
+        k_ls_g= Input(shape=(1,), name="realtime_knob_ls_gain_db")
+        k_ls_h= Input(shape=(1,), name="realtime_knob_ls_hz")
+        k_ls_s= Input(shape=(1,), name="realtime_knob_ls_slope_dbpoct")
+        k_md_g= Input(shape=(1,), name="realtime_knob_mid_gain_db")
+        k_md_h= Input(shape=(1,), name="realtime_knob_mid_hz")
+        k_md_q= Input(shape=(1,), name="realtime_knob_mid_q")
+        k_hs_g= Input(shape=(1,), name="realtime_knob_hs_gain_db")
+        k_hs_h= Input(shape=(1,), name="realtime_knob_hs_hz")
+        k_hs_s= Input(shape=(1,), name="realtime_knob_hs_slope_dbpoct")
+        y, s = dyn_model([inp, st_t, st_f, k_pa, k_pr, k_ir, k_dw,
+                          k_og, k_pi, k_lc_h, k_lc_s,
+                          k_ls_g, k_ls_h, k_ls_s,
+                          k_md_g, k_md_h, k_md_q,
+                          k_hs_g, k_hs_h, k_hs_s])
         y = Activation('linear', name="realtime_audio_out")(y)
         s = Activation('linear', name="realtime_style_prob_out")(s)
-
         export = tf.keras.Model(
-            inputs=[inp, st_t, st_f, k_pa, k_pr, k_ir, k_dw],
+            inputs=[inp, st_t, st_f, k_pa, k_pr, k_ir, k_dw,
+                    k_og, k_pi, k_lc_h, k_lc_s,
+                    k_ls_g, k_ls_h, k_ls_s,
+                    k_md_g, k_md_h, k_md_q,
+                    k_hs_g, k_hs_h, k_hs_s],
             outputs=[y, s],
             name=dyn_model.name + "_tflite_export"
         )
-    else:
-        raise ValueError("kind must be 'offline' or 'realtime'")
-    return export
-@register_keras_serializable()
-class PackStatesBundle(tf.keras.layers.Layer):
-    """
-    Concatenate all streaming 'next state' tensors into a single 2D bundle:
-      inputs: list of (B, L_i, C_i)
-      output: (B, sum_i (L_i*C_i))
-    """
-    def call(self, states_list):
-        flats = [tf.reshape(s, [tf.shape(s)[0], -1]) for s in states_list]
-        return tf.concat(flats, axis=1)
-
-    def get_config(self):
-        return super().get_config()
-
+        return export
 
 @register_keras_serializable()
 def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
-    """
-    Export wrapper for streaming realtime model that:
-      - Emits audio (B,T,1) and style (B,1)
-      - Packs all realtime_state_*_next into a single 2D bundle (B, sum(L_i*C_i))
-      - Emits splits (1, N_states) int32 equal to DECLARED state-input lengths (L_i*C_i)
-
-    strict:
-      - If True, raise if any '*_next' cannot be found in the model outputs.
-      - If False, pad missing states with zeros (legacy behavior).
-    """
     import re
     import numpy as np
     import tensorflow as tf
@@ -7061,23 +7739,22 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
         except Exception:
             return None
 
-    # Audio/style
-    try:
-        audio = rt_stream_model.get_layer("realtime_drywet_mix").output
-    except Exception:
-        audio = rt_stream_model.outputs[0]
-    try:
-        style = rt_stream_model.get_layer("realtime_style_prob").output
-    except Exception:
-        if len(rt_stream_model.outputs) > 1:
-            style = rt_stream_model.outputs[1]
-        else:
-            style = tf.keras.layers.Lambda(lambda x: tf.zeros((tf.shape(x)[0], 1), tf.float32),
-                                           name="realtime_style_prob")(audio)
+    # 1) Pick audio/style directly from model.outputs to avoid layer-name mismatch.
+    # build_realtime_streaming_model produces outputs_list = [y_out, style_prob, state_next..., coloreq_state_next...]
+    if len(rt_stream_model.outputs) < 1:
+        raise ValueError("[export/tflite] realtime streaming model has no outputs.")
+    audio = rt_stream_model.outputs[0]
+    if len(rt_stream_model.outputs) >= 2:
+        style = rt_stream_model.outputs[1]
+    else:
+        style = tf.keras.layers.Lambda(
+            lambda x: tf.zeros((tf.shape(x)[0], 1), tf.float32),
+            name="realtime_style_prob")(audio)
 
-    # Declared states (inputs) in lexicographic order with expected flattened lengths
+    # 2) Discover streaming state inputs (lex order) and their expected flattened lengths
     inputs = list(rt_stream_model.inputs)
     in_names = [norm_tensor_name(t) for t in inputs]
+
     state_in_meta = []
     for t in inputs:
         nm = norm_tensor_name(t)
@@ -7087,7 +7764,7 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
             state_in_meta.append((nm, L * C))
     state_in_meta.sort(key=lambda p: p[0])
 
-    # Map outputs by producer layer and normalized tensor name
+    # 3) Map outputs by producer layer name and by normalized tensor name (for *_next)
     outs = list(rt_stream_model.outputs)
     out_by_prod = {}
     for t in outs:
@@ -7100,16 +7777,15 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
     declared_lengths = []
     missing = []
 
+    # Find each state’s corresponding "*_next" output, flatten it, and pad/crop to declared length.
     for (nm, expected_len) in state_in_meta:
         nm_next = nm + "_next"
 
-        # Important: avoid boolean 'or' with KerasTensor; check None explicitly
         t = out_by_prod.get(nm_next, None)
         if t is None:
             t = out_by_name.get(nm_next, None)
-
         if t is None:
-            # relaxed match: strip trailing _<num> from producer names
+            # relaxed: allow *_next_<suffix> where TFLite may inject numeric suffixes
             base_map_prod = {re.sub(r"_\d+$", "", k): v for (k, v) in out_by_prod.items()}
             t = base_map_prod.get(nm_next, None)
             if t is None:
@@ -7122,7 +7798,7 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
             missing.append(nm_next)
             if strict:
                 continue
-            # Legacy behavior: synthesize zeros (B,exp_len)
+            # Synthesize zeros (B,exp_len) tied to batch of 'audio'
             z = tf.keras.layers.Lambda(
                 lambda a, e=exp_len: tf.tile(tf.zeros((1, e), dtype=tf.float32),
                                              [tf.shape(a)[0], 1]),
@@ -7131,7 +7807,6 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
             declared_lengths.append(exp_len)
             continue
 
-        # Flatten (B,L,C) -> (B,L*C)
         flat = tf.keras.layers.Flatten(name=f"{nm}_flatten")(t)
 
         got_len = flat.shape[1]
@@ -7143,13 +7818,11 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
 
         delta = exp_len - got_len
         if delta > 0:
-            # LEFT-pad zeros to preserve most recent tail alignment
             flat_fixed = tf.keras.layers.Lambda(
                 lambda f, d=delta: tf.concat(
                     [tf.zeros((tf.shape(f)[0], d), dtype=f.dtype), f], axis=1),
                 name=f"{nm}_padleft")(flat)
         elif delta < 0:
-            # Tail-crop to keep most recent samples
             flat_fixed = tf.keras.layers.Lambda(
                 lambda f, e=exp_len: f[:, -e:],
                 name=f"{nm}_tailcrop")(flat)
@@ -7165,7 +7838,7 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
                          "Export cannot proceed safely. Ensure every realtime_state_* input has a corresponding "
                          "'*_next' tensor in the model outputs.")
 
-    # Concatenate all fixed-length flats; splits from declared (input) sizes
+    # 4) Concatenate all fixed-length flats into one bundle; provide splits (lengths)
     if flat_list:
         bundle = tf.keras.layers.Concatenate(axis=1, name="realtime_states_bundle_out")(flat_list)
     else:
@@ -7176,7 +7849,7 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
     splits = tf.keras.layers.Lambda(lambda _: tf.constant(lens_np, dtype=tf.int32),
                                     name="realtime_states_splits_out")(audio)
 
-    # Final named outputs
+    # 5) Final named outputs
     y_out = tf.keras.layers.Activation('linear', name="realtime_audio_out")(audio)
     s_out = tf.keras.layers.Activation('linear', name="realtime_style_prob_out")(style)
 
@@ -7186,14 +7859,16 @@ def build_realtime_streaming_export_for_tflite(rt_stream_model, strict=True):
         name=rt_stream_model.name + "_tflite_export"
     )
 
-    # Debug summary
+    # Optional summary
     try:
         total = int(np.sum(lens_np))
         print("[export/tflite] Streaming realtime export wrapper")
         print(f"  states discovered: {len(state_in_meta)} (lex order by input name)")
-        for (nm, exp_len) in state_in_meta:
+        for (nm, exp_len) in state_in_meta[:8]:
             flag = "" if (nm + "_next") not in missing else " (MISSING_NEXT)"
             print(f"    - {nm:<40} len={exp_len:<6d}{flag}")
+        if len(state_in_meta) > 8:
+            print(f"    ... {len(state_in_meta)-8} more")
         print("[export/tflite] outputs:")
         for t_ in export.outputs:
             print("  -", t_.name.split(':')[0], "shape=", t_.shape)
@@ -7414,31 +8089,6 @@ def _convert_keras_to_tflite_fp32_checked(model, out_path, validate_kind=None, T
         _, outs = _inspect_tflite_file(out_path)
         _validate_tflite_outputs_by_shape(validate_kind, outs, T_fixed=T_fixed)
 
-def _convert_keras_to_tflite_fp32(model, out_path):
-    """
-    Convert the provided Keras model to FP32 TFLite. Tries pure builtin ops first,
-    falls back to SELECT_TF_OPS if needed.
-    """
-    converter = tf.lite.TFLiteConverter.from_keras_model(model)
-    converter.inference_input_type = tf.float32
-    converter.inference_output_type = tf.float32
-    try:
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS]
-        tflm = converter.convert()
-    except Exception as e:
-        print(f"[TFLite] Builtin conversion failed ({e}); retrying with SELECT_TF_OPS…")
-        converter = tf.lite.TFLiteConverter.from_keras_model(model)
-        converter.inference_input_type = tf.float32
-        converter.inference_output_type = tf.float32
-        converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS,
-            tf.lite.OpsSet.SELECT_TF_OPS
-        ]
-        tflm = converter.convert()
-    with open(out_path, "wb") as f:
-        f.write(tflm)
-    print(f"✅ Saved FP32 TFLite: {out_path}")
-
 def _build_dyn_model_for_export(kind):
     """
     Build the dynamic-time runtime graph (teacherless) for export.
@@ -7547,9 +8197,6 @@ def export_tflite_all():
 
 def _sum_rf(kernel, dilations):
     return (int(kernel) - 1) * sum(int(d) for d in dilations)
-
-def _align_up(x, m):
-    return int(((int(x) + int(m) - 1) // int(m)) * int(m))
 
 def compute_streaming_ctx_constants(kind):
     """
@@ -7668,7 +8315,7 @@ def _tflite_demo_blockwise(kind, tflite_runner, sample_rate, x_mod, y_mod=None,
                 l_dec = min(left_this, need); left_this -= l_dec
         print(f"[TFLite/demo] WINDOWED: T={T_fixed}, left={left_this}, core={core_len}, right={right_this}")
 
-    knob_feeds = _prepare_knob_feeds(kind=kind, use_finetuned=use_finetuned)
+    knob_feeds = prepare_demo_knob_feeds(kind=kind, use_finetuned=use_finetuned)
     
     # DEBUG: isolate main path only (no IR, no pick branches; fully wet)
     #if kind == "realtime":
@@ -8274,11 +8921,6 @@ class TFLiteRunner:
             nm = self._norm_name_input(d["name"])
             if "knob_" in nm:
                 val = 1.0
-                if "drywet" in nm:
-                    try:
-                        val = float(_default_dryness_value())
-                    except Exception:
-                        val = 0.0
                 feed[nm] = np.array([[val]], dtype=np.float32)
 
         if self._is_streaming:
@@ -8364,6 +9006,51 @@ def generate_demo_tflite(kind, use_finetuned=False, out_dir=None, hop=None):
                            x_mod=x_mod, y_mod=y_mod, style_true_flag=style_true_flag,
                            use_finetuned=use_finetuned, out_dir=out_dir,
                            fixed_hop=hop)
+    
+def migrate_offline_models_inplace():
+    """
+    Add master EQ/phase/output knobs to offline models by rebuilding graphs and copying weights by name.
+    Saves to the same baseline/finetuned filenames.
+    """
+    dst_offline_static_baseline  = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_STATIC_MODEL_FILENAME)
+    dst_offline_dynamic_baseline = os.path.join(MODELS_OFFLINE_OUT_DIR, OFFLINE_DYNAMIC_MODEL_FILENAME)
+    dst_offline_static_ft        = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_STATIC_MODEL_FILENAME)
+    dst_offline_dynamic_ft       = os.path.join(MODELS_OFFLINE_OUT_DIR, FINETUNE_OFFLINE_DYNAMIC_MODEL_FILENAME)
+
+    # Load old
+    if not os.path.exists(dst_offline_static_baseline) or not os.path.exists(dst_offline_dynamic_baseline):
+        print("[migrate/offline] Missing baseline offline models; run --train-offline first.")
+        return
+
+    off_static_old  = tf.keras.models.load_model(dst_offline_static_baseline,  compile=False)
+    off_dynamic_old = tf.keras.models.load_model(dst_offline_dynamic_baseline, compile=False)
+
+    # Rebuild new graphs with new knobs
+    off_static_new  = build_offline_model(dynamic_time=False)
+    off_dynamic_new = build_offline_model(dynamic_time=True)
+
+    copy_weights_by_name(off_static_new,  off_static_old,  verbose=True)
+    copy_weights_by_name(off_dynamic_new, off_dynamic_old, verbose=True)
+
+    off_static_new.save(dst_offline_static_baseline)
+    off_dynamic_new.save(dst_offline_dynamic_baseline)
+    print("✅ [migrate/offline] Saved updated baseline offline static/dynamic.")
+
+    # Finetuned (if present)
+    if os.path.exists(dst_offline_static_ft):
+        off_static_ft_old  = tf.keras.models.load_model(dst_offline_static_ft,  compile=False)
+        off_dynamic_ft_old = tf.keras.models.load_model(dst_offline_dynamic_ft, compile=False) if os.path.exists(dst_offline_dynamic_ft) else None
+
+        off_static_ft_new  = build_offline_model(dynamic_time=False)
+        copy_weights_by_name(off_static_ft_new, off_static_ft_old, verbose=True)
+        off_static_ft_new.save(dst_offline_static_ft)
+        print("✅ [migrate/offline] Saved updated finetuned offline static.")
+
+        if off_dynamic_ft_old is not None:
+            off_dynamic_ft_new = build_offline_model(dynamic_time=True)
+            copy_weights_by_name(off_dynamic_ft_new, off_dynamic_ft_old, verbose=True)
+            off_dynamic_ft_new.save(dst_offline_dynamic_ft)
+            print("✅ [migrate/offline] Saved updated finetuned offline dynamic.")
 
 def migrate_realtime_models_inplace():
     # Destination paths
@@ -8489,258 +9176,6 @@ def _print_model_io_summary(model):
     if state_out_names:
         print("  first outputs:", state_out_names[:5])
 
-def check_streaming_equivalence_realtime(use_finetuned=False,
-                                         hop=None,
-                                         sec=None,
-                                         offset_sec=None,
-                                         pair_index=None,
-                                         style_mode="pred",
-                                         only="full"):
-    """
-    Compare realtime DYNAMIC streaming model monolithic vs streaming.
-
-    We FORCE THE SAME STYLE in both passes to remove EMA/hop effects:
-      - style_mode='pick'   → style_true=1.0, style_force=1
-      - style_mode='finger' → style_true=0.0, style_force=1
-      - style_mode='pred'   → compute one global probability once on full clip
-      - style_mode='prob=<float>' → force exact value
-
-    Branch isolation:
-      --only=full  → compare full mix (main + IR + PA + PR)
-      --only=main  → compare main path only (PA=PR=IR=0)
-      --only=ir    → compare [main+IR] - [main]
-      --only=pa    → compare [main+PA] - [main]
-      --only=pr    → compare [main+PR] - [main]
-
-    Writes mono.wav, stream.wav, diff.wav under:
-      out/demos/realtime_streaming_equivalence/only_<mode>
-    """
-    assert_has_pairs()
-    if sec is None:
-        sec = float(LONG_DEMO_SEC)
-    if offset_sec is None:
-        offset_sec = float(LONG_DEMO_OFFSET_SEC)
-    if pair_index is None:
-        pair_index = int(LONG_DEMO_PAIR_INDEX)
-    if hop is None:
-        hop = int(REALTIME_TFLITE_T)
-    hop = int(hop)
-    only = str(only).strip().lower()
-
-    # Select pair
-    try:
-        path_src, path_tgt = all_pairs[pair_index]
-    except Exception:
-        raise RuntimeError(f"Invalid pair_index={pair_index}; there are {len(all_pairs)} pair(s).")
-
-    # Load realtime DYNAMIC streaming model
-    dpath = _select_stems_model_path(kind="realtime", use_finetuned=bool(use_finetuned))
-    if dpath is None or (not os.path.exists(dpath)):
-        raise FileNotFoundError(f"[check-streaming] Realtime dynamic model not found. Expected at: {dpath}")
-    print(f"[check-streaming] Using realtime DYNAMIC model: {dpath}")
-    rt_dyn = tf.keras.models.load_model(dpath, compile=False)
-
-    # Read and resample audio to 48k
-    info = sf.info(path_src)
-    file_sr = info.samplerate
-    start = int(round(offset_sec * file_sr))
-    frames = int(round(sec * file_sr))
-    x_blk_2d, _ = sf.read(path_src, start=start, frames=frames, dtype='float32', always_2d=True)
-    y_blk_2d, _ = sf.read(path_tgt, start=start, frames=frames, dtype='float32', always_2d=True)
-    x_file = x_blk_2d[:, 0]
-    y_file = y_blk_2d[:, 0]
-    x_mod = x_file if file_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(x_file, file_sr, REALTIME_SAMPLE_RATE)
-    y_mod = y_file if file_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(y_file, file_sr, REALTIME_SAMPLE_RATE)
-    N = len(x_mod)
-    if N <= 0:
-        raise RuntimeError("[check-streaming] Empty input after resampling.")
-
-    # Helpers
-    def _basename(t):
-        nm = t.name.split(':')[0]
-        if '/' in nm:
-            nm = nm.split('/',1)[0]
-        if nm.startswith("serving_default_"):
-            nm = nm[len("serving_default_"):]
-        return nm
-
-    in_tensors = list(rt_dyn.inputs)
-    in_names   = [_basename(t) for t in in_tensors]
-    out_names  = _output_names_from_model(rt_dyn)
-
-    # State input names and zero buffers
-    state_in_names = [n for n in in_names if n.startswith("realtime_state_")]
-    state_zero = {}
-    for t in in_tensors:
-        nm = _basename(t)
-        if nm in state_in_names:
-            L = int(t.shape[1]) if t.shape[1] is not None else 0
-            C = int(t.shape[2]) if t.shape[2] is not None else 1
-            state_zero[nm] = np.zeros((1, L, C), dtype=np.float32)
-
-    # Map input-state -> output-state indices (…_next names)
-    out_index_map = {name: idx for idx, name in enumerate(out_names)}
-    state_out_idx = {}
-    for nm in state_in_names:
-        nm_next = nm + "_next"
-        if nm_next in out_index_map:
-            state_out_idx[nm] = out_index_map[nm_next]
-
-    # Knobs fixed (fully wet by default)
-    def _knobs(pa, pr, ir):
-        return {
-            "realtime_knob_pickattack": np.array([[float(pa)]], dtype=np.float32),
-            "realtime_knob_pickreso":   np.array([[float(pr)]], dtype=np.float32),
-            "realtime_knob_ir":         np.array([[float(ir)]], dtype=np.float32),
-            "realtime_knob_drywet":     np.array([[_default_dryness_value()]], dtype=np.float32),
-        }
-
-    # Determine single style value to force for both passes
-    style_mode = str(style_mode).strip().lower()
-    if style_mode in ("pick", "p", "1", "true"):
-        style_val = 1.0
-        print("[check-streaming] Forcing style: pick (1.0)")
-    elif style_mode in ("finger", "f", "0", "false"):
-        style_val = 0.0
-        print("[check-streaming] Forcing style: finger (0.0)")
-    elif style_mode.startswith("prob="):
-        try:
-            style_val = float(style_mode.split("=",1)[1])
-        except Exception:
-            raise ValueError(f"Invalid style_mode '{style_mode}'. Use prob=<float 0..1>.")
-        style_val = float(np.clip(style_val, 0.0, 1.0))
-        print(f"[check-streaming] Forcing style: prob={style_val:.4f}")
-    else:
-        # style_mode == 'pred': compute one global probability on full clip
-        x_b_probe = x_mod[None, :, None].astype(np.float32)
-        probe = {
-            "realtime_piezo_input":         x_b_probe,
-            "realtime_style_true_input":    np.zeros((1,1), dtype=np.float32),
-            "realtime_style_force_input":   np.zeros((1,1), dtype=np.float32),
-            **_knobs(1.0, 1.0, 1.0),
-        }
-        for nm in state_in_names:
-            probe[nm] = state_zero[nm]
-        outs_probe = rt_dyn.predict(probe, batch_size=1, verbose=0)
-        style_val = float(np.asarray(outs_probe[1], dtype=np.float32)[0, 0])
-        style_val = float(np.clip(style_val, 0.0, 1.0))
-        print(f"[check-streaming] Forcing global predicted style prob={style_val:.4f} (as a constant).")
-
-    # Monolithic runner
-    def forward_mono(pa, pr, ir):
-        x_b = x_mod[None, :, None].astype(np.float32)
-        feed = {
-            "realtime_piezo_input": x_b,
-            "realtime_style_true_input":  np.array([[style_val]], dtype=np.float32),
-            "realtime_style_force_input": np.ones((1,1), dtype=np.float32),
-            **_knobs(pa, pr, ir),
-        }
-        for nm in state_in_names:
-            feed[nm] = state_zero[nm]
-        outs = rt_dyn.predict(feed, batch_size=1, verbose=0)
-        return outs[0][0, :, 0]
-
-    # Streaming runner
-    def forward_stream(pa, pr, ir):
-        state_bufs = {k: v.copy() for k, v in state_zero.items()}
-        y_accum = []
-        pos = 0
-        while pos < N:
-            core = min(hop, N - pos)
-            x_block = np.zeros((1, hop, 1), dtype=np.float32)
-            x_block[0, :core, 0] = x_mod[pos:pos+core]
-            feed = {
-                "realtime_piezo_input": x_block,
-                "realtime_style_true_input":  np.array([[style_val]], dtype=np.float32),
-                "realtime_style_force_input": np.ones((1,1), dtype=np.float32),
-                **_knobs(pa, pr, ir),
-            }
-            for nm in state_in_names:
-                feed[nm] = state_bufs[nm]
-            outs = rt_dyn.predict(feed, batch_size=1, verbose=0)
-            y_blk = outs[0][0, :hop, 0]
-            y_accum.append(y_blk[:core])
-            for nm, idx in state_out_idx.items():
-                state_bufs[nm] = outs[idx]
-            pos += core
-        return np.concatenate(y_accum, axis=0)
-
-    # Decide which signals to compare based on --only
-    if only == "full":
-        y_mono = forward_mono(pa=1.0, pr=1.0, ir=1.0)
-        y_stream = forward_stream(pa=1.0, pr=1.0, ir=1.0)
-        label = "full"
-    elif only == "main":
-        y_mono = forward_mono(pa=0.0, pr=0.0, ir=0.0)
-        y_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
-        label = "main"
-    elif only == "ir":
-        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
-        ir_on_mono  = forward_mono(pa=0.0, pr=0.0, ir=1.0)
-        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
-        ir_on_stream= forward_stream(pa=0.0, pr=0.0, ir=1.0)
-        y_mono   = ir_on_mono   - base_mono
-        y_stream = ir_on_stream - base_stream
-        label = "ir"
-    elif only == "pa":
-        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
-        pa_on_mono  = forward_mono(pa=1.0, pr=0.0, ir=0.0)
-        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
-        pa_on_stream= forward_stream(pa=1.0, pr=0.0, ir=0.0)
-        y_mono   = pa_on_mono   - base_mono
-        y_stream = pa_on_stream - base_stream
-        label = "pa"
-    elif only == "pr":
-        base_mono   = forward_mono(pa=0.0, pr=0.0, ir=0.0)
-        pr_on_mono  = forward_mono(pa=0.0, pr=1.0, ir=0.0)
-        base_stream = forward_stream(pa=0.0, pr=0.0, ir=0.0)
-        pr_on_stream= forward_stream(pa=0.0, pr=1.0, ir=0.0)
-        y_mono   = pr_on_mono   - base_mono
-        y_stream = pr_on_stream - base_stream
-        label = "pr"
-    else:
-        raise ValueError(f"Unknown --only='{only}'. Use one of: full, main, ir, pa, pr.")
-
-    # Align lengths and compute metrics
-    n = min(len(y_mono), len(y_stream))
-    y_mono = y_mono[:n]
-    y_stream = y_stream[:n]
-    err = (y_mono - y_stream).astype(np.float32)
-    rms_err = float(np.sqrt(np.mean(err*err) + 1e-12))
-    max_abs = float(np.max(np.abs(err))) if err.size else 0.0
-    rms_ref = float(np.sqrt(np.mean(y_mono*y_mono) + 1e-12))
-    snr = float(20.0 * np.log10((rms_ref + 1e-12) / (rms_err + 1e-12)))
-    corr = _corr(y_mono, y_stream)
-
-    # Write audio
-    out_dir = os.path.join(DEMOS_OUT_DIR, "realtime_streaming_equivalence", f"only_{label}")
-    os.makedirs(out_dir, exist_ok=True)
-    sf.write(os.path.join(out_dir, "mono.wav"),    y_mono,    REALTIME_SAMPLE_RATE, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "stream.wav"),  y_stream,  REALTIME_SAMPLE_RATE, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "diff.wav"),    err,       REALTIME_SAMPLE_RATE, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "source.wav"),  x_mod[:n], REALTIME_SAMPLE_RATE, subtype='FLOAT')
-    sf.write(os.path.join(out_dir, "target.wav"),  y_mod[:n], REALTIME_SAMPLE_RATE, subtype='FLOAT')
-
-    # Report
-    print("=== Streaming equivalence (realtime) ===")
-    print(f"Pair: {os.path.basename(path_src)}")
-    print(f"Length: {n} samples @ 48k, hop={hop}")
-    print(f"Forced style value: {style_val:.6f} (mode='{style_mode}')")
-    print(f"Branch: {label}")
-    print(f"RMS error: {rms_err:.9f}")
-    print(f"Max abs:   {max_abs:.9f}")
-    print(f"SNR:       {snr:.2f} dB")
-    print(f"Corr:      {corr:.6f}")
-    print(f"WAVs written to: {out_dir}")
-
-    # Tolerance (tight)
-    thr_rms = 5e-6
-    thr_max = 5e-6
-    if rms_err <= thr_rms and max_abs <= thr_max:
-        print("✅ PASS: Streaming equals monolithic within numerical tolerance.")
-    else:
-        print("⚠️  WARN: Differences exceed tolerance (inspect diff.wav and metrics).")
-
 def inspect_realtime_heads(use_finetuned=False, sec=None, offset_sec=None, pair_index=None, style="pick", hop=None):
     assert_has_pairs()
     if sec is None: sec = float(LONG_DEMO_SEC)
@@ -8843,9 +9278,7 @@ def inspect_realtime_heads(use_finetuned=False, sec=None, offset_sec=None, pair_
     # Style force value
     style_val = 1.0 if str(style).lower().startswith("p") else 0.0
 
-    # Head boosts (linear) and dryness
-    pa_lin, pr_lin, ir_lin = _resolve_demo_knobs(kind="realtime", use_finetuned=use_finetuned)
-    dry = _default_dryness_value()
+    knob_vals = _resolve_demo_knobs(kind="realtime", use_finetuned=use_finetuned)
 
     def filter_feed(d): return {k: v for k, v in d.items() if k in in_names}
 
@@ -8872,10 +9305,10 @@ def inspect_realtime_heads(use_finetuned=False, sec=None, offset_sec=None, pair_
             "realtime_piezo_input": xb,
             "realtime_style_true_input":  np.array([[style_val]], np.float32),
             "realtime_style_force_input": np.ones((1,1), np.float32),
-            "realtime_knob_pickattack":   np.array([[float(pa_lin)]], np.float32),
-            "realtime_knob_pickreso":     np.array([[float(pr_lin)]], np.float32),
-            "realtime_knob_ir":           np.array([[float(ir_lin)]], np.float32),
-            "realtime_knob_drywet":       np.array([[dry]], np.float32),
+            "realtime_knob_pickattack":   np.array([[float(knob_vals["pickattack"])]], np.float32),
+            "realtime_knob_pickreso":     np.array([[float(knob_vals["pickreso"])]], np.float32),
+            "realtime_knob_ir":           np.array([[float(knob_vals["ir"])]], np.float32),
+            "realtime_knob_drywet":       np.array([[float(knob_vals["dry_pct"])]], np.float32),
         }
         for n in state_in_names: feed[n] = state_bufs[n]
         feed = filter_feed(feed)
@@ -9011,25 +9444,6 @@ def inspect_realtime_heads(use_finetuned=False, sec=None, offset_sec=None, pair_
     print(f"Written stems to {out_dir}")
 
 @register_keras_serializable()
-def _make_minphase_hp_kernel_exact(sr, cut_hz, numtaps):
-    """
-    Build an exact-length (numtaps) min-phase high-pass FIR, reversed for tf.nn.conv1d.
-    Ensures odd numtaps (required by firwin HP).
-    Returns shape (numtaps, 1, 1) float32.
-    """
-    nt = int(numtaps)
-    if nt < 3:
-        nt = 3
-    if (nt % 2) == 0:
-        nt += 1  # HP requires odd
-    wn = float(cut_hz) / (float(sr) / 2.0)
-    taps = firwin(nt, cutoff=wn, window="hamming", pass_zero=False).astype(np.float32)
-    taps_min = minimum_phase(taps, method="homomorphic").astype(np.float32)
-    k_rev = taps_min[::-1].reshape(nt, 1, 1).astype(np.float32)
-    return k_rev
-
-
-@register_keras_serializable()
 def _hp_minphase_rev_padded(sr, cut_hz, target_len):
     """
     Build conv1d-ready reversed min-phase HPF, exact length target_len.
@@ -9139,6 +9553,23 @@ def dump_realtime_hpf_debug(model, sample_rate=REALTIME_SAMPLE_RATE):
         except Exception:
             pass
     print("============================================")
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
+    
+    
+    
+    
+    
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -9380,58 +9811,13 @@ def main ():
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--migrate-realtime":
         migrate_realtime_models_inplace()
-        
-        m = tf.keras.models.load_model(os.path.join(MODELS_REALTIME_OUT_DIR, REALTIME_DYNAMIC_MODEL_FILENAME), compile=False)
-        print([t.name.split(':')[0] for t in m.inputs if 'realtime_knob_' in t.name])
-        # Prints: realtime_knob_pickattack, realtime_knob_pickreso, realtime_knob_ir, realtime_knob_drywet
-        
-        w = m.get_layer("realtime_pickreso_modal_lr").get_weights()[0]
-        print("modal_lr shape:", w.shape, "L2:", float(np.linalg.norm(w)))
-        
-        # Prints: modal_lr shape: (128, 1, 9) L2: 2.606722831726074
-        
-    elif len(sys.argv)>1 and sys.argv[1]=="--check-streaming":
-        # Options:
-        #   --finetuned
-        #   --hop=NNN
-        #   --sec=S
-        #   --offset-sec=S
-        #   --pair-index=K
-        #   --style=pick|finger|pred|prob=<float>
-        #   --only=full|main|ir|pa|pr
-        args = sys.argv[2:]
-        use_finetuned = any(a == "--finetuned" for a in args)
-        hop = None
-        sec = None
-        offset = None
-        pair_idx = None
-        style = "pred"
-        only = "full"
-        for a in args:
-            if a.startswith("--hop="):
-                try: hop = int(a.split("=",1)[1])
-                except: hop = None
-            elif a.startswith("--sec="):
-                try: sec = float(a.split("=",1)[1])
-                except: sec = None
-            elif a.startswith("--offset-sec=") or a.startswith("--offset="):
-                try: offset = float(a.split("=",1)[1])
-                except: offset = None
-            elif a.startswith("--pair-index="):
-                try: pair_idx = int(a.split("=",1)[1])
-                except: pair_idx = None
-            elif a.startswith("--style="):
-                style = a.split("=",1)[1].strip()
-            elif a.startswith("--only="):
-                only = a.split("=",1)[1].strip().lower()
-
-        check_streaming_equivalence_realtime(use_finetuned=use_finetuned,
-                                             hop=hop,
-                                             sec=sec,
-                                             offset_sec=offset,
-                                             pair_index=pair_idx,
-                                             style_mode=style,
-                                             only=only)
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-offline":
+        migrate_offline_models_inplace()
+        sys.exit(0)
+    elif len(sys.argv)>1 and sys.argv[1]=="--migrate-all":
+        migrate_offline_models_inplace()
+        migrate_realtime_models_inplace()
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--inspect-heads":
         # Options: --finetuned --sec=S --offset-sec=S --pair-index=K --style=pick|finger --hop=N
