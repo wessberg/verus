@@ -60,7 +60,6 @@
 // ───────────────────────── GLOBALS/FLAGS ─────────────────────────
 // Rolling window of style prob (weighted by coreLen)
 const double windowSec = 2.0;
-const double maxKnobDbChange = 32.0f;
 
 std::atomic<bool> gStopFlag(false), gBypass(false);
 std::atomic<uint64_t> gBypassEpoch{0};
@@ -125,8 +124,14 @@ struct ProbWindow {
   }
 };
 
+const double MAX_PICK_ATTACK_KNOB_CHANGE = 42.0f;
+const double MAX_PICK_RESO_KNOB_CHANGE = 42.0f;
+const double MAX_IR_KNOB_CHANGE = 24.0f;
+const double MAX_MAIN_KNOB_CHANGE = 24.0f;
+
 // UI knobs (atomic so audio thread reads lock-free)
 struct Knobs {
+  std::atomic<float> main_dB{0.0f};
   std::atomic<float> pickAttack_dB{0.0f};
   std::atomic<float> pickReso_dB{0.0f};
   std::atomic<float> ir_dB{0.0f};
@@ -271,6 +276,11 @@ static std::string ui_htmlIndex() {
   <!-- Stems section -->
   <div class="row pedal">
     <div class="knob">
+      <canvas id="knob_main" width="110" height="110"></canvas>
+      <div class="label">Main</div>
+      <div class="value"><span id="val_main">0</span> dB</div>
+    </div>
+    <div class="knob">
       <canvas id="knob_pa" width="110" height="110"></canvas>
       <div class="label">Pick Attack</div>
       <div class="value"><span id="val_pa">0</span> dB</div>
@@ -405,7 +415,11 @@ static std::string ui_htmlIndex() {
 </div>
 
 <script>
-const DB_MAX = __MAX_DB__;
+const MAX_MAIN_KNOB_CHANGE = __MAX_MAIN_KNOB_CHANGE__;
+const MAX_PICK_ATTACK_KNOB_CHANGE = __MAX_PICK_ATTACK_KNOB_CHANGE__;
+const MAX_PICK_RESO_KNOB_CHANGE = __MAX_PICK_RESO_KNOB_CHANGE__;
+const MAX_IR_KNOB_CHANGE = __MAX_IR_KNOB_CHANGE__;
+
 function clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }
 function lerp(a,b,t){ return a + (b-a)*t; }
 
@@ -453,24 +467,20 @@ class Knob {
     this.startVal = this.value;
     this._pxAccum = 0;
   }
-
   moveDrag(e){
     if (!this.dragging) return;
     const dx = e.clientX - this.lastX;
-    const dy = this.lastY - e.clientY; // up = positive (increase), down = negative
+    const dy = this.lastY - e.clientY;
     this.lastX = e.clientX;
     this.lastY = e.clientY;
 
-    // Use dominant axis (horizontal or vertical) so dragging left/right also works.
     const useX = Math.abs(dx) > Math.abs(dy);
     const pix = useX ? dx : dy;
 
-    // Make coarse-stepped knobs (like slopes) more responsive by scaling sensitivity
     const range = this.max - this.min;
     const stepNorm = (this.step && range > 0) ? (this.step / range) : 0;
     let effSens = this.sens;
     if (stepNorm >= 0.1) {
-      // If step is a large fraction of range (e.g. 6 over 30), boost sensitivity
       effSens = this.sens / stepNorm;
     }
 
@@ -480,9 +490,9 @@ class Knob {
   endDrag(e){ if (!this.dragging) return; this.dragging = false; }
   onWheel(e){ e.preventDefault(); const delta = (e.deltaY < 0 ? this.step : -this.step); this.set(this.value + delta, true); }
   onDoubleClick(e){
-    // reset to sensible default
     const id = this.c.id;
     const defaults = {
+      'knob_main': 0,
       'knob_pa': 0, 'knob_pr': 0, 'knob_ir': 0, 'knob_wet': 100,
       'knob_outg': 0,
       'knob_lc_hz': 20, 'knob_lc_slope': 6,
@@ -540,9 +550,10 @@ const $btnBypass = el('btnBypass');
 const $btnPhase  = el('btnPhase');
 
 const kb = {
-  pa: new Knob(el('knob_pa'),  {min:-DB_MAX,max:DB_MAX,step:1,value:0,prec:0,displayEl:el('val_pa'),color:'#ffcc00', onchange:(v)=>sendSet({pa:v})}),
-  pr: new Knob(el('knob_pr'),  {min:-DB_MAX,max:DB_MAX,step:1,value:0,prec:0,displayEl:el('val_pr'),color:'#ff7f50', onchange:(v)=>sendSet({pr:v})}),
-  ir: new Knob(el('knob_ir'),  {min:-DB_MAX,max:DB_MAX,step:1,value:0,prec:0,displayEl:el('val_ir'),color:'#7ee787', onchange:(v)=>sendSet({ir:v})}),
+  main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
+  pa: new Knob(el('knob_pa'),  {min:-MAX_PICK_ATTACK_KNOB_CHANGE,max:MAX_PICK_ATTACK_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_pa'),color:'#ffcc00', onchange:(v)=>sendSet({pa:v})}),
+  pr: new Knob(el('knob_pr'),  {min:-MAX_PICK_RESO_KNOB_CHANGE,max:MAX_PICK_RESO_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_pr'),color:'#ff7f50', onchange:(v)=>sendSet({pr:v})}),
+  ir: new Knob(el('knob_ir'),  {min:-MAX_IR_KNOB_CHANGE,max:MAX_IR_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_ir'),color:'#7ee787', onchange:(v)=>sendSet({ir:v})}),
   wet:new Knob(el('knob_wet'), {min:0,max:100,step:1,value:100,prec:0,displayEl:el('val_wet'),color:'#00d1ff', onchange:(v)=>sendSet({wet:v})}),
 
   outg: new Knob(el('knob_outg'), {min:-24,max:24,step:1,value:0,prec:0,displayEl:el('val_outg'),color:'#c586f7', onchange:(v)=>sendSet({outg:v})}),
@@ -565,6 +576,7 @@ const kb = {
 
 function sendSet(obj) {
   const params = new URLSearchParams();
+  if ('main' in obj) params.set('main', obj.main);
   if ('pa' in obj) params.set('pa', obj.pa);
   if ('pr' in obj) params.set('pr', obj.pr);
   if ('ir' in obj) params.set('ir', obj.ir);
@@ -613,6 +625,7 @@ $btnPhase.addEventListener('click', ()=>{
 
 function applyStatus(s){
   if (typeof s !== 'object') return;
+  kb.main.set(s.main_dB, false);
   kb.pa.set(s.pickAttack_dB, false);
   kb.pr.set(s.pickReso_dB, false);
   kb.ir.set(s.ir_dB, false);
@@ -679,16 +692,18 @@ static std::string ui_jsonStatus() {
   std::ostringstream oss;
   oss.setf(std::ios::fixed); oss<<std::setprecision(3);
   oss<<"{";
-  // existing
+  // stems
+  oss<<"\"main_dB\":"     << gKnobs.main_dB.load()     <<",";
   oss<<"\"pickAttack_dB\":"<< gKnobs.pickAttack_dB.load() <<",";
   oss<<"\"pickReso_dB\":"<< gKnobs.pickReso_dB.load() <<",";
   oss<<"\"ir_dB\":"      << gKnobs.ir_dB.load()        <<",";
   oss<<"\"wet_pct\":"    << gKnobs.wet_pct.load()      <<",";
 
-  // new
+  // Output / phase
   oss<<"\"outGain_dB\":"     << gKnobs.outGain_dB.load()          <<",";
   oss<<"\"phaseInvert01\":"  << gKnobs.phaseInvert01.load()       <<",";
 
+  // Master EQ
   oss<<"\"lc_hz\":"          << gKnobs.lc_hz.load()               <<",";
   oss<<"\"lc_slope_dbpoct\":"<< gKnobs.lc_slope_dbpoct.load()     <<",";
 
@@ -778,21 +793,26 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
       } catch (...) {}
     }
   };
-  // Existing
+  // NEW: Main stem
+  float mainv = gKnobs.main_dB.load();
+  getf("main", mainv, -MAX_MAIN_KNOB_CHANGE, MAX_MAIN_KNOB_CHANGE);
+  gKnobs.main_dB.store(mainv);
+
+  // Existing stems
   float pa = gKnobs.pickAttack_dB.load();
   float pr = gKnobs.pickReso_dB.load();
   float ir = gKnobs.ir_dB.load();
   float wt = gKnobs.wet_pct.load();
-  getf("pa", pa, -maxKnobDbChange, maxKnobDbChange);
-  getf("pr", pr, -maxKnobDbChange, maxKnobDbChange);
-  getf("ir", ir, -maxKnobDbChange, maxKnobDbChange);
+  getf("pa", pa, -MAX_PICK_ATTACK_KNOB_CHANGE, MAX_PICK_ATTACK_KNOB_CHANGE);
+  getf("pr", pr, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE);
+  getf("ir", ir, -MAX_IR_KNOB_CHANGE, MAX_IR_KNOB_CHANGE);
   getf("wet", wt, 0.0f, 100.0f);
   gKnobs.pickAttack_dB.store(pa);
   gKnobs.pickReso_dB.store(pr);
   gKnobs.ir_dB.store(ir);
   gKnobs.wet_pct.store(wt);
 
-  // New: output/phase
+  // Output/phase
   float outg = gKnobs.outGain_dB.load();
   getf("outg", outg, -24.0f, 24.0f);
   gKnobs.outGain_dB.store(outg);
@@ -921,7 +941,11 @@ static void ui_handleClient(int cfd) {
   // Routes
   if (method == "GET" && (path == "/" || path == "/index.html")) {
     std::string body = ui_htmlIndex();
-    ui_replaceAll(body, "__MAX_DB__", std::to_string(maxKnobDbChange));
+    ui_replaceAll(body, "__MAX_MAIN_KNOB_CHANGE__", std::to_string(MAX_MAIN_KNOB_CHANGE));
+    ui_replaceAll(body, "__MAX_PICK_ATTACK_KNOB_CHANGE__", std::to_string(MAX_PICK_ATTACK_KNOB_CHANGE));
+    ui_replaceAll(body, "__MAX_PICK_RESO_KNOB_CHANGE__", std::to_string(MAX_PICK_RESO_KNOB_CHANGE));
+    ui_replaceAll(body, "__MAX_IR_KNOB_CHANGE__", std::to_string(MAX_IR_KNOB_CHANGE));
+
     std::string h = ui_httpHeader("200 OK", "text/html; charset=utf-8", body.size());
     ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
   } else if (method == "GET" && path == "/status") {
@@ -1274,10 +1298,6 @@ public:
     }
   }
 
-  // STREAMING invoke:
-  //   - coreLen samples are at the start of 'inBlock' (size >= coreLen),
-  //     we fill the first coreLen of [1,T,1] and zero the remainder.
-  //   - Returns the full T-length output block; caller will use first coreLen samples.
   void invokeStreamingBlock(const float* inBlockCore, int coreLen,
                           float* outBlockT, float &styleProb,
                           float pa_lin, float pr_lin, float ir_lin, float dry_frac,
@@ -1304,12 +1324,13 @@ public:
     if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
   };
 
-  // New: Output/Phase + Master EQ (all scalar [1,1])
-  // Output gain: dB → linear
+  // NEW: Main stem gain (realtime_knob_main), dB -> lin
+  const float main_lin = db2lin(gKnobs.main_dB.load());
+  setIf("realtime_knob_main", main_lin);
+
+  // Output/Phase + Master EQ (all scalar [1,1])
   const float out_lin = db2lin(gKnobs.outGain_dB.load());
   setIf("realtime_knob_outgain", out_lin);
-
-  // Phase invert: 0 or 1
   setIf("realtime_knob_phaseinv", gKnobs.phaseInvert01.load());
 
   // Low cut (HP)
@@ -1403,7 +1424,6 @@ public:
   }
 }
 
-  // WINDOWED invoke (legacy non-streaming model): pass full [1,T,1] window.
   void invokeWindowed(const float* inWindowT, float* outWindowT, float &styleProb,
                     float pa_lin, float pr_lin, float ir_lin, float dry_frac,
                     float style_true, float style_force)
@@ -1423,6 +1443,10 @@ public:
     int idx = findInput(name);
     if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
   };
+
+  // NEW: Main stem gain (realtime_knob_main), dB -> lin
+  const float main_lin = db2lin(gKnobs.main_dB.load());
+  setIf("realtime_knob_main", main_lin);
 
   const float out_lin = db2lin(gKnobs.outGain_dB.load());
   setIf("realtime_knob_outgain", out_lin);
@@ -2150,12 +2174,12 @@ int main(int argc, char** argv) {
         shared.in.r.store(shared.in.w.load(std::memory_order_acquire), std::memory_order_release);
         shared.out.r.store(shared.out.w.load(std::memory_order_acquire), std::memory_order_release);
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
-      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
-        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
-        else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
-        else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
-        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
-        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -maxKnobDbChange, maxKnobDbChange) ); }
+      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
         else if (c=='r') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()+5.0f, 0.0f, 100.0f) ); }
         else if (c=='f') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()-5.0f, 0.0f, 100.0f) ); }
         else if (c=='t') {
