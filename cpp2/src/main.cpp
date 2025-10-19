@@ -59,7 +59,9 @@
 
 // ───────────────────────── GLOBALS/FLAGS ─────────────────────────
 // Rolling window of style prob (weighted by coreLen)
-const double windowSec = 2.0;
+static constexpr float windowSec = 2.0;
+static constexpr float kPickAttackBaselineBoostDB = 22.0f;
+static constexpr float kPickResoBaselineBoostDB   = 32.0f;
 
 std::atomic<bool> gStopFlag(false), gBypass(false);
 std::atomic<uint64_t> gBypassEpoch{0};
@@ -124,8 +126,8 @@ struct ProbWindow {
   }
 };
 
-const double MAX_PICK_ATTACK_KNOB_CHANGE = 42.0f;
-const double MAX_PICK_RESO_KNOB_CHANGE = 42.0f;
+const double MAX_PICK_ATTACK_KNOB_CHANGE = 24.0f;
+const double MAX_PICK_RESO_KNOB_CHANGE = 24.0f;
 const double MAX_IR_KNOB_CHANGE = 24.0f;
 const double MAX_MAIN_KNOB_CHANGE = 24.0f;
 
@@ -144,7 +146,7 @@ struct Knobs {
 
   // Low-cut (high-pass)
   std::atomic<float> lc_hz{20.0f};
-  std::atomic<float> lc_slope_dbpoct{6.0f};
+  std::atomic<float> lc_slope_dbpoct{12.0f};
 
   // Low shelf
   std::atomic<float> ls_gain_db{0.0f};
@@ -1771,8 +1773,8 @@ void inferenceThread(InferCtx ctx) {
 
   // Helpers to call TFLite for one block
   auto do_invoke_streaming = [&](const float* coreBuf, int coreLen, float guidedStableForAuto){
-    float pa_lin = std::pow(10.0f, gKnobs.pickAttack_dB.load() / 20.0f);
-    float pr_lin = std::pow(10.0f, gKnobs.pickReso_dB.load()   / 20.0f);
+    float pa_lin = std::pow(10.0f, (gKnobs.pickAttack_dB.load() + kPickAttackBaselineBoostDB) / 20.0f);
+    float pr_lin = std::pow(10.0f, (gKnobs.pickReso_dB.load()   + kPickResoBaselineBoostDB)   / 20.0f);
     float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
     float wet    = std::max(0.0f, std::min(100.0f, gKnobs.wet_pct.load()));
     float dryFrac= 1.0f - (wet / 100.0f);
