@@ -166,7 +166,6 @@ struct Knobs {
   std::atomic<float> hs_hz{4000.0f};
   std::atomic<float> hs_slope_dbpoct{12.0f};
 
-
   // Reverb
   std::atomic<int> rvb_enabled{0};
   std::atomic<float> rvb_mix{35.0f};
@@ -186,6 +185,18 @@ struct Knobs {
   std::atomic<float> ng_release_ms{150.0f};
   std::atomic<float> ng_hold_ms{400.0f};
   std::atomic<float> ng_sc_hpf_hz{150.0f};
+
+  std::atomic<int>   dly_enabled{0};            // 0/1
+  std::atomic<float> dly_mix{18.0f};            // % 0..100
+  std::atomic<float> dly_time_ms{350.0f};       // ms
+  std::atomic<float> dly_feedback{35.0f};       // % 0..98
+  std::atomic<float> dly_highcut_hz{4500.0f};   // Hz
+  std::atomic<float> dly_lowcut_hz{120.0f};     // Hz (NEW)
+  std::atomic<float> dly_width{80.0f};          // % 0..100
+  std::atomic<int>   dly_pingpong{0};           // 0/1
+  std::atomic<float> dly_mod_rate_hz{0.30f};    // Hz
+  std::atomic<float> dly_mod_depth_ms{3.0f};    // ms
+  std::atomic<float> dly_drive_db{4.0f};        // dB
 } gKnobs;
 
 // For latency logging
@@ -879,6 +890,346 @@ struct NoiseGate {
 
 
 
+// ───────────────────────── TAPE/MOD DELAY (Mono in → Stereo wet add) ─────────────────────────
+// Features:
+//  - Mono input, stereo wet output (added to existing LR).
+//  - Wow/flutter modulation of delay time.
+//  - Feedback with soft saturation and high-cut low-pass (tape tone).
+//  - Stereo width and optional ping-pong (cross feedback).
+//  - Proper reset on bypass edges via DelayReset() epoch.
+//
+// UI stores: enable, mix %, time ms, feedback %, highcut Hz, width %, ping-pong, mod rate Hz, mod depth ms, drive dB.
+
+static constexpr float dly_time_max_ms         = 2000.0f;
+static constexpr float dly_mod_max_rate_hz     = 8.0f;
+static constexpr float dly_mod_max_depth_ms    = 12.0f;
+static constexpr float dly_highcut_min_hz      = 500.0f;
+static constexpr float dly_highcut_max_hz      = 20000.0f;
+static constexpr float dly_lowcut_min_hz       = 10.0f;
+static constexpr float dly_lowcut_max_hz       = 4000.0f; 
+static constexpr float dly_max_feedback_pct    = 98.0f;
+static constexpr float dly_default_flutter_hz  = 4.5f;
+static constexpr float dly_default_stereo_offs_ms = 7.0f;
+
+// Delay UI atomics now refer to gKnobs
+static std::atomic<int>&   DlyEnabledStore()     { return gKnobs.dly_enabled; }
+static std::atomic<float>& DlyMixStore()         { return gKnobs.dly_mix; }
+static std::atomic<float>& DlyTimeMsStore()      { return gKnobs.dly_time_ms; }
+static std::atomic<float>& DlyFeedbackStore()    { return gKnobs.dly_feedback; }
+static std::atomic<float>& DlyHighcutHzStore()   { return gKnobs.dly_highcut_hz; }
+static std::atomic<float>& DlyLowcutHzStore()    { return gKnobs.dly_lowcut_hz; }
+static std::atomic<float>& DlyWidthStore()       { return gKnobs.dly_width; }
+static std::atomic<int>&   DlyPingPongStore()    { return gKnobs.dly_pingpong; }
+static std::atomic<float>& DlyModRateHzStore()   { return gKnobs.dly_mod_rate_hz; }
+static std::atomic<float>& DlyModDepthMsStore()  { return gKnobs.dly_mod_depth_ms; }
+static std::atomic<float>& DlyDriveDBStore()     { return gKnobs.dly_drive_db; }
+
+static void DelayUISet(bool enabled, float mix_pct, float time_ms, float feedback_pct,
+                       float highcut_hz, float lowcut_hz, float width_pct, bool pingpong,
+                       float mod_rate_hz, float mod_depth_ms, float drive_db)
+{
+  DlyEnabledStore().store(enabled ? 1 : 0, std::memory_order_relaxed);
+  DlyMixStore().store(clampf(mix_pct, 0.0f, 100.0f), std::memory_order_relaxed);
+  DlyTimeMsStore().store(clampf(time_ms, 5.0f, dly_time_max_ms), std::memory_order_relaxed);
+  DlyFeedbackStore().store(clampf(feedback_pct, 0.0f, dly_max_feedback_pct), std::memory_order_relaxed);
+  DlyHighcutHzStore().store(clampf(highcut_hz, dly_highcut_min_hz, dly_highcut_max_hz), std::memory_order_relaxed);
+  DlyLowcutHzStore().store(clampf(lowcut_hz, dly_lowcut_min_hz, dly_lowcut_max_hz), std::memory_order_relaxed);
+  DlyWidthStore().store(clampf(width_pct, 0.0f, 100.0f), std::memory_order_relaxed);
+  DlyPingPongStore().store(pingpong ? 1 : 0, std::memory_order_relaxed);
+  DlyModRateHzStore().store(clampf(mod_rate_hz, 0.01f, dly_mod_max_rate_hz), std::memory_order_relaxed);
+  DlyModDepthMsStore().store(clampf(mod_depth_ms, 0.0f, dly_mod_max_depth_ms), std::memory_order_relaxed);
+  DlyDriveDBStore().store(clampf(drive_db, 0.0f, 18.0f), std::memory_order_relaxed);
+}
+
+static void DelayUIGet(bool &enabled, float &mix_pct, float &time_ms, float &feedback_pct,
+                       float &highcut_hz, float &width_pct, bool &pingpong,
+                       float &mod_rate_hz, float &mod_depth_ms, float &drive_db,
+                       float &lowcut_hz /* NEW */)
+{
+  enabled       = (DlyEnabledStore().load(std::memory_order_relaxed) != 0);
+  mix_pct       = DlyMixStore().load(std::memory_order_relaxed);
+  time_ms       = DlyTimeMsStore().load(std::memory_order_relaxed);
+  feedback_pct  = DlyFeedbackStore().load(std::memory_order_relaxed);
+  highcut_hz    = DlyHighcutHzStore().load(std::memory_order_relaxed);
+  width_pct     = DlyWidthStore().load(std::memory_order_relaxed);
+  pingpong      = (DlyPingPongStore().load(std::memory_order_relaxed) != 0);
+  mod_rate_hz   = DlyModRateHzStore().load(std::memory_order_relaxed);
+  mod_depth_ms  = DlyModDepthMsStore().load(std::memory_order_relaxed);
+  drive_db      = DlyDriveDBStore().load(std::memory_order_relaxed);
+  lowcut_hz     = DlyLowcutHzStore().load(std::memory_order_relaxed);
+}
+
+// Reset epoch for delay (for bypass edges)
+static std::atomic<uint64_t>& DelayResetEpochRef() {
+  static std::atomic<uint64_t> e{0};
+  return e;
+}
+static inline void DelayReset() {
+  DelayResetEpochRef().fetch_add(1, std::memory_order_acq_rel);
+}
+
+// One-pole low-pass for feedback tone
+struct OnePoleLP {
+  float a = 0.0f; // update coefficient
+  float y = 0.0f;
+  void setCutoff(float fc, float sr) {
+    float f = clampf(fc, 20.0f, 20000.0f);
+    float srSafe = std::max(1.0f, sr);
+    float x = std::expf(-2.0f * float(M_PI) * f / srSafe);
+    a = 1.0f - x; // y += a*(x - y)
+  }
+  inline float process(float x) {
+    y += a * (x - y);
+    return y;
+  }
+  void reset() { y = 0.0f; }
+};
+
+// Simple ring delay line with fractional read
+struct DelayLine {
+  std::vector<float> buf;
+  int w = 0;
+  int mask = 0;
+
+  void init(int minCapacitySamples) {
+    int cap = 1;
+    while (cap < minCapacitySamples) cap <<= 1;
+    buf.assign(cap, 0.0f);
+    mask = cap - 1;
+    w = 0;
+  }
+  inline float readLinear(float D) const {
+    const float maxD = float(mask - 2);
+    float d = D;
+    if (d < 1.0f) d = 1.0f;
+    if (d > maxD) d = maxD;
+    int dInt = int(std::floor(d));
+    float frac = d - float(dInt);
+    int r0 = (w - dInt) & mask;
+    int r1 = (r0 - 1) & mask;
+    return buf[r0] * (1.0f - frac) + buf[r1] * frac;
+  }
+  inline void write(float v) {
+    buf[w] = v;
+    w = (w + 1) & mask;
+  }
+  void reset() {
+    if (!buf.empty()) std::fill(buf.begin(), buf.end(), 0.0f);
+    w = 0;
+  }
+};
+
+// Soft saturation for feedback path
+static inline float softclip_tanh(float x, float driveK) {
+  float k = std::max(0.1f, driveK);
+  float y = std::tanh(x * k);
+  float n = std::tanh(k);
+  return n > 1e-6f ? (y / n) : y;
+}
+
+static inline float drive_db_to_k(float drive_db) {
+  // Map 0..18 dB roughly into multiplier 0.8..4.0
+  float lin = db2lin(clampf(drive_db, 0.0f, 24.0f));
+  float k = 0.8f + 0.35f * lin; // gentle growth
+  if (k < 0.5f) k = 0.5f;
+  if (k > 6.0f) k = 6.0f;
+  return k;
+}
+
+static void DelayProcessAddMonoToStereoWet(const float* inMono,
+                                           float* ioLRInterleaved,
+                                           size_t n,
+                                           unsigned long /*framesPerBuffer*/,
+                                           const PaStreamCallbackTimeInfo* /*timeInfo*/)
+{
+  if (DlyEnabledStore().load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
+  struct TapeDelayStereo {
+    struct OnePoleLP {
+      float a = 0.0f;
+      float y = 0.0f;
+      void setCutoff(float fc, float sr) {
+        float f = clampf(fc, 20.0f, 20000.0f);
+        float srSafe = std::max(1.0f, sr);
+        float x = std::expf(-2.0f * float(M_PI) * f / srSafe);
+        a = 1.0f - x;
+      }
+      inline float process(float x) {
+        y += a * (x - y);
+        return y;
+      }
+      void reset() { y = 0.0f; }
+    };
+
+    DelayLine dlL, dlR;
+    OnePoleLP lpfL, lpfR;
+    OnePoleHP hpfL, hpfR;
+
+    // LFO phases
+    float wowPhaseL = 0.0f, wowPhaseR = float(M_PI)*0.5f;
+    float fltPhaseL = 1.3f, fltPhaseR = float(M_PI);
+
+    float wowInc = 0.0f, fltInc = 0.0f;
+    float depthSamp = 0.0f;
+
+    float curBaseL = 12000.0f, curBaseR = 12000.0f;
+    float stepBaseL = 0.0f, stepBaseR = 0.0f;
+
+    float feedback = 0.35f;
+    float wet = 0.2f;
+    float width = 0.8f;
+    float driveK = 1.2f;
+    float lowcutHz = 120.0f;
+    float highcutHz = 4500.0f;
+    bool  pingpong = true;
+
+    bool inited = false;
+    uint64_t lastResetSeen = 0;
+
+    void init() {
+      dlL.init(4 * 48000);
+      dlR.init(4 * 48000);
+      lpfL.reset(); lpfR.reset();
+      hpfL.reset(); hpfR.reset();
+      inited = true;
+    }
+
+    void hardReset() {
+      dlL.reset(); dlR.reset();
+      lpfL.reset(); lpfR.reset();
+      hpfL.reset(); hpfR.reset();
+      wowPhaseL = 0.0f; wowPhaseR = float(M_PI)*0.5f;
+      fltPhaseL = 1.3f; fltPhaseR = float(M_PI);
+    }
+
+    void setParamsFromUI(float sr, size_t blockN) {
+      float mix_pct = DlyMixStore().load(std::memory_order_relaxed);
+      float time_ms = DlyTimeMsStore().load(std::memory_order_relaxed);
+      float fb_pct  = DlyFeedbackStore().load(std::memory_order_relaxed);
+      float hc_hz   = DlyHighcutHzStore().load(std::memory_order_relaxed);
+      float lc_hz   = DlyLowcutHzStore().load(std::memory_order_relaxed);
+      float width_p = DlyWidthStore().load(std::memory_order_relaxed);
+      bool  ping    = (DlyPingPongStore().load(std::memory_order_relaxed) != 0);
+      float rate_hz = DlyModRateHzStore().load(std::memory_order_relaxed);
+      float depth_ms= DlyModDepthMsStore().load(std::memory_order_relaxed);
+      float drive_db= DlyDriveDBStore().load(std::memory_order_relaxed);
+
+      wet      = clampf(mix_pct * 0.01f, 0.0f, 1.0f);
+      feedback = clampf(fb_pct * 0.01f, 0.0f, dly_max_feedback_pct * 0.01f);
+      width    = clampf(width_p * 0.01f, 0.0f, 1.0f);
+      pingpong = ping;
+
+      float srSafe = std::max(1.0f, sr);
+      highcutHz = clampf(hc_hz, dly_highcut_min_hz, dly_highcut_max_hz);
+      lowcutHz  = clampf(lc_hz, dly_lowcut_min_hz,  dly_lowcut_max_hz);
+
+      lpfL.setCutoff(highcutHz, srSafe);
+      lpfR.setCutoff(highcutHz, srSafe);
+      hpfL.setCutoff(lowcutHz,  srSafe);
+      hpfR.setCutoff(lowcutHz,  srSafe);
+
+      float baseTarget = clampf(time_ms, 5.0f, dly_time_max_ms) * 0.001f * srSafe;
+      float stereoOffs = dly_default_stereo_offs_ms * 0.001f * srSafe;
+
+      // Bound within ring
+      float maxD = float(dlL.mask - 4);
+      if (baseTarget > maxD) baseTarget = maxD;
+      float baseTargetL = baseTarget;
+      float baseTargetR = std::min(maxD, baseTarget + stereoOffs);
+
+      stepBaseL = (baseTargetL - curBaseL) / float(std::max<size_t>(1, blockN));
+      stepBaseR = (baseTargetR - curBaseR) / float(std::max<size_t>(1, blockN));
+
+      depthSamp = clampf(depth_ms, 0.0f, dly_mod_max_depth_ms) * 0.001f * srSafe;
+      wowInc = 2.0f * float(M_PI) * clampf(rate_hz, 0.01f, dly_mod_max_rate_hz) / srSafe;
+      fltInc = 2.0f * float(M_PI) * dly_default_flutter_hz / srSafe;
+
+      driveK = drive_db_to_k(drive_db);
+    }
+
+    inline void stepPhases() {
+      wowPhaseL += wowInc; if (wowPhaseL >= 2.0f*float(M_PI)) wowPhaseL -= 2.0f*float(M_PI);
+      wowPhaseR += wowInc; if (wowPhaseR >= 2.0f*float(M_PI)) wowPhaseR -= 2.0f*float(M_PI);
+      fltPhaseL += fltInc; if (fltPhaseL >= 2.0f*float(M_PI)) fltPhaseL -= 2.0f*float(M_PI);
+      fltPhaseR += fltInc; if (fltPhaseR >= 2.0f*float(M_PI)) fltPhaseR -= 2.0f*float(M_PI);
+    }
+
+    void processAdd(const float* xMono, float* ioLR, size_t n, float sr) {
+      if (!inited) init();
+
+      uint64_t curEpoch = DelayResetEpochRef().load(std::memory_order_acquire);
+      if (curEpoch != lastResetSeen) {
+        hardReset();
+        lastResetSeen = curEpoch;
+      }
+
+      setParamsFromUI(sr, n);
+
+      const float wet1 = wet * (width * 0.5f + 0.5f);
+      const float wet2 = wet * ((1.0f - width) * 0.5f);
+
+      for (size_t i = 0; i < n; ++i) {
+        curBaseL += stepBaseL;
+        curBaseR += stepBaseR;
+
+        float mL = 0.7f * std::sinf(wowPhaseL) + 0.3f * std::sinf(fltPhaseL);
+        float mR = 0.7f * std::sinf(wowPhaseR) + 0.3f * std::sinf(fltPhaseR);
+
+        float DL = curBaseL + depthSamp * mL;
+        float DR = curBaseR + depthSamp * mR;
+
+        float yL = dlL.readLinear(DL);
+        float yR = dlR.readLinear(DR);
+
+        // Tone/drive on the first bounce AND on feedback
+        float yLproc = lpfL.process(hpfL.process( softclip_tanh(yL, driveK) ));
+        float yRproc = lpfR.process(hpfR.process( softclip_tanh(yR, driveK) ));
+
+        // Feedback source: use processed taps so tone/drive affect first bounce and repeats
+        float fbSrcL = pingpong ? yRproc : yLproc;
+        float fbSrcR = pingpong ? yLproc : yRproc;
+
+        float xi = xMono[i];
+
+        // Ping-pong immediate: inject input into LEFT line only (right gets only feedback)
+        float writeL = xi + feedback * fbSrcL;
+        float writeR = (pingpong ? 0.0f : xi) + feedback * fbSrcR;
+
+        dlL.write(writeL);
+        dlR.write(writeR);
+
+        // Stereo wet mix (use processed taps)
+        float L = yLproc * wet1 + yRproc * wet2;
+        float R = yRproc * wet1 + yLproc * wet2;
+
+        // Add wet on top of whatever is in ioLR
+        ioLR[2*i + 0] += std::isfinite(L) ? L : 0.0f;
+        ioLR[2*i + 1] += std::isfinite(R) ? R : 0.0f;
+
+        stepPhases();
+      }
+    }
+  };
+
+  static TapeDelayStereo D;
+  if (n == 0) return;
+  D.processAdd(inMono, ioLRInterleaved, n, kSR);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -1097,7 +1448,7 @@ static std::string ui_htmlIndex() {
     </div>
   </div>
 
-  <!-- Reverb -->
+  <!-- Hall Reverb -->
   <div class="grid">
     <div class="panel">
       <div class="row">
@@ -1141,6 +1492,66 @@ static std::string ui_htmlIndex() {
           <canvas id="knob_rvb_mod_depth" width="110" height="110"></canvas>
           <div class="label">Mod Depth</div>
           <div class="value"><span id="val_rvb_mod_depth">__DEF_RVB_MOD_DEPTH__</span> ms</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tape/Mod Delay -->
+  <div class="grid">
+    <div class="panel">
+      <div class="row">
+        <div class="title">Tape / Mod Delay</div>
+        <div class="btn" id="btnDelay">Delay: __DEF_DELAY_ENABLED_TEXT__</div>
+        <div class="btn" id="btnDelayPing">PingPong: __DEF_DLY_PINGPONG_TEXT__</div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_dly_mix" width="110" height="110"></canvas>
+          <div class="label">Mix</div>
+          <div class="value"><span id="val_dly_mix">__DEF_DLY_MIX__</span> %</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_time" width="110" height="110"></canvas>
+          <div class="label">Time</div>
+          <div class="value"><span id="val_dly_time">__DEF_DLY_TIME_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_fb" width="110" height="110"></canvas>
+          <div class="label">Feedback</div>
+          <div class="value"><span id="val_dly_fb">__DEF_DLY_FEEDBACK__</span> %</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_lowcut" width="110" height="110"></canvas>
+          <div class="label">Lowcut</div>
+          <div class="value"><span id="val_dly_lowcut">__DEF_DLY_LOWCUT_HZ__</span> Hz</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_highcut" width="110" height="110"></canvas>
+          <div class="label">Highcut</div>
+          <div class="value"><span id="val_dly_highcut">__DEF_DLY_HIGHCUT_HZ__</span> Hz</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_width" width="110" height="110"></canvas>
+          <div class="label">Width</div>
+          <div class="value"><span id="val_dly_width">__DEF_DLY_WIDTH__</span> %</div>
+        </div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_dly_mod_rate" width="110" height="110"></canvas>
+          <div class="label">Mod Rate</div>
+          <div class="value"><span id="val_dly_mod_rate">__DEF_DLY_MOD_RATE__</span> Hz</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_mod_depth" width="110" height="110"></canvas>
+          <div class="label">Mod Depth</div>
+          <div class="value"><span id="val_dly_mod_depth">__DEF_DLY_MOD_DEPTH__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_dly_drive" width="110" height="110"></canvas>
+          <div class="label">Drive</div>
+          <div class="value"><span id="val_dly_drive">__DEF_DLY_DRIVE_DB__</span> dB</div>
         </div>
       </div>
     </div>
@@ -1289,6 +1700,10 @@ class Knob {
       'knob_rvb_mix': __DEF_RVB_MIX__, 'knob_rvb_t60': __DEF_RVB_T60__, 'knob_rvb_damp': __DEF_RVB_DAMP__,
       'knob_rvb_width': __DEF_RVB_WIDTH__,
       'knob_rvb_lc_hz': __DEF_RVB_LC_HZ__, 'knob_rvb_mod_rate': __DEF_RVB_MOD_RATE__, 'knob_rvb_mod_depth': __DEF_RVB_MOD_DEPTH__,
+      // Delay defaults
+      'knob_dly_mix': __DEF_DLY_MIX__, 'knob_dly_time': __DEF_DLY_TIME_MS__, 'knob_dly_fb': __DEF_DLY_FEEDBACK__,
+      'knob_dly_lowcut': __DEF_DLY_LOWCUT_HZ__, 'knob_dly_highcut': __DEF_DLY_HIGHCUT_HZ__, 'knob_dly_width': __DEF_DLY_WIDTH__,
+      'knob_dly_mod_rate': __DEF_DLY_MOD_RATE__, 'knob_dly_mod_depth': __DEF_DLY_MOD_DEPTH__, 'knob_dly_drive': __DEF_DLY_DRIVE_DB__,
       // Gate defaults
       'knob_gate_thresh': __DEF_GATE_THRESH_DB__, 'knob_gate_hyst': __DEF_GATE_HYST_DB__,
       'knob_gate_range': __DEF_GATE_RANGE_DB__,
@@ -1345,6 +1760,8 @@ const $btnBypass = el('btnBypass');
 const $btnPhase  = el('btnPhase');
 const $btnReverb   = el('btnReverb');
 const $btnGate   = el('btnGate');
+const $btnDelay = el('btnDelay');
+const $btnDelayPing = el('btnDelayPing');
 
 const kb = {
   main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:__DEF_MAIN_DB__,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
@@ -1378,6 +1795,17 @@ const kb = {
   rvb_lc_hz: new Knob(el('knob_rvb_lc_hz'), {min:10,max:__DEF_RVB_LC_MAX_HZ__,step:1,value:__DEF_RVB_LC_HZ__,prec:0,displayEl:el('val_rvb_lc_hz'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_lc_hz:v})}),
   rvb_mod_rate: new Knob(el('knob_rvb_mod_rate'), {min:0.05,max:__DEF_RVB_MOD_MAX_RATE_HZ__,step:0.01,value:__DEF_RVB_MOD_RATE__,prec:2,displayEl:el('val_rvb_mod_rate'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_rate:v})}),
   rvb_mod_depth: new Knob(el('knob_rvb_mod_depth'), {min:0.0,max:__DEF_RVB_MOD_MAX_DEPTH_MS__,step:0.1,value:__DEF_RVB_MOD_DEPTH__,prec:1,displayEl:el('val_rvb_mod_depth'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_depth:v})}),
+
+  // Delay knobs
+  dly_mix:   new Knob(el('knob_dly_mix'), {min:0,max:100,step:1,value:__DEF_DLY_MIX__,prec:0,displayEl:el('val_dly_mix'),color:'#00ffa0', onchange:(v)=>sendSet({dly_mix:v})}),
+  dly_time:  new Knob(el('knob_dly_time'), {min:5,max:__DEF_DLY_TIME_MAX_MS__,step:1,value:__DEF_DLY_TIME_MS__,prec:0,displayEl:el('val_dly_time'),color:'#00ffa0', onchange:(v)=>sendSet({dly_time:v})}),
+  dly_fb:    new Knob(el('knob_dly_fb'), {min:0,max:98,step:1,value:__DEF_DLY_FEEDBACK__,prec:0,displayEl:el('val_dly_fb'),color:'#00ffa0', onchange:(v)=>sendSet({dly_feedback:v})}),
+  dly_lowcut: new Knob(el('knob_dly_lowcut'), {min:__DEF_DLY_LOWCUT_MIN_HZ__,max:__DEF_DLY_LOWCUT_MAX_HZ__,step:10,value:__DEF_DLY_LOWCUT_HZ__,prec:0,displayEl:el('val_dly_lowcut'),color:'#00ffa0', onchange:(v)=>sendSet({dly_lowcut:v})}),
+  dly_highcut: new Knob(el('knob_dly_highcut'), {min:__DEF_DLY_HIGHCUT_MIN_HZ__,max:__DEF_DLY_HIGHCUT_MAX_HZ__,step:10,value:__DEF_DLY_HIGHCUT_HZ__,prec:0,displayEl:el('val_dly_highcut'),color:'#00ffa0', onchange:(v)=>sendSet({dly_highcut:v})}),
+  dly_width: new Knob(el('knob_dly_width'), {min:0,max:100,step:1,value:__DEF_DLY_WIDTH__,prec:0,displayEl:el('val_dly_width'),color:'#00ffa0', onchange:(v)=>sendSet({dly_width:v})}),
+  dly_mod_rate: new Knob(el('knob_dly_mod_rate'), {min:0.01,max:__DEF_DLY_MOD_MAX_RATE_HZ__,step:0.01,value:__DEF_DLY_MOD_RATE__,prec:2,displayEl:el('val_dly_mod_rate'),color:'#00ffa0', onchange:(v)=>sendSet({dly_mod_rate:v})}),
+  dly_mod_depth: new Knob(el('knob_dly_mod_depth'), {min:0.0,max:__DEF_DLY_MOD_MAX_DEPTH_MS__,step:0.1,value:__DEF_DLY_MOD_DEPTH__,prec:1,displayEl:el('val_dly_mod_depth'),color:'#00ffa0', onchange:(v)=>sendSet({dly_mod_depth:v})}),
+  dly_drive: new Knob(el('knob_dly_drive'), {min:0,max:18,step:1,value:__DEF_DLY_DRIVE_DB__,prec:0,displayEl:el('val_dly_drive'),color:'#00ffa0', onchange:(v)=>sendSet({dly_drive:v})}),
 
   // Noise Gate knobs
   gate_thresh: new Knob(el('knob_gate_thresh'), {min:-80,max:-20,step:1,value:__DEF_GATE_THRESH_DB__,prec:0,displayEl:el('val_gate_thresh'),color:'#ffa600', onchange:(v)=>sendSet({gate_thresh:v})}),
@@ -1426,6 +1854,19 @@ function sendSet(obj) {
   if ('rvb_mod_rate' in obj) params.set('rvb_mod_rate', obj.rvb_mod_rate);
   if ('rvb_mod_depth' in obj) params.set('rvb_mod_depth', obj.rvb_mod_depth);
 
+  // Delay
+  if ('dly_enabled' in obj) params.set('dly_enabled', obj.dly_enabled ? 1 : 0);
+  if ('dly_pingpong' in obj) params.set('dly_pingpong', obj.dly_pingpong ? 1 : 0);
+  if ('dly_mix' in obj) params.set('dly_mix', obj.dly_mix);
+  if ('dly_time' in obj) params.set('dly_time', obj.dly_time);
+  if ('dly_feedback' in obj) params.set('dly_feedback', obj.dly_feedback);
+  if ('dly_lowcut' in obj) params.set('dly_lowcut', obj.dly_lowcut);
+  if ('dly_highcut' in obj) params.set('dly_highcut', obj.dly_highcut);
+  if ('dly_width' in obj) params.set('dly_width', obj.dly_width);
+  if ('dly_mod_rate' in obj) params.set('dly_mod_rate', obj.dly_mod_rate);
+  if ('dly_mod_depth' in obj) params.set('dly_mod_depth', obj.dly_mod_depth);
+  if ('dly_drive' in obj) params.set('dly_drive', obj.dly_drive);
+
   // Noise Gate
   if ('gate_enabled' in obj) params.set('gate_enabled', obj.gate_enabled ? 1 : 0);
   if ('gate_thresh' in obj) params.set('gate_thresh', obj.gate_thresh);
@@ -1462,6 +1903,12 @@ $btnGate.addEventListener('click', ()=>{
 });
 $btnReverb.addEventListener('click', ()=>{
   const isOn = $btnReverb.classList.contains('on'); sendSet({rvb_enabled: !isOn});
+});
+$btnDelay.addEventListener('click', ()=>{
+  const isOn = $btnDelay.classList.contains('on'); sendSet({dly_enabled: !isOn});
+});
+$btnDelayPing.addEventListener('click', ()=>{
+  const isOn = $btnDelayPing.classList.contains('on'); sendSet({dly_pingpong: !isOn});
 });
 
 function applyStatus(s){
@@ -1504,6 +1951,29 @@ function applyStatus(s){
   if ('rvb_lc_hz' in s) kb.rvb_lc_hz.set(s.rvb_lc_hz, false);
   if ('rvb_mod_rate_hz' in s) kb.rvb_mod_rate.set(s.rvb_mod_rate_hz, false);
   if ('rvb_mod_depth_ms' in s) kb.rvb_mod_depth.set(s.rvb_mod_depth_ms, false);
+
+  // Delay
+  if ('dly_enabled' in s) {
+    const don = !!s.dly_enabled;
+    $btnDelay.textContent = 'Delay: ' + (don ? 'ON' : 'OFF');
+    $btnDelay.classList.toggle('on', don);
+    $btnDelay.classList.toggle('off', !don);
+  }
+  if ('dly_pingpong' in s) {
+    const pong = !!s.dly_pingpong;
+    $btnDelayPing.textContent = 'PingPong: ' + (pong ? 'ON' : 'OFF');
+    $btnDelayPing.classList.toggle('on', pong);
+    $btnDelayPing.classList.toggle('off', !pong);
+  }
+  if ('dly_mix_pct' in s) kb.dly_mix.set(s.dly_mix_pct, false);
+  if ('dly_time_ms' in s) kb.dly_time.set(s.dly_time_ms, false);
+  if ('dly_feedback_pct' in s) kb.dly_fb.set(s.dly_feedback_pct, false);
+  if ('dly_lowcut_hz' in s) kb.dly_lowcut.set(s.dly_lowcut_hz, false);
+  if ('dly_highcut_hz' in s) kb.dly_highcut.set(s.dly_highcut_hz, false);
+  if ('dly_width_pct' in s) kb.dly_width.set(s.dly_width_pct, false);
+  if ('dly_mod_rate_hz' in s) kb.dly_mod_rate.set(s.dly_mod_rate_hz, false);
+  if ('dly_mod_depth_ms' in s) kb.dly_mod_depth.set(s.dly_mod_depth_ms, false);
+  if ('dly_drive_db' in s) kb.dly_drive.set(s.dly_drive_db, false);
 
   // Phase switch
   const phaseOn = (s.phaseInvert01 >= 0.5);
@@ -1590,31 +2060,51 @@ static std::string ui_jsonStatus() {
   oss << "\"hs_hz\":"        << gKnobs.hs_hz.load()          << ",";
   oss << "\"hs_slope_dbpoct\":"<< gKnobs.hs_slope_dbpoct.load() << ",";
 
-  // Reverb (main)
-  bool rvb_enabled=true;
-  float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth_ms=0;
-  ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth_ms);
-  oss << "\"rvb_enabled\":"   << rvb_enabled << ",";
-  oss << "\"rvb_mix_pct\":"  << rvb_mix   << ",";
-  oss << "\"rvb_t60_sec\":"  << rvb_t60   << ",";
-  oss << "\"rvb_damp_pct\":" << rvb_damp  << ",";
-  oss << "\"rvb_width_pct\":"<< rvb_width << ",";
+  // Reverb
+  {
+    bool rvb_enabled=true; float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth_ms=0;
+    ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth_ms);
+    oss << "\"rvb_enabled\":"   << (rvb_enabled?1:0) << ",";
+    oss << "\"rvb_mix_pct\":"  << rvb_mix   << ",";
+    oss << "\"rvb_t60_sec\":"  << rvb_t60   << ",";
+    oss << "\"rvb_damp_pct\":" << rvb_damp  << ",";
+    oss << "\"rvb_width_pct\":"<< rvb_width << ",";
+    oss << "\"rvb_lc_hz\":"        << rvb_lc_hz       << ",";
+    oss << "\"rvb_mod_rate_hz\":"  << rvb_mod_rate   << ",";
+    oss << "\"rvb_mod_depth_ms\":" << rvb_mod_depth_ms << ",";
+  }
 
-  oss << "\"rvb_lc_hz\":"        << rvb_lc_hz       << ",";
-  oss << "\"rvb_mod_rate_hz\":"  << rvb_mod_rate   << ",";
-  oss << "\"rvb_mod_depth_ms\":" << rvb_mod_depth_ms << ",";
+    // Delay
+  {
+    bool dly_enabled=false, dly_ping=false;
+    float mix=0, time_ms=0, fb=0, hc=0, width=0, rate=0, depth=0, drive=0, lc=0;
+    DelayUIGet(dly_enabled, mix, time_ms, fb, hc, width, dly_ping, rate, depth, drive, lc);
+    oss << "\"dly_enabled\":"     << (dly_enabled ? 1 : 0) << ",";
+    oss << "\"dly_pingpong\":"    << (dly_ping ? 1 : 0) << ",";
+    oss << "\"dly_mix_pct\":"     << mix << ",";
+    oss << "\"dly_time_ms\":"     << time_ms << ",";
+    oss << "\"dly_feedback_pct\":"<< fb << ",";
+    oss << "\"dly_lowcut_hz\":"   << lc << ",";
+    oss << "\"dly_highcut_hz\":"  << hc << ",";
+    oss << "\"dly_width_pct\":"   << width << ",";
+    oss << "\"dly_mod_rate_hz\":" << rate << ",";
+    oss << "\"dly_mod_depth_ms\":"<< depth << ",";
+    oss << "\"dly_drive_db\":"    << drive << ",";
+  }
 
   // Noise Gate
-  bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
-  GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
-  oss << "\"gate_enabled\":"        << (gate_enabled ? 1 : 0) << ",";
-  oss << "\"gate_thresh_db\":" << gth   << ",";
-  oss << "\"gate_hyst_db\":"   << gh    << ",";
-  oss << "\"gate_attack_ms\":" << ga    << ",";
-  oss << "\"gate_release_ms\":"<< gr    << ",";
-  oss << "\"gate_hold_ms\":"   << ghld  << ",";
-  oss << "\"gate_range_db\":"  << grng  << ",";
-  oss << "\"gate_hpf_hz\":"    << ghpf  << ",";
+  {
+    bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
+    GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
+    oss << "\"gate_enabled\":"        << (gate_enabled ? 1 : 0) << ",";
+    oss << "\"gate_thresh_db\":" << gth   << ",";
+    oss << "\"gate_hyst_db\":"   << gh    << ",";
+    oss << "\"gate_attack_ms\":" << ga    << ",";
+    oss << "\"gate_release_ms\":"<< gr    << ",";
+    oss << "\"gate_hold_ms\":"   << ghld  << ",";
+    oss << "\"gate_range_db\":"  << grng  << ",";
+    oss << "\"gate_hpf_hz\":"    << ghpf  << ",";
+  }
 
   // switches/mode
   oss << "\"bypass\":"       << (gBypass.load()?1:0) << ",";
@@ -1690,12 +2180,11 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
       } catch (...) {}
     }
   };
-  // NEW: Main stem
+
   float mainv = gKnobs.main_dB.load();
   getf("main", mainv, -MAX_MAIN_KNOB_CHANGE, MAX_MAIN_KNOB_CHANGE);
   gKnobs.main_dB.store(mainv);
 
-  // Existing stems
   float pa = gKnobs.pickAttack_dB.load();
   float pr = gKnobs.pickReso_dB.load();
   float ir = gKnobs.ir_dB.load();
@@ -1764,60 +2253,118 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   gKnobs.hs_slope_dbpoct.store(hs_s);
 
   // Reverb (partial updates allowed)
-  bool rvb_enabled = true;
-  float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f, rvb_lc_hz = 0.0f, rvb_mod_rate = 0.0f, rvb_mod_depth = 0.0f;
-  ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+  {
+    bool rvb_enabled = true;
+    float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f, rvb_lc_hz = 0.0f, rvb_mod_rate = 0.0f, rvb_mod_depth = 0.0f;
+    ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
 
-  // Parse gate_enabled (toggle) first and bump reset on change
-  auto itRvbEnabled = q.find("rvb_enabled");
-  if (itRvbEnabled != q.end()) {
-    try {
-      int v = std::stoi(itRvbEnabled->second);
-      int prev = RvbEnabledStore().load(std::memory_order_relaxed);
-      if (v != prev) {
-        RvbEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
-        ReverbReset(); // avoid pops on state change
-      }
-      rvb_enabled = (v != 0);
-    } catch (...) {}
+    // Toggle enable
+    auto itRvbEnabled = q.find("rvb_enabled");
+    if (itRvbEnabled != q.end()) {
+      try {
+        int v = std::stoi(itRvbEnabled->second);
+        int prev = RvbEnabledStore().load(std::memory_order_relaxed);
+        if (v != prev) {
+          RvbEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+          ReverbReset(); // avoid pops on change
+        }
+        rvb_enabled = (v != 0);
+      } catch (...) {}
+    }
+    getf("rvb_mix",  rvb_mix, 0.0f, 100.0f);
+    getf("rvb_t60",  rvb_t60, 0.10f, rvb_max_decay_sec);
+    getf("rvb_damp", rvb_damp, 0.0f, 100.0f);
+    getf("rvb_width", rvb_width, 0.0f, 100.0f);
+    getf("rvb_lc_hz", rvb_lc_hz, 10.0f, rvb_lc_max_hz);
+    getf("rvb_mod_rate", rvb_mod_rate, 0.05f, rvb_mod_max_rate_hz);
+    getf("rvb_mod_depth", rvb_mod_depth, 0.0f, rvb_mod_max_depth_ms);
+    ReverbUISet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
   }
-  
-  getf("rvb_mix",  rvb_mix, 0.0f, 100.0f);
-  getf("rvb_t60",  rvb_t60, 0.10f, rvb_max_decay_sec);
-  getf("rvb_damp", rvb_damp, 0.0f, 100.0f);
-  getf("rvb_width", rvb_width, 0.0f, 100.0f);
-  getf("rvb_lc_hz", rvb_lc_hz, 10.0f, rvb_lc_max_hz);
-  getf("rvb_mod_rate", rvb_mod_rate, 0.05f, rvb_mod_max_rate_hz);
-  getf("rvb_mod_depth", rvb_mod_depth, 0.0f, rvb_mod_max_depth_ms);
-  ReverbUISet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+
+    // Delay (partial updates allowed)
+  {
+    bool dly_enabled=false, dly_ping=false;
+    float mix=0, time_ms=0, fb=0, hc=0, lc=0, width=0, rate=0, depth=0, drive=0;
+    DelayUIGet(dly_enabled, mix, time_ms, fb, hc, width, dly_ping, rate, depth, drive, lc);
+
+    // Toggle delay enable; bump reset on change
+    auto itDlyEnabled = q.find("dly_enabled");
+    if (itDlyEnabled != q.end()) {
+      try {
+        int v = std::stoi(itDlyEnabled->second);
+        int prev = DlyEnabledStore().load(std::memory_order_relaxed);
+        if (v != prev) {
+          DlyEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+          DelayReset();
+        }
+        dly_enabled = (v != 0);
+      } catch (...) {}
+    }
+
+    // Toggle ping-pong
+    auto itDlyPing = q.find("dly_pingpong");
+    if (itDlyPing != q.end()) {
+      try {
+        int v = std::stoi(itDlyPing->second);
+        DlyPingPongStore().store(v ? 1 : 0, std::memory_order_relaxed);
+        dly_ping = (v != 0);
+      } catch (...) {}
+    }
+
+    auto getf = [&](const char* k, float &dst, float lo, float hi){
+      auto it = q.find(k);
+      if (it != q.end()) {
+        try {
+          float v = std::stof(it->second);
+          if (v < lo) v = lo;
+          if (v > hi) v = hi;
+          dst = v;
+        } catch (...) {}
+      }
+    };
+
+    getf("dly_mix",       mix, 0.0f, 100.0f);
+    getf("dly_time",      time_ms, 5.0f, dly_time_max_ms);
+    getf("dly_feedback",  fb,   0.0f, dly_max_feedback_pct);
+    getf("dly_lowcut",    lc,   dly_lowcut_min_hz, dly_lowcut_max_hz);
+    getf("dly_highcut",   hc,   dly_highcut_min_hz, dly_highcut_max_hz);
+    getf("dly_width",     width,0.0f, 100.0f);
+    getf("dly_mod_rate",  rate, 0.01f, dly_mod_max_rate_hz);
+    getf("dly_mod_depth", depth,0.0f, dly_mod_max_depth_ms);
+    getf("dly_drive",     drive,0.0f, 18.0f);
+
+    DelayUISet(dly_enabled, mix, time_ms, fb, hc, lc, width, dly_ping, rate, depth, drive);
+  }
 
   // Noise Gate
-  bool gon=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
-  GateUIGet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
+  {
+    bool gon=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
+    GateUIGet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
 
-  // Parse gate_enabled (toggle) first and bump reset on change
-  auto itGateEnabled = q.find("gate_enabled");
-  if (itGateEnabled != q.end()) {
-    try {
-      int v = std::stoi(itGateEnabled->second);
-      int prev = GateEnabledStore().load(std::memory_order_relaxed);
-      if (v != prev) {
-        GateEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
-        GateReset(); // avoid pops on state change
-      }
-      gon = (v != 0);
-    } catch (...) {}
+    // Parse gate_enabled (toggle) first and bump reset on change
+    auto itGateEnabled = q.find("gate_enabled");
+    if (itGateEnabled != q.end()) {
+      try {
+        int v = std::stoi(itGateEnabled->second);
+        int prev = GateEnabledStore().load(std::memory_order_relaxed);
+        if (v != prev) {
+          GateEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+          GateReset(); // avoid pops on state change
+        }
+        gon = (v != 0);
+      } catch (...) {}
+    }
+
+    getf("gate_thresh", gth, -80.0f, -20.0f);
+    getf("gate_hyst",   gh,   0.0f,   24.0f);
+    getf("gate_attack", ga,   0.10f,  200.0f);
+    getf("gate_release",gr,  10.0f,  1200.0f);
+    getf("gate_hold",   ghld, 0.0f,   500.0f);
+    getf("gate_range",  grng, 6.0f,   90.0f);
+    getf("gate_hpf",    ghpf, 20.0f,  600.0f);
+
+    GateUISet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
   }
-
-  getf("gate_thresh", gth, -80.0f, -20.0f);
-  getf("gate_hyst",   gh,   0.0f,   24.0f);
-  getf("gate_attack", ga,   0.10f,  200.0f);
-  getf("gate_release",gr,  10.0f,  1200.0f);
-  getf("gate_hold",   ghld, 0.0f,   500.0f);
-  getf("gate_range",  grng, 6.0f,   90.0f);
-  getf("gate_hpf",    ghpf, 20.0f,  600.0f);
-
-  GateUISet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
 }
 
 static inline void ui_handleMode(const std::unordered_map<std::string,std::string>& q) {
@@ -1946,6 +2493,11 @@ static void ui_handleClient(int cfd) {
     float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth=0;
     ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
 
+    // Delay defaults
+    bool dly_enabled=false, dly_ping=false;
+    float dly_mix=0, dly_time=0, dly_fb=0, dly_hc=0, dly_width=0, dly_rate=0, dly_depth=0, dly_drive=0, dly_lc=0;
+    DelayUIGet(dly_enabled, dly_mix, dly_time, dly_fb, dly_hc, dly_width, dly_ping, dly_rate, dly_depth, dly_drive, dly_lc);
+
     // Noise gate defaults
     bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
     GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
@@ -1988,6 +2540,26 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_RVB_MOD_MAX_DEPTH_MS__",fmtFloatTrim(rvb_mod_max_depth_ms,1));
     ui_replaceAll(body, "__DEF_RVB_MOD_RATE__",fmtFloatTrim(rvb_mod_rate,2));
     ui_replaceAll(body, "__DEF_RVB_MOD_DEPTH__",fmtFloatTrim(rvb_mod_depth,1));
+
+    // Delay defaults + maxima
+    ui_replaceAll(body, "__DEF_DELAY_ENABLED_TEXT__", dly_enabled ? "ON" : "OFF");
+    ui_replaceAll(body, "__DEF_DLY_PINGPONG_TEXT__", dly_ping ? "ON" : "OFF");
+    ui_replaceAll(body, "__DEF_DLY_MIX__", fmtInt(dly_mix));
+    ui_replaceAll(body, "__DEF_DLY_TIME_MS__", fmtFloatTrim(dly_time, 0));
+    ui_replaceAll(body, "__DEF_DLY_FEEDBACK__", fmtInt(dly_fb));
+    ui_replaceAll(body, "__DEF_DLY_HIGHCUT_HZ__", fmtInt(dly_hc));
+    ui_replaceAll(body, "__DEF_DLY_WIDTH__", fmtInt(dly_width));
+    ui_replaceAll(body, "__DEF_DLY_MOD_RATE__", fmtFloatTrim(dly_rate, 2));
+    ui_replaceAll(body, "__DEF_DLY_MOD_DEPTH__", fmtFloatTrim(dly_depth, 1));
+    ui_replaceAll(body, "__DEF_DLY_DRIVE_DB__", fmtInt(dly_drive));
+    ui_replaceAll(body, "__DEF_DLY_TIME_MAX_MS__", fmtFloatTrim(dly_time_max_ms, 1));
+    ui_replaceAll(body, "__DEF_DLY_MOD_MAX_RATE_HZ__", fmtFloatTrim(dly_mod_max_rate_hz, 2));
+    ui_replaceAll(body, "__DEF_DLY_MOD_MAX_DEPTH_MS__", fmtFloatTrim(dly_mod_max_depth_ms, 1));
+    ui_replaceAll(body, "__DEF_DLY_HIGHCUT_MIN_HZ__", fmtInt(dly_highcut_min_hz));
+    ui_replaceAll(body, "__DEF_DLY_HIGHCUT_MAX_HZ__", fmtInt(dly_highcut_max_hz));
+    ui_replaceAll(body, "__DEF_DLY_LOWCUT_HZ__", fmtInt(dly_lc));
+    ui_replaceAll(body, "__DEF_DLY_LOWCUT_MIN_HZ__", fmtInt(dly_lowcut_min_hz));
+    ui_replaceAll(body, "__DEF_DLY_LOWCUT_MAX_HZ__", fmtInt(dly_lowcut_max_hz));
 
     // Gate defaults
     ui_replaceAll(body, "__DEF_GATE_ENABLED_TEXT__", gate_enabled ? "ON" : "OFF");
@@ -3057,6 +3629,7 @@ static int paCallback(const void *inputBuffer,
       // Reset time-based processors on bypass edges
       ReverbReset();
       GateReset();
+      DelayReset();
     }
   }
 
@@ -3080,7 +3653,7 @@ static int paCallback(const void *inputBuffer,
   size_t got  = sh->out.pop(temp, hop);
   if (got < hop) std::memset(temp+got, 0, sizeof(float)*(hop-got));
 
-  // Apply noise gate (mono, in-place) before reverb
+  // Apply noise gate (mono, in-place) before reverb/delay
   {
     static NoiseGate s_gate;
     static bool s_inited = false;
@@ -3110,8 +3683,26 @@ static int paCallback(const void *inputBuffer,
     s_gate.processBlock(temp, hop, gate_enabled);
   }
 
-  // Mono → Stereo reverb
-  ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
+  const bool rvbOn = (RvbEnabledStore().load(std::memory_order_relaxed) != 0);
+  const bool dlyOn = (DlyEnabledStore().load(std::memory_order_relaxed) != 0);
+
+  if (rvbOn) {
+    // Reverb handles its own dry/wet
+    ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
+  } else {
+    // No reverb: do a simple dry mix controlled by the delay Mix (kill dry at 100%)
+    float dlyMix01 = dlyOn ? clampf(DlyMixStore().load(std::memory_order_relaxed) * 0.01f, 0.0f, 1.0f) : 0.0f;
+    float dryAmt   = dlyOn ? (1.0f - dlyMix01) : 1.0f;
+    for (size_t i = 0; i < hop; ++i) {
+      float v = temp[i] * dryAmt;
+      out[2*i + 0] = v;
+      out[2*i + 1] = v;
+    }
+  }
+
+  // Delay always adds its wet on top (it returns early if disabled)
+  DelayProcessAddMonoToStereoWet(temp, out, hop, framesPerBuffer, timeInfo);
+
   return paContinue;
 }
 
