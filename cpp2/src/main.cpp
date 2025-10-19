@@ -223,7 +223,7 @@ static constexpr int kNumAP    = 4;
 // Tunables
 float mix01  = 30.0f; // wet mix
 float t60Sec = 6.20f; // decay to -60 dB
-float damp01 = 0.40f; // HF damping inside comb feedback
+float damp01 = 0.30f; // HF damping inside comb feedback
 float width  = 0.70f; // stereo width (0..1), safe default
 
     // Constants
