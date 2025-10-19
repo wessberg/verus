@@ -221,7 +221,7 @@ static inline float clampf(float x, float lo, float hi) {
 static constexpr int kNumCombs = 8;
 static constexpr int kNumAP    = 4;
 // Tunables
-float mix01  = 0.30f; // wet mix
+float mix01  = 30.0f; // wet mix
 float t60Sec = 6.20f; // decay to -60 dB
 float damp01 = 0.40f; // HF damping inside comb feedback
 float width  = 0.70f; // stereo width (0..1), safe default
@@ -239,10 +239,10 @@ static constexpr float kSR = 48000.0f;      // fixed 48 kHz
 //
 // Thread-safety: parameters are atomics accessed lock-free from the PA callback and Web UI threads.
 
-static std::atomic<float>& RvbMixStore() { static std::atomic<float> v{20.0f}; return v; }    // percent
-static std::atomic<float>& RvbT60Store() { static std::atomic<float> v{2.2f};  return v; }    // seconds
-static std::atomic<float>& RvbDampStore(){ static std::atomic<float> v{0.50f}; return v; }    // 0..1
-static std::atomic<float>& RvbWidthStore(){ static std::atomic<float> v{0.10f}; return v; } // 0..1
+static std::atomic<float>& RvbMixStore() { static std::atomic<float> v{mix01}; return v; }    // percent
+static std::atomic<float>& RvbT60Store() { static std::atomic<float> v{t60Sec};  return v; }    // seconds
+static std::atomic<float>& RvbDampStore(){ static std::atomic<float> v{damp01}; return v; }    // 0..1
+static std::atomic<float>& RvbWidthStore(){ static std::atomic<float> v{width}; return v; } // 0..1
 
 static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct) {
   float mix = clampf(mix_pct, 0.0f, 100.0f);
