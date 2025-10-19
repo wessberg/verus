@@ -186,10 +186,11 @@ struct Knobs {
   std::atomic<float> ng_hold_ms{400.0f};
   std::atomic<float> ng_sc_hpf_hz{150.0f};
 
+  // Delay
   std::atomic<int>   dly_enabled{0};            // 0/1
   std::atomic<float> dly_mix{18.0f};            // % 0..100
   std::atomic<float> dly_time_ms{350.0f};       // ms
-  std::atomic<float> dly_feedback{35.0f};       // % 0..98
+  std::atomic<float> dly_feedback{35.0f};       // % 0..100
   std::atomic<float> dly_highcut_hz{4500.0f};   // Hz
   std::atomic<float> dly_lowcut_hz{120.0f};     // Hz (NEW)
   std::atomic<float> dly_width{80.0f};          // % 0..100
@@ -197,6 +198,15 @@ struct Knobs {
   std::atomic<float> dly_mod_rate_hz{0.30f};    // Hz
   std::atomic<float> dly_mod_depth_ms{3.0f};    // ms
   std::atomic<float> dly_drive_db{4.0f};        // dB
+
+  // Stereo Chorus
+  std::atomic<int>   ch_enabled{0};        // 0/1 (OFF by default)
+  std::atomic<float> ch_mix{25.0f};        // % 0..100
+  std::atomic<float> ch_rate_hz{0.80f};    // Hz
+  std::atomic<float> ch_depth_ms{6.0f};    // ms
+  std::atomic<float> ch_delay_ms{12.0f};   // ms (base delay)
+  std::atomic<float> ch_width{80.0f};      // % 0..100
+  std::atomic<float> ch_feedback{6.0f};    // % 0..40
 } gKnobs;
 
 // For latency logging
@@ -1258,6 +1268,193 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
 
 
 
+
+
+// ───────────────────────── STEREO CHORUS (Mono → Stereo wet add) ─────────────────────────
+// Gentle, musical stereo chorus: modulated short delays with stereo phase offset.
+// Mono input, stereo wet add. Place before Delay in PA callback.
+
+// Limits/defaults for UI
+static constexpr float ch_rate_max_hz        = 5.0f;
+static constexpr float ch_depth_max_ms       = 10.0f;
+static constexpr float ch_delay_min_ms       = 2.0f;
+static constexpr float ch_delay_max_ms       = 30.0f;
+static constexpr float ch_feedback_max_pct   = 40.0f;
+static constexpr float ch_default_stereo_offs_ms = 2.7f;
+
+// UI atomics (referencing gKnobs)
+static std::atomic<int>&   ChEnabledStore()   { return gKnobs.ch_enabled; }
+static std::atomic<float>& ChMixStore()       { return gKnobs.ch_mix; }
+static std::atomic<float>& ChRateHzStore()    { return gKnobs.ch_rate_hz; }
+static std::atomic<float>& ChDepthMsStore()   { return gKnobs.ch_depth_ms; }
+static std::atomic<float>& ChDelayMsStore()   { return gKnobs.ch_delay_ms; }
+static std::atomic<float>& ChWidthStore()     { return gKnobs.ch_width; }
+static std::atomic<float>& ChFeedbackStore()  { return gKnobs.ch_feedback; }
+
+// Reset epoch
+static std::atomic<uint64_t>& ChorusResetEpochRef() { static std::atomic<uint64_t> e{0}; return e; }
+static inline void ChorusReset() { ChorusResetEpochRef().fetch_add(1, std::memory_order_acq_rel); }
+
+// UI set/get
+static void ChorusUISet(bool enabled, float mix_pct, float rate_hz, float depth_ms, float delay_ms, float width_pct, float feedback_pct) {
+  ChEnabledStore().store(enabled ? 1 : 0, std::memory_order_relaxed);
+  ChMixStore().store( clampf(mix_pct,   0.0f, 100.0f),       std::memory_order_relaxed);
+  ChRateHzStore().store(clampf(rate_hz, 0.05f, ch_rate_max_hz), std::memory_order_relaxed);
+  ChDepthMsStore().store(clampf(depth_ms, 0.0f, ch_depth_max_ms), std::memory_order_relaxed);
+  ChDelayMsStore().store(clampf(delay_ms, ch_delay_min_ms, ch_delay_max_ms), std::memory_order_relaxed);
+  ChWidthStore().store(clampf(width_pct, 0.0f, 100.0f),     std::memory_order_relaxed);
+  ChFeedbackStore().store(clampf(feedback_pct, 0.0f, ch_feedback_max_pct), std::memory_order_relaxed);
+}
+static void ChorusUIGet(bool &enabled, float &mix_pct, float &rate_hz, float &depth_ms, float &delay_ms, float &width_pct, float &feedback_pct) {
+  enabled      = (ChEnabledStore().load(std::memory_order_relaxed) != 0);
+  mix_pct      = ChMixStore().load(std::memory_order_relaxed);
+  rate_hz      = ChRateHzStore().load(std::memory_order_relaxed);
+  depth_ms     = ChDepthMsStore().load(std::memory_order_relaxed);
+  delay_ms     = ChDelayMsStore().load(std::memory_order_relaxed);
+  width_pct    = ChWidthStore().load(std::memory_order_relaxed);
+  feedback_pct = ChFeedbackStore().load(std::memory_order_relaxed);
+}
+
+// DSP: Mono in → add stereo wet onto ioLR
+static void ChorusProcessAddMonoToStereoWet(const float* inMono,
+                                            float* ioLRInterleaved,
+                                            size_t n,
+                                            unsigned long /*framesPerBuffer*/,
+                                            const PaStreamCallbackTimeInfo* /*timeInfo*/)
+{
+  if (ChEnabledStore().load(std::memory_order_relaxed) == 0) return;
+
+  struct StereoChorus {
+    DelayLine dlL, dlR;
+
+    float phaseL = 0.0f, phaseR = float(M_PI)*0.5f;
+    float phaseInc = 0.0f;
+
+    float curBaseL = 600.0f, curBaseR = 700.0f;
+    float stepBaseL = 0.0f, stepBaseR = 0.0f;
+    float depthSamp = 0.0f;
+
+    float wet = 0.25f;
+    float width = 0.8f;
+    float feedback = 0.06f;
+
+    bool inited = false;
+    uint64_t lastResetSeen = 0;
+
+    void init() {
+      dlL.init(1<<13); // plenty for 30 ms
+      dlR.init(1<<13);
+      inited = true;
+    }
+    void hardReset() {
+      dlL.reset(); dlR.reset();
+      phaseL = 0.0f; phaseR = float(M_PI)*0.5f;
+    }
+    inline void stepPhases() {
+      phaseL += phaseInc; if (phaseL >= 2.0f*float(M_PI)) phaseL -= 2.0f*float(M_PI);
+      phaseR += phaseInc; if (phaseR >= 2.0f*float(M_PI)) phaseR -= 2.0f*float(M_PI);
+    }
+
+    void setParamsFromUI(float sr, size_t blockN) {
+      float mix_pct=ChMixStore().load(std::memory_order_relaxed);
+      float rate   =ChRateHzStore().load(std::memory_order_relaxed);
+      float depth  =ChDepthMsStore().load(std::memory_order_relaxed);
+      float delay  =ChDelayMsStore().load(std::memory_order_relaxed);
+      float widthP =ChWidthStore().load(std::memory_order_relaxed);
+      float fb_pct =ChFeedbackStore().load(std::memory_order_relaxed);
+
+      wet      = clampf(mix_pct*0.01f, 0.0f, 1.0f);
+      width    = clampf(widthP*0.01f,  0.0f, 1.0f);
+      feedback = clampf(fb_pct*0.01f, 0.0f, ch_feedback_max_pct*0.01f);
+
+      float srSafe = std::max(1.0f, sr);
+      phaseInc = 2.0f * float(M_PI) * clampf(rate, 0.05f, ch_rate_max_hz) / srSafe;
+      depthSamp = clampf(depth, 0.0f, ch_depth_max_ms) * 0.001f * srSafe;
+
+      float baseTarget = clampf(delay, ch_delay_min_ms, ch_delay_max_ms) * 0.001f * srSafe;
+      float stereoOffs = ch_default_stereo_offs_ms * 0.001f * srSafe;
+
+      float maxD = float(dlL.mask - 4);
+      if (baseTarget > maxD) baseTarget = maxD;
+      float baseTargetL = baseTarget;
+      float baseTargetR = std::min(maxD, baseTarget + stereoOffs);
+
+      stepBaseL = (baseTargetL - curBaseL) / float(std::max<size_t>(1, blockN));
+      stepBaseR = (baseTargetR - curBaseR) / float(std::max<size_t>(1, blockN));
+    }
+
+    void processAdd(const float* xMono, float* ioLR, size_t n, float sr) {
+      if (!inited) init();
+
+      uint64_t curEpoch = ChorusResetEpochRef().load(std::memory_order_acquire);
+      if (curEpoch != lastResetSeen) {
+        hardReset(); lastResetSeen = curEpoch;
+      }
+
+      setParamsFromUI(sr, n);
+
+      const float wet1 = wet * (width * 0.5f + 0.5f);
+      const float wet2 = wet * ((1.0f - width) * 0.5f);
+
+      for (size_t i = 0; i < n; ++i) {
+        curBaseL += stepBaseL;
+        curBaseR += stepBaseR;
+
+        float mL = std::sinf(phaseL);
+        float mR = std::sinf(phaseR);
+
+        float DL = curBaseL + depthSamp * mL;
+        float DR = curBaseR + depthSamp * mR;
+
+        float yL = dlL.readLinear(DL);
+        float yR = dlR.readLinear(DR);
+
+        float xi = xMono[i];
+
+        float writeL = xi + feedback * yL;
+        float writeR = xi + feedback * yR;
+        dlL.write(writeL);
+        dlR.write(writeR);
+
+        float L = yL * wet1 + yR * wet2;
+        float R = yR * wet1 + yL * wet2;
+
+        ioLR[2*i + 0] += std::isfinite(L) ? L : 0.0f;
+        ioLR[2*i + 1] += std::isfinite(R) ? R : 0.0f;
+
+        stepPhases();
+      }
+    }
+  };
+
+  static StereoChorus C;
+  if (n == 0) return;
+  C.processAdd(inMono, ioLRInterleaved, n, kSR);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ───────────────────────── KNOB WEB UI (SEPARATE WINDOW VIA BROWSER) ─────────────────────────
 // Add these functions anywhere after the globals (they reference gKnobs, gStyleMode, gBypass, gGuidedAuto).
 // Call StartKnobWebUI(8088); from main() after printing the "Keys" help (e.g., right before opening PA stream).
@@ -1389,6 +1586,55 @@ static std::string ui_htmlIndex() {
         </div>
         <div class="panel" style="display:flex;align-items:center;justify-content:center;gap:10px;min-width:200px;">
           <div class="btn" id="btnPhase">Phase Invert: __DEF_PHASE_TEXT__</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Noise Gate -->
+  <div class="grid">
+    <div class="panel">
+      <div class="row">
+        <div class="title">Noise Gate</div>
+        <div class="btn" id="btnGate">Gate: __DEF_GATE_ENABLED_TEXT__</div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_gate_thresh" width="110" height="110"></canvas>
+          <div class="label">Threshold</div>
+          <div class="value"><span id="val_gate_thresh">__DEF_GATE_THRESH_DB__</span> dB</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hyst" width="110" height="110"></canvas>
+          <div class="label">Hysteresis</div>
+          <div class="value"><span id="val_gate_hyst">__DEF_GATE_HYST_DB__</span> dB</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_range" width="110" height="110"></canvas>
+          <div class="label">Range</div>
+          <div class="value"><span id="val_gate_range">__DEF_GATE_RANGE_DB__</span> dB</div>
+        </div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_gate_attack" width="110" height="110"></canvas>
+          <div class="label">Attack</div>
+          <div class="value"><span id="val_gate_attack">__DEF_GATE_ATTACK_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_release" width="110" height="110"></canvas>
+          <div class="label">Release</div>
+          <div class="value"><span id="val_gate_release">__DEF_GATE_RELEASE_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hold" width="110" height="110"></canvas>
+          <div class="label">Hold</div>
+          <div class="value"><span id="val_gate_hold">__DEF_GATE_HOLD_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hpf" width="110" height="110"></canvas>
+          <div class="label">SC HPF</div>
+          <div class="value"><span id="val_gate_hpf">__DEF_GATE_HPF_HZ__</span> Hz</div>
         </div>
       </div>
     </div>
@@ -1576,50 +1822,43 @@ static std::string ui_htmlIndex() {
     </div>
   </div>
 
-  <!-- Noise Gate -->
+   <!-- Stereo Chorus -->
   <div class="grid">
     <div class="panel">
       <div class="row">
-        <div class="title">Noise Gate</div>
-        <div class="btn" id="btnGate">Gate: __DEF_GATE_ENABLED_TEXT__</div>
+        <div class="title">Stereo Chorus</div>
+        <div class="btn" id="btnChorus">Chorus: __DEF_CHORUS_ENABLED_TEXT__</div>
       </div>
       <div class="hrow">
         <div class="knob">
-          <canvas id="knob_gate_thresh" width="110" height="110"></canvas>
-          <div class="label">Threshold</div>
-          <div class="value"><span id="val_gate_thresh">__DEF_GATE_THRESH_DB__</span> dB</div>
+          <canvas id="knob_ch_mix" width="110" height="110"></canvas>
+          <div class="label">Mix</div>
+          <div class="value"><span id="val_ch_mix">__DEF_CH_MIX__</span> %</div>
         </div>
         <div class="knob">
-          <canvas id="knob_gate_hyst" width="110" height="110"></canvas>
-          <div class="label">Hysteresis</div>
-          <div class="value"><span id="val_gate_hyst">__DEF_GATE_HYST_DB__</span> dB</div>
+          <canvas id="knob_ch_rate" width="110" height="110"></canvas>
+          <div class="label">Rate</div>
+          <div class="value"><span id="val_ch_rate">__DEF_CH_RATE_HZ__</span> Hz</div>
         </div>
         <div class="knob">
-          <canvas id="knob_gate_range" width="110" height="110"></canvas>
-          <div class="label">Range</div>
-          <div class="value"><span id="val_gate_range">__DEF_GATE_RANGE_DB__</span> dB</div>
-        </div>
-      </div>
-      <div class="hrow">
-        <div class="knob">
-          <canvas id="knob_gate_attack" width="110" height="110"></canvas>
-          <div class="label">Attack</div>
-          <div class="value"><span id="val_gate_attack">__DEF_GATE_ATTACK_MS__</span> ms</div>
+          <canvas id="knob_ch_depth" width="110" height="110"></canvas>
+          <div class="label">Depth</div>
+          <div class="value"><span id="val_ch_depth">__DEF_CH_DEPTH_MS__</span> ms</div>
         </div>
         <div class="knob">
-          <canvas id="knob_gate_release" width="110" height="110"></canvas>
-          <div class="label">Release</div>
-          <div class="value"><span id="val_gate_release">__DEF_GATE_RELEASE_MS__</span> ms</div>
+          <canvas id="knob_ch_delay" width="110" height="110"></canvas>
+          <div class="label">Delay</div>
+          <div class="value"><span id="val_ch_delay">__DEF_CH_DELAY_MS__</span> ms</div>
         </div>
         <div class="knob">
-          <canvas id="knob_gate_hold" width="110" height="110"></canvas>
-          <div class="label">Hold</div>
-          <div class="value"><span id="val_gate_hold">__DEF_GATE_HOLD_MS__</span> ms</div>
+          <canvas id="knob_ch_width" width="110" height="110"></canvas>
+          <div class="label">Width</div>
+          <div class="value"><span id="val_ch_width">__DEF_CH_WIDTH__</span> %</div>
         </div>
         <div class="knob">
-          <canvas id="knob_gate_hpf" width="110" height="110"></canvas>
-          <div class="label">SC HPF</div>
-          <div class="value"><span id="val_gate_hpf">__DEF_GATE_HPF_HZ__</span> Hz</div>
+          <canvas id="knob_ch_fb" width="110" height="110"></canvas>
+          <div class="label">Feedback</div>
+          <div class="value"><span id="val_ch_fb">__DEF_CH_FEEDBACK__</span> %</div>
         </div>
       </div>
     </div>
@@ -1723,6 +1962,11 @@ class Knob {
       'knob_dly_mix': __DEF_DLY_MIX__, 'knob_dly_time': __DEF_DLY_TIME_MS__, 'knob_dly_fb': __DEF_DLY_FEEDBACK__,
       'knob_dly_lowcut': __DEF_DLY_LOWCUT_HZ__, 'knob_dly_highcut': __DEF_DLY_HIGHCUT_HZ__, 'knob_dly_width': __DEF_DLY_WIDTH__,
       'knob_dly_mod_rate': __DEF_DLY_MOD_RATE__, 'knob_dly_mod_depth': __DEF_DLY_MOD_DEPTH__, 'knob_dly_drive': __DEF_DLY_DRIVE_DB__,
+      // Chorus defaults
+      'knob_ch_mix': __DEF_CH_MIX__, 'knob_ch_rate': __DEF_CH_RATE_HZ__,
+      'knob_ch_depth': __DEF_CH_DEPTH_MS__, 'knob_ch_delay': __DEF_CH_DELAY_MS__,
+      'knob_ch_width': __DEF_CH_WIDTH__, 'knob_ch_fb': __DEF_CH_FEEDBACK__,
+
       // Gate defaults
       'knob_gate_thresh': __DEF_GATE_THRESH_DB__, 'knob_gate_hyst': __DEF_GATE_HYST_DB__,
       'knob_gate_range': __DEF_GATE_RANGE_DB__,
@@ -1781,6 +2025,7 @@ const $btnReverb   = el('btnReverb');
 const $btnGate   = el('btnGate');
 const $btnDelay = el('btnDelay');
 const $btnDelayPing = el('btnDelayPing');
+const $btnChorus = el('btnChorus');
 
 const kb = {
   main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:__DEF_MAIN_DB__,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
@@ -1825,6 +2070,14 @@ const kb = {
   dly_mod_rate: new Knob(el('knob_dly_mod_rate'), {min:0.01,max:__DEF_DLY_MOD_MAX_RATE_HZ__,step:0.01,value:__DEF_DLY_MOD_RATE__,prec:2,displayEl:el('val_dly_mod_rate'),color:'#00ffa0', onchange:(v)=>sendSet({dly_mod_rate:v})}),
   dly_mod_depth: new Knob(el('knob_dly_mod_depth'), {min:0.0,max:__DEF_DLY_MOD_MAX_DEPTH_MS__,step:0.1,value:__DEF_DLY_MOD_DEPTH__,prec:1,displayEl:el('val_dly_mod_depth'),color:'#00ffa0', onchange:(v)=>sendSet({dly_mod_depth:v})}),
   dly_drive: new Knob(el('knob_dly_drive'), {min:0,max:18,step:1,value:__DEF_DLY_DRIVE_DB__,prec:0,displayEl:el('val_dly_drive'),color:'#00ffa0', onchange:(v)=>sendSet({dly_drive:v})}),
+
+  // Chorus knobs
+  ch_mix:   new Knob(el('knob_ch_mix'), {min:0,max:100,step:1,value:__DEF_CH_MIX__,prec:0,displayEl:el('val_ch_mix'),color:'#37c6ff', onchange:(v)=>sendSet({ch_mix:v})}),
+  ch_rate:  new Knob(el('knob_ch_rate'), {min:0.05,max:__DEF_CH_RATE_MAX_HZ__,step:0.01,value:__DEF_CH_RATE_HZ__,prec:2,displayEl:el('val_ch_rate'),color:'#37c6ff', onchange:(v)=>sendSet({ch_rate:v})}),
+  ch_depth: new Knob(el('knob_ch_depth'), {min:0.0,max:__DEF_CH_DEPTH_MAX_MS__,step:0.1,value:__DEF_CH_DEPTH_MS__,prec:1,displayEl:el('val_ch_depth'),color:'#37c6ff', onchange:(v)=>sendSet({ch_depth:v})}),
+  ch_delay: new Knob(el('knob_ch_delay'), {min:__DEF_CH_DELAY_MIN_MS__,max:__DEF_CH_DELAY_MAX_MS__,step:0.1,value:__DEF_CH_DELAY_MS__,prec:1,displayEl:el('val_ch_delay'),color:'#37c6ff', onchange:(v)=>sendSet({ch_delay:v})}),
+  ch_width: new Knob(el('knob_ch_width'), {min:0,max:100,step:1,value:__DEF_CH_WIDTH__,prec:0,displayEl:el('val_ch_width'),color:'#37c6ff', onchange:(v)=>sendSet({ch_width:v})}),
+  ch_fb:    new Knob(el('knob_ch_fb'), {min:0,max:__DEF_CH_FEEDBACK_MAX_PCT__,step:1,value:__DEF_CH_FEEDBACK__,prec:0,displayEl:el('val_ch_fb'),color:'#37c6ff', onchange:(v)=>sendSet({ch_feedback:v})}),
 
   // Noise Gate knobs
   gate_thresh: new Knob(el('knob_gate_thresh'), {min:-80,max:-20,step:1,value:__DEF_GATE_THRESH_DB__,prec:0,displayEl:el('val_gate_thresh'),color:'#ffa600', onchange:(v)=>sendSet({gate_thresh:v})}),
@@ -1886,6 +2139,15 @@ function sendSet(obj) {
   if ('dly_mod_depth' in obj) params.set('dly_mod_depth', obj.dly_mod_depth);
   if ('dly_drive' in obj) params.set('dly_drive', obj.dly_drive);
 
+  // Chorus
+  if ('ch_enabled' in obj) params.set('ch_enabled', obj.ch_enabled ? 1 : 0);
+  if ('ch_mix' in obj) params.set('ch_mix', obj.ch_mix);
+  if ('ch_rate' in obj) params.set('ch_rate', obj.ch_rate);
+  if ('ch_depth' in obj) params.set('ch_depth', obj.ch_depth);
+  if ('ch_delay' in obj) params.set('ch_delay', obj.ch_delay);
+  if ('ch_width' in obj) params.set('ch_width', obj.ch_width);
+  if ('ch_feedback' in obj) params.set('ch_feedback', obj.ch_feedback);
+
   // Noise Gate
   if ('gate_enabled' in obj) params.set('gate_enabled', obj.gate_enabled ? 1 : 0);
   if ('gate_thresh' in obj) params.set('gate_thresh', obj.gate_thresh);
@@ -1928,6 +2190,10 @@ $btnDelay.addEventListener('click', ()=>{
 });
 $btnDelayPing.addEventListener('click', ()=>{
   const isOn = $btnDelayPing.classList.contains('on'); sendSet({dly_pingpong: !isOn});
+});
+
+$btnChorus.addEventListener('click', ()=>{
+  const isOn = $btnChorus.classList.contains('on'); sendSet({ch_enabled: !isOn});
 });
 
 function applyStatus(s){
@@ -1993,6 +2259,20 @@ function applyStatus(s){
   if ('dly_mod_rate_hz' in s) kb.dly_mod_rate.set(s.dly_mod_rate_hz, false);
   if ('dly_mod_depth_ms' in s) kb.dly_mod_depth.set(s.dly_mod_depth_ms, false);
   if ('dly_drive_db' in s) kb.dly_drive.set(s.dly_drive_db, false);
+
+    // Chorus
+  if ('ch_enabled' in s) {
+    const con = !!s.ch_enabled;
+    $btnChorus.textContent = 'Chorus: ' + (con ? 'ON' : 'OFF');
+    $btnChorus.classList.toggle('on', con);
+    $btnChorus.classList.toggle('off', !con);
+  }
+  if ('ch_mix_pct' in s) kb.ch_mix.set(s.ch_mix_pct, false);
+  if ('ch_rate_hz' in s) kb.ch_rate.set(s.ch_rate_hz, false);
+  if ('ch_depth_ms' in s) kb.ch_depth.set(s.ch_depth_ms, false);
+  if ('ch_delay_ms' in s) kb.ch_delay.set(s.ch_delay_ms, false);
+  if ('ch_width_pct' in s) kb.ch_width.set(s.ch_width_pct, false);
+  if ('ch_feedback_pct' in s) kb.ch_fb.set(s.ch_feedback_pct, false);
 
   // Phase switch
   const phaseOn = (s.phaseInvert01 >= 0.5);
@@ -2109,6 +2389,19 @@ static std::string ui_jsonStatus() {
     oss << "\"dly_mod_rate_hz\":" << rate << ",";
     oss << "\"dly_mod_depth_ms\":"<< depth << ",";
     oss << "\"dly_drive_db\":"    << drive << ",";
+  }
+
+    // Chorus
+  {
+    bool ch_enabled=false; float ch_mix=0, ch_rate=0, ch_depth=0, ch_delay=0, ch_width=0, ch_fb=0;
+    ChorusUIGet(ch_enabled, ch_mix, ch_rate, ch_depth, ch_delay, ch_width, ch_fb);
+    oss << "\"ch_enabled\":"      << (ch_enabled ? 1 : 0) << ",";
+    oss << "\"ch_mix_pct\":"      << ch_mix   << ",";
+    oss << "\"ch_rate_hz\":"      << ch_rate  << ",";
+    oss << "\"ch_depth_ms\":"     << ch_depth << ",";
+    oss << "\"ch_delay_ms\":"     << ch_delay << ",";
+    oss << "\"ch_width_pct\":"    << ch_width << ",";
+    oss << "\"ch_feedback_pct\":" << ch_fb    << ",";
   }
 
   // Noise Gate
@@ -2355,6 +2648,46 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
     DelayUISet(dly_enabled, mix, time_ms, fb, hc, lc, width, dly_ping, rate, depth, drive);
   }
 
+    // Chorus (partial updates allowed)
+  {
+    bool ch_enabled=false;
+    float mix=0, rate=0, depth=0, delay=0, width=0, fb=0;
+    ChorusUIGet(ch_enabled, mix, rate, depth, delay, width, fb);
+
+    auto itChEnabled = q.find("ch_enabled");
+    if (itChEnabled != q.end()) {
+      try {
+        int v = std::stoi(itChEnabled->second);
+        int prev = ChEnabledStore().load(std::memory_order_relaxed);
+        if (v != prev) {
+          ChEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+          ChorusReset();
+        }
+        ch_enabled = (v != 0);
+      } catch (...) {}
+    }
+
+    auto getf = [&](const char* k, float &dst, float lo, float hi){
+      auto it = q.find(k);
+      if (it != q.end()) {
+        try {
+          float v = std::stof(it->second);
+          if (v < lo) v = lo;
+          if (v > hi) v = hi;
+          dst = v;
+        } catch (...) {}
+      }
+    };
+    getf("ch_mix",      mix,   0.0f, 100.0f);
+    getf("ch_rate",     rate,  0.05f, ch_rate_max_hz);
+    getf("ch_depth",    depth, 0.0f,  ch_depth_max_ms);
+    getf("ch_delay",    delay, ch_delay_min_ms, ch_delay_max_ms);
+    getf("ch_width",    width, 0.0f, 100.0f);
+    getf("ch_feedback", fb,    0.0f, ch_feedback_max_pct);
+
+    ChorusUISet(ch_enabled, mix, rate, depth, delay, width, fb);
+  }
+
   // Noise Gate
   {
     bool gon=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
@@ -2517,6 +2850,10 @@ static void ui_handleClient(int cfd) {
     float dly_mix=0, dly_time=0, dly_fb=0, dly_hc=0, dly_width=0, dly_rate=0, dly_depth=0, dly_drive=0, dly_lc=0;
     DelayUIGet(dly_enabled, dly_mix, dly_time, dly_fb, dly_hc, dly_width, dly_ping, dly_rate, dly_depth, dly_drive, dly_lc);
 
+    // Chorus defaults
+    bool ch_enabled=false; float ch_mix=0, ch_rate=0, ch_depth=0, ch_delay=0, ch_width=0, ch_fb=0;
+    ChorusUIGet(ch_enabled, ch_mix, ch_rate, ch_depth, ch_delay, ch_width, ch_fb);
+
     // Noise gate defaults
     bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
     GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
@@ -2579,6 +2916,21 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_DLY_LOWCUT_HZ__", fmtInt(dly_lc));
     ui_replaceAll(body, "__DEF_DLY_LOWCUT_MIN_HZ__", fmtInt(dly_lowcut_min_hz));
     ui_replaceAll(body, "__DEF_DLY_LOWCUT_MAX_HZ__", fmtInt(dly_lowcut_max_hz));
+
+    // Chorus defaults
+    ui_replaceAll(body, "__DEF_CHORUS_ENABLED_TEXT__", ch_enabled ? "ON" : "OFF");
+    ui_replaceAll(body, "__DEF_CH_MIX__",              fmtInt(ch_mix));
+    ui_replaceAll(body, "__DEF_CH_RATE_HZ__",          fmtFloatTrim(ch_rate, 2));
+    ui_replaceAll(body, "__DEF_CH_DEPTH_MS__",         fmtFloatTrim(ch_depth, 1));
+    ui_replaceAll(body, "__DEF_CH_DELAY_MS__",         fmtFloatTrim(ch_delay, 1));
+    ui_replaceAll(body, "__DEF_CH_WIDTH__",            fmtInt(ch_width));
+    ui_replaceAll(body, "__DEF_CH_FEEDBACK__",         fmtInt(ch_fb));
+
+    ui_replaceAll(body, "__DEF_CH_RATE_MAX_HZ__",      fmtFloatTrim(ch_rate_max_hz, 2));
+    ui_replaceAll(body, "__DEF_CH_DEPTH_MAX_MS__",     fmtFloatTrim(ch_depth_max_ms, 1));
+    ui_replaceAll(body, "__DEF_CH_DELAY_MIN_MS__",     fmtFloatTrim(ch_delay_min_ms, 1));
+    ui_replaceAll(body, "__DEF_CH_DELAY_MAX_MS__",     fmtFloatTrim(ch_delay_max_ms, 1));
+    ui_replaceAll(body, "__DEF_CH_FEEDBACK_MAX_PCT__", fmtInt(ch_feedback_max_pct));
 
     // Gate defaults
     ui_replaceAll(body, "__DEF_GATE_ENABLED_TEXT__", gate_enabled ? "ON" : "OFF");
@@ -3649,6 +4001,7 @@ static int paCallback(const void *inputBuffer,
       ReverbReset();
       GateReset();
       DelayReset();
+      ChorusReset();
     }
   }
 
@@ -3718,6 +4071,9 @@ static int paCallback(const void *inputBuffer,
       out[2*i + 1] = v;
     }
   }
+
+  // Chorus always adds its wet on top (returns early if disabled)
+  ChorusProcessAddMonoToStereoWet(temp, out, hop, framesPerBuffer, timeInfo);
 
   // Delay always adds its wet on top (it returns early if disabled)
   DelayProcessAddMonoToStereoWet(temp, out, hop, framesPerBuffer, timeInfo);
