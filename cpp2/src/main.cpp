@@ -66,6 +66,8 @@ static constexpr float kPickResoBaselineBoostDB   = 32.0f;
 
 std::atomic<bool> gStopFlag(false), gBypass(false);
 std::atomic<uint64_t> gBypassEpoch{0};
+std::atomic<uint64_t> gReverbResetEpoch{0};
+
 void signalHandler(int){ gStopFlag = true; }
 
 enum class StyleMode : int { Auto = 0, ForcePick = 1, ForceFinger = 2 };
@@ -208,61 +210,171 @@ static inline float clampf(float x, float lo, float hi) {
 
 
 // ───────────────────────── STEREO HALL REVERB (Freeverb-style, 48 kHz tuned) ─────────────────────────
-// Mono in -> stereo out (interleaved). Parameters are conservative defaults:
-//   mix01  = wet mix (0..1)
-//   t60Sec = decay time to -60 dB
-//   damp01 = high-frequency damping in comb feedback (0..1)
-// This version:
-//   - Uses 48 kHz tuned delay tables (derived from Jezar's 44.1k by precise scaling and rounding).
-//   - Applies the canonical Freeverb gain (0.015) at the INPUT of the comb bank (not after AP),
-//     which avoids comb/dry beating that can sound like tremolo.
-//   - Does not try to re-estimate sample rate per block; it is fixed at 48000 Hz for stability.
+// Mono in -> stereo out (interleaved).
+// Enhancements:
+//   - Reverb-only low-cut (HPF) pre-tank (mono) so you can take bass out of the reverb without thinning the dry.
+//   - Gentle stereo modulation (post-tank, wet path only) for a prettier tail, with adjustable rate/depth.
+//   - Proper reset on bypass edges via gReverbResetEpoch.
+//
+// UI parameters:
+//   rvb_mix   (0..1)    wet mix
+//   rvb_decay  (0.05..12) decay time to -60 dB
+//   rvb_damp  (0..1)    high-frequency damping inside comb feedback
+//   rvb_width  (0..1)    stereo width mixer
+//   rvb_lc_hz        10..400 Hz     reverb-only low cut (pre-tank)
+//   rvb_mod_rate     0.05..3.0 Hz   modulation rate (post-tank, wet only)
+//   rvb_mod_depth    0..10 ms       modulation depth (post-tank, wet only)
 
 static constexpr int kNumCombs = 8;
 static constexpr int kNumAP    = 4;
-// Tunables
-float mix01  = 30.0f; // wet mix
-float t60Sec = 6.20f; // decay to -60 dB
-float damp01 = 0.30f; // HF damping inside comb feedback
-float width  = 0.70f; // stereo width (0..1), safe default
 
-    // Constants
-static constexpr float kFixedGain = 0.02f; // canonical Freeverb input gain
-static constexpr float kAPFeedback = 0.5f;  // allpass feedback
-static constexpr float kSR = 48000.0f;      // fixed 48 kHz
+static constexpr float rvb_lc_max_hz    = 8000.0f;
+static constexpr float rvb_mod_max_rate_hz    = 10.0f;
+static constexpr float rvb_mod_max_depth_ms    = 100.0f;
+static constexpr float rvb_max_decay_sec = 60.0f;
 
-// ───────────────────────── STEREO HALL REVERB (Freeverb-style, 48 kHz tuned) + UI params ─────────────────────────
-// Mono in -> stereo out (interleaved). Parameters exposed to Web UI:
-//   - Mix %   (0..100)
-//   - Decay s (0.1..12.0)
-//   - Damp %  (0..100) -> mapped to [0..1] internally
-//
-// Thread-safety: parameters are atomics accessed lock-free from the PA callback and Web UI threads.
+static float rvb_mix  = 30.0f;
+static float rvb_decay = 6.20f;
+static float rvb_damp = 0.30f;
+static float rvb_width  = 0.70f; // stereo width (0..1)
+static float rvb_lc_hz     = 120.0f; // reverb-only low cut (pre-tank)
+static float rvb_mod_rate  = 0.35f;  // modulation rate (post-tank, wet only)
+static float rvb_mod_depth = 1.5f;   // modulation depth (post-tank, wet only)
 
-static std::atomic<float>& RvbMixStore() { static std::atomic<float> v{mix01}; return v; }    // percent
-static std::atomic<float>& RvbT60Store() { static std::atomic<float> v{t60Sec};  return v; }    // seconds
-static std::atomic<float>& RvbDampStore(){ static std::atomic<float> v{damp01}; return v; }    // 0..1
-static std::atomic<float>& RvbWidthStore(){ static std::atomic<float> v{width}; return v; } // 0..1
+// Constants
+static constexpr float kFixedGain   = 0.02f; // canonical Freeverb input gain
+static constexpr float kAPFeedback  = 0.5f;  // allpass feedback
+static constexpr float kSR          = 48000.0f;      // fixed 48 kHz
 
-static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct) {
+// Reverb UI atomics
+static std::atomic<float>& RvbMixStore()     { static std::atomic<float> v{rvb_mix};   return v; }     // percent
+static std::atomic<float>& RvbT60Store()     { static std::atomic<float> v{rvb_decay};  return v; }     // seconds
+static std::atomic<float>& RvbDampStore()    { static std::atomic<float> v{rvb_damp};  return v; }     // 0..1
+static std::atomic<float>& RvbWidthStore()   { static std::atomic<float> v{rvb_width};   return v; }     // 0..1
+static std::atomic<float>& RvbLCHzStore()        { static std::atomic<float> v{rvb_lc_hz}; return v; }  // Hz
+static std::atomic<float>& RvbModRateStore()     { static std::atomic<float> v{rvb_mod_rate};  return v; }  // Hz
+static std::atomic<float>& RvbModDepthMsStore()  { static std::atomic<float> v{rvb_mod_depth};   return v; }  // ms
+
+static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct, float lc_hz, float mod_rate, float mod_depth_ms) {
   float mix = clampf(mix_pct, 0.0f, 100.0f);
-  float t60 = clampf(t60_sec, 0.10f, 12.0f);
+  float t60 = clampf(t60_sec, 0.10f, rvb_max_decay_sec);
   float d01 = clampf(damp_pct * 0.01f, 0.0f, 1.0f);
   float w01 = clampf(width_pct * 0.01f, 0.0f, 1.0f);
-  RvbMixStore().store(mix, std::memory_order_relaxed);
-  RvbT60Store().store(t60, std::memory_order_relaxed);
-  RvbDampStore().store(d01, std::memory_order_relaxed);
+  float lc = clampf(lc_hz, 10.0f, rvb_lc_max_hz);
+  float mr = clampf(mod_rate, 0.05f, rvb_mod_max_rate_hz);
+  float md = clampf(mod_depth_ms, 0.0f, rvb_mod_max_depth_ms);
+
+  RvbMixStore().store(mix,   std::memory_order_relaxed);
+  RvbT60Store().store(t60,   std::memory_order_relaxed);
+  RvbDampStore().store(d01,  std::memory_order_relaxed);
   RvbWidthStore().store(w01, std::memory_order_relaxed);
+  RvbLCHzStore().store(lc,   std::memory_order_relaxed);
+  RvbModRateStore().store(mr,   std::memory_order_relaxed);
+  RvbModDepthMsStore().store(md, std::memory_order_relaxed);
 }
 
-static void ReverbUIGet(float &mix_pct, float &t60_sec, float &damp_pct, float &width_pct) {
-  mix_pct = RvbMixStore().load(std::memory_order_relaxed);
-  t60_sec = RvbT60Store().load(std::memory_order_relaxed);
-  damp_pct= RvbDampStore().load(std::memory_order_relaxed) * 100.0f;
-  width_pct= RvbWidthStore().load(std::memory_order_relaxed) * 100.0f;
+static void ReverbUIGet(float &mix_pct, float &t60_sec, float &damp_pct, float &width_pct, float &lc_hz, float &mod_rate, float &mod_depth_ms) {
+  mix_pct   = RvbMixStore().load(std::memory_order_relaxed);
+  t60_sec   = RvbT60Store().load(std::memory_order_relaxed);
+  damp_pct  = RvbDampStore().load(std::memory_order_relaxed) * 100.0f;
+  width_pct = RvbWidthStore().load(std::memory_order_relaxed) * 100.0f;
+  lc_hz    = RvbLCHzStore().load(std::memory_order_relaxed);
+  mod_rate  = RvbModRateStore().load(std::memory_order_relaxed);
+  mod_depth_ms = RvbModDepthMsStore().load(std::memory_order_relaxed);
 }
 
 static void ReverbReset();
+
+// Internal helper: first-order HP used in cascade for pre-tank low-cut
+struct OnePoleHP {
+  float a = 0.0f; // alpha = rc / (rc + dt)
+  float x1 = 0.0f;
+  float y1 = 0.0f;
+
+  void setCutoff(float fc, float sr) {
+    float f = std::max(1.0f, fc);
+    float dt = 1.0f / std::max(1.0f, sr);
+    float rc = 1.0f / (2.0f * float(M_PI) * f);
+    a = rc / (rc + dt);
+  }
+  inline float process(float x) {
+    float y = a * (y1 + x - x1);
+    x1 = x;
+    y1 = y;
+    return y;
+  }
+  void reset() { x1 = 0.0f; y1 = 0.0f; }
+};
+
+// Internal helper: lightweight modulated delay for wet tail sweetening
+struct ModDelay {
+  std::vector<float> buf;
+  int w = 0;
+  float phase = 0.0f;
+  float phaseInc = 0.0f;
+  float baseSamp = 0.0f;
+  float depthSamp = 0.0f;
+  int mask = 0;
+  bool enabled = false;
+
+  void init(int maxSamplesPow2) {
+    int cap = 1;
+    while (cap < maxSamplesPow2) cap <<= 1;
+    buf.assign(cap, 0.0f);
+    mask = cap - 1;
+    w = 0;
+    phase = 0.0f;
+  }
+  void setParams(float rateHz, float depthMs, float sr, float baseMs, float phaseOffsetRad) {
+    float r = clampf(rateHz, 0.0f, 10.0f);
+    float dms = std::max(0.0f, depthMs);
+    baseSamp  = std::max(1.0f, baseMs * sr * 0.001f);
+    depthSamp = std::max(0.0f, dms  * sr * 0.001f);
+    phaseInc  = 2.0f * float(M_PI) * r / std::max(1.0f, sr);
+    phase += phaseOffsetRad; // apply offset once on (re)config
+    // keep in bounds
+    while (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
+    while (phase < 0.0f) phase += 2.0f * float(M_PI);
+    enabled = (depthSamp > 1e-6f && r >= 0.01f);
+  }
+  inline float tick(float x) {
+    // write current
+    buf[w] = x;
+
+    if (!enabled) {
+      // pass-through read at base delay (center)
+      float D = baseSamp;
+      int ri1 = (w - int(D)) & mask;
+      int ri0 = (ri1 - 1) & mask;
+      float frac = D - std::floor(D);
+      float y = buf[ri0] * (1.0f - frac) + buf[ri1] * frac;
+      w = (w + 1) & mask;
+      return y;
+    }
+
+    float m = std::sinf(phase);
+    phase += phaseInc;
+    if (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
+
+    float D = baseSamp + depthSamp * m;
+    // Safety clamp to buffer
+    float maxD = float(mask); // OK: mask == cap-1, buffer indexes safe
+    if (D < 1.0f) D = 1.0f;
+    if (D > maxD) D = maxD;
+
+    int ri1 = (w - int(D)) & mask;
+    int ri0 = (ri1 - 1) & mask;
+    float frac = D - std::floor(D);
+    float y = buf[ri0] * (1.0f - frac) + buf[ri1] * frac;
+
+    w = (w + 1) & mask;
+    return y;
+  }
+  void reset() {
+    if (!buf.empty()) std::fill(buf.begin(), buf.end(), 0.0f);
+    w = 0; phase = 0.0f;
+  }
+};
 
 static void ReverbProcessMonoToStereo(const float* inMono,
                                       float* outLRInterleaved,
@@ -294,8 +406,24 @@ static void ReverbProcessMonoToStereo(const float* inMono,
     Comb comb[2][kNumCombs];
     Allpass ap[2][kNumAP];
     bool inited = false;
+
+    // Param cache
     float prevT60 = -1.0f;
     float prevDmp = -1.0f;
+    float prevWidth = -1.0f;
+
+    // Reverb-only low cut (cascade of two 1st-order HPF)
+    OnePoleHP hp1, hp2;
+    float prevLcHz = -1.0f;
+
+    // Modulated wet delay (post-tank)
+    ModDelay modL, modR;
+    float prevModRate = -1.0f;
+    float prevModDepth = -1.0f;
+    bool modInited = false;
+
+    // Reset epoch
+    uint64_t lastResetSeen = 0;
 
     void init() {
       // Allocate buffers to exact 48 kHz tuned lengths
@@ -312,15 +440,39 @@ static void ReverbProcessMonoToStereo(const float* inMono,
           ap[ch][i].idx = 0;
         }
       }
-      // Set initial coeffs
-      updateDamping(damp01);
-      updateFeedbackForT60(t60Sec);
-      prevT60 = t60Sec;
-      prevDmp = damp01;
+      updateDamping(rvb_damp);
+      updateFeedbackForT60(rvb_decay);
+      prevT60   = rvb_decay;
+      prevDmp   = rvb_damp;
+      prevWidth = rvb_width;
+
+      // Pre-tank HPF defaults
+      float lc = clampf(RvbLCHzStore().load(std::memory_order_relaxed), 10.0f, rvb_lc_max_hz);
+      hp1.setCutoff(lc, kSR);
+      hp2.setCutoff(lc, kSR);
+      hp1.reset(); hp2.reset();
+      prevLcHz = lc;
+
+      // Modulated wet sweetener: buffers big enough for ~30 ms
+      if (!modInited) {
+        modL.init(8192);
+        modR.init(8192);
+        // default params
+        float rate = clampf(RvbModRateStore().load(std::memory_order_relaxed), 0.05f, rvb_mod_max_rate_hz);
+        float depth = clampf(RvbModDepthMsStore().load(std::memory_order_relaxed), 0.0f, rvb_mod_max_depth_ms);
+        // Slightly different base delay and phase for stereo decorrelation
+        modL.setParams(rate, depth, kSR, 12.0f, 0.0f);
+        modR.setParams(rate, depth, kSR, 13.7f, float(M_PI) * 0.5f); // +90 deg
+        prevModRate  = rate;
+        prevModDepth = depth;
+        modInited = true;
+      }
+
       inited = true;
     }
 
-    void reset() {
+    void hardReset() {
+      // Zero all internal buffers
       for (int ch = 0; ch < 2; ++ch) {
         for (int i = 0; i < kNumCombs; ++i) {
           std::fill(comb[ch][i].buf.begin(), comb[ch][i].buf.end(), 0.0f);
@@ -332,6 +484,8 @@ static void ReverbProcessMonoToStereo(const float* inMono,
           ap[ch][i].idx = 0;
         }
       }
+      hp1.reset(); hp2.reset();
+      modL.reset(); modR.reset();
     }
 
     void updateDamping(float d01) {
@@ -375,35 +529,57 @@ static void ReverbProcessMonoToStereo(const float* inMono,
     void process(const float* x, float* outLR, size_t n) {
       if (!inited) init();
 
+      // Reset on epoch bump (e.g., bypass edge)
+      uint64_t curEpoch = gReverbResetEpoch.load(std::memory_order_acquire);
+      if (curEpoch != lastResetSeen) {
+        hardReset();
+        lastResetSeen = curEpoch;
+      }
+
       // Pull latest UI parameters
-      const float mix01_ui  = clampf(RvbMixStore().load(std::memory_order_relaxed) * 0.01f, 0.0f, 1.0f);
-      const float t60_ui    = clampf(RvbT60Store().load(std::memory_order_relaxed), 0.05f, 12.0f);
-      const float damp01_ui = clampf(RvbDampStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
-      const float width_ui  = clampf(RvbWidthStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
+      const float mix01_ui    = clampf(RvbMixStore().load(std::memory_order_relaxed) * 0.01f, 0.0f, 1.0f);
+      const float t60_ui      = clampf(RvbT60Store().load(std::memory_order_relaxed), 0.05f, rvb_max_decay_sec);
+      const float damp01_ui   = clampf(RvbDampStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
+      const float width_ui    = clampf(RvbWidthStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
+      const float lcHz_ui     = clampf(RvbLCHzStore().load(std::memory_order_relaxed), 10.0f, rvb_lc_max_hz);
+      const float modRate_ui  = clampf(RvbModRateStore().load(std::memory_order_relaxed), 0.05f, rvb_mod_max_rate_hz);
+      const float modDepth_ui = clampf(RvbModDepthMsStore().load(std::memory_order_relaxed), 0.0f, rvb_mod_max_depth_ms);
 
-      mix01  = mix01_ui;
-      if (std::fabs(damp01 - damp01_ui) > 1e-4f) {
-        damp01 = damp01_ui;
-        updateDamping(damp01);
-        prevDmp = damp01;
+      // Update params if changed
+      if (std::fabs(rvb_damp - damp01_ui) > 1e-4f) {
+        rvb_damp = damp01_ui; updateDamping(rvb_damp);
+        prevDmp = rvb_damp;
       }
-      if (std::fabs(t60Sec - t60_ui) > 1e-4f) {
-        t60Sec = t60_ui;
-        updateFeedbackForT60(t60Sec);
-        prevT60 = t60Sec;
+      if (std::fabs(rvb_decay - t60_ui) > 1e-4f) {
+        rvb_decay = t60_ui; updateFeedbackForT60(rvb_decay);
+        prevT60 = rvb_decay;
       }
-      // IMPORTANT: keep module-level width in sync and use UI width in mixing
-      width = width_ui;
+      if (std::fabs(prevLcHz - lcHz_ui) > 1e-3f) {
+        hp1.setCutoff(lcHz_ui, kSR);
+        hp2.setCutoff(lcHz_ui, kSR);
+        prevLcHz = lcHz_ui;
+      }
+      if (std::fabs(prevModRate - modRate_ui) > 1e-5f || std::fabs(prevModDepth - modDepth_ui) > 1e-4f) {
+        // Keep stereo decorrelation via different base delays and phase offset
+        modL.setParams(modRate_ui, modDepth_ui, kSR, 12.0f, 0.0f);
+        modR.setParams(modRate_ui, modDepth_ui, kSR, 13.7f, float(M_PI)*0.5f);
+        prevModRate  = modRate_ui;
+        prevModDepth = modDepth_ui;
+      }
+      rvb_width = width_ui;
 
-      const float wet = std::max(0.0f, std::min(1.0f, mix01));
+      const float wet = std::max(0.0f, std::min(1.0f, mix01_ui));
       const float dry = 1.0f - wet;
-      const float w   = std::max(0.0f, std::min(1.0f, width_ui)); // use UI width
+      const float w   = std::max(0.0f, std::min(1.0f, width_ui));
       const float wet1 = wet * (w * 0.5f + 0.5f);
       const float wet2 = wet * ((1.0f - w) * 0.5f);
 
       for (size_t i = 0; i < n; ++i) {
         const float inDry = x[i];
-        const float inToTank = inDry * kFixedGain;
+
+        // Pre-tank low-cut on wet only
+        float xhp = hp2.process(hp1.process(inDry));
+        const float inToTank = xhp * kFixedGain;
 
         float sumL = 0.0f, sumR = 0.0f;
         for (int c = 0; c < kNumCombs; ++c) {
@@ -417,8 +593,12 @@ static void ReverbProcessMonoToStereo(const float* inMono,
           outR = procAllpass(ap[1][a], outR);
         }
 
-        const float L = outL * wet1 + outR * wet2 + dry * inDry;
-        const float R = outR * wet1 + outL * wet2 + dry * inDry;
+        // Post-tank modulation (wet only)
+        float wetL = modL.tick(outL);
+        float wetR = modR.tick(outR);
+
+        const float L = wetL * wet1 + wetR * wet2 + dry * inDry;
+        const float R = wetR * wet1 + wetL * wet2 + dry * inDry;
 
         outLR[2*i + 0] = L;
         outLR[2*i + 1] = R;
@@ -432,29 +612,8 @@ static void ReverbProcessMonoToStereo(const float* inMono,
 }
 
 static void ReverbReset() {
-  // Zero the primary static instance by calling process with zeroed buffers and then resetting internals
-  // We keep a mirror instance to reach reset() safely.
-  struct Mirror {
-    struct Comb { std::vector<float> buf; int idx; float filterStore; float feedback; float damp1, damp2; };
-    struct Allpass { std::vector<float> buf; int idx; };
-    Comb comb[2][kNumCombs];
-    Allpass ap[2][kNumAP];
-    void reset() {
-      for (int ch = 0; ch < 2; ++ch) {
-        for (int i = 0; i < kNumCombs; ++i) {
-          std::fill(comb[ch][i].buf.begin(), comb[ch][i].buf.end(), 0.0f);
-          comb[ch][i].idx = 0;
-          comb[ch][i].filterStore = 0.0f;
-        }
-        for (int i = 0; i < kNumAP; ++i) {
-          std::fill(ap[ch][i].buf.begin(), ap[ch][i].buf.end(), 0.0f);
-          ap[ch][i].idx = 0;
-        }
-      }
-    }
-  };
-  static Mirror m;
-  m.reset();
+  // Bump reset epoch; the processor will zero internal buffers on next call.
+  gReverbResetEpoch.fetch_add(1, std::memory_order_acq_rel);
 }
 
 
@@ -709,6 +868,24 @@ static std::string ui_htmlIndex() {
           <canvas id="knob_rvb_width" width="110" height="110"></canvas>
           <div class="label">Width</div>
           <div class="value"><span id="val_rvb_width">__DEF_RVB_WIDTH__</span> %</div>
+        </div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_rvb_lc_hz" width="110" height="110"></canvas>
+          <div class="label">LoCut Hz (wet)</div>
+          <div class="value"><span id="val_rvb_lc_hz">__DEF_RVB_LC_HZ__</span> Hz</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_rvb_mod_rate" width="110" height="110"></canvas>
+          <div class="label">Mod Rate</div>
+          <div class="value"><span id="val_rvb_mod_rate">__DEF_RVB_MOD_RATE__</span> Hz</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_rvb_mod_depth" width="110" height="110"></canvas>
+          <div class="label">Mod Depth</div>
+          <div class="value"><span id="val_rvb_mod_depth">__DEF_RVB_MOD_DEPTH__</span> ms</div>
+        </div>
       </div>
     </div>
   </div>
@@ -805,7 +982,8 @@ class Knob {
       'knob_mid_gain': __DEF_MID_GAIN__, 'knob_mid_hz': __DEF_MID_HZ__, 'knob_mid_q': __DEF_MID_Q__,
       'knob_hs_gain': __DEF_HS_GAIN__, 'knob_hs_hz': __DEF_HS_HZ__, 'knob_hs_slope': __DEF_HS_SLOPE__,
       'knob_rvb_mix': __DEF_RVB_MIX__, 'knob_rvb_t60': __DEF_RVB_T60__, 'knob_rvb_damp': __DEF_RVB_DAMP__,
-      'knob_rvb_width': __DEF_RVB_WIDTH__
+      'knob_rvb_width': __DEF_RVB_WIDTH__,
+      'knob_rvb_lc_hz': __DEF_RVB_LC_HZ__, 'knob_rvb_mod_rate': __DEF_RVB_MOD_RATE__, 'knob_rvb_mod_depth': __DEF_RVB_MOD_DEPTH__
     };
     const defv = (id in defaults) ? defaults[id] : ( (this.min === 0 && this.max === 100) ? 100 : 0 );
     this.set(defv, true);
@@ -881,9 +1059,13 @@ const kb = {
   hs_slope: new Knob(el('knob_hs_slope'), {min:6,max:36,step:6,value:__DEF_HS_SLOPE__,prec:0,displayEl:el('val_hs_slope'),color:'#d19a66', onchange:(v)=>sendSet({hs_slope:v})}),
 
   rvb_mix:  new Knob(el('knob_rvb_mix'),  {min:0,max:100,step:1,value:__DEF_RVB_MIX__,prec:0,displayEl:el('val_rvb_mix'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mix:v})}),
-  rvb_t60:  new Knob(el('knob_rvb_t60'),  {min:0.1,max:12.0,step:0.1,value:__DEF_RVB_T60__,prec:1,displayEl:el('val_rvb_t60'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_t60:v})}),
+  rvb_t60:  new Knob(el('knob_rvb_t60'),  {min:0.1,max:__DEF_RVB_MAX_DECAY_SEC__,step:0.1,value:__DEF_RVB_T60__,prec:1,displayEl:el('val_rvb_t60'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_t60:v})}),
   rvb_damp: new Knob(el('knob_rvb_damp'), {min:0,max:100,step:1,value:__DEF_RVB_DAMP__,prec:0,displayEl:el('val_rvb_damp'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_damp:v})}),
   rvb_width: new Knob(el('knob_rvb_width'), {min:0,max:100,step:1,value:__DEF_RVB_WIDTH__,prec:0,displayEl:el('val_rvb_width'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_width:v})}),
+
+  rvb_lc_hz: new Knob(el('knob_rvb_lc_hz'), {min:10,max:__DEF_RVB_LC_MAX_HZ__,step:1,value:__DEF_RVB_LC_HZ__,prec:0,displayEl:el('val_rvb_lc_hz'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_lc_hz:v})}),
+  rvb_mod_rate: new Knob(el('knob_rvb_mod_rate'), {min:0.05,max:__DEF_RVB_MOD_MAX_RATE_HZ__,step:0.01,value:__DEF_RVB_MOD_RATE__,prec:2,displayEl:el('val_rvb_mod_rate'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_rate:v})}),
+  rvb_mod_depth: new Knob(el('knob_rvb_mod_depth'), {min:0.0,max:__DEF_RVB_MOD_MAX_DEPTH_MS__,step:0.1,value:__DEF_RVB_MOD_DEPTH__,prec:1,displayEl:el('val_rvb_mod_depth'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_depth:v})}),
 };
 
 function sendSet(obj) {
@@ -918,6 +1100,11 @@ function sendSet(obj) {
   if ('rvb_t60' in obj) params.set('rvb_t60', obj.rvb_t60);
   if ('rvb_damp' in obj) params.set('rvb_damp', obj.rvb_damp);
   if ('rvb_width' in obj) params.set('rvb_width', obj.rvb_width);
+
+  // New reverb-only controls
+  if ('rvb_lc_hz' in obj) params.set('rvb_lc_hz', obj.rvb_lc_hz);
+  if ('rvb_mod_rate' in obj) params.set('rvb_mod_rate', obj.rvb_mod_rate);
+  if ('rvb_mod_depth' in obj) params.set('rvb_mod_depth', obj.rvb_mod_depth);
 
   fetch('/set?' + params.toString()).catch(()=>{});
 }
@@ -971,6 +1158,10 @@ function applyStatus(s){
   if ('rvb_t60_sec' in s) kb.rvb_t60.set(s.rvb_t60_sec, false);
   if ('rvb_damp_pct' in s) kb.rvb_damp.set(s.rvb_damp_pct, false);
   if ('rvb_width_pct' in s) kb.rvb_width.set(s.rvb_width_pct, false);
+
+  if ('rvb_lc_hz' in s) kb.rvb_lc_hz.set(s.rvb_lc_hz, false);
+  if ('rvb_mod_rate_hz' in s) kb.rvb_mod_rate.set(s.rvb_mod_rate_hz, false);
+  if ('rvb_mod_depth_ms' in s) kb.rvb_mod_depth.set(s.rvb_mod_depth_ms, false);
 
   // Phase switch
   const phaseOn = (s.phaseInvert01 >= 0.5);
@@ -1042,13 +1233,17 @@ static std::string ui_jsonStatus() {
   oss << "\"hs_hz\":"        << gKnobs.hs_hz.load()          << ",";
   oss << "\"hs_slope_dbpoct\":"<< gKnobs.hs_slope_dbpoct.load() << ",";
 
-  // Reverb
-  float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0;
-  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+  // Reverb (main)
+  float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth_ms=0;
+  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth_ms);
   oss << "\"rvb_mix_pct\":"  << rvb_mix   << ",";
   oss << "\"rvb_t60_sec\":"  << rvb_t60   << ",";
   oss << "\"rvb_damp_pct\":" << rvb_damp  << ",";
   oss << "\"rvb_width_pct\":"<< rvb_width << ",";
+
+  oss << "\"rvb_lc_hz\":"        << rvb_lc_hz       << ",";
+  oss << "\"rvb_mod_rate_hz\":"  << rvb_mod_rate   << ",";
+  oss << "\"rvb_mod_depth_ms\":" << rvb_mod_depth_ms << ",";
 
   // switches/mode
   oss << "\"bypass\":"       << (gBypass.load()?1:0) << ",";
@@ -1198,13 +1393,18 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   gKnobs.hs_slope_dbpoct.store(hs_s);
 
   // Reverb (partial updates allowed)
-  float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f;
-  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+  float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f, rvb_lc_hz = 0.0f, rvb_mod_rate = 0.0f, rvb_mod_depth = 0.0f;
+  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
   getf("rvb_mix",  rvb_mix, 0.0f, 100.0f);
-  getf("rvb_t60",  rvb_t60, 0.10f, 12.0f);
+  getf("rvb_t60",  rvb_t60, 0.10f, rvb_max_decay_sec);
   getf("rvb_damp", rvb_damp, 0.0f, 100.0f);
   getf("rvb_width", rvb_width, 0.0f, 100.0f);
-  ReverbUISet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+  getf("rvb_lc_hz", rvb_lc_hz, 10.0f, rvb_lc_max_hz);
+  getf("rvb_mod_rate", rvb_mod_rate, 0.05f, rvb_mod_max_rate_hz);
+  getf("rvb_mod_depth", rvb_mod_depth, 0.0f, rvb_mod_max_depth_ms);
+  ReverbUISet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+
+  
 }
 
 static inline void ui_handleMode(const std::unordered_map<std::string,std::string>& q) {
@@ -1331,8 +1531,8 @@ static void ui_handleClient(int cfd) {
     const float def_hs_hz   = gKnobs.hs_hz.load();
     const float def_hs_slope= gKnobs.hs_slope_dbpoct.load();
 
-    float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0;
-    ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+    float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth=0;
+    ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
 
     // Inject formatted defaults (integers where appropriate)
     ui_replaceAll(body, "__DEF_MAIN_DB__",   fmtInt(def_main));
@@ -1363,6 +1563,14 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_RVB_T60__",   fmtFloatTrim(rvb_t60, 1));
     ui_replaceAll(body, "__DEF_RVB_DAMP__",  fmtInt(rvb_damp));
     ui_replaceAll(body, "__DEF_RVB_WIDTH__", fmtInt(rvb_width));
+    ui_replaceAll(body, "__DEF_RVB_MAX_DECAY_SEC__", fmtFloatTrim(rvb_max_decay_sec,1));
+
+    ui_replaceAll(body, "__DEF_RVB_LC_HZ__",   fmtInt(rvb_lc_hz));
+    ui_replaceAll(body, "__DEF_RVB_LC_MAX_HZ__",fmtInt(rvb_lc_max_hz));
+    ui_replaceAll(body, "__DEF_RVB_MOD_MAX_RATE_HZ__",fmtFloatTrim(rvb_mod_max_rate_hz,2));
+    ui_replaceAll(body, "__DEF_RVB_MOD_MAX_DEPTH_MS__",fmtFloatTrim(rvb_mod_max_depth_ms,1));
+    ui_replaceAll(body, "__DEF_RVB_MOD_RATE__",fmtFloatTrim(rvb_mod_rate,2));
+    ui_replaceAll(body, "__DEF_RVB_MOD_DEPTH__",fmtFloatTrim(rvb_mod_depth,1));
 
     std::string h = ui_httpHeader("200 OK", "text/html; charset=utf-8", body.size());
     ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
