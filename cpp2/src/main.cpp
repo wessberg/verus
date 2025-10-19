@@ -37,6 +37,7 @@
 #include <unordered_map>
 #include <string>
 #include <algorithm>
+#include <iomanip>
 
 #include <pthread/qos.h>
 #include <Accelerate/Accelerate.h>
@@ -185,6 +186,296 @@ static inline float clampf(float x, float lo, float hi) {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ───────────────────────── STEREO HALL REVERB (Freeverb-style, 48 kHz tuned) ─────────────────────────
+// Mono in -> stereo out (interleaved). Parameters are conservative defaults:
+//   mix01  = wet mix (0..1)
+//   t60Sec = decay time to -60 dB
+//   damp01 = high-frequency damping in comb feedback (0..1)
+// This version:
+//   - Uses 48 kHz tuned delay tables (derived from Jezar's 44.1k by precise scaling and rounding).
+//   - Applies the canonical Freeverb gain (0.015) at the INPUT of the comb bank (not after AP),
+//     which avoids comb/dry beating that can sound like tremolo.
+//   - Does not try to re-estimate sample rate per block; it is fixed at 48000 Hz for stability.
+
+static constexpr int kNumCombs = 8;
+static constexpr int kNumAP    = 4;
+// Tunables
+float mix01  = 0.30f; // wet mix
+float t60Sec = 6.20f; // decay to -60 dB
+float damp01 = 0.40f; // HF damping inside comb feedback
+float width  = 0.70f; // stereo width (0..1), safe default
+
+    // Constants
+static constexpr float kFixedGain = 0.02f; // canonical Freeverb input gain
+static constexpr float kAPFeedback = 0.5f;  // allpass feedback
+static constexpr float kSR = 48000.0f;      // fixed 48 kHz
+
+// ───────────────────────── STEREO HALL REVERB (Freeverb-style, 48 kHz tuned) + UI params ─────────────────────────
+// Mono in -> stereo out (interleaved). Parameters exposed to Web UI:
+//   - Mix %   (0..100)
+//   - Decay s (0.1..12.0)
+//   - Damp %  (0..100) -> mapped to [0..1] internally
+//
+// Thread-safety: parameters are atomics accessed lock-free from the PA callback and Web UI threads.
+
+static std::atomic<float>& RvbMixStore() { static std::atomic<float> v{20.0f}; return v; }    // percent
+static std::atomic<float>& RvbT60Store() { static std::atomic<float> v{2.2f};  return v; }    // seconds
+static std::atomic<float>& RvbDampStore(){ static std::atomic<float> v{0.50f}; return v; }    // 0..1
+static std::atomic<float>& RvbWidthStore(){ static std::atomic<float> v{0.10f}; return v; } // 0..1
+
+static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct) {
+  float mix = clampf(mix_pct, 0.0f, 100.0f);
+  float t60 = clampf(t60_sec, 0.10f, 12.0f);
+  float d01 = clampf(damp_pct * 0.01f, 0.0f, 1.0f);
+  float w01 = clampf(width_pct * 0.01f, 0.0f, 1.0f);
+  RvbMixStore().store(mix, std::memory_order_relaxed);
+  RvbT60Store().store(t60, std::memory_order_relaxed);
+  RvbDampStore().store(d01, std::memory_order_relaxed);
+  RvbWidthStore().store(w01, std::memory_order_relaxed);
+}
+
+static void ReverbUIGet(float &mix_pct, float &t60_sec, float &damp_pct, float &width_pct) {
+  mix_pct = RvbMixStore().load(std::memory_order_relaxed);
+  t60_sec = RvbT60Store().load(std::memory_order_relaxed);
+  damp_pct= RvbDampStore().load(std::memory_order_relaxed) * 100.0f;
+  width_pct= RvbWidthStore().load(std::memory_order_relaxed) * 100.0f;
+}
+
+static void ReverbReset();
+
+static void ReverbProcessMonoToStereo(const float* inMono,
+                                      float* outLRInterleaved,
+                                      size_t n,
+                                      unsigned long /*framesPerBuffer*/,
+                                      const PaStreamCallbackTimeInfo* /*timeInfo*/)
+{
+  struct Freeverb48Stereo {
+
+    // 48 kHz tuned delays (samples) (scaled and rounded from 44.1k Jezar tables)
+    int combDelaysL[kNumCombs]  = {1216,1294,1390,1476,1547,1623,1694,1762};
+    int combDelaysR[kNumCombs]  = {1241,1317,1415,1502,1572,1648,1721,1785};
+    int allpassDelaysL[kNumAP]  = {605,480,371,245};
+    int allpassDelaysR[kNumAP]  = {631,505,396,270};
+
+    struct Comb {
+      std::vector<float> buf;
+      int idx = 0;
+      float filterStore = 0.0f;
+      float feedback = 0.0f;
+      float damp1 = 0.0f; // (1 - damp)
+      float damp2 = 0.0f; // damp
+    };
+    struct Allpass {
+      std::vector<float> buf;
+      int idx = 0;
+    };
+
+    Comb comb[2][kNumCombs];
+    Allpass ap[2][kNumAP];
+    bool inited = false;
+    float prevT60 = -1.0f;
+    float prevDmp = -1.0f;
+
+    void init() {
+      // Allocate buffers to exact 48 kHz tuned lengths
+      for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < kNumCombs; ++i) {
+          const int M = (ch==0) ? combDelaysL[i] : combDelaysR[i];
+          comb[ch][i].buf.assign(std::max(32, M), 0.0f);
+          comb[ch][i].idx = 0;
+          comb[ch][i].filterStore = 0.0f;
+        }
+        for (int i = 0; i < kNumAP; ++i) {
+          const int M = (ch==0) ? allpassDelaysL[i] : allpassDelaysR[i];
+          ap[ch][i].buf.assign(std::max(16, M), 0.0f);
+          ap[ch][i].idx = 0;
+        }
+      }
+      // Set initial coeffs
+      updateDamping(damp01);
+      updateFeedbackForT60(t60Sec);
+      prevT60 = t60Sec;
+      prevDmp = damp01;
+      inited = true;
+    }
+
+    void reset() {
+      for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < kNumCombs; ++i) {
+          std::fill(comb[ch][i].buf.begin(), comb[ch][i].buf.end(), 0.0f);
+          comb[ch][i].idx = 0;
+          comb[ch][i].filterStore = 0.0f;
+        }
+        for (int i = 0; i < kNumAP; ++i) {
+          std::fill(ap[ch][i].buf.begin(), ap[ch][i].buf.end(), 0.0f);
+          ap[ch][i].idx = 0;
+        }
+      }
+    }
+
+    void updateDamping(float d01) {
+      float d = std::max(0.0f, std::min(1.0f, d01));
+      for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < kNumCombs; ++i) {
+          comb[ch][i].damp2 = d;
+          comb[ch][i].damp1 = 1.0f - d;
+        }
+      }
+    }
+
+    void updateFeedbackForT60(float t60) {
+      float t = std::max(0.05f, t60);
+      for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < kNumCombs; ++i) {
+          const int M = std::max(1, (int)comb[ch][i].buf.size());
+          const double g = std::pow(10.0, -3.0 * double(M) / (double(t) * double(kSR)));
+          comb[ch][i].feedback = (float)g;
+        }
+      }
+    }
+
+    inline float procComb(Comb &C, float inp) {
+      const float y = C.buf[C.idx];
+      C.filterStore = (y * C.damp1) + (C.filterStore * C.damp2);
+      const float v = inp + C.filterStore * C.feedback;
+      C.buf[C.idx] = v;
+      C.idx++; if (C.idx >= (int)C.buf.size()) C.idx = 0;
+      return y;
+    }
+
+    inline float procAllpass(Allpass &A, float x) {
+      const float bufout = A.buf[A.idx];
+      const float y = -x + bufout;
+      A.buf[A.idx] = x + bufout * kAPFeedback;
+      A.idx++; if (A.idx >= (int)A.buf.size()) A.idx = 0;
+      return y;
+    }
+
+    void process(const float* x, float* outLR, size_t n) {
+      if (!inited) init();
+
+      // Pull latest UI parameters
+      const float mix01_ui  = clampf(RvbMixStore().load(std::memory_order_relaxed) * 0.01f, 0.0f, 1.0f);
+      const float t60_ui    = clampf(RvbT60Store().load(std::memory_order_relaxed), 0.05f, 12.0f);
+      const float damp01_ui = clampf(RvbDampStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
+      const float width_ui  = clampf(RvbWidthStore().load(std::memory_order_relaxed), 0.0f, 1.0f);
+
+      mix01  = mix01_ui;
+      if (std::fabs(damp01 - damp01_ui) > 1e-4f) {
+        damp01 = damp01_ui;
+        updateDamping(damp01);
+        prevDmp = damp01;
+      }
+      if (std::fabs(t60Sec - t60_ui) > 1e-4f) {
+        t60Sec = t60_ui;
+        updateFeedbackForT60(t60Sec);
+        prevT60 = t60Sec;
+      }
+      // IMPORTANT: keep module-level width in sync and use UI width in mixing
+      width = width_ui;
+
+      const float wet = std::max(0.0f, std::min(1.0f, mix01));
+      const float dry = 1.0f - wet;
+      const float w   = std::max(0.0f, std::min(1.0f, width_ui)); // use UI width
+      const float wet1 = wet * (w * 0.5f + 0.5f);
+      const float wet2 = wet * ((1.0f - w) * 0.5f);
+
+      for (size_t i = 0; i < n; ++i) {
+        const float inDry = x[i];
+        const float inToTank = inDry * kFixedGain;
+
+        float sumL = 0.0f, sumR = 0.0f;
+        for (int c = 0; c < kNumCombs; ++c) {
+          sumL += procComb(comb[0][c], inToTank);
+          sumR += procComb(comb[1][c], inToTank);
+        }
+
+        float outL = sumL, outR = sumR;
+        for (int a = 0; a < kNumAP; ++a) {
+          outL = procAllpass(ap[0][a], outL);
+          outR = procAllpass(ap[1][a], outR);
+        }
+
+        const float L = outL * wet1 + outR * wet2 + dry * inDry;
+        const float R = outR * wet1 + outL * wet2 + dry * inDry;
+
+        outLR[2*i + 0] = L;
+        outLR[2*i + 1] = R;
+      }
+    }
+  };
+
+  static Freeverb48Stereo R;
+  if (n == 0) return;
+  R.process(inMono, outLRInterleaved, n);
+}
+
+static void ReverbReset() {
+  // Zero the primary static instance by calling process with zeroed buffers and then resetting internals
+  // We keep a mirror instance to reach reset() safely.
+  struct Mirror {
+    struct Comb { std::vector<float> buf; int idx; float filterStore; float feedback; float damp1, damp2; };
+    struct Allpass { std::vector<float> buf; int idx; };
+    Comb comb[2][kNumCombs];
+    Allpass ap[2][kNumAP];
+    void reset() {
+      for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < kNumCombs; ++i) {
+          std::fill(comb[ch][i].buf.begin(), comb[ch][i].buf.end(), 0.0f);
+          comb[ch][i].idx = 0;
+          comb[ch][i].filterStore = 0.0f;
+        }
+        for (int i = 0; i < kNumAP; ++i) {
+          std::fill(ap[ch][i].buf.begin(), ap[ch][i].buf.end(), 0.0f);
+          ap[ch][i].idx = 0;
+        }
+      }
+    }
+  };
+  static Mirror m;
+  m.reset();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ───────────────────────── KNOB WEB UI (SEPARATE WINDOW VIA BROWSER) ─────────────────────────
 // Add these functions anywhere after the globals (they reference gKnobs, gStyleMode, gBypass, gGuidedAuto).
 // Call StartKnobWebUI(8088); from main() after printing the "Keys" help (e.g., right before opening PA stream).
@@ -280,27 +571,27 @@ static std::string ui_htmlIndex() {
     <div class="knob">
       <canvas id="knob_main" width="110" height="110"></canvas>
       <div class="label">Main</div>
-      <div class="value"><span id="val_main">0</span> dB</div>
+      <div class="value"><span id="val_main">__DEF_MAIN_DB__</span> dB</div>
     </div>
     <div class="knob">
       <canvas id="knob_pa" width="110" height="110"></canvas>
       <div class="label">Pick Attack</div>
-      <div class="value"><span id="val_pa">0</span> dB</div>
+      <div class="value"><span id="val_pa">__DEF_PA_DB__</span> dB</div>
     </div>
     <div class="knob">
       <canvas id="knob_pr" width="110" height="110"></canvas>
       <div class="label">Pick Resonance</div>
-      <div class="value"><span id="val_pr">0</span> dB</div>
+      <div class="value"><span id="val_pr">__DEF_PR_DB__</span> dB</div>
     </div>
     <div class="knob">
       <canvas id="knob_ir" width="110" height="110"></canvas>
       <div class="label">IR Gain</div>
-      <div class="value"><span id="val_ir">0</span> dB</div>
+      <div class="value"><span id="val_ir">__DEF_IR_DB__</span> dB</div>
     </div>
     <div class="knob">
       <canvas id="knob_wet" width="110" height="110"></canvas>
       <div class="label">Wet</div>
-      <div class="value"><span id="val_wet">100</span> %</div>
+      <div class="value"><span id="val_wet">__DEF_WET_PCT__</span> %</div>
     </div>
   </div>
 
@@ -312,10 +603,10 @@ static std::string ui_htmlIndex() {
         <div class="knob">
           <canvas id="knob_outg" width="110" height="110"></canvas>
           <div class="label">Output Gain</div>
-          <div class="value"><span id="val_outg">0</span> dB</div>
+          <div class="value"><span id="val_outg">__DEF_OUTG_DB__</span> dB</div>
         </div>
         <div class="panel" style="display:flex;align-items:center;justify-content:center;gap:10px;min-width:200px;">
-          <div class="btn" id="btnPhase">Phase Invert: OFF</div>
+          <div class="btn" id="btnPhase">Phase Invert: __DEF_PHASE_TEXT__</div>
         </div>
       </div>
     </div>
@@ -329,12 +620,12 @@ static std::string ui_htmlIndex() {
         <div class="knob">
           <canvas id="knob_lc_hz" width="110" height="110"></canvas>
           <div class="label">Low Cut Hz</div>
-          <div class="value"><span id="val_lc_hz">20</span> Hz</div>
+          <div class="value"><span id="val_lc_hz">__DEF_LC_HZ__</span> Hz</div>
         </div>
         <div class="knob">
           <canvas id="knob_lc_slope" width="110" height="110"></canvas>
           <div class="label">Low Cut Slope</div>
-          <div class="value"><span id="val_lc_slope">6</span> dB/oct</div>
+          <div class="value"><span id="val_lc_slope">__DEF_LC_SLOPE__</span> dB/oct</div>
         </div>
       </div>
 
@@ -342,17 +633,17 @@ static std::string ui_htmlIndex() {
         <div class="knob">
           <canvas id="knob_ls_gain" width="110" height="110"></canvas>
           <div class="label">Low Shelf Gain</div>
-          <div class="value"><span id="val_ls_gain">0</span> dB</div>
+          <div class="value"><span id="val_ls_gain">__DEF_LS_GAIN__</span> dB</div>
         </div>
         <div class="knob">
           <canvas id="knob_ls_hz" width="110" height="110"></canvas>
           <div class="label">Low Shelf Hz</div>
-          <div class="value"><span id="val_ls_hz">200</span> Hz</div>
+          <div class="value"><span id="val_ls_hz">__DEF_LS_HZ__</span> Hz</div>
         </div>
         <div class="knob">
           <canvas id="knob_ls_slope" width="110" height="110"></canvas>
           <div class="label">Low Shelf Slope</div>
-          <div class="value"><span id="val_ls_slope">12</span> dB/oct</div>
+          <div class="value"><span id="val_ls_slope">__DEF_LS_SLOPE__</span> dB/oct</div>
         </div>
       </div>
 
@@ -360,17 +651,17 @@ static std::string ui_htmlIndex() {
         <div class="knob">
           <canvas id="knob_mid_gain" width="110" height="110"></canvas>
           <div class="label">Mid Gain</div>
-          <div class="value"><span id="val_mid_gain">0</span> dB</div>
+          <div class="value"><span id="val_mid_gain">__DEF_MID_GAIN__</span> dB</div>
         </div>
         <div class="knob">
           <canvas id="knob_mid_hz" width="110" height="110"></canvas>
           <div class="label">Mid Hz</div>
-          <div class="value"><span id="val_mid_hz">1000</span> Hz</div>
+          <div class="value"><span id="val_mid_hz">__DEF_MID_HZ__</span> Hz</div>
         </div>
         <div class="knob">
           <canvas id="knob_mid_q" width="110" height="110"></canvas>
           <div class="label">Mid Q</div>
-          <div class="value"><span id="val_mid_q">1.00</span></div>
+          <div class="value"><span id="val_mid_q">__DEF_MID_Q__</span></div>
         </div>
       </div>
 
@@ -378,18 +669,46 @@ static std::string ui_htmlIndex() {
         <div class="knob">
           <canvas id="knob_hs_gain" width="110" height="110"></canvas>
           <div class="label">High Shelf Gain</div>
-          <div class="value"><span id="val_hs_gain">0</span> dB</div>
+          <div class="value"><span id="val_hs_gain">__DEF_HS_GAIN__</span> dB</div>
         </div>
         <div class="knob">
           <canvas id="knob_hs_hz" width="110" height="110"></canvas>
           <div class="label">High Shelf Hz</div>
-          <div class="value"><span id="val_hs_hz">4000</span> Hz</div>
+          <div class="value"><span id="val_hs_hz">__DEF_HS_HZ__</span> Hz</div>
         </div>
         <div class="knob">
           <canvas id="knob_hs_slope" width="110" height="110"></canvas>
           <div class="label">High Shelf Slope</div>
-          <div class="value"><span id="val_hs_slope">12</span> dB/oct</div>
+          <div class="value"><span id="val_hs_slope">__DEF_HS_SLOPE__</span> dB/oct</div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Reverb -->
+  <div class="grid">
+    <div class="panel">
+      <div class="row"><div class="title">Hall Reverb</div></div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_rvb_mix" width="110" height="110"></canvas>
+          <div class="label">Mix</div>
+          <div class="value"><span id="val_rvb_mix">__DEF_RVB_MIX__</span> %</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_rvb_t60" width="110" height="110"></canvas>
+          <div class="label">Decay</div>
+          <div class="value"><span id="val_rvb_t60">__DEF_RVB_T60__</span> s</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_rvb_damp" width="110" height="110"></canvas>
+          <div class="label">Damp</div>
+          <div class="value"><span id="val_rvb_damp">__DEF_RVB_DAMP__</span> %</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_rvb_width" width="110" height="110"></canvas>
+          <div class="label">Width</div>
+          <div class="value"><span id="val_rvb_width">__DEF_RVB_WIDTH__</span> %</div>
       </div>
     </div>
   </div>
@@ -450,7 +769,7 @@ class Knob {
     window.addEventListener('resize', () => this.draw());
   }
   set(v, fire=true){
-    const nv = Math.round(clamp(v, this.min, this.max)/this.step)*this.step;
+    const nv = Math.round((clamp(v, this.min, this.max))/this.step)*this.step;
     if (nv !== this.value){
       this.value = nv;
       if (this.displayEl) this.displayEl.textContent = nv.toFixed(this.prec);
@@ -461,32 +780,16 @@ class Knob {
       if (fire) this.oninput(this.value);
     }
   }
-  startDrag(e){
-    e.preventDefault();
-    this.dragging = true;
-    this.lastY = e.clientY;
-    this.lastX = e.clientX;
-    this.startVal = this.value;
-    this._pxAccum = 0;
-  }
+  startDrag(e){ e.preventDefault(); this.dragging = true; this.lastY = e.clientY; this.lastX = e.clientX; this.startVal = this.value; }
   moveDrag(e){
     if (!this.dragging) return;
     const dx = e.clientX - this.lastX;
     const dy = this.lastY - e.clientY;
-    this.lastX = e.clientX;
-    this.lastY = e.clientY;
-
+    this.lastX = e.clientX; this.lastY = e.clientY;
     const useX = Math.abs(dx) > Math.abs(dy);
     const pix = useX ? dx : dy;
-
     const range = this.max - this.min;
-    const stepNorm = (this.step && range > 0) ? (this.step / range) : 0;
-    let effSens = this.sens;
-    if (stepNorm >= 0.1) {
-      effSens = this.sens / stepNorm;
-    }
-
-    const delta = pix * effSens * range / 200.0;
+    const delta = pix * this.sens * range / 200.0;
     this.set(this.value + delta, true);
   }
   endDrag(e){ if (!this.dragging) return; this.dragging = false; }
@@ -494,13 +797,15 @@ class Knob {
   onDoubleClick(e){
     const id = this.c.id;
     const defaults = {
-      'knob_main': 0,
-      'knob_pa': 0, 'knob_pr': 0, 'knob_ir': 0, 'knob_wet': 100,
-      'knob_outg': 0,
-      'knob_lc_hz': 20, 'knob_lc_slope': 6,
-      'knob_ls_gain': 0, 'knob_ls_hz': 200, 'knob_ls_slope': 12,
-      'knob_mid_gain': 0, 'knob_mid_hz': 1000, 'knob_mid_q': 1.0,
-      'knob_hs_gain': 0, 'knob_hs_hz': 4000, 'knob_hs_slope': 12
+      'knob_main': __DEF_MAIN_DB__,
+      'knob_pa': __DEF_PA_DB__, 'knob_pr': __DEF_PR_DB__, 'knob_ir': __DEF_IR_DB__, 'knob_wet': __DEF_WET_PCT__,
+      'knob_outg': __DEF_OUTG_DB__,
+      'knob_lc_hz': __DEF_LC_HZ__, 'knob_lc_slope': __DEF_LC_SLOPE__,
+      'knob_ls_gain': __DEF_LS_GAIN__, 'knob_ls_hz': __DEF_LS_HZ__, 'knob_ls_slope': __DEF_LS_SLOPE__,
+      'knob_mid_gain': __DEF_MID_GAIN__, 'knob_mid_hz': __DEF_MID_HZ__, 'knob_mid_q': __DEF_MID_Q__,
+      'knob_hs_gain': __DEF_HS_GAIN__, 'knob_hs_hz': __DEF_HS_HZ__, 'knob_hs_slope': __DEF_HS_SLOPE__,
+      'knob_rvb_mix': __DEF_RVB_MIX__, 'knob_rvb_t60': __DEF_RVB_T60__, 'knob_rvb_damp': __DEF_RVB_DAMP__,
+      'knob_rvb_width': __DEF_RVB_WIDTH__
     };
     const defv = (id in defaults) ? defaults[id] : ( (this.min === 0 && this.max === 100) ? 100 : 0 );
     this.set(defv, true);
@@ -552,28 +857,33 @@ const $btnBypass = el('btnBypass');
 const $btnPhase  = el('btnPhase');
 
 const kb = {
-  main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
-  pa: new Knob(el('knob_pa'),  {min:-MAX_PICK_ATTACK_KNOB_CHANGE,max:MAX_PICK_ATTACK_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_pa'),color:'#ffcc00', onchange:(v)=>sendSet({pa:v})}),
-  pr: new Knob(el('knob_pr'),  {min:-MAX_PICK_RESO_KNOB_CHANGE,max:MAX_PICK_RESO_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_pr'),color:'#ff7f50', onchange:(v)=>sendSet({pr:v})}),
-  ir: new Knob(el('knob_ir'),  {min:-MAX_IR_KNOB_CHANGE,max:MAX_IR_KNOB_CHANGE,step:1,value:0,prec:0,displayEl:el('val_ir'),color:'#7ee787', onchange:(v)=>sendSet({ir:v})}),
-  wet:new Knob(el('knob_wet'), {min:0,max:100,step:1,value:100,prec:0,displayEl:el('val_wet'),color:'#00d1ff', onchange:(v)=>sendSet({wet:v})}),
+  main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:__DEF_MAIN_DB__,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
+  pa: new Knob(el('knob_pa'),  {min:-MAX_PICK_ATTACK_KNOB_CHANGE,max:MAX_PICK_ATTACK_KNOB_CHANGE,step:1,value:__DEF_PA_DB__,prec:0,displayEl:el('val_pa'),color:'#ffcc00', onchange:(v)=>sendSet({pa:v})}),
+  pr: new Knob(el('knob_pr'),  {min:-MAX_PICK_RESO_KNOB_CHANGE,max:MAX_PICK_RESO_KNOB_CHANGE,step:1,value:__DEF_PR_DB__,prec:0,displayEl:el('val_pr'),color:'#ff7f50', onchange:(v)=>sendSet({pr:v})}),
+  ir: new Knob(el('knob_ir'),  {min:-MAX_IR_KNOB_CHANGE,max:MAX_IR_KNOB_CHANGE,step:1,value:__DEF_IR_DB__,prec:0,displayEl:el('val_ir'),color:'#7ee787', onchange:(v)=>sendSet({ir:v})}),
+  wet:new Knob(el('knob_wet'), {min:0,max:100,step:1,value:__DEF_WET_PCT__,prec:0,displayEl:el('val_wet'),color:'#00d1ff', onchange:(v)=>sendSet({wet:v})}),
 
-  outg: new Knob(el('knob_outg'), {min:-24,max:24,step:1,value:0,prec:0,displayEl:el('val_outg'),color:'#c586f7', onchange:(v)=>sendSet({outg:v})}),
+  outg: new Knob(el('knob_outg'), {min:-24,max:24,step:1,value:__DEF_OUTG_DB__,prec:0,displayEl:el('val_outg'),color:'#c586f7', onchange:(v)=>sendSet({outg:v})}),
 
-  lc_hz:    new Knob(el('knob_lc_hz'),    {min:10,max:300,step:1,value:20,prec:0,displayEl:el('val_lc_hz'),color:'#e5c07b', onchange:(v)=>sendSet({lc_hz:v})}),
-  lc_slope: new Knob(el('knob_lc_slope'), {min:6,max:36,step:6,value:6,prec:0,displayEl:el('val_lc_slope'),color:'#e5c07b', onchange:(v)=>sendSet({lc_slope:v})}),
+  lc_hz:    new Knob(el('knob_lc_hz'),    {min:10,max:300,step:1,value:__DEF_LC_HZ__,prec:0,displayEl:el('val_lc_hz'),color:'#e5c07b', onchange:(v)=>sendSet({lc_hz:v})}),
+  lc_slope: new Knob(el('knob_lc_slope'), {min:6,max:36,step:6,value:__DEF_LC_SLOPE__,prec:0,displayEl:el('val_lc_slope'),color:'#e5c07b', onchange:(v)=>sendSet({lc_slope:v})}),
 
-  ls_gain:  new Knob(el('knob_ls_gain'),  {min:-18,max:18,step:1,value:0,prec:0,displayEl:el('val_ls_gain'),color:'#98c379', onchange:(v)=>sendSet({ls_gain:v})}),
-  ls_hz:    new Knob(el('knob_ls_hz'),    {min:50,max:1000,step:5,value:200,prec:0,displayEl:el('val_ls_hz'),color:'#98c379', onchange:(v)=>sendSet({ls_hz:v})}),
-  ls_slope: new Knob(el('knob_ls_slope'), {min:6,max:36,step:6,value:12,prec:0,displayEl:el('val_ls_slope'),color:'#98c379', onchange:(v)=>sendSet({ls_slope:v})}),
+  ls_gain:  new Knob(el('knob_ls_gain'),  {min:-18,max:18,step:1,value:__DEF_LS_GAIN__,prec:0,displayEl:el('val_ls_gain'),color:'#98c379', onchange:(v)=>sendSet({ls_gain:v})}),
+  ls_hz:    new Knob(el('knob_ls_hz'),    {min:50,max:1000,step:5,value:__DEF_LS_HZ__,prec:0,displayEl:el('val_ls_hz'),color:'#98c379', onchange:(v)=>sendSet({ls_hz:v})}),
+  ls_slope: new Knob(el('knob_ls_slope'), {min:6,max:36,step:6,value:__DEF_LS_SLOPE__,prec:0,displayEl:el('val_ls_slope'),color:'#98c379', onchange:(v)=>sendSet({ls_slope:v})}),
 
-  mid_gain: new Knob(el('knob_mid_gain'), {min:-18,max:18,step:1,value:0,prec:0,displayEl:el('val_mid_gain'),color:'#61afef', onchange:(v)=>sendSet({mid_gain:v})}),
-  mid_hz:   new Knob(el('knob_mid_hz'),   {min:200,max:6000,step:10,value:1000,prec:0,displayEl:el('val_mid_hz'),color:'#61afef', onchange:(v)=>sendSet({mid_hz:v})}),
-  mid_q:    new Knob(el('knob_mid_q'),    {min:0.5,max:2.0,step:0.05,value:1.0,prec:2,displayEl:el('val_mid_q'),color:'#61afef', onchange:(v)=>sendSet({mid_q:v})}),
+  mid_gain: new Knob(el('knob_mid_gain'), {min:-18,max:18,step:1,value:__DEF_MID_GAIN__,prec:0,displayEl:el('val_mid_gain'),color:'#61afef', onchange:(v)=>sendSet({mid_gain:v})}),
+  mid_hz:   new Knob(el('knob_mid_hz'),   {min:200,max:6000,step:10,value:__DEF_MID_HZ__,prec:0,displayEl:el('val_mid_hz'),color:'#61afef', onchange:(v)=>sendSet({mid_hz:v})}),
+  mid_q:    new Knob(el('knob_mid_q'),    {min:0.5,max:2.0,step:0.05,value:__DEF_MID_Q__,prec:2,displayEl:el('val_mid_q'),color:'#61afef', onchange:(v)=>sendSet({mid_q:v})}),
 
-  hs_gain:  new Knob(el('knob_hs_gain'),  {min:-18,max:18,step:1,value:0,prec:0,displayEl:el('val_hs_gain'),color:'#d19a66', onchange:(v)=>sendSet({hs_gain:v})}),
-  hs_hz:    new Knob(el('knob_hs_hz'),    {min:2000,max:16000,step:50,value:4000,prec:0,displayEl:el('val_hs_hz'),color:'#d19a66', onchange:(v)=>sendSet({hs_hz:v})}),
-  hs_slope: new Knob(el('knob_hs_slope'), {min:6,max:36,step:6,value:12,prec:0,displayEl:el('val_hs_slope'),color:'#d19a66', onchange:(v)=>sendSet({hs_slope:v})}),
+  hs_gain:  new Knob(el('knob_hs_gain'),  {min:-18,max:18,step:1,value:__DEF_HS_GAIN__,prec:0,displayEl:el('val_hs_gain'),color:'#d19a66', onchange:(v)=>sendSet({hs_gain:v})}),
+  hs_hz:    new Knob(el('knob_hs_hz'),    {min:2000,max:16000,step:50,value:__DEF_HS_HZ__,prec:0,displayEl:el('val_hs_hz'),color:'#d19a66', onchange:(v)=>sendSet({hs_hz:v})}),
+  hs_slope: new Knob(el('knob_hs_slope'), {min:6,max:36,step:6,value:__DEF_HS_SLOPE__,prec:0,displayEl:el('val_hs_slope'),color:'#d19a66', onchange:(v)=>sendSet({hs_slope:v})}),
+
+  rvb_mix:  new Knob(el('knob_rvb_mix'),  {min:0,max:100,step:1,value:__DEF_RVB_MIX__,prec:0,displayEl:el('val_rvb_mix'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mix:v})}),
+  rvb_t60:  new Knob(el('knob_rvb_t60'),  {min:0.1,max:12.0,step:0.1,value:__DEF_RVB_T60__,prec:1,displayEl:el('val_rvb_t60'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_t60:v})}),
+  rvb_damp: new Knob(el('knob_rvb_damp'), {min:0,max:100,step:1,value:__DEF_RVB_DAMP__,prec:0,displayEl:el('val_rvb_damp'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_damp:v})}),
+  rvb_width: new Knob(el('knob_rvb_width'), {min:0,max:100,step:1,value:__DEF_RVB_WIDTH__,prec:0,displayEl:el('val_rvb_width'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_width:v})}),
 };
 
 function sendSet(obj) {
@@ -602,6 +912,12 @@ function sendSet(obj) {
   if ('hs_slope' in obj) params.set('hs_slope', obj.hs_slope);
 
   if ('phase' in obj) params.set('phase', obj.phase ? 1 : 0);
+
+  // Reverb
+  if ('rvb_mix' in obj) params.set('rvb_mix', obj.rvb_mix);
+  if ('rvb_t60' in obj) params.set('rvb_t60', obj.rvb_t60);
+  if ('rvb_damp' in obj) params.set('rvb_damp', obj.rvb_damp);
+  if ('rvb_width' in obj) params.set('rvb_width', obj.rvb_width);
 
   fetch('/set?' + params.toString()).catch(()=>{});
 }
@@ -650,6 +966,12 @@ function applyStatus(s){
   kb.hs_hz.set(s.hs_hz, false);
   kb.hs_slope.set(s.hs_slope_dbpoct, false);
 
+  // Reverb
+  if ('rvb_mix_pct' in s) kb.rvb_mix.set(s.rvb_mix_pct, false);
+  if ('rvb_t60_sec' in s) kb.rvb_t60.set(s.rvb_t60_sec, false);
+  if ('rvb_damp_pct' in s) kb.rvb_damp.set(s.rvb_damp_pct, false);
+  if ('rvb_width_pct' in s) kb.rvb_width.set(s.rvb_width_pct, false);
+
   // Phase switch
   const phaseOn = (s.phaseInvert01 >= 0.5);
   $btnPhase.textContent = 'Phase Invert: ' + (phaseOn ? 'ON' : 'OFF');
@@ -692,41 +1014,48 @@ poll();
 
 static std::string ui_jsonStatus() {
   std::ostringstream oss;
-  oss.setf(std::ios::fixed); oss<<std::setprecision(3);
-  oss<<"{";
+  oss << "{";
   // stems
-  oss<<"\"main_dB\":"     << gKnobs.main_dB.load()     <<",";
-  oss<<"\"pickAttack_dB\":"<< gKnobs.pickAttack_dB.load() <<",";
-  oss<<"\"pickReso_dB\":"<< gKnobs.pickReso_dB.load() <<",";
-  oss<<"\"ir_dB\":"      << gKnobs.ir_dB.load()        <<",";
-  oss<<"\"wet_pct\":"    << gKnobs.wet_pct.load()      <<",";
+  oss << "\"main_dB\":"      << gKnobs.main_dB.load()        << ",";
+  oss << "\"pickAttack_dB\":"<< gKnobs.pickAttack_dB.load()  << ",";
+  oss << "\"pickReso_dB\":"  << gKnobs.pickReso_dB.load()    << ",";
+  oss << "\"ir_dB\":"        << gKnobs.ir_dB.load()          << ",";
+  oss << "\"wet_pct\":"      << gKnobs.wet_pct.load()        << ",";
 
   // Output / phase
-  oss<<"\"outGain_dB\":"     << gKnobs.outGain_dB.load()          <<",";
-  oss<<"\"phaseInvert01\":"  << gKnobs.phaseInvert01.load()       <<",";
+  oss << "\"outGain_dB\":"   << gKnobs.outGain_dB.load()     << ",";
+  oss << "\"phaseInvert01\":"<< gKnobs.phaseInvert01.load()  << ",";
 
   // Master EQ
-  oss<<"\"lc_hz\":"          << gKnobs.lc_hz.load()               <<",";
-  oss<<"\"lc_slope_dbpoct\":"<< gKnobs.lc_slope_dbpoct.load()     <<",";
+  oss << "\"lc_hz\":"        << gKnobs.lc_hz.load()          << ",";
+  oss << "\"lc_slope_dbpoct\":"<< gKnobs.lc_slope_dbpoct.load() << ",";
 
-  oss<<"\"ls_gain_db\":"     << gKnobs.ls_gain_db.load()          <<",";
-  oss<<"\"ls_hz\":"          << gKnobs.ls_hz.load()               <<",";
-  oss<<"\"ls_slope_dbpoct\":"<< gKnobs.ls_slope_dbpoct.load()     <<",";
+  oss << "\"ls_gain_db\":"   << gKnobs.ls_gain_db.load()     << ",";
+  oss << "\"ls_hz\":"        << gKnobs.ls_hz.load()          << ",";
+  oss << "\"ls_slope_dbpoct\":"<< gKnobs.ls_slope_dbpoct.load() << ",";
 
-  oss<<"\"mid_gain_db\":"    << gKnobs.mid_gain_db.load()         <<",";
-  oss<<"\"mid_hz\":"         << gKnobs.mid_hz.load()              <<",";
-  oss<<"\"mid_q\":"          << gKnobs.mid_q.load()               <<",";
+  oss << "\"mid_gain_db\":"  << gKnobs.mid_gain_db.load()    << ",";
+  oss << "\"mid_hz\":"       << gKnobs.mid_hz.load()         << ",";
+  oss << "\"mid_q\":"        << gKnobs.mid_q.load()          << ",";
 
-  oss<<"\"hs_gain_db\":"     << gKnobs.hs_gain_db.load()          <<",";
-  oss<<"\"hs_hz\":"          << gKnobs.hs_hz.load()               <<",";
-  oss<<"\"hs_slope_dbpoct\":"<< gKnobs.hs_slope_dbpoct.load()     <<",";
+  oss << "\"hs_gain_db\":"   << gKnobs.hs_gain_db.load()     << ",";
+  oss << "\"hs_hz\":"        << gKnobs.hs_hz.load()          << ",";
+  oss << "\"hs_slope_dbpoct\":"<< gKnobs.hs_slope_dbpoct.load() << ",";
+
+  // Reverb
+  float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0;
+  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+  oss << "\"rvb_mix_pct\":"  << rvb_mix   << ",";
+  oss << "\"rvb_t60_sec\":"  << rvb_t60   << ",";
+  oss << "\"rvb_damp_pct\":" << rvb_damp  << ",";
+  oss << "\"rvb_width_pct\":"<< rvb_width << ",";
 
   // switches/mode
-  oss<<"\"bypass\":"     << (gBypass.load()?1:0)       <<",";
-  oss<<"\"mode\":"       << gStyleMode.load()          <<",";
-  oss<<"\"modeName\":"   << ui_styleModeName_jsonsafe() <<",";
-  oss<<"\"guidedAuto\":" << (gGuidedAuto.load()?1:0);
-  oss<<"}";
+  oss << "\"bypass\":"       << (gBypass.load()?1:0) << ",";
+  oss << "\"mode\":"         << gStyleMode.load()    << ",";
+  oss << "\"modeName\":"     << ui_styleModeName_jsonsafe() << ",";
+  oss << "\"guidedAuto\":"   << (gGuidedAuto.load()?1:0);
+  oss << "}";
   return oss.str();
 }
 
@@ -867,6 +1196,15 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   gKnobs.hs_gain_db.store(hs_g);
   gKnobs.hs_hz.store(hs_h);
   gKnobs.hs_slope_dbpoct.store(hs_s);
+
+  // Reverb (partial updates allowed)
+  float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f;
+  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+  getf("rvb_mix",  rvb_mix, 0.0f, 100.0f);
+  getf("rvb_t60",  rvb_t60, 0.10f, 12.0f);
+  getf("rvb_damp", rvb_damp, 0.0f, 100.0f);
+  getf("rvb_width", rvb_width, 0.0f, 100.0f);
+  ReverbUISet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
 }
 
 static inline void ui_handleMode(const std::unordered_map<std::string,std::string>& q) {
@@ -906,6 +1244,25 @@ static inline void ui_replaceAll(std::string &s, const std::string& from, const 
   }
 }
 
+static inline std::string fmtInt(float v) {
+  int iv = static_cast<int>(std::lround(v));
+  return std::to_string(iv);
+}
+static inline std::string fmtFloatTrim(float v, int prec) {
+  std::ostringstream os;
+  os.setf(std::ios::fixed);
+  os << std::setprecision(prec) << v;
+  std::string s = os.str();
+  if (prec > 0) {
+    size_t dot = s.find('.');
+    if (dot != std::string::npos) {
+      while (!s.empty() && s.back() == '0') s.pop_back();
+      if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+  }
+  return s;
+}
+
 static void ui_handleClient(int cfd) {
   // Read basic HTTP request (up to headers end). Limit to 16KB
   std::string req; req.resize(0);
@@ -941,12 +1298,71 @@ static void ui_handleClient(int cfd) {
   if (qpos != std::string::npos) { path = uri.substr(0,qpos); query = uri.substr(qpos+1); }
 
   // Routes
-  if (method == "GET" && (path == "/" || path == "/index.html")) {
+    if (method == "GET" && (path == "/" || path == "/index.html")) {
     std::string body = ui_htmlIndex();
+
+    // Limits
     ui_replaceAll(body, "__MAX_MAIN_KNOB_CHANGE__", std::to_string(MAX_MAIN_KNOB_CHANGE));
     ui_replaceAll(body, "__MAX_PICK_ATTACK_KNOB_CHANGE__", std::to_string(MAX_PICK_ATTACK_KNOB_CHANGE));
     ui_replaceAll(body, "__MAX_PICK_RESO_KNOB_CHANGE__", std::to_string(MAX_PICK_RESO_KNOB_CHANGE));
     ui_replaceAll(body, "__MAX_IR_KNOB_CHANGE__", std::to_string(MAX_IR_KNOB_CHANGE));
+
+    // Current defaults from back-end
+    const float def_main = gKnobs.main_dB.load();
+    const float def_pa   = gKnobs.pickAttack_dB.load();
+    const float def_pr   = gKnobs.pickReso_dB.load();
+    const float def_ir   = gKnobs.ir_dB.load();
+    const float def_wet  = gKnobs.wet_pct.load();
+    const float def_outg = gKnobs.outGain_dB.load();
+    const float def_phase= gKnobs.phaseInvert01.load();
+
+    const float def_lc_hz   = gKnobs.lc_hz.load();
+    const float def_lc_slope= gKnobs.lc_slope_dbpoct.load();
+
+    const float def_ls_gain = gKnobs.ls_gain_db.load();
+    const float def_ls_hz   = gKnobs.ls_hz.load();
+    const float def_ls_slope= gKnobs.ls_slope_dbpoct.load();
+
+    const float def_mid_gain= gKnobs.mid_gain_db.load();
+    const float def_mid_hz  = gKnobs.mid_hz.load();
+    const float def_mid_q   = gKnobs.mid_q.load();
+
+    const float def_hs_gain = gKnobs.hs_gain_db.load();
+    const float def_hs_hz   = gKnobs.hs_hz.load();
+    const float def_hs_slope= gKnobs.hs_slope_dbpoct.load();
+
+    float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0;
+    ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width);
+
+    // Inject formatted defaults (integers where appropriate)
+    ui_replaceAll(body, "__DEF_MAIN_DB__",   fmtInt(def_main));
+    ui_replaceAll(body, "__DEF_PA_DB__",     fmtInt(def_pa));
+    ui_replaceAll(body, "__DEF_PR_DB__",     fmtInt(def_pr));
+    ui_replaceAll(body, "__DEF_IR_DB__",     fmtInt(def_ir));
+    ui_replaceAll(body, "__DEF_WET_PCT__",   fmtInt(def_wet));
+
+    ui_replaceAll(body, "__DEF_OUTG_DB__",   fmtInt(def_outg));
+    ui_replaceAll(body, "__DEF_PHASE_TEXT__", (def_phase >= 0.5f) ? "ON" : "OFF");
+
+    ui_replaceAll(body, "__DEF_LC_HZ__",     fmtInt(def_lc_hz));
+    ui_replaceAll(body, "__DEF_LC_SLOPE__",  fmtInt(def_lc_slope));
+
+    ui_replaceAll(body, "__DEF_LS_GAIN__",   fmtInt(def_ls_gain));
+    ui_replaceAll(body, "__DEF_LS_HZ__",     fmtInt(def_ls_hz));
+    ui_replaceAll(body, "__DEF_LS_SLOPE__",  fmtInt(def_ls_slope));
+
+    ui_replaceAll(body, "__DEF_MID_GAIN__",  fmtInt(def_mid_gain));
+    ui_replaceAll(body, "__DEF_MID_HZ__",    fmtInt(def_mid_hz));
+    ui_replaceAll(body, "__DEF_MID_Q__",     fmtFloatTrim(def_mid_q, 2));
+
+    ui_replaceAll(body, "__DEF_HS_GAIN__",   fmtInt(def_hs_gain));
+    ui_replaceAll(body, "__DEF_HS_HZ__",     fmtInt(def_hs_hz));
+    ui_replaceAll(body, "__DEF_HS_SLOPE__",  fmtInt(def_hs_slope));
+
+    ui_replaceAll(body, "__DEF_RVB_MIX__",   fmtInt(rvb_mix));
+    ui_replaceAll(body, "__DEF_RVB_T60__",   fmtFloatTrim(rvb_t60, 1));
+    ui_replaceAll(body, "__DEF_RVB_DAMP__",  fmtInt(rvb_damp));
+    ui_replaceAll(body, "__DEF_RVB_WIDTH__", fmtInt(rvb_width));
 
     std::string h = ui_httpHeader("200 OK", "text/html; charset=utf-8", body.size());
     ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
@@ -1118,6 +1534,39 @@ struct RingBuffer {
     return toR;
   }
 };
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 struct Shared {
   RingBuffer in, out;
@@ -1971,6 +2420,8 @@ static int paCallback(const void *inputBuffer,
       s_prevInputAdcTime = 0.0;
       s_lastBypassEpoch = curEpoch;
       s_lastBypass = curBypass;
+      // Reset reverb tail on any bypass edge
+      ReverbReset();
     }
   }
 
@@ -1994,10 +2445,10 @@ static int paCallback(const void *inputBuffer,
   float *temp = sh->tempOut.data();
   size_t got  = sh->out.pop(temp, hop);
   if (got < hop) std::memset(temp+got, 0, sizeof(float)*(hop-got));
-  for (size_t i=0;i<hop;i++){
-    float v = temp[i];
-    out[2*i] = v; out[2*i+1] = v;
-  }
+
+  // Process with stereo hall reverb (mono -> stereo), tuned for 48 kHz
+  ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
+
   return paContinue;
 }
 
