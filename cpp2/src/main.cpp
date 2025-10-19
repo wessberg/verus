@@ -144,8 +144,23 @@ struct Knobs {
 
   // Output gain (dB → converted to linear for TFLite input)
   std::atomic<float> outGain_dB{-3.0f};
+
   // Phase invert switch: 0.0 = normal, 1.0 = inverted
   std::atomic<int> phaseInvert01{0};
+
+  // Noise Gate
+  std::atomic<int> ng_enabled{0};
+  std::atomic<float> ng_threshold_db{-70.0f};
+  std::atomic<float> ng_hysteresis_db{6.0f};
+  std::atomic<float> ng_range_db{48.0f};
+  std::atomic<float> ng_attack_ms{2.0f};
+  std::atomic<float> ng_release_ms{150.0f};
+  std::atomic<float> ng_hold_ms{400.0f};
+  std::atomic<float> ng_sc_hpf_hz{150.0f};
+
+  // Feedback Protection (frequency shifter)
+  std::atomic<int>   afb_enabled{0};   // 0/1 (OFF by default)
+  std::atomic<float> afb_shift_hz{5.0f}; // Hz
 
   // Low-cut (high-pass)
   std::atomic<float> lc_hz{20.0f};
@@ -175,16 +190,6 @@ struct Knobs {
   std::atomic<float> rvb_lc_hz{250.0f};
   std::atomic<float> rvb_mod_rate{0.30f};
   std::atomic<float> rvb_mod_depth{1.0f};
-
-  // Noise Gate
-  std::atomic<int> ng_enabled{0};
-  std::atomic<float> ng_threshold_db{-70.0f};
-  std::atomic<float> ng_hysteresis_db{6.0f};
-  std::atomic<float> ng_range_db{48.0f};
-  std::atomic<float> ng_attack_ms{2.0f};
-  std::atomic<float> ng_release_ms{150.0f};
-  std::atomic<float> ng_hold_ms{400.0f};
-  std::atomic<float> ng_sc_hpf_hz{150.0f};
 
   // Delay
   std::atomic<int>   dly_enabled{0};            // 0/1
@@ -274,8 +279,6 @@ static constexpr float rvb_lc_max_hz    = 8000.0f;
 static constexpr float rvb_mod_max_rate_hz    = 8.0f;
 static constexpr float rvb_mod_max_depth_ms    = 8.0f;
 static constexpr float rvb_max_decay_sec = 60.0f;
-
-
 
 // Constants
 static constexpr float kFixedGain   = 0.02f; // canonical Freeverb input gain
@@ -732,7 +735,7 @@ static inline float clampf_range(float x, float lo, float hi) { return std::max(
 static void GateUISet(bool on, float thresh_db, float hyst_db, float atk_ms, float rel_ms, float hold_ms, float range_db, float sc_hpf_hz) {
   // Hard limits (sane ranges for acoustic guitar)
   int on_i = on ? 1 : 0;
-  float th = clampf_range(thresh_db, -80.0f, -20.0f);
+  float th = clampf_range(thresh_db, -80.0f, -0.0f);
   float hy = clampf_range(hyst_db,    0.0f,   24.0f);
   float am = clampf_range(atk_ms,     0.10f,  200.0f);
   float rm = clampf_range(rel_ms,     10.0f,  1200.0f);
@@ -1437,6 +1440,126 @@ static void ChorusProcessAddMonoToStereoWet(const float* inMono,
 
 
 
+// Feedback Protection (frequency shifter)
+
+// Limits/defaults for UI
+static constexpr float afb_shift_min_hz = 0.5f;
+static constexpr float afb_shift_max_hz = 12.0f;
+
+// UI atomics (referencing gKnobs)
+static std::atomic<int>&   AFBEnabledStore()     { return gKnobs.afb_enabled; }
+static std::atomic<float>& AFBShiftHzStore()     { return gKnobs.afb_shift_hz; }
+static std::atomic<uint64_t>& AFBResetEpochRef() { static std::atomic<uint64_t> e{0}; return e; }
+static inline void AFBReset() { AFBResetEpochRef().fetch_add(1, std::memory_order_acq_rel); }
+static inline uint64_t AFBGetResetEpoch() { return AFBResetEpochRef().load(std::memory_order_acquire); }
+
+struct FIRHilbert90 {
+  int N = 0;
+  int idx = 0;
+  int half = 0;
+  std::vector<float> h;
+  std::vector<float> z;
+
+  void init(int taps) {
+    int T = taps;
+    if (T < 7) T = 7;
+    if ((T & 1) == 0) T += 1; // ensure odd
+    N = T;
+    h.resize(N);
+    z.assign(N, 0.0f);
+    idx = 0;
+    half = (N - 1) / 2;
+
+    // Windowed ideal Hilbert: h[k] = 2/(pi*k) for odd k, 0 for even/zero, Hanning window
+    for (int n = 0; n < N; ++n) {
+      int k = n - half;
+      float c = 0.0f;
+      if (k != 0 && (k & 1) != 0) {
+        c = 2.0f / (float(M_PI) * float(k));
+      }
+      float w = 0.5f * (1.0f - std::cos(2.0f * float(M_PI) * float(n) / float(N - 1)));
+      h[n] = c * w;
+    }
+  }
+
+  inline float process(float x) {
+    z[idx] = x;
+    float y = 0.0f;
+    int j = idx;
+    for (int n = 0; n < N; ++n) {
+      y += h[n] * z[j];
+      --j; if (j < 0) j = N - 1;
+    }
+    ++idx; if (idx >= N) idx = 0;
+    return y;
+  }
+};
+
+struct AntiFeedbackShifter {
+  FIRHilbert90 hil;
+  std::vector<float> dly;
+  int dlen = 0;
+  int didx = 0;
+
+  float phase = 0.0f;
+  float inc   = 0.0f;
+  float sr    = kSR;
+  bool  inited = false;
+
+  void setSampleRate(float s) { sr = std::max(1000.0f, s); }
+
+  void init() {
+    if (inited) return;
+    hil.init(63); // small, ~0.65 ms group delay
+    dlen = std::max(1, hil.half);
+    dly.assign(dlen, 0.0f);
+    didx = 0;
+    phase = 0.0f;
+    inited = true;
+  }
+
+  void reset() {
+    if (!inited) init();
+    std::fill(dly.begin(), dly.end(), 0.0f);
+    phase = 0.0f;
+  }
+
+  inline float delayProcess(float x) {
+    float y = dly[didx];
+    dly[didx] = x;
+    ++didx; if (didx >= dlen) didx = 0;
+    return y;
+  }
+
+  void setShiftHz(float hz) {
+    float f = clampf(hz, afb_shift_min_hz, afb_shift_max_hz);
+    inc = 2.0f * float(M_PI) * (f / std::max(1.0f, sr));
+  }
+
+  void processBlock(float* x, size_t n, bool enabled) {
+    if (!enabled) return;
+    if (!inited) init();
+    for (size_t i = 0; i < n; ++i) {
+      float xi = x[i];
+      float xh = hil.process(xi);   // approx Hilbert{x} delayed by hil.half samples
+      float xd = delayProcess(xi);  // delay dry by the same group delay
+
+      float c = std::cos(phase);
+      float s = std::sin(phase);
+      float y = xd * c - xh * s;    // Re{ (x + j*H{x}) * e^{j wt} }
+
+      x[i] = std::isfinite(y) ? y : 0.0f;
+
+      phase += inc;
+      if (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
+    }
+  }
+};
+
+
+
+
+
 
 
 
@@ -1586,6 +1709,23 @@ static std::string ui_htmlIndex() {
         </div>
         <div class="panel" style="display:flex;align-items:center;justify-content:center;gap:10px;min-width:200px;">
           <div class="btn" id="btnPhase">Phase Invert: __DEF_PHASE_TEXT__</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+    <!-- Feedback Protection -->
+  <div class="grid">
+    <div class="panel">
+      <div class="row">
+        <div class="title">Feedback Protection</div>
+        <div class="btn" id="btnAFB">Feedback Prot: __DEF_AFB_ENABLED_TEXT__</div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_afb_shift" width="110" height="110"></canvas>
+          <div class="label">Shift</div>
+          <div class="value"><span id="val_afb_shift">__DEF_AFB_SHIFT_HZ__</span> Hz</div>
         </div>
       </div>
     </div>
@@ -1955,17 +2095,24 @@ class Knob {
       'knob_ls_gain': __DEF_LS_GAIN__, 'knob_ls_hz': __DEF_LS_HZ__, 'knob_ls_slope': __DEF_LS_SLOPE__,
       'knob_mid_gain': __DEF_MID_GAIN__, 'knob_mid_hz': __DEF_MID_HZ__, 'knob_mid_q': __DEF_MID_Q__,
       'knob_hs_gain': __DEF_HS_GAIN__, 'knob_hs_hz': __DEF_HS_HZ__, 'knob_hs_slope': __DEF_HS_SLOPE__,
+
+      // Reverb defaults
       'knob_rvb_mix': __DEF_RVB_MIX__, 'knob_rvb_t60': __DEF_RVB_T60__, 'knob_rvb_damp': __DEF_RVB_DAMP__,
       'knob_rvb_width': __DEF_RVB_WIDTH__,
       'knob_rvb_lc_hz': __DEF_RVB_LC_HZ__, 'knob_rvb_mod_rate': __DEF_RVB_MOD_RATE__, 'knob_rvb_mod_depth': __DEF_RVB_MOD_DEPTH__,
+
       // Delay defaults
       'knob_dly_mix': __DEF_DLY_MIX__, 'knob_dly_time': __DEF_DLY_TIME_MS__, 'knob_dly_fb': __DEF_DLY_FEEDBACK__,
       'knob_dly_lowcut': __DEF_DLY_LOWCUT_HZ__, 'knob_dly_highcut': __DEF_DLY_HIGHCUT_HZ__, 'knob_dly_width': __DEF_DLY_WIDTH__,
       'knob_dly_mod_rate': __DEF_DLY_MOD_RATE__, 'knob_dly_mod_depth': __DEF_DLY_MOD_DEPTH__, 'knob_dly_drive': __DEF_DLY_DRIVE_DB__,
+
       // Chorus defaults
       'knob_ch_mix': __DEF_CH_MIX__, 'knob_ch_rate': __DEF_CH_RATE_HZ__,
       'knob_ch_depth': __DEF_CH_DEPTH_MS__, 'knob_ch_delay': __DEF_CH_DELAY_MS__,
       'knob_ch_width': __DEF_CH_WIDTH__, 'knob_ch_fb': __DEF_CH_FEEDBACK__,
+
+      // Feedback Protection defaults
+      'knob_afb_shift': __DEF_AFB_SHIFT_HZ__,
 
       // Gate defaults
       'knob_gate_thresh': __DEF_GATE_THRESH_DB__, 'knob_gate_hyst': __DEF_GATE_HYST_DB__,
@@ -2026,6 +2173,7 @@ const $btnGate   = el('btnGate');
 const $btnDelay = el('btnDelay');
 const $btnDelayPing = el('btnDelayPing');
 const $btnChorus = el('btnChorus');
+const $btnAFB = el('btnAFB');
 
 const kb = {
   main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:__DEF_MAIN_DB__,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
@@ -2079,8 +2227,15 @@ const kb = {
   ch_width: new Knob(el('knob_ch_width'), {min:0,max:100,step:1,value:__DEF_CH_WIDTH__,prec:0,displayEl:el('val_ch_width'),color:'#37c6ff', onchange:(v)=>sendSet({ch_width:v})}),
   ch_fb:    new Knob(el('knob_ch_fb'), {min:0,max:__DEF_CH_FEEDBACK_MAX_PCT__,step:1,value:__DEF_CH_FEEDBACK__,prec:0,displayEl:el('val_ch_fb'),color:'#37c6ff', onchange:(v)=>sendSet({ch_feedback:v})}),
 
+  // Feedback Protection Shift knob
+  afb_shift: new Knob(el('knob_afb_shift'), {
+  min: __DEF_AFB_SHIFT_MIN_HZ__, max: __DEF_AFB_SHIFT_MAX_HZ__, step: 0.1,
+  value: __DEF_AFB_SHIFT_HZ__, prec: 1, displayEl: el('val_afb_shift'),
+  color: '#ff5577', onchange: (v)=>sendSet({afb_shift:v})
+  }),
+
   // Noise Gate knobs
-  gate_thresh: new Knob(el('knob_gate_thresh'), {min:-80,max:-20,step:1,value:__DEF_GATE_THRESH_DB__,prec:0,displayEl:el('val_gate_thresh'),color:'#ffa600', onchange:(v)=>sendSet({gate_thresh:v})}),
+  gate_thresh: new Knob(el('knob_gate_thresh'), {min:-80,max:-0,step:1,value:__DEF_GATE_THRESH_DB__,prec:0,displayEl:el('val_gate_thresh'),color:'#ffa600', onchange:(v)=>sendSet({gate_thresh:v})}),
   gate_hyst:   new Knob(el('knob_gate_hyst'),   {min:0,max:24,step:0.5,value:__DEF_GATE_HYST_DB__,prec:1,displayEl:el('val_gate_hyst'),color:'#ff9e00', onchange:(v)=>sendSet({gate_hyst:v})}),
   gate_range:  new Knob(el('knob_gate_range'),  {min:6,max:90,step:1,value:__DEF_GATE_RANGE_DB__,prec:0,displayEl:el('val_gate_range'),color:'#ff7b00', onchange:(v)=>sendSet({gate_range:v})}),
   gate_attack: new Knob(el('knob_gate_attack'), {min:0.1,max:200,step:0.1,value:__DEF_GATE_ATTACK_MS__,prec:1,displayEl:el('val_gate_attack'),color:'#ff6d00', onchange:(v)=>sendSet({gate_attack:v})}),
@@ -2148,6 +2303,10 @@ function sendSet(obj) {
   if ('ch_width' in obj) params.set('ch_width', obj.ch_width);
   if ('ch_feedback' in obj) params.set('ch_feedback', obj.ch_feedback);
 
+  // Feedback Protection
+  if ('afb_enabled' in obj) params.set('afb_enabled', obj.afb_enabled ? 1 : 0);
+  if ('afb_shift' in obj)   params.set('afb_shift', obj.afb_shift);
+
   // Noise Gate
   if ('gate_enabled' in obj) params.set('gate_enabled', obj.gate_enabled ? 1 : 0);
   if ('gate_thresh' in obj) params.set('gate_thresh', obj.gate_thresh);
@@ -2173,12 +2332,19 @@ $modeSeg.querySelectorAll('.segbtn').forEach(btn=>{
 $btnGuided.addEventListener('click', ()=>{
   const isOn = $btnGuided.classList.contains('on'); setGuided(!isOn);
 });
+
 $btnBypass.addEventListener('click', ()=>{
   const isOn = $btnBypass.classList.contains('on'); setBypass(!isOn);
 });
+
 $btnPhase.addEventListener('click', ()=>{
   const isOn = $btnPhase.classList.contains('on'); setPhase(!isOn);
 });
+
+$btnAFB.addEventListener('click', ()=>{
+  const isOn = $btnAFB.classList.contains('on'); sendSet({afb_enabled: !isOn});
+});
+
 $btnGate.addEventListener('click', ()=>{
   const isOn = $btnGate.classList.contains('on'); sendSet({gate_enabled: !isOn});
 });
@@ -2260,7 +2426,7 @@ function applyStatus(s){
   if ('dly_mod_depth_ms' in s) kb.dly_mod_depth.set(s.dly_mod_depth_ms, false);
   if ('dly_drive_db' in s) kb.dly_drive.set(s.dly_drive_db, false);
 
-    // Chorus
+  // Chorus
   if ('ch_enabled' in s) {
     const con = !!s.ch_enabled;
     $btnChorus.textContent = 'Chorus: ' + (con ? 'ON' : 'OFF');
@@ -2279,6 +2445,15 @@ function applyStatus(s){
   $btnPhase.textContent = 'Phase Invert: ' + (phaseOn ? 'ON' : 'OFF');
   $btnPhase.classList.toggle('on', phaseOn);
   $btnPhase.classList.toggle('off', !phaseOn);
+
+  // Feedback Protection
+  if ('afb_enabled' in s) {
+    const aon = !!s.afb_enabled;
+    $btnAFB.textContent = 'Feedback Prot: ' + (aon ? 'ON' : 'OFF');
+    $btnAFB.classList.toggle('on', aon);
+    $btnAFB.classList.toggle('off', !aon);
+  }
+  if ('afb_shift_hz' in s) kb.afb_shift.set(s.afb_shift_hz, false);
 
   // Gate
   if ('gate_enabled' in s) {
@@ -2402,6 +2577,12 @@ static std::string ui_jsonStatus() {
     oss << "\"ch_delay_ms\":"     << ch_delay << ",";
     oss << "\"ch_width_pct\":"    << ch_width << ",";
     oss << "\"ch_feedback_pct\":" << ch_fb    << ",";
+  }
+
+  // Feedback Protection
+  {
+    oss << "\"afb_enabled\":" << (gKnobs.afb_enabled.load() ? 1 : 0) << ",";
+    oss << "\"afb_shift_hz\":" << gKnobs.afb_shift_hz.load() << ",";
   }
 
   // Noise Gate
@@ -2688,6 +2869,32 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
     ChorusUISet(ch_enabled, mix, rate, depth, delay, width, fb);
   }
 
+  // Feedback Protection (frequency shifter)
+  {
+    auto itAFBEnabled = q.find("afb_enabled");
+    if (itAFBEnabled != q.end()) {
+      try {
+        int v = std::stoi(itAFBEnabled->second);
+        int prev = AFBEnabledStore().load(std::memory_order_relaxed);
+        if (v != prev) {
+          AFBEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+          AFBReset();
+        }
+      } catch (...) {}
+    }
+    float afb_shift = AFBShiftHzStore().load(std::memory_order_relaxed);
+    auto itAFBShift = q.find("afb_shift");
+    if (itAFBShift != q.end()) {
+      try {
+        float v = std::stof(itAFBShift->second);
+        if (v < afb_shift_min_hz) v = afb_shift_min_hz;
+        if (v > afb_shift_max_hz) v = afb_shift_max_hz;
+        afb_shift = v;
+      } catch (...) {}
+    }
+    AFBShiftHzStore().store(afb_shift, std::memory_order_relaxed);
+  }
+
   // Noise Gate
   {
     bool gon=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
@@ -2707,7 +2914,7 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
       } catch (...) {}
     }
 
-    getf("gate_thresh", gth, -80.0f, -20.0f);
+    getf("gate_thresh", gth, -80.0f, -0.0f);
     getf("gate_hyst",   gh,   0.0f,   24.0f);
     getf("gate_attack", ga,   0.10f,  200.0f);
     getf("gate_release",gr,  10.0f,  1200.0f);
@@ -2854,6 +3061,10 @@ static void ui_handleClient(int cfd) {
     bool ch_enabled=false; float ch_mix=0, ch_rate=0, ch_depth=0, ch_delay=0, ch_width=0, ch_fb=0;
     ChorusUIGet(ch_enabled, ch_mix, ch_rate, ch_depth, ch_delay, ch_width, ch_fb);
 
+    // Feedback Protection defaults
+    const bool  def_afb_enabled = (gKnobs.afb_enabled.load() != 0);
+    const float def_afb_shift   = gKnobs.afb_shift_hz.load();
+
     // Noise gate defaults
     bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
     GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
@@ -2932,7 +3143,13 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_CH_DELAY_MAX_MS__",     fmtFloatTrim(ch_delay_max_ms, 1));
     ui_replaceAll(body, "__DEF_CH_FEEDBACK_MAX_PCT__", fmtInt(ch_feedback_max_pct));
 
-    // Gate defaults
+    // Feedback Protection defaults
+    ui_replaceAll(body, "__DEF_AFB_ENABLED_TEXT__", def_afb_enabled ? "ON" : "OFF");
+    ui_replaceAll(body, "__DEF_AFB_SHIFT_HZ__",     fmtFloatTrim(def_afb_shift, 1));
+    ui_replaceAll(body, "__DEF_AFB_SHIFT_MIN_HZ__", fmtFloatTrim(afb_shift_min_hz, 1));
+    ui_replaceAll(body, "__DEF_AFB_SHIFT_MAX_HZ__", fmtFloatTrim(afb_shift_max_hz, 1));
+
+    // Noise Gate defaults
     ui_replaceAll(body, "__DEF_GATE_ENABLED_TEXT__", gate_enabled ? "ON" : "OFF");
     ui_replaceAll(body, "__DEF_GATE_THRESH_DB__", fmtInt(gth));
     ui_replaceAll(body, "__DEF_GATE_HYST_DB__",   fmtFloatTrim(gh,1));
@@ -4002,6 +4219,7 @@ static int paCallback(const void *inputBuffer,
       GateReset();
       DelayReset();
       ChorusReset();
+      AFBReset();
     }
   }
 
@@ -4053,6 +4271,23 @@ static int paCallback(const void *inputBuffer,
 
     s_gate.setParams(th_db, hy_db, atk_ms, rel_ms, hold_ms, range_db, hpf_hz);
     s_gate.processBlock(temp, hop, gate_enabled);
+  }
+
+  // Anti-feedback frequency shifter (mono, in-place), before reverb/delay
+  {
+    static AntiFeedbackShifter s_afb;
+    static bool s_inited = false;
+    if (!s_inited) { s_afb.setSampleRate(kSR); s_afb.init(); s_inited = true; }
+    static uint64_t s_lastAfbEpoch = 0;
+    uint64_t curAfbEpoch = AFBGetResetEpoch();
+    if (curAfbEpoch != s_lastAfbEpoch) {
+      s_afb.reset();
+      s_lastAfbEpoch = curAfbEpoch;
+    }
+    const bool afb_on = (AFBEnabledStore().load(std::memory_order_relaxed) != 0);
+    const float shz   = AFBShiftHzStore().load(std::memory_order_relaxed);
+    s_afb.setShiftHz(shz);
+    s_afb.processBlock(temp, hop, afb_on);
   }
 
   const bool rvbOn = (RvbEnabledStore().load(std::memory_order_relaxed) != 0);
