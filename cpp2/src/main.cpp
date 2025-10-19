@@ -145,7 +145,7 @@ struct Knobs {
   // Output gain (dB → converted to linear for TFLite input)
   std::atomic<float> outGain_dB{-3.0f};
   // Phase invert switch: 0.0 = normal, 1.0 = inverted
-  std::atomic<float> phaseInvert01{0.0f};
+  std::atomic<int> phaseInvert01{0};
 
   // Low-cut (high-pass)
   std::atomic<float> lc_hz{20.0f};
@@ -167,6 +167,8 @@ struct Knobs {
   std::atomic<float> hs_slope_dbpoct{12.0f};
 
 
+  // Reverb
+  std::atomic<int> rvb_enabled{0};
   std::atomic<float> rvb_mix{35.0f};
   std::atomic<float> rvb_decay{6.20f};
   std::atomic<float> rvb_damp{0.30f};
@@ -174,6 +176,16 @@ struct Knobs {
   std::atomic<float> rvb_lc_hz{250.0f};
   std::atomic<float> rvb_mod_rate{0.30f};
   std::atomic<float> rvb_mod_depth{1.0f};
+
+  // Noise Gate
+  std::atomic<int> ng_enabled{0};
+  std::atomic<float> ng_threshold_db{-70.0f};
+  std::atomic<float> ng_hysteresis_db{6.0f};
+  std::atomic<float> ng_range_db{48.0f};
+  std::atomic<float> ng_attack_ms{2.0f};
+  std::atomic<float> ng_release_ms{150.0f};
+  std::atomic<float> ng_hold_ms{400.0f};
+  std::atomic<float> ng_sc_hpf_hz{150.0f};
 } gKnobs;
 
 // For latency logging
@@ -250,6 +262,7 @@ static constexpr float kAPFeedback  = 0.5f;  // allpass feedback
 static constexpr float kSR          = 48000.0f;      // fixed 48 kHz
 
 // Reverb UI atomics
+static std::atomic<int>& RvbEnabledStore()   { static std::atomic<int> v{gKnobs.rvb_enabled.load()}; return v; } // ON by default
 static std::atomic<float>& RvbMixStore()     { static std::atomic<float> v{gKnobs.rvb_mix.load()};   return v; }     // percent
 static std::atomic<float>& RvbT60Store()     { static std::atomic<float> v{gKnobs.rvb_decay.load()};  return v; }     // seconds
 static std::atomic<float>& RvbDampStore()    { static std::atomic<float> v{gKnobs.rvb_damp.load()};  return v; }     // 0..1
@@ -258,7 +271,8 @@ static std::atomic<float>& RvbLCHzStore()        { static std::atomic<float> v{g
 static std::atomic<float>& RvbModRateStore()     { static std::atomic<float> v{gKnobs.rvb_mod_rate.load()};  return v; }  // Hz
 static std::atomic<float>& RvbModDepthMsStore()  { static std::atomic<float> v{gKnobs.rvb_mod_depth.load()};   return v; }  // ms
 
-static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct, float lc_hz, float mod_rate, float mod_depth_ms) {
+static void ReverbUISet(bool enabled, float mix_pct, float t60_sec, float damp_pct, float width_pct, float lc_hz, float mod_rate, float mod_depth_ms) {
+  int enabled_int = enabled ? 1 : 0;
   float mix = clampf(mix_pct, 0.0f, 100.0f);
   float t60 = clampf(t60_sec, 0.10f, rvb_max_decay_sec);
   float d01 = clampf(damp_pct * 0.01f, 0.0f, 1.0f);
@@ -267,6 +281,7 @@ static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float widt
   float mr = clampf(mod_rate, 0.05f, rvb_mod_max_rate_hz);
   float md = clampf(mod_depth_ms, 0.0f, rvb_mod_max_depth_ms);
 
+  RvbEnabledStore().store(enabled_int, std::memory_order_relaxed);
   RvbMixStore().store(mix,   std::memory_order_relaxed);
   RvbT60Store().store(t60,   std::memory_order_relaxed);
   RvbDampStore().store(d01,  std::memory_order_relaxed);
@@ -276,7 +291,8 @@ static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float widt
   RvbModDepthMsStore().store(md, std::memory_order_relaxed);
 }
 
-static void ReverbUIGet(float &mix_pct, float &t60_sec, float &damp_pct, float &width_pct, float &lc_hz, float &mod_rate, float &mod_depth_ms) {
+static void ReverbUIGet(bool &enabled, float &mix_pct, float &t60_sec, float &damp_pct, float &width_pct, float &lc_hz, float &mod_rate, float &mod_depth_ms) {
+  enabled   = (RvbEnabledStore().load(std::memory_order_relaxed) != 0);
   mix_pct   = RvbMixStore().load(std::memory_order_relaxed);
   t60_sec   = RvbT60Store().load(std::memory_order_relaxed);
   damp_pct  = RvbDampStore().load(std::memory_order_relaxed) * 100.0f;
@@ -285,8 +301,6 @@ static void ReverbUIGet(float &mix_pct, float &t60_sec, float &damp_pct, float &
   mod_rate  = RvbModRateStore().load(std::memory_order_relaxed);
   mod_depth_ms = RvbModDepthMsStore().load(std::memory_order_relaxed);
 }
-
-static void ReverbReset();
 
 // Internal helper: first-order HP used in cascade for pre-tank low-cut
 struct OnePoleHP {
@@ -406,6 +420,16 @@ static void ReverbProcessMonoToStereo(const float* inMono,
                                       unsigned long /*framesPerBuffer*/,
                                       const PaStreamCallbackTimeInfo* /*timeInfo*/)
 {
+  // Hard bypass when reverb is disabled: copy mono to L/R and return.
+  if (RvbEnabledStore().load(std::memory_order_relaxed) == 0) {
+    for (size_t i = 0; i < n; ++i) {
+      float v = inMono[i];
+      outLRInterleaved[2*i + 0] = v;
+      outLRInterleaved[2*i + 1] = v;
+    }
+    return;
+  }
+
   struct Freeverb48Stereo {
 
     // 48 kHz tuned delays (samples) (scaled and rounded from 44.1k Jezar tables)
@@ -655,6 +679,209 @@ static void ReverbReset() {
 
 
 
+// ───────────────────────── NOISE GATE: UI stores + DSP ─────────────────────────
+
+// Gate UI atomics (kept separate from gKnobs to avoid struct changes)
+static std::atomic<int>& GateEnabledStore()            { static std::atomic<int> v{gKnobs.ng_enabled.load()}; return v; } // ON by default
+static std::atomic<float>& GateThreshDBStore()    { static std::atomic<float> v{gKnobs.ng_threshold_db.load()}; return v; } // dBFS
+static std::atomic<float>& GateHystDBStore()      { static std::atomic<float> v{gKnobs.ng_hysteresis_db.load()}; return v; }   // dB
+static std::atomic<float>& GateAttackMsStore()    { static std::atomic<float> v{gKnobs.ng_attack_ms.load()}; return v; }   // ms
+static std::atomic<float>& GateReleaseMsStore()   { static std::atomic<float> v{gKnobs.ng_release_ms.load()}; return v; } // ms
+static std::atomic<float>& GateHoldMsStore()      { static std::atomic<float> v{gKnobs.ng_hold_ms.load()}; return v; }  // ms
+static std::atomic<float>& GateRangeDBStore()     { static std::atomic<float> v{gKnobs.ng_range_db.load()}; return v; }  // dB attenuation when closed
+static std::atomic<float>& GateScHPHzStore()      { static std::atomic<float> v{gKnobs.ng_sc_hpf_hz.load()}; return v; } // Hz
+
+// Gate reset epoch (function-backed to avoid new globals)
+static std::atomic<uint64_t>& GateResetEpochRef() {
+  static std::atomic<uint64_t> e{0};
+  return e;
+}
+static inline void GateReset() {
+  GateResetEpochRef().fetch_add(1, std::memory_order_acq_rel);
+}
+static inline uint64_t GateGetResetEpoch() {
+  return GateResetEpochRef().load(std::memory_order_acquire);
+}
+
+// Clamp helpers for Gate UI
+static inline float clampf_pos(float x, float hi) { return std::max(0.0f, std::min(hi, x)); }
+static inline float clampf_range(float x, float lo, float hi) { return std::max(lo, std::min(hi, x)); }
+
+// UI set/get for gate (thread-safe atomics)
+static void GateUISet(bool on, float thresh_db, float hyst_db, float atk_ms, float rel_ms, float hold_ms, float range_db, float sc_hpf_hz) {
+  // Hard limits (sane ranges for acoustic guitar)
+  int on_i = on ? 1 : 0;
+  float th = clampf_range(thresh_db, -80.0f, -20.0f);
+  float hy = clampf_range(hyst_db,    0.0f,   24.0f);
+  float am = clampf_range(atk_ms,     0.10f,  200.0f);
+  float rm = clampf_range(rel_ms,     10.0f,  1200.0f);
+  float hm = clampf_range(hold_ms,    0.0f,   500.0f);
+  float rg = clampf_range(range_db,    6.0f,   90.0f);
+  float hp = clampf_range(sc_hpf_hz,  20.0f,  600.0f);
+
+  GateEnabledStore().store(on_i, std::memory_order_relaxed);
+  GateThreshDBStore().store(th, std::memory_order_relaxed);
+  GateHystDBStore().store(hy, std::memory_order_relaxed);
+  GateAttackMsStore().store(am, std::memory_order_relaxed);
+  GateReleaseMsStore().store(rm, std::memory_order_relaxed);
+  GateHoldMsStore().store(hm, std::memory_order_relaxed);
+  GateRangeDBStore().store(rg, std::memory_order_relaxed);
+  GateScHPHzStore().store(hp, std::memory_order_relaxed);
+}
+
+static void GateUIGet(bool &on, float &thresh_db, float &hyst_db, float &atk_ms, float &rel_ms, float &hold_ms, float &range_db, float &sc_hpf_hz) {
+  on        = (GateEnabledStore().load(std::memory_order_relaxed) != 0);
+  thresh_db = GateThreshDBStore().load(std::memory_order_relaxed);
+  hyst_db   = GateHystDBStore().load(std::memory_order_relaxed);
+  atk_ms    = GateAttackMsStore().load(std::memory_order_relaxed);
+  rel_ms    = GateReleaseMsStore().load(std::memory_order_relaxed);
+  hold_ms   = GateHoldMsStore().load(std::memory_order_relaxed);
+  range_db  = GateRangeDBStore().load(std::memory_order_relaxed);
+  sc_hpf_hz = GateScHPHzStore().load(std::memory_order_relaxed);
+}
+
+// ───────── NoiseGate DSP ─────────
+// Simple, robust gate with peak-ish envelope, attack/release smoothing, hold and hysteresis.
+// Sidechain uses a 2x 1st-order HP cascade to ignore very low thumps/rumble.
+
+struct NoiseGate {
+  // Detection/envelope
+  float env = 0.0f;
+  float envAtkA = 0.0f;  // per-sample smoothing coefficients
+  float envRelA = 0.0f;
+  // Gain smoothing
+  float curGain = 1.0f;
+  float gAtkA = 0.0f;
+  float gRelA = 0.0f;
+
+  // Thresholds and closed gain (linear amplitude)
+  float thrOpenLin  = 0.0f;
+  float thrCloseLin = 0.0f;
+  float closedGainLin = 0.001f; // -60 dB default
+
+  // Hold and state
+  int   holdSamples = 0;
+  int   holdCounter = 0;
+  bool  isOpen = true;
+
+  // Sidechain HPF
+  OnePoleHP hp1;
+  OnePoleHP hp2;
+  float prevHpfHz = -1.0f;
+
+  // Sample rate (use global kSR=48k default)
+  float sr = kSR;
+
+  static inline float coeffFromMs(float ms, float sr) {
+    float t = std::max(0.0001f, ms * 0.001f);
+    float a = 1.0f - std::expf(-1.0f / (t * std::max(1.0f, sr)));
+    if (a < 0.000001f) a = 0.000001f;
+    if (a > 1.0f) a = 1.0f;
+    return a;
+  }
+
+  void setSampleRate(float sampleRate) {
+    sr = std::max(1000.0f, sampleRate);
+  }
+
+  void reset() {
+    env = 0.0f;
+    curGain = 1.0f;
+    holdCounter = 0;
+    isOpen = true;
+    hp1.reset();
+    hp2.reset();
+  }
+
+  void setParams(float thresh_db, float hyst_db, float atk_ms, float rel_ms, float hold_ms, float range_db, float sc_hpf_hz) {
+    // thresholds in linear amplitude
+    float thOpen = db2lin(thresh_db);
+    float thClose = db2lin(thresh_db - std::fabs(hyst_db));
+    // ensure close <= open (amplitude)
+    if (thClose > thOpen) thClose = thOpen;
+
+    thrOpenLin  = thOpen;
+    thrCloseLin = thClose;
+    closedGainLin = db2lin(-std::fabs(range_db));
+
+    envAtkA = coeffFromMs(atk_ms, sr);
+    envRelA = coeffFromMs(rel_ms, sr);
+    // Use same time constants for gain smoothing; could be different if desired
+    gAtkA   = envAtkA;
+    gRelA   = envRelA;
+
+    holdSamples = (int)std::round(std::max(0.0f, hold_ms) * 0.001f * sr);
+
+    float hp = std::max(20.0f, sc_hpf_hz);
+    if (std::fabs(hp - prevHpfHz) > 1e-3f) {
+      hp1.setCutoff(hp, sr);
+      hp2.setCutoff(hp, sr);
+      prevHpfHz = hp;
+    }
+  }
+
+  inline void processBlock(float* x, size_t n, bool enabled) {
+    if (!enabled) return;
+    for (size_t i = 0; i < n; ++i) {
+      float xi = x[i];
+
+      // Sidechain HPF (12 dB/oct via cascade)
+      float sc = hp2.process(hp1.process(xi));
+      float r  = std::fabs(sc);
+
+      // Envelope follower with separate attack/release
+      if (r > env) {
+        env += envAtkA * (r - env);
+      } else {
+        env += envRelA * (r - env);
+      }
+
+      // Hysteresis + hold
+      if (isOpen) {
+        if (env < thrCloseLin) {
+          if (holdCounter <= 0) {
+            // start closing
+            isOpen = false;
+          } else {
+            holdCounter--;
+          }
+        } else {
+          // signal above close threshold -> refresh hold
+          holdCounter = holdSamples;
+        }
+      } else {
+        if (env >= thrOpenLin) {
+          isOpen = true;
+          holdCounter = holdSamples;
+        }
+      }
+
+      float target = isOpen ? 1.0f : closedGainLin;
+      if (target > curGain) {
+        // opening -> attack toward 1.0
+        curGain += gAtkA * (target - curGain);
+      } else {
+        // closing -> release toward closed gain
+        curGain += gRelA * (target - curGain);
+      }
+
+      x[i] = xi * curGain;
+    }
+  }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -717,7 +944,7 @@ static std::string ui_htmlIndex() {
   html, body { margin:0; padding:0; background: var(--bg); color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; user-select:none; }
   .wrap { display:flex; flex-direction:column; align-items:center; gap:14px; padding:14px; }
-  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:center; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:center; margin-block-end: 14px; }
   .pedal {
     background: linear-gradient(180deg, #2a2f3a, #1b1f26); border-radius: 16px;
     box-shadow: 0 10px 24px rgba(0,0,0,0.35), inset 0 2px 0 rgba(255,255,255,0.05);
@@ -873,7 +1100,10 @@ static std::string ui_htmlIndex() {
   <!-- Reverb -->
   <div class="grid">
     <div class="panel">
-      <div class="row"><div class="title">Hall Reverb</div></div>
+      <div class="row">
+        <div class="title">Hall Reverb</div>
+        <div class="btn" id="btnReverb">Reverb: __DEF_REVERB_ENABLED_TEXT__</div>
+      </div>
       <div class="hrow">
         <div class="knob">
           <canvas id="knob_rvb_mix" width="110" height="110"></canvas>
@@ -911,6 +1141,55 @@ static std::string ui_htmlIndex() {
           <canvas id="knob_rvb_mod_depth" width="110" height="110"></canvas>
           <div class="label">Mod Depth</div>
           <div class="value"><span id="val_rvb_mod_depth">__DEF_RVB_MOD_DEPTH__</span> ms</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Noise Gate -->
+  <div class="grid">
+    <div class="panel">
+      <div class="row">
+        <div class="title">Noise Gate</div>
+        <div class="btn" id="btnGate">Gate: __DEF_GATE_ENABLED_TEXT__</div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_gate_thresh" width="110" height="110"></canvas>
+          <div class="label">Threshold</div>
+          <div class="value"><span id="val_gate_thresh">__DEF_GATE_THRESH_DB__</span> dB</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hyst" width="110" height="110"></canvas>
+          <div class="label">Hysteresis</div>
+          <div class="value"><span id="val_gate_hyst">__DEF_GATE_HYST_DB__</span> dB</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_range" width="110" height="110"></canvas>
+          <div class="label">Range</div>
+          <div class="value"><span id="val_gate_range">__DEF_GATE_RANGE_DB__</span> dB</div>
+        </div>
+      </div>
+      <div class="hrow">
+        <div class="knob">
+          <canvas id="knob_gate_attack" width="110" height="110"></canvas>
+          <div class="label">Attack</div>
+          <div class="value"><span id="val_gate_attack">__DEF_GATE_ATTACK_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_release" width="110" height="110"></canvas>
+          <div class="label">Release</div>
+          <div class="value"><span id="val_gate_release">__DEF_GATE_RELEASE_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hold" width="110" height="110"></canvas>
+          <div class="label">Hold</div>
+          <div class="value"><span id="val_gate_hold">__DEF_GATE_HOLD_MS__</span> ms</div>
+        </div>
+        <div class="knob">
+          <canvas id="knob_gate_hpf" width="110" height="110"></canvas>
+          <div class="label">SC HPF</div>
+          <div class="value"><span id="val_gate_hpf">__DEF_GATE_HPF_HZ__</span> Hz</div>
         </div>
       </div>
     </div>
@@ -1009,7 +1288,12 @@ class Knob {
       'knob_hs_gain': __DEF_HS_GAIN__, 'knob_hs_hz': __DEF_HS_HZ__, 'knob_hs_slope': __DEF_HS_SLOPE__,
       'knob_rvb_mix': __DEF_RVB_MIX__, 'knob_rvb_t60': __DEF_RVB_T60__, 'knob_rvb_damp': __DEF_RVB_DAMP__,
       'knob_rvb_width': __DEF_RVB_WIDTH__,
-      'knob_rvb_lc_hz': __DEF_RVB_LC_HZ__, 'knob_rvb_mod_rate': __DEF_RVB_MOD_RATE__, 'knob_rvb_mod_depth': __DEF_RVB_MOD_DEPTH__
+      'knob_rvb_lc_hz': __DEF_RVB_LC_HZ__, 'knob_rvb_mod_rate': __DEF_RVB_MOD_RATE__, 'knob_rvb_mod_depth': __DEF_RVB_MOD_DEPTH__,
+      // Gate defaults
+      'knob_gate_thresh': __DEF_GATE_THRESH_DB__, 'knob_gate_hyst': __DEF_GATE_HYST_DB__,
+      'knob_gate_range': __DEF_GATE_RANGE_DB__,
+      'knob_gate_attack': __DEF_GATE_ATTACK_MS__, 'knob_gate_release': __DEF_GATE_RELEASE_MS__, 'knob_gate_hold': __DEF_GATE_HOLD_MS__,
+      'knob_gate_hpf': __DEF_GATE_HPF_HZ__
     };
     const defv = (id in defaults) ? defaults[id] : ( (this.min === 0 && this.max === 100) ? 100 : 0 );
     this.set(defv, true);
@@ -1059,6 +1343,8 @@ const $modeSeg = el('modeSeg');
 const $btnGuided = el('btnGuided');
 const $btnBypass = el('btnBypass');
 const $btnPhase  = el('btnPhase');
+const $btnReverb   = el('btnReverb');
+const $btnGate   = el('btnGate');
 
 const kb = {
   main: new Knob(el('knob_main'), {min:-MAX_MAIN_KNOB_CHANGE,max:MAX_MAIN_KNOB_CHANGE,step:1,value:__DEF_MAIN_DB__,prec:0,displayEl:el('val_main'),color:'#ffd166', onchange:(v)=>sendSet({main:v})}),
@@ -1092,6 +1378,15 @@ const kb = {
   rvb_lc_hz: new Knob(el('knob_rvb_lc_hz'), {min:10,max:__DEF_RVB_LC_MAX_HZ__,step:1,value:__DEF_RVB_LC_HZ__,prec:0,displayEl:el('val_rvb_lc_hz'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_lc_hz:v})}),
   rvb_mod_rate: new Knob(el('knob_rvb_mod_rate'), {min:0.05,max:__DEF_RVB_MOD_MAX_RATE_HZ__,step:0.01,value:__DEF_RVB_MOD_RATE__,prec:2,displayEl:el('val_rvb_mod_rate'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_rate:v})}),
   rvb_mod_depth: new Knob(el('knob_rvb_mod_depth'), {min:0.0,max:__DEF_RVB_MOD_MAX_DEPTH_MS__,step:0.1,value:__DEF_RVB_MOD_DEPTH__,prec:1,displayEl:el('val_rvb_mod_depth'),color:'#00b3ff', onchange:(v)=>sendSet({rvb_mod_depth:v})}),
+
+  // Noise Gate knobs
+  gate_thresh: new Knob(el('knob_gate_thresh'), {min:-80,max:-20,step:1,value:__DEF_GATE_THRESH_DB__,prec:0,displayEl:el('val_gate_thresh'),color:'#ffa600', onchange:(v)=>sendSet({gate_thresh:v})}),
+  gate_hyst:   new Knob(el('knob_gate_hyst'),   {min:0,max:24,step:0.5,value:__DEF_GATE_HYST_DB__,prec:1,displayEl:el('val_gate_hyst'),color:'#ff9e00', onchange:(v)=>sendSet({gate_hyst:v})}),
+  gate_range:  new Knob(el('knob_gate_range'),  {min:6,max:90,step:1,value:__DEF_GATE_RANGE_DB__,prec:0,displayEl:el('val_gate_range'),color:'#ff7b00', onchange:(v)=>sendSet({gate_range:v})}),
+  gate_attack: new Knob(el('knob_gate_attack'), {min:0.1,max:200,step:0.1,value:__DEF_GATE_ATTACK_MS__,prec:1,displayEl:el('val_gate_attack'),color:'#ff6d00', onchange:(v)=>sendSet({gate_attack:v})}),
+  gate_release:new Knob(el('knob_gate_release'),{min:10,max:1200,step:5,value:__DEF_GATE_RELEASE_MS__,prec:0,displayEl:el('val_gate_release'),color:'#ff6d00', onchange:(v)=>sendSet({gate_release:v})}),
+  gate_hold:   new Knob(el('knob_gate_hold'),   {min:0,max:500,step:5,value:__DEF_GATE_HOLD_MS__,prec:0,displayEl:el('val_gate_hold'),color:'#ff6d00', onchange:(v)=>sendSet({gate_hold:v})}),
+  gate_hpf:    new Knob(el('knob_gate_hpf'),    {min:20,max:600,step:5,value:__DEF_GATE_HPF_HZ__,prec:0,displayEl:el('val_gate_hpf'),color:'#ff6d00', onchange:(v)=>sendSet({gate_hpf:v})})
 };
 
 function sendSet(obj) {
@@ -1122,15 +1417,24 @@ function sendSet(obj) {
   if ('phase' in obj) params.set('phase', obj.phase ? 1 : 0);
 
   // Reverb
+  if ('rvb_enabled' in obj) params.set('rvb_enabled', obj.rvb_enabled ? 1 : 0);
   if ('rvb_mix' in obj) params.set('rvb_mix', obj.rvb_mix);
   if ('rvb_t60' in obj) params.set('rvb_t60', obj.rvb_t60);
   if ('rvb_damp' in obj) params.set('rvb_damp', obj.rvb_damp);
   if ('rvb_width' in obj) params.set('rvb_width', obj.rvb_width);
-
-  // New reverb-only controls
   if ('rvb_lc_hz' in obj) params.set('rvb_lc_hz', obj.rvb_lc_hz);
   if ('rvb_mod_rate' in obj) params.set('rvb_mod_rate', obj.rvb_mod_rate);
   if ('rvb_mod_depth' in obj) params.set('rvb_mod_depth', obj.rvb_mod_depth);
+
+  // Noise Gate
+  if ('gate_enabled' in obj) params.set('gate_enabled', obj.gate_enabled ? 1 : 0);
+  if ('gate_thresh' in obj) params.set('gate_thresh', obj.gate_thresh);
+  if ('gate_hyst' in obj) params.set('gate_hyst', obj.gate_hyst);
+  if ('gate_range' in obj) params.set('gate_range', obj.gate_range);
+  if ('gate_attack' in obj) params.set('gate_attack', obj.gate_attack);
+  if ('gate_release' in obj) params.set('gate_release', obj.gate_release);
+  if ('gate_hold' in obj) params.set('gate_hold', obj.gate_hold);
+  if ('gate_hpf' in obj) params.set('gate_hpf', obj.gate_hpf);
 
   fetch('/set?' + params.toString()).catch(()=>{});
 }
@@ -1152,6 +1456,12 @@ $btnBypass.addEventListener('click', ()=>{
 });
 $btnPhase.addEventListener('click', ()=>{
   const isOn = $btnPhase.classList.contains('on'); setPhase(!isOn);
+});
+$btnGate.addEventListener('click', ()=>{
+  const isOn = $btnGate.classList.contains('on'); sendSet({gate_enabled: !isOn});
+});
+$btnReverb.addEventListener('click', ()=>{
+  const isOn = $btnReverb.classList.contains('on'); sendSet({rvb_enabled: !isOn});
 });
 
 function applyStatus(s){
@@ -1180,6 +1490,12 @@ function applyStatus(s){
   kb.hs_slope.set(s.hs_slope_dbpoct, false);
 
   // Reverb
+  if ('rvb_enabled' in s) {
+    const revOn = !!s.rvb_enabled;
+    $btnReverb.textContent = 'Reverb: ' + (revOn ? 'ON' : 'OFF');
+    $btnReverb.classList.toggle('on', revOn);
+    $btnReverb.classList.toggle('off', !revOn);
+  }
   if ('rvb_mix_pct' in s) kb.rvb_mix.set(s.rvb_mix_pct, false);
   if ('rvb_t60_sec' in s) kb.rvb_t60.set(s.rvb_t60_sec, false);
   if ('rvb_damp_pct' in s) kb.rvb_damp.set(s.rvb_damp_pct, false);
@@ -1194,6 +1510,21 @@ function applyStatus(s){
   $btnPhase.textContent = 'Phase Invert: ' + (phaseOn ? 'ON' : 'OFF');
   $btnPhase.classList.toggle('on', phaseOn);
   $btnPhase.classList.toggle('off', !phaseOn);
+
+  // Gate
+  if ('gate_enabled' in s) {
+    const gon = !!s.gate_enabled;
+    $btnGate.textContent = 'Gate: ' + (gon ? 'ON' : 'OFF');
+    $btnGate.classList.toggle('on', gon);
+    $btnGate.classList.toggle('off', !gon);
+  }
+  if ('gate_thresh_db' in s) kb.gate_thresh.set(s.gate_thresh_db, false);
+  if ('gate_hyst_db' in s) kb.gate_hyst.set(s.gate_hyst_db, false);
+  if ('gate_range_db' in s) kb.gate_range.set(s.gate_range_db, false);
+  if ('gate_attack_ms' in s) kb.gate_attack.set(s.gate_attack_ms, false);
+  if ('gate_release_ms' in s) kb.gate_release.set(s.gate_release_ms, false);
+  if ('gate_hold_ms' in s) kb.gate_hold.set(s.gate_hold_ms, false);
+  if ('gate_hpf_hz' in s) kb.gate_hpf.set(s.gate_hpf_hz, false);
 
   // Seg
   $modeSeg.querySelectorAll('.segbtn').forEach(b=>{
@@ -1260,8 +1591,10 @@ static std::string ui_jsonStatus() {
   oss << "\"hs_slope_dbpoct\":"<< gKnobs.hs_slope_dbpoct.load() << ",";
 
   // Reverb (main)
+  bool rvb_enabled=true;
   float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth_ms=0;
-  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth_ms);
+  ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth_ms);
+  oss << "\"rvb_enabled\":"   << rvb_enabled << ",";
   oss << "\"rvb_mix_pct\":"  << rvb_mix   << ",";
   oss << "\"rvb_t60_sec\":"  << rvb_t60   << ",";
   oss << "\"rvb_damp_pct\":" << rvb_damp  << ",";
@@ -1270,6 +1603,18 @@ static std::string ui_jsonStatus() {
   oss << "\"rvb_lc_hz\":"        << rvb_lc_hz       << ",";
   oss << "\"rvb_mod_rate_hz\":"  << rvb_mod_rate   << ",";
   oss << "\"rvb_mod_depth_ms\":" << rvb_mod_depth_ms << ",";
+
+  // Noise Gate
+  bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
+  GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
+  oss << "\"gate_enabled\":"        << (gate_enabled ? 1 : 0) << ",";
+  oss << "\"gate_thresh_db\":" << gth   << ",";
+  oss << "\"gate_hyst_db\":"   << gh    << ",";
+  oss << "\"gate_attack_ms\":" << ga    << ",";
+  oss << "\"gate_release_ms\":"<< gr    << ",";
+  oss << "\"gate_hold_ms\":"   << ghld  << ",";
+  oss << "\"gate_range_db\":"  << grng  << ",";
+  oss << "\"gate_hpf_hz\":"    << ghpf  << ",";
 
   // switches/mode
   oss << "\"bypass\":"       << (gBypass.load()?1:0) << ",";
@@ -1373,7 +1718,7 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   if (itPh != q.end()) {
     try {
       int v = std::stoi(itPh->second);
-      gKnobs.phaseInvert01.store((v!=0) ? 1.0f : 0.0f);
+      gKnobs.phaseInvert01.store((v!=0) ? 1 : 0);
     } catch (...) {}
   }
 
@@ -1419,8 +1764,24 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   gKnobs.hs_slope_dbpoct.store(hs_s);
 
   // Reverb (partial updates allowed)
+  bool rvb_enabled = true;
   float rvb_mix = 0.0f, rvb_t60 = 0.0f, rvb_damp = 0.0f, rvb_width = 0.0f, rvb_lc_hz = 0.0f, rvb_mod_rate = 0.0f, rvb_mod_depth = 0.0f;
-  ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+  ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+
+  // Parse gate_enabled (toggle) first and bump reset on change
+  auto itRvbEnabled = q.find("rvb_enabled");
+  if (itRvbEnabled != q.end()) {
+    try {
+      int v = std::stoi(itRvbEnabled->second);
+      int prev = RvbEnabledStore().load(std::memory_order_relaxed);
+      if (v != prev) {
+        RvbEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+        ReverbReset(); // avoid pops on state change
+      }
+      rvb_enabled = (v != 0);
+    } catch (...) {}
+  }
+  
   getf("rvb_mix",  rvb_mix, 0.0f, 100.0f);
   getf("rvb_t60",  rvb_t60, 0.10f, rvb_max_decay_sec);
   getf("rvb_damp", rvb_damp, 0.0f, 100.0f);
@@ -1428,9 +1789,35 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
   getf("rvb_lc_hz", rvb_lc_hz, 10.0f, rvb_lc_max_hz);
   getf("rvb_mod_rate", rvb_mod_rate, 0.05f, rvb_mod_max_rate_hz);
   getf("rvb_mod_depth", rvb_mod_depth, 0.0f, rvb_mod_max_depth_ms);
-  ReverbUISet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+  ReverbUISet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
 
-  
+  // Noise Gate
+  bool gon=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
+  GateUIGet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
+
+  // Parse gate_enabled (toggle) first and bump reset on change
+  auto itGateEnabled = q.find("gate_enabled");
+  if (itGateEnabled != q.end()) {
+    try {
+      int v = std::stoi(itGateEnabled->second);
+      int prev = GateEnabledStore().load(std::memory_order_relaxed);
+      if (v != prev) {
+        GateEnabledStore().store(v ? 1 : 0, std::memory_order_relaxed);
+        GateReset(); // avoid pops on state change
+      }
+      gon = (v != 0);
+    } catch (...) {}
+  }
+
+  getf("gate_thresh", gth, -80.0f, -20.0f);
+  getf("gate_hyst",   gh,   0.0f,   24.0f);
+  getf("gate_attack", ga,   0.10f,  200.0f);
+  getf("gate_release",gr,  10.0f,  1200.0f);
+  getf("gate_hold",   ghld, 0.0f,   500.0f);
+  getf("gate_range",  grng, 6.0f,   90.0f);
+  getf("gate_hpf",    ghpf, 20.0f,  600.0f);
+
+  GateUISet(gon, gth, gh, ga, gr, ghld, grng, ghpf);
 }
 
 static inline void ui_handleMode(const std::unordered_map<std::string,std::string>& q) {
@@ -1498,7 +1885,6 @@ static void ui_handleClient(int cfd) {
     ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
     if (n <= 0) break;
     req.append(buf, buf+n);
-    // find \r\n\r\n
     size_t pos = req.find("\r\n\r\n");
     if (pos != std::string::npos) { headerEnd = int(pos + 4); break; }
     if (req.size() > 16384) break;
@@ -1508,7 +1894,6 @@ static void ui_handleClient(int cfd) {
     ui_writeAllStr(cfd, h);
     return;
   }
-  // Parse request line
   size_t lineEnd = req.find("\r\n");
   if (lineEnd == std::string::npos) {
     std::string h = ui_httpHeader("400 Bad Request", "text/plain; charset=utf-8", 0);
@@ -1524,7 +1909,7 @@ static void ui_handleClient(int cfd) {
   if (qpos != std::string::npos) { path = uri.substr(0,qpos); query = uri.substr(qpos+1); }
 
   // Routes
-    if (method == "GET" && (path == "/" || path == "/index.html")) {
+  if (method == "GET" && (path == "/" || path == "/index.html")) {
     std::string body = ui_htmlIndex();
 
     // Limits
@@ -1557,8 +1942,13 @@ static void ui_handleClient(int cfd) {
     const float def_hs_hz   = gKnobs.hs_hz.load();
     const float def_hs_slope= gKnobs.hs_slope_dbpoct.load();
 
+    bool rvb_enabled=true;
     float rvb_mix=0, rvb_t60=0, rvb_damp=0, rvb_width=0, rvb_lc_hz=0, rvb_mod_rate=0, rvb_mod_depth=0;
-    ReverbUIGet(rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+    ReverbUIGet(rvb_enabled, rvb_mix, rvb_t60, rvb_damp, rvb_width, rvb_lc_hz, rvb_mod_rate, rvb_mod_depth);
+
+    // Noise gate defaults
+    bool gate_enabled=false; float gth=0, gh=0, ga=0, gr=0, ghld=0, grng=0, ghpf=0;
+    GateUIGet(gate_enabled, gth, gh, ga, gr, ghld, grng, ghpf);
 
     // Inject formatted defaults (integers where appropriate)
     ui_replaceAll(body, "__DEF_MAIN_DB__",   fmtInt(def_main));
@@ -1585,6 +1975,7 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_HS_HZ__",     fmtInt(def_hs_hz));
     ui_replaceAll(body, "__DEF_HS_SLOPE__",  fmtInt(def_hs_slope));
 
+    ui_replaceAll(body, "__DEF_RVB_ENABLED_TEXT__", rvb_enabled ? "ON" : "OFF");
     ui_replaceAll(body, "__DEF_RVB_MIX__",   fmtInt(rvb_mix));
     ui_replaceAll(body, "__DEF_RVB_T60__",   fmtFloatTrim(rvb_t60, 1));
     ui_replaceAll(body, "__DEF_RVB_DAMP__",  fmtInt(rvb_damp));
@@ -1597,6 +1988,16 @@ static void ui_handleClient(int cfd) {
     ui_replaceAll(body, "__DEF_RVB_MOD_MAX_DEPTH_MS__",fmtFloatTrim(rvb_mod_max_depth_ms,1));
     ui_replaceAll(body, "__DEF_RVB_MOD_RATE__",fmtFloatTrim(rvb_mod_rate,2));
     ui_replaceAll(body, "__DEF_RVB_MOD_DEPTH__",fmtFloatTrim(rvb_mod_depth,1));
+
+    // Gate defaults
+    ui_replaceAll(body, "__DEF_GATE_ENABLED_TEXT__", gate_enabled ? "ON" : "OFF");
+    ui_replaceAll(body, "__DEF_GATE_THRESH_DB__", fmtInt(gth));
+    ui_replaceAll(body, "__DEF_GATE_HYST_DB__",   fmtFloatTrim(gh,1));
+    ui_replaceAll(body, "__DEF_GATE_RANGE_DB__",  fmtInt(grng));
+    ui_replaceAll(body, "__DEF_GATE_ATTACK_MS__", fmtFloatTrim(ga,1));
+    ui_replaceAll(body, "__DEF_GATE_RELEASE_MS__",fmtFloatTrim(gr,0));
+    ui_replaceAll(body, "__DEF_GATE_HOLD_MS__",   fmtFloatTrim(ghld,0));
+    ui_replaceAll(body, "__DEF_GATE_HPF_HZ__",    fmtInt(ghpf));
 
     std::string h = ui_httpHeader("200 OK", "text/html; charset=utf-8", body.size());
     ui_writeAllStr(cfd, h); ui_writeAllStr(cfd, body);
@@ -2637,34 +3038,33 @@ static int paCallback(const void *inputBuffer,
   auto *out= static_cast<float*>(outputBuffer);
   size_t hop = framesPerBuffer;
 
-  // Update measured E2E latency using PA's hardware timestamps.
+  // Update measured latency and handle bypass edges
   if (timeInfo) {
     static double s_prevInputAdcTime = 0.0;
     s_prevInputAdcTime = timeInfo->inputBufferAdcTime;
 
-    // Bypass edge detection: drop all queued audio immediately on any toggle.
     static uint64_t s_lastBypassEpoch = 0;
     static bool s_lastBypass = false;
     uint64_t curEpoch = gBypassEpoch.load(std::memory_order_acquire);
     bool curBypass = gBypass.load(std::memory_order_relaxed);
     if (curEpoch != s_lastBypassEpoch || curBypass != s_lastBypass) {
+      // Flush rings on toggle
       sh->in.r.store(sh->in.w.load(std::memory_order_acquire), std::memory_order_release);
       sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-      // Reset measurement to avoid reporting garbage around toggle
       s_prevInputAdcTime = 0.0;
       s_lastBypassEpoch = curEpoch;
       s_lastBypass = curBypass;
-      // Reset reverb tail on any bypass edge
+      // Reset time-based processors on bypass edges
       ReverbReset();
+      GateReset();
     }
   }
 
   if (in) sh->in.push(in, hop);
 
   if (gBypass.load(std::memory_order_relaxed)) {
-    // While bypass is ON, ensure the processed output ring stays empty
+    // Ensure processed ring empty while bypassed
     sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-
     if (in) {
       for (size_t i=0;i<hop;i++){
         float v = in[i];
@@ -2680,9 +3080,38 @@ static int paCallback(const void *inputBuffer,
   size_t got  = sh->out.pop(temp, hop);
   if (got < hop) std::memset(temp+got, 0, sizeof(float)*(hop-got));
 
-  // Process with stereo hall reverb (mono -> stereo), tuned for 48 kHz
-  ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
+  // Apply noise gate (mono, in-place) before reverb
+  {
+    static NoiseGate s_gate;
+    static bool s_inited = false;
+    if (!s_inited) {
+      s_gate.setSampleRate(kSR); // follow reverb's 48k tuning
+      s_inited = true;
+    }
+    // Reset on any external gate reset epoch bump
+    static uint64_t s_lastGateEpoch = 0;
+    uint64_t curGateEpoch = GateGetResetEpoch();
+    if (curGateEpoch != s_lastGateEpoch) {
+      s_gate.reset();
+      s_lastGateEpoch = curGateEpoch;
+    }
 
+    // Pull latest UI params
+    const bool gate_enabled    = (GateEnabledStore().load(std::memory_order_relaxed) != 0);
+    const float th_db    = GateThreshDBStore().load(std::memory_order_relaxed);
+    const float hy_db    = GateHystDBStore().load(std::memory_order_relaxed);
+    const float atk_ms   = GateAttackMsStore().load(std::memory_order_relaxed);
+    const float rel_ms   = GateReleaseMsStore().load(std::memory_order_relaxed);
+    const float hold_ms  = GateHoldMsStore().load(std::memory_order_relaxed);
+    const float range_db = GateRangeDBStore().load(std::memory_order_relaxed);
+    const float hpf_hz   = GateScHPHzStore().load(std::memory_order_relaxed);
+
+    s_gate.setParams(th_db, hy_db, atk_ms, rel_ms, hold_ms, range_db, hpf_hz);
+    s_gate.processBlock(temp, hop, gate_enabled);
+  }
+
+  // Mono → Stereo reverb
+  ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
   return paContinue;
 }
 
