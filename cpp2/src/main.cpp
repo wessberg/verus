@@ -238,8 +238,8 @@ static constexpr int kNumCombs = 8;
 static constexpr int kNumAP    = 4;
 
 static constexpr float rvb_lc_max_hz    = 8000.0f;
-static constexpr float rvb_mod_max_rate_hz    = 5.0f;
-static constexpr float rvb_mod_max_depth_ms    = 10.0f;
+static constexpr float rvb_mod_max_rate_hz    = 8.0f;
+static constexpr float rvb_mod_max_depth_ms    = 8.0f;
 static constexpr float rvb_max_decay_sec = 60.0f;
 
 
