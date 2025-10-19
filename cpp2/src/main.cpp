@@ -143,7 +143,7 @@ struct Knobs {
   std::atomic<float> wet_pct{100.0f}; // 0..100
 
   // Output gain (dB → converted to linear for TFLite input)
-  std::atomic<float> outGain_dB{0.0f};
+  std::atomic<float> outGain_dB{-3.0f};
   // Phase invert switch: 0.0 = normal, 1.0 = inverted
   std::atomic<float> phaseInvert01{0.0f};
 
@@ -165,6 +165,15 @@ struct Knobs {
   std::atomic<float> hs_gain_db{0.0f};
   std::atomic<float> hs_hz{4000.0f};
   std::atomic<float> hs_slope_dbpoct{12.0f};
+
+
+  std::atomic<float> rvb_mix{35.0f};
+  std::atomic<float> rvb_decay{6.20f};
+  std::atomic<float> rvb_damp{0.30f};
+  std::atomic<float> rvb_width{0.70f};
+  std::atomic<float> rvb_lc_hz{250.0f};
+  std::atomic<float> rvb_mod_rate{0.30f};
+  std::atomic<float> rvb_mod_depth{1.0f};
 } gKnobs;
 
 // For latency logging
@@ -229,17 +238,11 @@ static constexpr int kNumCombs = 8;
 static constexpr int kNumAP    = 4;
 
 static constexpr float rvb_lc_max_hz    = 8000.0f;
-static constexpr float rvb_mod_max_rate_hz    = 10.0f;
-static constexpr float rvb_mod_max_depth_ms    = 100.0f;
+static constexpr float rvb_mod_max_rate_hz    = 5.0f;
+static constexpr float rvb_mod_max_depth_ms    = 10.0f;
 static constexpr float rvb_max_decay_sec = 60.0f;
 
-static float rvb_mix  = 30.0f;
-static float rvb_decay = 6.20f;
-static float rvb_damp = 0.30f;
-static float rvb_width  = 0.70f; // stereo width (0..1)
-static float rvb_lc_hz     = 120.0f; // reverb-only low cut (pre-tank)
-static float rvb_mod_rate  = 0.35f;  // modulation rate (post-tank, wet only)
-static float rvb_mod_depth = 1.5f;   // modulation depth (post-tank, wet only)
+
 
 // Constants
 static constexpr float kFixedGain   = 0.02f; // canonical Freeverb input gain
@@ -247,13 +250,13 @@ static constexpr float kAPFeedback  = 0.5f;  // allpass feedback
 static constexpr float kSR          = 48000.0f;      // fixed 48 kHz
 
 // Reverb UI atomics
-static std::atomic<float>& RvbMixStore()     { static std::atomic<float> v{rvb_mix};   return v; }     // percent
-static std::atomic<float>& RvbT60Store()     { static std::atomic<float> v{rvb_decay};  return v; }     // seconds
-static std::atomic<float>& RvbDampStore()    { static std::atomic<float> v{rvb_damp};  return v; }     // 0..1
-static std::atomic<float>& RvbWidthStore()   { static std::atomic<float> v{rvb_width};   return v; }     // 0..1
-static std::atomic<float>& RvbLCHzStore()        { static std::atomic<float> v{rvb_lc_hz}; return v; }  // Hz
-static std::atomic<float>& RvbModRateStore()     { static std::atomic<float> v{rvb_mod_rate};  return v; }  // Hz
-static std::atomic<float>& RvbModDepthMsStore()  { static std::atomic<float> v{rvb_mod_depth};   return v; }  // ms
+static std::atomic<float>& RvbMixStore()     { static std::atomic<float> v{gKnobs.rvb_mix.load()};   return v; }     // percent
+static std::atomic<float>& RvbT60Store()     { static std::atomic<float> v{gKnobs.rvb_decay.load()};  return v; }     // seconds
+static std::atomic<float>& RvbDampStore()    { static std::atomic<float> v{gKnobs.rvb_damp.load()};  return v; }     // 0..1
+static std::atomic<float>& RvbWidthStore()   { static std::atomic<float> v{gKnobs.rvb_width.load()};   return v; }     // 0..1
+static std::atomic<float>& RvbLCHzStore()        { static std::atomic<float> v{gKnobs.rvb_lc_hz.load()}; return v; }  // Hz
+static std::atomic<float>& RvbModRateStore()     { static std::atomic<float> v{gKnobs.rvb_mod_rate.load()};  return v; }  // Hz
+static std::atomic<float>& RvbModDepthMsStore()  { static std::atomic<float> v{gKnobs.rvb_mod_depth.load()};   return v; }  // ms
 
 static void ReverbUISet(float mix_pct, float t60_sec, float damp_pct, float width_pct, float lc_hz, float mod_rate, float mod_depth_ms) {
   float mix = clampf(mix_pct, 0.0f, 100.0f);
@@ -310,66 +313,87 @@ struct OnePoleHP {
 struct ModDelay {
   std::vector<float> buf;
   int w = 0;
+  int mask = 0;
+
   float phase = 0.0f;
   float phaseInc = 0.0f;
+
   float baseSamp = 0.0f;
   float depthSamp = 0.0f;
-  int mask = 0;
+
   bool enabled = false;
 
-  void init(int maxSamplesPow2) {
+  void init(int minCapacitySamples) {
     int cap = 1;
-    while (cap < maxSamplesPow2) cap <<= 1;
+    while (cap < minCapacitySamples) cap <<= 1;
     buf.assign(cap, 0.0f);
     mask = cap - 1;
     w = 0;
     phase = 0.0f;
   }
+
   void setParams(float rateHz, float depthMs, float sr, float baseMs, float phaseOffsetRad) {
-    float r = clampf(rateHz, 0.0f, 10.0f);
+    const float srSafe = std::max(1.0f, sr);
+    float r = std::max(0.0f, rateHz);
     float dms = std::max(0.0f, depthMs);
-    baseSamp  = std::max(1.0f, baseMs * sr * 0.001f);
-    depthSamp = std::max(0.0f, dms  * sr * 0.001f);
-    phaseInc  = 2.0f * float(M_PI) * r / std::max(1.0f, sr);
-    phase += phaseOffsetRad; // apply offset once on (re)config
-    // keep in bounds
+
+    baseSamp  = std::max(1.0f, baseMs  * srSafe * 0.001f);
+    depthSamp = std::max(0.0f, dms     * srSafe * 0.001f);
+    phaseInc  = 2.0f * float(M_PI) * r / srSafe;
+
+    // Keep base/depth inside the ring so we never read the write slot.
+    const float maxD = float(mask - 2);
+    if (baseSamp < 2.0f) baseSamp = 2.0f;
+    if (baseSamp > maxD) baseSamp = maxD;
+
+    float maxDepthDown = baseSamp - 1.0f;
+    float maxDepthUp   = maxD - baseSamp;
+    float maxDepth     = std::max(0.0f, std::min(maxDepthDown, maxDepthUp));
+    if (depthSamp > maxDepth) depthSamp = maxDepth;
+
+    // Keep stereo decorrelation but avoid accumulating offset on each call.
+    // Apply the offset once relative to current phase and wrap.
+    phase += phaseOffsetRad;
     while (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
     while (phase < 0.0f) phase += 2.0f * float(M_PI);
+
     enabled = (depthSamp > 1e-6f && r >= 0.01f);
   }
-  inline float tick(float x) {
-    // write current
-    buf[w] = x;
 
-    if (!enabled) {
-      // pass-through read at base delay (center)
-      float D = baseSamp;
-      int ri1 = (w - int(D)) & mask;
-      int ri0 = (ri1 - 1) & mask;
-      float frac = D - std::floor(D);
-      float y = buf[ri0] * (1.0f - frac) + buf[ri1] * frac;
-      w = (w + 1) & mask;
-      return y;
-    }
-
-    float m = std::sinf(phase);
-    phase += phaseInc;
-    if (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
-
-    float D = baseSamp + depthSamp * m;
-    // Safety clamp to buffer
-    float maxD = float(mask); // OK: mask == cap-1, buffer indexes safe
+  inline float readLinear(float D) const {
+    // Bound D away from extremes so (r1) never hits the write index
+    const float maxD = float(mask - 2);
     if (D < 1.0f) D = 1.0f;
     if (D > maxD) D = maxD;
 
-    int ri1 = (w - int(D)) & mask;
-    int ri0 = (ri1 - 1) & mask;
-    float frac = D - std::floor(D);
-    float y = buf[ri0] * (1.0f - frac) + buf[ri1] * frac;
+    int dInt = int(std::floor(D));
+    float frac = D - float(dInt);
 
+    // r0 = younger tap = x[n - dInt]
+    int r0 = (w - dInt) & mask;
+    // r1 = older tap   = x[n - dInt - 1]
+    int r1 = (r0 - 1) & mask;
+
+    // Proper linear interpolation: y = r0*(1-frac) + r1*frac
+    return buf[r0] * (1.0f - frac) + buf[r1] * frac;
+  }
+
+  inline float tick(float x) {
+    buf[w] = x;
+
+    float D = baseSamp;
+    if (enabled) {
+      float m = std::sinf(phase);
+      phase += phaseInc;
+      if (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
+      D += depthSamp * m;
+    }
+
+    float y = readLinear(D);
     w = (w + 1) & mask;
     return y;
   }
+
   void reset() {
     if (!buf.empty()) std::fill(buf.begin(), buf.end(), 0.0f);
     w = 0; phase = 0.0f;
@@ -440,11 +464,11 @@ static void ReverbProcessMonoToStereo(const float* inMono,
           ap[ch][i].idx = 0;
         }
       }
-      updateDamping(rvb_damp);
-      updateFeedbackForT60(rvb_decay);
-      prevT60   = rvb_decay;
-      prevDmp   = rvb_damp;
-      prevWidth = rvb_width;
+      updateDamping(gKnobs.rvb_damp.load());
+      updateFeedbackForT60(gKnobs.rvb_decay.load());
+      prevT60   = gKnobs.rvb_decay.load();
+      prevDmp   =  gKnobs.rvb_damp.load();
+      prevWidth = gKnobs.rvb_width.load();
 
       // Pre-tank HPF defaults
       float lc = clampf(RvbLCHzStore().load(std::memory_order_relaxed), 10.0f, rvb_lc_max_hz);
@@ -546,13 +570,15 @@ static void ReverbProcessMonoToStereo(const float* inMono,
       const float modDepth_ui = clampf(RvbModDepthMsStore().load(std::memory_order_relaxed), 0.0f, rvb_mod_max_depth_ms);
 
       // Update params if changed
-      if (std::fabs(rvb_damp - damp01_ui) > 1e-4f) {
-        rvb_damp = damp01_ui; updateDamping(rvb_damp);
-        prevDmp = rvb_damp;
+      if (std::fabs(gKnobs.rvb_damp.load() - damp01_ui) > 1e-4f) {
+        gKnobs.rvb_damp.store(damp01_ui);
+        updateDamping(damp01_ui);
+        prevDmp = damp01_ui;
       }
-      if (std::fabs(rvb_decay - t60_ui) > 1e-4f) {
-        rvb_decay = t60_ui; updateFeedbackForT60(rvb_decay);
-        prevT60 = rvb_decay;
+      if (std::fabs(gKnobs.rvb_decay.load() - t60_ui) > 1e-4f) {
+        gKnobs.rvb_decay.store(t60_ui);
+        updateFeedbackForT60(t60_ui);
+        prevT60 = t60_ui;
       }
       if (std::fabs(prevLcHz - lcHz_ui) > 1e-3f) {
         hp1.setCutoff(lcHz_ui, kSR);
@@ -566,7 +592,7 @@ static void ReverbProcessMonoToStereo(const float* inMono,
         prevModRate  = modRate_ui;
         prevModDepth = modDepth_ui;
       }
-      rvb_width = width_ui;
+      gKnobs.rvb_width.store(width_ui);
 
       const float wet = std::max(0.0f, std::min(1.0f, mix01_ui));
       const float dry = 1.0f - wet;
