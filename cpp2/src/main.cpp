@@ -907,7 +907,7 @@ static constexpr float dly_highcut_min_hz      = 500.0f;
 static constexpr float dly_highcut_max_hz      = 20000.0f;
 static constexpr float dly_lowcut_min_hz       = 10.0f;
 static constexpr float dly_lowcut_max_hz       = 4000.0f; 
-static constexpr float dly_max_feedback_pct    = 98.0f;
+static constexpr float dly_max_feedback_pct    = 100.0f;
 static constexpr float dly_default_flutter_hz  = 4.5f;
 static constexpr float dly_default_stereo_offs_ms = 7.0f;
 
@@ -1064,12 +1064,18 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
     };
 
     DelayLine dlL, dlR;
+
+    // Tone for the delayed tap (wet output + feedback)
     OnePoleLP lpfL, lpfR;
     OnePoleHP hpfL, hpfR;
 
+    // NEW: Tone for the write injection (first repeat)
+    OnePoleLP inLpfL, inLpfR;
+    OnePoleHP inHpfL, inHpfR;
+
     // LFO phases
     float wowPhaseL = 0.0f, wowPhaseR = float(M_PI)*0.5f;
-    float fltPhaseL = 1.3f, fltPhaseR = float(M_PI);
+    float fltPhaseL = 1.3f,  fltPhaseR = float(M_PI);
 
     float wowInc = 0.0f, fltInc = 0.0f;
     float depthSamp = 0.0f;
@@ -1093,6 +1099,8 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
       dlR.init(4 * 48000);
       lpfL.reset(); lpfR.reset();
       hpfL.reset(); hpfR.reset();
+      inLpfL.reset(); inLpfR.reset();
+      inHpfL.reset(); inHpfR.reset();
       inited = true;
     }
 
@@ -1100,8 +1108,10 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
       dlL.reset(); dlR.reset();
       lpfL.reset(); lpfR.reset();
       hpfL.reset(); hpfR.reset();
+      inLpfL.reset(); inLpfR.reset();
+      inHpfL.reset(); inHpfR.reset();
       wowPhaseL = 0.0f; wowPhaseR = float(M_PI)*0.5f;
-      fltPhaseL = 1.3f; fltPhaseR = float(M_PI);
+      fltPhaseL = 1.3f;  fltPhaseR = float(M_PI);
     }
 
     void setParamsFromUI(float sr, size_t blockN) {
@@ -1125,10 +1135,17 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
       highcutHz = clampf(hc_hz, dly_highcut_min_hz, dly_highcut_max_hz);
       lowcutHz  = clampf(lc_hz, dly_lowcut_min_hz,  dly_lowcut_max_hz);
 
+      // Set tone for delayed tap (wet + feedback)
       lpfL.setCutoff(highcutHz, srSafe);
       lpfR.setCutoff(highcutHz, srSafe);
       hpfL.setCutoff(lowcutHz,  srSafe);
       hpfR.setCutoff(lowcutHz,  srSafe);
+
+      // Set tone for write injection (first repeat)
+      inLpfL.setCutoff(highcutHz, srSafe);
+      inLpfR.setCutoff(highcutHz, srSafe);
+      inHpfL.setCutoff(lowcutHz,  srSafe);
+      inHpfR.setCutoff(lowcutHz,  srSafe);
 
       float baseTarget = clampf(time_ms, 5.0f, dly_time_max_ms) * 0.001f * srSafe;
       float stereoOffs = dly_default_stereo_offs_ms * 0.001f * srSafe;
@@ -1183,28 +1200,30 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
         float yL = dlL.readLinear(DL);
         float yR = dlR.readLinear(DR);
 
-        // Tone/drive on the first bounce AND on feedback
+        // Tone/drive on the delayed tap
         float yLproc = lpfL.process(hpfL.process( softclip_tanh(yL, driveK) ));
         float yRproc = lpfR.process(hpfR.process( softclip_tanh(yR, driveK) ));
 
-        // Feedback source: use processed taps so tone/drive affect first bounce and repeats
+        // Feedback source uses processed taps
         float fbSrcL = pingpong ? yRproc : yLproc;
         float fbSrcR = pingpong ? yLproc : yRproc;
 
         float xi = xMono[i];
 
-        // Ping-pong immediate: inject input into LEFT line only (right gets only feedback)
-        float writeL = xi + feedback * fbSrcL;
-        float writeR = (pingpong ? 0.0f : xi) + feedback * fbSrcR;
+        // NEW: pre-filter the write (first repeat is immediately toned)
+        float xiL = inLpfL.process(inHpfL.process(xi));
+        float xiR = inLpfR.process(inHpfR.process(xi));
+
+        float writeL = xiL + feedback * fbSrcL;
+        float writeR = (pingpong ? 0.0f : xiR) + feedback * fbSrcR;
 
         dlL.write(writeL);
         dlR.write(writeR);
 
-        // Stereo wet mix (use processed taps)
+        // Stereo wet mix (processed taps)
         float L = yLproc * wet1 + yRproc * wet2;
         float R = yRproc * wet1 + yLproc * wet2;
 
-        // Add wet on top of whatever is in ioLR
         ioLR[2*i + 0] += std::isfinite(L) ? L : 0.0f;
         ioLR[2*i + 1] += std::isfinite(R) ? R : 0.0f;
 
