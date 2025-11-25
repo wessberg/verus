@@ -1,20 +1,154 @@
 /*
-  stream_tflite.cpp
-  Realtime PortAudio streamer using TensorFlow Lite (LiteRT) model windows.
+  Realtime TFLite-based mono-in / multi-out streamer with:
+    - model-based piezo → mic processing,
+    - time‑aligned DI,
+    - stereo reverb / delay / chorus,
+    - optional stereo FX loop,
+    - headphone monitoring.
 
-  Updated for streaming/stateful realtime TFLite (T=32):
-    - Detects realtime_state_* inputs at runtime.
-    - If streaming: feeds/updates states via a packed bundle + splits outputs, and
-      schedules true streaming blocks (first 'hop' samples filled, rest zeros).
-    - If not streaming: falls back to original windowed schedule (left=T-hop).
+  Hardware / channel mapping
+  ==========================
 
-  Build notes (example):
-    clang++ -O3 -std=c++17 stream_tflite.cpp -o streamer_tflite \
-      -ltensorflowlite -lXNNPACK -lportaudio -framework Accelerate -lpthread
+  ADC (input, 8 channels @ 48 kHz)
+  --------------------------------
+    ch1 (index 0) : Guitar IN (mono)
+    ch2 (index 1) : Reserved for future stereo IN (right)
+    ch3 (index 2) : FX RETURN L
+    ch4 (index 3) : FX RETURN R
+    ch5–ch8       : Unused (0.0)
 
-  Usage example:
-    ./streamer_tflite --tflite out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite \
-                      --input-device <id> --output-device <id> --blocksize 16
+  DAC (output, 8 channels @ 48 kHz)
+  ---------------------------------
+    ch1 (index 0) : MAIN OUT L
+    ch2 (index 1) : MAIN OUT R
+    ch3 (index 2) : DRY OUT (time‑aligned DI)
+    ch4 (index 3) : FX SEND L  (pre‑FX-loop processed stereo)
+    ch5 (index 4) : FX SEND R  (pre‑FX-loop processed stereo)
+    ch6 (index 5) : HEADPHONE L (mirrors MAIN OUT L)
+    ch7 (index 6) : HEADPHONE R (mirrors MAIN OUT R)
+    ch8 (index 7) : Unused (0.0)
+
+  High‑level signal flow
+  ======================
+
+  1. Input capture
+     -------------
+     - The PortAudio callback reads ADC ch1 (guitar IN) into a mono buffer `tempIn`.
+     - `tempIn` is pushed into a ring buffer (`Shared::in`) for the inference thread.
+     - At the same time, the callback deinterleaves:
+         - ADC ch3 → `tempFxReturnL`  (FX RETURN L)
+         - ADC ch4 → `tempFxReturnR`  (FX RETURN R)
+
+  2. Inference thread (TFLite)
+     --------------------------
+     - Runs on a separate thread using a streaming or windowed TFLite model.
+     - Reads mono hops from `Shared::in`.
+     - Feeds the model input `realtime_piezo_input` and the various control knobs
+       (pick attack, pick resonance, IR, wet, main, EQ, etc.).
+     - Produces:
+         - Processed mono audio y[n] (piezo → mic),
+         - Style probability (pick vs finger),
+         - Updated model states (if streaming).
+     - Writes:
+         - processed mono y[n] → `Shared::out` ring,
+         - time‑aligned dry mono x[n] → `Shared::dry` ring
+           (the DI path is latency‑matched to the processed path).
+
+  3. Audio callback post‑processing
+     ------------------------------
+     For each audio block (`framesPerBuffer = hop`):
+
+     a) Pop from rings:
+        - processed mono  → `tempOut` (proc)
+        - time‑aligned DI → `tempDry` (dry)
+
+     b) Insert processors on the processed mono path:
+        - Noise gate (side‑chain HPF, attack/hold/release, hysteresis, range)
+        - Feedback protection frequency shifter (Hilbert-based)
+        - Hall reverb:
+            mono in  → stereo wet/dry mix → `tempStereo` (st[0]=L, st[1]=R)
+          If reverb is disabled:
+            `tempStereo` is just proc copied to L/R with appropriate dry/wet.
+        - Stereo chorus (mono in → stereo wet add) on top of `tempStereo`
+        - Tape/mod delay (mono in → stereo wet add) on top of `tempStereo`
+
+        After this stage we have the internal **processed stereo**:
+          preFxL = st[2*i + 0]
+          preFxR = st[2*i + 1]
+
+     c) FX loop routing
+        ----------------
+        - FX SEND (always active):
+            DAC ch4 = FX SEND L = preFxL
+            DAC ch5 = FX SEND R = preFxR
+
+        - FX RETURN:
+            ADC ch3 = FX RETURN L → tempFxReturnL
+            ADC ch4 = FX RETURN R → tempFxReturnR
+
+        - Software switch: gFxLoopEnabled (toggled from keyboard, can later
+          be tied to jack detect / GPIO):
+
+          If gFxLoopEnabled == false  (FX loop disabled):
+            MAIN OUT and headphones use the internal processed stereo:
+
+              mainL = preFxL
+              mainR = preFxR
+
+          If gFxLoopEnabled == true   (FX loop enabled):
+            MAIN OUT and headphones use the external FX return:
+
+              mainL = tempFxReturnL[i]
+              mainR = tempFxReturnR[i]
+
+        - DRY OUT:
+            DAC ch3 (index 2) = dry[i]
+          This is the time‑aligned DI coming from `Shared::dry`.
+
+        - Headphones:
+            DAC ch6 (index 5) = mainL
+            DAC ch7 (index 6) = mainR
+          Headphones always mirror the final MAIN OUT L/R after FX loop
+          selection.
+
+     d) Final DAC mapping per frame i:
+        --------------------------------
+          idx = 8 * i
+
+          out[idx + 0] = mainL         // MAIN OUT L (processed or FX return)
+          out[idx + 1] = mainR         // MAIN OUT R
+          out[idx + 2] = dry[i]        // DRY OUT (time‑aligned DI)
+          out[idx + 3] = preFxL        // FX SEND L (always internal processed)
+          out[idx + 4] = preFxR        // FX SEND R (always internal processed)
+          out[idx + 5] = mainL         // HEADPHONE L
+          out[idx + 6] = mainR         // HEADPHONE R
+          out[idx + 7] = 0.0f          // unused
+
+  4. Bypass behavior
+     ----------------
+     - Global bypass is controlled by gBypass (keyboard 'b').
+     - On bypass:
+         * All rings (in/out/dry) are flushed.
+         * Time‑domain FX (reverb, delay, chorus, gate, feedback shifter)
+           are reset via their respective reset epochs.
+         * The callback routes **dry mono input** from ADC ch1 to:
+
+             MAIN L/R      : dry
+             DRY OUT       : dry
+             FX SEND L/R   : dry
+             HEADPHONE L/R : dry
+
+           (FX RETURN is ignored; gFxLoopEnabled is effectively irrelevant
+            while bypass is active.)
+
+  Notes
+  =====
+  - Sample rate is fixed to 48 kHz.
+  - Hop size (PortAudio blocksize) must be <= model T; streaming models are
+    preferred (T==hop) for best latency/behavior.
+  - All knob controls are atomic and can be changed at runtime via:
+      * stdin keyboard shortcuts, and/or
+      * the optional HTTP/JS Web UI (when enabled in main()).
 */
 
 #include <iostream>
