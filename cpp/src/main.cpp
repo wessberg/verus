@@ -61,6 +61,8 @@ static constexpr float kPickResoBaselineBoostDB   = 32.0f;
 std::atomic<bool> gStopFlag(false), gBypass(false);
 std::atomic<uint64_t> gBypassEpoch{0};
 std::atomic<uint64_t> gReverbResetEpoch{0};
+std::atomic<bool> gFxLoopEnabled(false);
+
 
 void signalHandler(int){ gStopFlag = true; }
 
@@ -3330,6 +3332,9 @@ struct Shared {
   std::vector<float> tempOut;     // processed mono
   std::vector<float> tempStereo;  // processed stereo L/R
   std::vector<float> tempDry;     // delayed DI
+  std::vector<float> tempFxReturnL;
+  std::vector<float> tempFxReturnR;
+
   explicit Shared(size_t cap) : in(cap), out(cap), dry(cap) {}
 };
 
@@ -4170,7 +4175,9 @@ static int paCallback(const void *inputBuffer,
   const unsigned numInCh  = 8;
   const unsigned numOutCh = 8;
 
-  float *monoIn = sh->tempIn.data();
+  float *monoIn  = sh->tempIn.data();
+  float *fxRetL  = sh->tempFxReturnL.data();
+  float *fxRetR  = sh->tempFxReturnR.data();
 
   // Handle bypass edge + reset time-based DSP
   if (timeInfo) {
@@ -4197,15 +4204,22 @@ static int paCallback(const void *inputBuffer,
     }
   }
 
-  // Deinterleave ADC ch1 (channel 0) into monoIn, even if bypassed
+  // Deinterleave ADC channels:
+  //  - ch1 (index 0): guitar input -> monoIn
+  //  - ch3 (index 2): FX RETURN L  -> fxRetL
+  //  - ch4 (index 3): FX RETURN R  -> fxRetR
   if (in) {
     for (size_t i = 0; i < hop; ++i) {
-      monoIn[i] = in[numInCh * i + 0]; // ADC channel 1
+      monoIn[i] = in[numInCh * i + 0]; // ADC ch1: guitar in
+      fxRetL[i] = in[numInCh * i + 2]; // ADC ch3: FX return L
+      fxRetR[i] = in[numInCh * i + 3]; // ADC ch4: FX return R
     }
     // Feed mono input to inference thread ring
     sh->in.push(monoIn, hop);
   } else {
     std::memset(monoIn, 0, sizeof(float) * hop);
+    std::memset(fxRetL, 0, sizeof(float) * hop);
+    std::memset(fxRetR, 0, sizeof(float) * hop);
     sh->in.push(monoIn, hop);
   }
 
@@ -4217,12 +4231,16 @@ static int paCallback(const void *inputBuffer,
 
     for (size_t i = 0; i < hop; ++i) {
       float v = monoIn[i];
-      out[numOutCh * i + 0] = v; // L
-      out[numOutCh * i + 1] = v; // R
-      out[numOutCh * i + 2] = v; // DI
-      for (unsigned ch = 3; ch < numOutCh; ++ch) {
-        out[numOutCh * i + ch] = 0.0f;
-      }
+      size_t idx = numOutCh * i;
+
+      out[idx + 0] = v; // Main L (dry)
+      out[idx + 1] = v; // Main R (dry)
+      out[idx + 2] = v; // DI (dry, time-alignment irrelevant in bypass)
+      out[idx + 3] = v; // FX SEND L (dry)
+      out[idx + 4] = v; // FX SEND R (dry)
+      out[idx + 5] = v; // Headphone L (dry)
+      out[idx + 6] = v; // Headphone R (dry)
+      out[idx + 7] = 0.0f; // unused
     }
     return paContinue;
   }
@@ -4302,14 +4320,49 @@ static int paCallback(const void *inputBuffer,
   ChorusProcessAddMonoToStereoWet(proc, st, hop, framesPerBuffer, timeInfo);
   DelayProcessAddMonoToStereoWet (proc, st, hop, framesPerBuffer, timeInfo);
 
-  // Write to 8-channel output
+  // Final routing:
+  //  - preFxL/preFxR: internal processed stereo (after reverb/delay/chorus)
+  //  - FX SEND (DAC ch4/5): always preFxL/preFxR
+  //  - FX RETURN (ADC ch3/4): fxRetL/fxRetR
+  //  - Main OUT + Headphones: from FX RETURN if loop enabled, else from preFx
+  const bool fxOn = gFxLoopEnabled.load(std::memory_order_relaxed);
+
   for (size_t i = 0; i < hop; ++i) {
-    out[numOutCh * i + 0] = st[2 * i + 0]; // L
-    out[numOutCh * i + 1] = st[2 * i + 1]; // R
-    out[numOutCh * i + 2] = dry[i];        // DI
-    for (unsigned ch = 3; ch < numOutCh; ++ch) {
-      out[numOutCh * i + ch] = 0.0f;
+    float preFxL = st[2 * i + 0];
+    float preFxR = st[2 * i + 1];
+
+    float sendL  = preFxL;
+    float sendR  = preFxR;
+
+    float retL   = fxRetL[i];
+    float retR   = fxRetR[i];
+
+    float mainL, mainR;
+    if (fxOn) {
+      // Use external FX return as the "processed" signal
+      mainL = retL;
+      mainR = retR;
+    } else {
+      // No FX loop: use internal processed stereo
+      mainL = preFxL;
+      mainR = preFxR;
     }
+
+    float hpL = mainL;
+    float hpR = mainR;
+
+    size_t idx = numOutCh * i;
+    out[idx + 0] = mainL;   // DAC ch1: main L
+    out[idx + 1] = mainR;   // DAC ch2: main R
+    out[idx + 2] = dry[i];  // DAC ch3: time-aligned DI
+
+    out[idx + 3] = sendL;   // DAC ch4: FX SEND L
+    out[idx + 4] = sendR;   // DAC ch5: FX SEND R
+
+    out[idx + 5] = hpL;     // DAC ch6: Headphone L
+    out[idx + 6] = hpR;     // DAC ch7: Headphone R
+
+    out[idx + 7] = 0.0f;    // DAC ch8: unused
   }
 
   return paContinue;
@@ -4397,13 +4450,15 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, signalHandler);
 
-  // Shared rings
-  size_t cap = 1<<14;
- Shared shared(cap);
+// Shared rings
+size_t cap = 1<<14;
+Shared shared(cap);
 shared.tempIn.resize(blockSize);
 shared.tempOut.resize(blockSize);
 shared.tempStereo.resize(blockSize * 2);
 shared.tempDry.resize(blockSize);
+shared.tempFxReturnL.resize(blockSize);
+shared.tempFxReturnR.resize(blockSize);
 
   // Spawn inference thread
   InferCtx ictx;
@@ -4413,7 +4468,7 @@ shared.tempDry.resize(blockSize);
   // Keyboard thread for bypass + knobs
   std::thread kbThread([&](){
 
-  std::cout
+    std::cout
     << "[MAIN] Keys: "
     << "b=Bypass  "
     << "q/a=PA +/-1dB  "
@@ -4422,6 +4477,7 @@ shared.tempDry.resize(blockSize);
     << "r/f=Wet +/-5%  "
     << "t=Style mode (auto→pick→finger)  "
     << "g=Guided AUTO on/off  "
+    << "l=FX loop on/off  "          // NEW
     << "p=print"
     << "\n";
 
@@ -4439,6 +4495,16 @@ shared.tempDry.resize(blockSize);
         shared.dry.r.store(shared.dry.w.load(std::memory_order_acquire), std::memory_order_release);
 
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
+
+      } else if (c=='l' || c=='L') {          // NEW: FX loop toggle
+        bool now = !gFxLoopEnabled.load(std::memory_order_relaxed);
+        gFxLoopEnabled.store(now, std::memory_order_relaxed);
+        std::cout << "[UI] FX loop "
+                  << (now
+                      ? "ENABLED (main outs/headphones from ADC ch3/4 return)"
+                      : "DISABLED (main outs/headphones from internal processing)")
+                  << "\n";
+
       } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
         else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
         else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
