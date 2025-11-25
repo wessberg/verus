@@ -38,16 +38,10 @@
 #include <string>
 #include <algorithm>
 #include <iomanip>
-
-#include <pthread/qos.h>
-#include <Accelerate/Accelerate.h>
 #include <portaudio.h>
-#ifdef __APPLE__
-  #include <sched.h>
-  #include "pa_mac_core.h"
-  #include <CoreAudio/CoreAudio.h>
-  #include <CoreFoundation/CoreFoundation.h>
-#endif
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 
 // TensorFlow Lite
 #include "tensorflow/lite/interpreter.h"
@@ -3330,43 +3324,13 @@ struct RingBuffer {
   }
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 struct Shared {
-  RingBuffer in, out;
-  std::vector<float> tempOut;
-  explicit Shared(size_t cap): in(cap), out(cap){}
+  RingBuffer in, out, dry;
+  std::vector<float> tempIn;      // mono input (from ADC ch1)
+  std::vector<float> tempOut;     // processed mono
+  std::vector<float> tempStereo;  // processed stereo L/R
+  std::vector<float> tempDry;     // delayed DI
+  explicit Shared(size_t cap) : in(cap), out(cap), dry(cap) {}
 };
 
 // ───────────────────────── DEVICE ENUM ─────────────────────────
@@ -3912,14 +3876,10 @@ struct InferCtx {
 };
 
 void inferenceThread(InferCtx ctx) {
-#if defined(__APPLE__)
-  #ifdef QOS_CLASS_AUDIO
-    pthread_set_qos_class_self_np(QOS_CLASS_AUDIO, 0);
-  #else
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-  #endif
+#if defined(__linux__)
   struct sched_param sp;
-  sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+  std::memset(&sp, 0, sizeof(sp));
+  sp.sched_priority = 30;  // slightly higher than main
   pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 #endif
 
@@ -4007,13 +3967,18 @@ void inferenceThread(InferCtx ctx) {
       }
       probWin.reset();
       // Drop any queued processed audio to be extra safe
+      ctx.sh->in .r.store(ctx.sh->in .w.load(std::memory_order_acquire), std::memory_order_release);
       ctx.sh->out.r.store(ctx.sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
+      ctx.sh->dry.r.store(ctx.sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
     }
   };
 
   // Initial hop
   size_t got = ctx.sh->in.pop(xhop.data(), hop);
   if (got < (size_t)hop) std::fill(xhop.begin()+got, xhop.end(), 0.0f);
+
+  // enqueue dry path with the same hop
+  ctx.sh->dry.push(xhop.data(), hop);
 
   // Helpers to call TFLite for one block
   auto do_invoke_streaming = [&](const float* coreBuf, int coreLen, float guidedStableForAuto){
@@ -4092,6 +4057,8 @@ void inferenceThread(InferCtx ctx) {
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
       if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
 
+      ctx.sh->dry.push(xhop.data(), hop);
+
       // Reset state/rings on bypass edge
       onBypassEdgeIfAny();
 
@@ -4140,6 +4107,8 @@ void inferenceThread(InferCtx ctx) {
 
       size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
       if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
+
+      ctx.sh->dry.push(xhop.data(), hop);
 
       // Reset state/rings on bypass edge
       onBypassEdgeIfAny();
@@ -4193,28 +4162,33 @@ static int paCallback(const void *inputBuffer,
                       PaStreamCallbackFlags,
                       void *userData)
 {
-  auto *sh = static_cast<Shared*>(userData);
-  auto *in = static_cast<const float*>(inputBuffer);
-  auto *out= static_cast<float*>(outputBuffer);
-  size_t hop = framesPerBuffer;
+  auto *sh  = static_cast<Shared*>(userData);
+  auto *in  = static_cast<const float*>(inputBuffer);
+  auto *out = static_cast<float*>(outputBuffer);
 
-  // Update measured latency and handle bypass edges
+  const size_t   hop      = framesPerBuffer;
+  const unsigned numInCh  = 8;
+  const unsigned numOutCh = 8;
+
+  float *monoIn = sh->tempIn.data();
+
+  // Handle bypass edge + reset time-based DSP
   if (timeInfo) {
-    static double s_prevInputAdcTime = 0.0;
-    s_prevInputAdcTime = timeInfo->inputBufferAdcTime;
-
     static uint64_t s_lastBypassEpoch = 0;
-    static bool s_lastBypass = false;
-    uint64_t curEpoch = gBypassEpoch.load(std::memory_order_acquire);
-    bool curBypass = gBypass.load(std::memory_order_relaxed);
+    static bool     s_lastBypass      = false;
+
+    uint64_t curEpoch  = gBypassEpoch.load(std::memory_order_acquire);
+    bool     curBypass = gBypass.load(std::memory_order_relaxed);
     if (curEpoch != s_lastBypassEpoch || curBypass != s_lastBypass) {
-      // Flush rings on toggle
-      sh->in.r.store(sh->in.w.load(std::memory_order_acquire), std::memory_order_release);
+      // Flush all rings
+      sh->in.r.store (sh->in.w.load (std::memory_order_acquire), std::memory_order_release);
       sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-      s_prevInputAdcTime = 0.0;
+      sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
+
       s_lastBypassEpoch = curEpoch;
-      s_lastBypass = curBypass;
-      // Reset time-based processors on bypass edges
+      s_lastBypass      = curBypass;
+
+      // Reset time-based processors
       ReverbReset();
       GateReset();
       DelayReset();
@@ -4223,35 +4197,52 @@ static int paCallback(const void *inputBuffer,
     }
   }
 
-  if (in) sh->in.push(in, hop);
+  // Deinterleave ADC ch1 (channel 0) into monoIn, even if bypassed
+  if (in) {
+    for (size_t i = 0; i < hop; ++i) {
+      monoIn[i] = in[numInCh * i + 0]; // ADC channel 1
+    }
+    // Feed mono input to inference thread ring
+    sh->in.push(monoIn, hop);
+  } else {
+    std::memset(monoIn, 0, sizeof(float) * hop);
+    sh->in.push(monoIn, hop);
+  }
 
+  // Global bypass: route monoIn to outputs
   if (gBypass.load(std::memory_order_relaxed)) {
-    // Ensure processed ring empty while bypassed
+    // Ensure processed/dry rings are empty while bypassed
     sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-    if (in) {
-      for (size_t i=0;i<hop;i++){
-        float v = in[i];
-        out[2*i] = v; out[2*i+1] = v;
+    sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
+
+    for (size_t i = 0; i < hop; ++i) {
+      float v = monoIn[i];
+      out[numOutCh * i + 0] = v; // L
+      out[numOutCh * i + 1] = v; // R
+      out[numOutCh * i + 2] = v; // DI
+      for (unsigned ch = 3; ch < numOutCh; ++ch) {
+        out[numOutCh * i + ch] = 0.0f;
       }
-    } else {
-      std::memset(out, 0, sizeof(float)*2*hop);
     }
     return paContinue;
   }
 
-  float *temp = sh->tempOut.data();
-  size_t got  = sh->out.pop(temp, hop);
-  if (got < hop) std::memset(temp+got, 0, sizeof(float)*(hop-got));
+  // Pop processed mono and delayed dry mono from rings
+  float *proc = sh->tempOut.data();
+  float *dry  = sh->tempDry.data();
+  size_t gotP = sh->out.pop(proc, hop);
+  size_t gotD = sh->dry.pop(dry,  hop);
+  if (gotP < hop) std::memset(proc + gotP, 0, sizeof(float) * (hop - gotP));
+  if (gotD < hop) std::memset(dry  + gotD, 0, sizeof(float) * (hop - gotD));
 
-  // Apply noise gate (mono, in-place) before reverb/delay
+  // Noise gate on processed mono
   {
     static NoiseGate s_gate;
     static bool s_inited = false;
     if (!s_inited) {
-      s_gate.setSampleRate(kSR); // follow reverb's 48k tuning
+      s_gate.setSampleRate(kSR);
       s_inited = true;
     }
-    // Reset on any external gate reset epoch bump
     static uint64_t s_lastGateEpoch = 0;
     uint64_t curGateEpoch = GateGetResetEpoch();
     if (curGateEpoch != s_lastGateEpoch) {
@@ -4259,7 +4250,6 @@ static int paCallback(const void *inputBuffer,
       s_lastGateEpoch = curGateEpoch;
     }
 
-    // Pull latest UI params
     const bool gate_enabled    = (GateEnabledStore().load(std::memory_order_relaxed) != 0);
     const float th_db    = GateThreshDBStore().load(std::memory_order_relaxed);
     const float hy_db    = GateHystDBStore().load(std::memory_order_relaxed);
@@ -4270,10 +4260,10 @@ static int paCallback(const void *inputBuffer,
     const float hpf_hz   = GateScHPHzStore().load(std::memory_order_relaxed);
 
     s_gate.setParams(th_db, hy_db, atk_ms, rel_ms, hold_ms, range_db, hpf_hz);
-    s_gate.processBlock(temp, hop, gate_enabled);
+    s_gate.processBlock(proc, hop, gate_enabled);
   }
 
-  // Anti-feedback frequency shifter (mono, in-place), before reverb/delay
+  // Anti-feedback shifter on processed mono
   {
     static AntiFeedbackShifter s_afb;
     static bool s_inited = false;
@@ -4287,101 +4277,43 @@ static int paCallback(const void *inputBuffer,
     const bool afb_on = (AFBEnabledStore().load(std::memory_order_relaxed) != 0);
     const float shz   = AFBShiftHzStore().load(std::memory_order_relaxed);
     s_afb.setShiftHz(shz);
-    s_afb.processBlock(temp, hop, afb_on);
+    s_afb.processBlock(proc, hop, afb_on);
   }
 
   const bool rvbOn = (RvbEnabledStore().load(std::memory_order_relaxed) != 0);
   const bool dlyOn = (DlyEnabledStore().load(std::memory_order_relaxed) != 0);
 
+  // Stereo scratch for processed path
+  float *st = sh->tempStereo.data();
+  std::memset(st, 0, sizeof(float) * 2 * hop);
+
   if (rvbOn) {
-    // Reverb handles its own dry/wet
-    ReverbProcessMonoToStereo(temp, out, hop, framesPerBuffer, timeInfo);
+    ReverbProcessMonoToStereo(proc, st, hop, framesPerBuffer, timeInfo);
   } else {
-    // No reverb: do a simple dry mix controlled by the delay Mix (kill dry at 100%)
     float dlyMix01 = dlyOn ? clampf(DlyMixStore().load(std::memory_order_relaxed) * 0.01f, 0.0f, 1.0f) : 0.0f;
     float dryAmt   = dlyOn ? (1.0f - dlyMix01) : 1.0f;
     for (size_t i = 0; i < hop; ++i) {
-      float v = temp[i] * dryAmt;
-      out[2*i + 0] = v;
-      out[2*i + 1] = v;
+      float v = proc[i] * dryAmt;
+      st[2 * i + 0] = v;
+      st[2 * i + 1] = v;
     }
   }
 
-  // Chorus always adds its wet on top (returns early if disabled)
-  ChorusProcessAddMonoToStereoWet(temp, out, hop, framesPerBuffer, timeInfo);
+  ChorusProcessAddMonoToStereoWet(proc, st, hop, framesPerBuffer, timeInfo);
+  DelayProcessAddMonoToStereoWet (proc, st, hop, framesPerBuffer, timeInfo);
 
-  // Delay always adds its wet on top (it returns early if disabled)
-  DelayProcessAddMonoToStereoWet(temp, out, hop, framesPerBuffer, timeInfo);
+  // Write to 8-channel output
+  for (size_t i = 0; i < hop; ++i) {
+    out[numOutCh * i + 0] = st[2 * i + 0]; // L
+    out[numOutCh * i + 1] = st[2 * i + 1]; // R
+    out[numOutCh * i + 2] = dry[i];        // DI
+    for (unsigned ch = 3; ch < numOutCh; ++ch) {
+      out[numOutCh * i + ch] = 0.0f;
+    }
+  }
 
   return paContinue;
 }
-
-// ───────────────────────── MAC HAL BUFFER SIZE ─────────────────────────
-#ifdef __APPLE__
-static void setMacHardwareBufferSize(const DeviceInfo& paDev, int blockSize, bool isInput) {
-  AudioObjectID coreAudioDeviceID = kAudioObjectUnknown;
-
-  // Enumerate devices to match by name
-  AudioObjectPropertyAddress propAddr = {
-    kAudioHardwarePropertyDevices,
-    kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
-  };
-  UInt32 dataSize = 0;
-  OSStatus deviceErr = AudioObjectGetPropertyDataSize(
-      kAudioObjectSystemObject, &propAddr, 0, nullptr, &dataSize);
-  if (deviceErr) { std::cerr << "Error get dev size: " << deviceErr << "\n"; return; }
-
-  int deviceCount = dataSize / sizeof(AudioDeviceID);
-  std::vector<AudioDeviceID> devs(deviceCount);
-  deviceErr = AudioObjectGetPropertyData(
-      kAudioObjectSystemObject, &propAddr, 0, nullptr, &dataSize, devs.data());
-  if (deviceErr) { std::cerr << "Error get dev list: " << deviceErr << "\n"; return; }
-
-  for (auto devID : devs) {
-    AudioObjectPropertyAddress nameAddr = {
-      kAudioObjectPropertyName,
-      kAudioObjectPropertyScopeGlobal,
-      kAudioObjectPropertyElementMain
-    };
-    CFStringRef cfName = nullptr;
-    UInt32 nSize = sizeof(cfName);
-    OSStatus err = AudioObjectGetPropertyData(
-        devID, &nameAddr, 0, nullptr, &nSize, &cfName);
-    if (err == noErr && cfName) {
-      char nameBuf[256] = {0};
-      CFStringGetCString(cfName, nameBuf, sizeof(nameBuf), kCFStringEncodingUTF8);
-      CFRelease(cfName);
-      if (std::string(nameBuf) == paDev.name) {
-        coreAudioDeviceID = devID; break;
-      }
-    }
-  }
-  if (coreAudioDeviceID == kAudioObjectUnknown) {
-    std::cerr << "[HAL] could not find CoreAudio device by name: " << paDev.name << "\n";
-    return;
-  }
-
-  // Set buffer frame size
-  UInt32 newBufferSize = (UInt32)blockSize;
-  AudioObjectPropertyAddress bufAddr = {
-    kAudioDevicePropertyBufferFrameSize,
-    kAudioObjectPropertyScopeGlobal,
-    kAudioObjectPropertyElementMain
-  };
-  deviceErr = AudioObjectSetPropertyData(
-      coreAudioDeviceID, &bufAddr, 0, nullptr, sizeof(newBufferSize), &newBufferSize);
-  if (deviceErr) {
-    std::cerr << "Error setting buffer size: " << deviceErr << "\n";
-  }
-  // Read back
-  UInt32 actualSize = 0; UInt32 asize = sizeof(actualSize);
-  deviceErr = AudioObjectGetPropertyData(coreAudioDeviceID, &bufAddr, 0, nullptr, &asize, &actualSize);
-  if (!deviceErr) {
-    std::cout << "[HAL] " << (isInput?"Input":"Output") << " buffer now: " << actualSize << " frames\n";
-  }
-}
-#endif
 
 // ───────────────────────── MAIN ─────────────────────────
 int main(int argc, char** argv) {
@@ -4422,10 +4354,20 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-#ifdef __APPLE__
-  setMacHardwareBufferSize(inDev,  blockSize, true);
-  setMacHardwareBufferSize(outDev, blockSize, false);
-#endif
+  #ifdef __linux__
+    // Lock current and future memory to avoid page faults in RT audio threads
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+      perror("mlockall");
+    }
+
+    // Try to give the process a SCHED_FIFO policy (requires CAP_SYS_NICE / root)
+    struct sched_param sp;
+    std::memset(&sp, 0, sizeof(sp));
+    sp.sched_priority = 20;  // tune as needed (1–99)
+    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
+      perror("sched_setscheduler");
+    }
+  #endif
 
   PaError err = Pa_Initialize();
   if (err != paNoError) {
@@ -4434,7 +4376,7 @@ int main(int argc, char** argv) {
   }
   auto *diIn  = Pa_GetDeviceInfo(inDevId);
   auto *diOut = Pa_GetDeviceInfo(outDevId);
-  int sampleRate = (int)std::lround(diIn->defaultSampleRate);
+  int sampleRate = 48000;
 
   std::cout<<"[MAIN] In ["<<inDevId<<"] "<<diIn->name<<" sr="<<diIn->defaultSampleRate<<"\n";
   std::cout<<"[MAIN] Out["<<outDevId<<"] "<<diOut->name<<" sr="<<diOut->defaultSampleRate<<"\n";
@@ -4443,8 +4385,8 @@ int main(int argc, char** argv) {
 
   // PortAudio stream params
   double wantLatencySecs = double(blockSize) / sampleRate;
-  PaStreamParameters ip = { inDevId, 1, paFloat32, wantLatencySecs, nullptr };
-  PaStreamParameters op = { outDevId, 2, paFloat32, wantLatencySecs, nullptr };
+  PaStreamParameters ip = { inDevId, 8, paFloat32, wantLatencySecs, nullptr };
+  PaStreamParameters op = { outDevId, 8, paFloat32, wantLatencySecs, nullptr };
 
   // stdin non-blocking for UI
   termios oldt,newt;
@@ -4457,8 +4399,11 @@ int main(int argc, char** argv) {
 
   // Shared rings
   size_t cap = 1<<14;
-  Shared shared(cap);
-  shared.tempOut.resize(blockSize);
+ Shared shared(cap);
+shared.tempIn.resize(blockSize);
+shared.tempOut.resize(blockSize);
+shared.tempStereo.resize(blockSize * 2);
+shared.tempDry.resize(blockSize);
 
   // Spawn inference thread
   InferCtx ictx;
@@ -4487,9 +4432,12 @@ int main(int argc, char** argv) {
         bool now = !gBypass.load(std::memory_order_relaxed);
         bool prev = gBypass.exchange(now, std::memory_order_acq_rel);
         gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);
+
         // Drop all queued audio immediately
-        shared.in.r.store(shared.in.w.load(std::memory_order_acquire), std::memory_order_release);
+        shared.in.r .store(shared.in .w.load(std::memory_order_acquire), std::memory_order_release);
         shared.out.r.store(shared.out.w.load(std::memory_order_acquire), std::memory_order_release);
+        shared.dry.r.store(shared.dry.w.load(std::memory_order_acquire), std::memory_order_release);
+
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
       } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
         else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
@@ -4523,7 +4471,8 @@ int main(int argc, char** argv) {
     }
   });
 
-  StartKnobWebUI(8088);
+  // Comment out for now
+  // StartKnobWebUI(8088);
 
   PaStream *stream = nullptr;
   err = Pa_OpenStream(&stream, &ip, &op, sampleRate, (unsigned long)blockSize, paNoFlag, paCallback, &shared);
@@ -4554,7 +4503,8 @@ int main(int argc, char** argv) {
 
   std::cout<<"[MAIN] Stopping…\n";
 
-  StopKnobWebUI();
+  // Comment out for now
+  // StopKnobWebUI();
 
   Pa_StopStream(stream);
   Pa_CloseStream(stream);

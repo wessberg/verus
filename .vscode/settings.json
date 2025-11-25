@@ -71,5 +71,5 @@
         "*.inc": "cpp",
         "cstddef": "cpp"
     },
-    "cmake.sourceDirectory": "/Users/ideanote/Developer/tf-audio-experiment/cpp2"
+    "cmake.sourceDirectory": "/Users/ideanote/Developer/tf-audio-experiment/cpp"
 }

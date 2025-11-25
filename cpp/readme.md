@@ -43,7 +43,7 @@ bazelisk build -c opt --config=monolithic --define tflite_with_xnnpack=true \
 Make sure it is installed with XNNPACK enabled:
 
 ```
-nm -gU /Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow-src/bazel-bin/tensorflow/lite/libtensorflowlite.so | grep TfLiteXNNPackDelegateCreate
+nm -gU /Users/ideanote/Developer/tf-audio-experiment/cpp/lib/tensorflow-src/bazel-bin/tensorflow/lite/libtensorflowlite.so | grep TfLiteXNNPackDelegateCreate
 ```
 
 If you see `_TfLiteXNNPackDelegateCreate` somewhere in there, then all is well!
@@ -59,20 +59,18 @@ git clone --depth 1 --branch v24.3.25 https://github.com/google/flatbuffers.git 
 
 3. **Build the project**
 
-Make sure you cd out into `/cpp2` before continuing.
+Make sure you cd out into `/cpp` before continuing.
 
 ```
 mkdir -p build && cd build
 
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
-  -DTFLITE_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow-src \
-  -DTFLITE_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/tensorflow-src/bazel-bin/tensorflow/lite/libtensorflowlite.so \
-  -DFLATBUFFERS_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/flatbuffers/include \
-  -DCNPY_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib \
-  -DCNPY_LIBRARY=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/cnpy/build/libcnpy.dylib \
-  -DPORTAUDIO_INCLUDE_DIR=/Users/ideanote/Developer/tf-audio-experiment/cpp2/lib/portaudio/include \
-  -DPORTAUDIO_LIBRARY=/usr/local/lib/libportaudio.dylib \
+  -DTFLITE_INCLUDE_DIR=$HOME/dev/tensorflow-src \
+  -DTFLITE_LIBRARY=$HOME/dev/tensorflow-src/bazel-bin/tensorflow/lite/libtensorflowlite.so \
+  -DFLATBUFFERS_INCLUDE_DIR=$HOME/dev/flatbuffers/include \
+  -DPORTAUDIO_INCLUDE_DIR=/usr/include \
+  -DPORTAUDIO_LIBRARY=/usr/lib/aarch64-linux-gnu/libportaudio.so \
   -DUSE_TFLITE_XNNPACK=ON
 
 cmake --build .
@@ -81,11 +79,11 @@ cmake --build .
 # USAGE
 
 ```
-cmake --build . && ./stream_audio_cpp --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N]
+cmake --build . && sudo ./stream_audio_cpp --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N]
 ```
 
 E.g.:
 
 ```
-cmake --build . && ./stream_audio_cpp --tflite ../../out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite --input-device 4 --output-device 4 --blocksize 32
+cmake --build . && sudo ./stream_audio_cpp --tflite ../../out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite --blocksize 32 --input-device 0 --output-device 0
 ```
