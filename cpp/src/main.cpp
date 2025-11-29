@@ -26,7 +26,7 @@
     ch5 (index 4) : FX SEND R  (pre‑FX-loop processed stereo)
     ch6 (index 5) : HEADPHONE L (mirrors MAIN OUT L)
     ch7 (index 6) : HEADPHONE R (mirrors MAIN OUT R)
-    ch8 (index 7) : Unused (0.0)
+    ch8 (index 7) : MONO OUT (sum of MAIN L/R)
 
   High‑level signal flow
   ======================
@@ -115,14 +115,14 @@
         --------------------------------
           idx = 8 * i
 
-          out[idx + 0] = mainL         // MAIN OUT L (processed or FX return)
-          out[idx + 1] = mainR         // MAIN OUT R
-          out[idx + 2] = dry[i]        // DRY OUT (time‑aligned DI)
-          out[idx + 3] = preFxL        // FX SEND L (always internal processed)
-          out[idx + 4] = preFxR        // FX SEND R (always internal processed)
-          out[idx + 5] = mainL         // HEADPHONE L
-          out[idx + 6] = mainR         // HEADPHONE R
-          out[idx + 7] = 0.0f          // unused
+          out[idx + 0] = mainL                  // MAIN OUT L (processed or FX return)
+          out[idx + 1] = mainR                  // MAIN OUT R
+          out[idx + 2] = dry[i]                 // DRY OUT (time‑aligned DI)
+          out[idx + 3] = preFxL                 // FX SEND L (always internal processed)
+          out[idx + 4] = preFxR                 // FX SEND R (always internal processed)
+          out[idx + 5] = mainL                  // HEADPHONE L
+          out[idx + 6] = mainR                  // HEADPHONE R
+          out[idx + 7] = 0.5f * (mainL + mainR) // MONO OUT (MAIN L/R sum)
 
   4. Bypass behavior
      ----------------
@@ -4358,11 +4358,9 @@ static int paCallback(const void *inputBuffer,
   }
 
   // Global bypass: route monoIn to outputs
-  if (gBypass.load(std::memory_order_relaxed)) {
+    if (gBypass.load(std::memory_order_relaxed)) {
     // Ensure processed/dry rings are empty while bypassed
-    sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-    sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
-
+    ...
     for (size_t i = 0; i < hop; ++i) {
       float v = monoIn[i];
       size_t idx = numOutCh * i;
@@ -4374,7 +4372,7 @@ static int paCallback(const void *inputBuffer,
       out[idx + 4] = v; // FX SEND R (dry)
       out[idx + 5] = v; // Headphone L (dry)
       out[idx + 6] = v; // Headphone R (dry)
-      out[idx + 7] = 0.0f; // unused
+      out[idx + 7] = v; // MONO OUT (dry; MAIN L/R are both v anyway)
     }
     return paContinue;
   }
@@ -4461,7 +4459,7 @@ static int paCallback(const void *inputBuffer,
   //  - Main OUT + Headphones: from FX RETURN if loop enabled, else from preFx
   const bool fxOn = gFxLoopEnabled.load(std::memory_order_relaxed);
 
-  for (size_t i = 0; i < hop; ++i) {
+    for (size_t i = 0; i < hop; ++i) {
     float preFxL = st[2 * i + 0];
     float preFxR = st[2 * i + 1];
 
@@ -4473,11 +4471,9 @@ static int paCallback(const void *inputBuffer,
 
     float mainL, mainR;
     if (fxOn) {
-      // Use external FX return as the "processed" signal
       mainL = retL;
       mainR = retR;
     } else {
-      // No FX loop: use internal processed stereo
       mainL = preFxL;
       mainR = preFxR;
     }
@@ -4485,18 +4481,21 @@ static int paCallback(const void *inputBuffer,
     float hpL = mainL;
     float hpR = mainR;
 
+    // Mono sum of MAIN L/R (−6 dB to keep level consistent for centered signals)
+    float monoMain = 0.5f * (mainL + mainR);
+
     size_t idx = numOutCh * i;
-    out[idx + 0] = mainL;   // DAC ch1: main L
-    out[idx + 1] = mainR;   // DAC ch2: main R
-    out[idx + 2] = dry[i];  // DAC ch3: time-aligned DI
+    out[idx + 0] = mainL;    // DAC ch1: main L
+    out[idx + 1] = mainR;    // DAC ch2: main R
+    out[idx + 2] = dry[i];   // DAC ch3: time-aligned DI
 
-    out[idx + 3] = sendL;   // DAC ch4: FX SEND L
-    out[idx + 4] = sendR;   // DAC ch5: FX SEND R
+    out[idx + 3] = sendL;    // DAC ch4: FX SEND L
+    out[idx + 4] = sendR;    // DAC ch5: FX SEND R
 
-    out[idx + 5] = hpL;     // DAC ch6: Headphone L
-    out[idx + 6] = hpR;     // DAC ch7: Headphone R
+    out[idx + 5] = hpL;      // DAC ch6: Headphone L
+    out[idx + 6] = hpR;      // DAC ch7: Headphone R
 
-    out[idx + 7] = 0.0f;    // DAC ch8: unused
+    out[idx + 7] = monoMain; // DAC ch8: MONO OUT (MAIN L/R sum)
   }
 
   return paContinue;
