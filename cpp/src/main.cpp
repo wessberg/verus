@@ -176,6 +176,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <limits>
 
 // TensorFlow Lite
 #include "tensorflow/lite/interpreter.h"
@@ -357,6 +358,61 @@ static inline float db2lin(float dB) {
 }
 static inline float clampf(float x, float lo, float hi) {
   return std::max(lo, std::min(hi, x));
+}
+
+// ───────────────────────── Raspberry Pi temperature monitor ─────────────────────────
+// Don't call `vcgencmd` from RT threads (fork/exec). Read sysfs once/sec in a low-priority thread.
+static std::atomic<float> gSoCTempC{std::numeric_limits<float>::quiet_NaN()};
+static std::atomic<bool>  gTempMonStop{false};
+static std::thread        gTempMonThread;
+
+static inline float ReadSoCTempC() {
+#if defined(__linux__)
+  // millidegrees C, e.g. "45123\n"
+  std::ifstream f("/sys/class/thermal/thermal_zone0/temp");
+  long milli = 0;
+  if (f && (f >> milli)) return float(milli) * 0.001f;
+#endif
+  return std::numeric_limits<float>::quiet_NaN();
+}
+
+static inline void AppendSoCTemp(std::ostream& os) {
+  float t = gSoCTempC.load(std::memory_order_relaxed);
+  if (std::isfinite(t)) {
+    auto oldFlags = os.flags();
+    auto oldPrec  = os.precision();
+    os << "  Temp=" << std::fixed << std::setprecision(1) << t << "C";
+    os.flags(oldFlags);
+    os.precision(oldPrec);
+  } else {
+    os << "  Temp=n/a";
+  }
+}
+
+static void StartTempMonitor(int periodMs = 1000) {
+  if (gTempMonThread.joinable()) return;
+  gTempMonStop.store(false, std::memory_order_relaxed);
+
+  // Seed an initial value
+  gSoCTempC.store(ReadSoCTempC(), std::memory_order_relaxed);
+
+  gTempMonThread = std::thread([periodMs]{
+#if defined(__linux__)
+    // If main() switched to SCHED_FIFO, std::thread inherits it. Force non-RT here.
+    sched_param sp{}; sp.sched_priority = 0;
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+#endif
+    while (!gTempMonStop.load(std::memory_order_relaxed) &&
+           !gStopFlag.load(std::memory_order_relaxed)) {
+      gSoCTempC.store(ReadSoCTempC(), std::memory_order_relaxed);
+      std::this_thread::sleep_for(std::chrono::milliseconds(periodMs));
+    }
+  });
+}
+
+static void StopTempMonitor() {
+  gTempMonStop.store(true, std::memory_order_relaxed);
+  if (gTempMonThread.joinable()) gTempMonThread.join();
 }
 
 
@@ -4071,8 +4127,9 @@ void inferenceThread(InferCtx ctx) {
               << "Pred P=" << dispP << "  "
               << "Pred=" << pickOrFinger(dispP, sm) << "  "
               << "Mode=" << styleModeName(sm)
-              << (gGuidedAuto.load() ? "  (Guided AUTO ON)" : "")
-              << "\n";
+              << (gGuidedAuto.load() ? "  (Guided AUTO ON)" : "");
+    AppendSoCTemp(std::cout);
+    std::cout << "\n";
   };
 
   auto checkAndReportKnobChanges = [&](float dispP){
@@ -4231,8 +4288,9 @@ void inferenceThread(InferCtx ctx) {
         std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
                   << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
                   << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
-                  << (gGuidedAuto.load() ? "  (Guided)" : "")
-                  << "\n";
+                  << (gGuidedAuto.load() ? "  (Guided)" : "");
+        AppendSoCTemp(std::cerr);
+        std::cerr << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
@@ -4284,8 +4342,9 @@ void inferenceThread(InferCtx ctx) {
         std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
                   << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
                   << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
-                  << (gGuidedAuto.load() ? "  (Guided)" : "")
-                  << "\n";
+                  << (gGuidedAuto.load() ? "  (Guided)" : "");
+        AppendSoCTemp(std::cerr);
+        std::cerr << "\n";
         last_report = t1; sum_proc = 0.0; cnt = 0;
       }
     }
@@ -4697,6 +4756,8 @@ shared.tempFxReturnR.resize(blockSize);
   gIOOutputLatencySec = info->outputLatency;
   std::cerr<<"[MAIN] Actual I/O buffer: in="<<(int)std::round(gIOInputLatencySec*sampleRate)
            <<" out="<<(int)std::round(gIOOutputLatencySec*sampleRate)<<" frames\n";
+  
+  StartTempMonitor(1000); // 1 Hz is plenty
 
   std::cout<<"[MAIN] Streaming… (Ctrl-C to quit)\n";
   while (!gStopFlag) Pa_Sleep(100);
@@ -4709,6 +4770,7 @@ shared.tempFxReturnR.resize(blockSize);
   Pa_StopStream(stream);
   Pa_CloseStream(stream);
   Pa_Terminate();
+  StopTempMonitor();
 
   infThread.join();
   kbThread.join();
