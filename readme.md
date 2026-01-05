@@ -30,6 +30,8 @@ The model has 5 outputs:
 
 `vulture piezo2mic.py`
 
-# Timeout prevention for ROCm
+# Pico interaction from Raspberry
 
-./rocm-idle-protection.sh
+```
+mpremote connect /dev/serial/by-id/usb-MicroPython_Board_in_FS_mode_3ec34210277d08ef-if00 run ./demo_color_palette.py
+```
