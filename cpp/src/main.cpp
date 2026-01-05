@@ -4360,7 +4360,8 @@ static int paCallback(const void *inputBuffer,
   // Global bypass: route monoIn to outputs
     if (gBypass.load(std::memory_order_relaxed)) {
     // Ensure processed/dry rings are empty while bypassed
-    ...
+    sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
+    sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
     for (size_t i = 0; i < hop; ++i) {
       float v = monoIn[i];
       size_t idx = numOutCh * i;
