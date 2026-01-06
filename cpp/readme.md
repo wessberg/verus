@@ -32,6 +32,8 @@ bazelisk --version
 2. **Tensorflow**
 
 Pick a stable version, e.g. 2.20.0
+Building the full TensorFlow version will take up >4gb on disk,
+but we only need TFLite for inferrence, so we'll make a minimal build.
 
 ```
 cd $HOME
@@ -55,9 +57,10 @@ When it asks for optimization flags, use:
 Now build with `bazelisk`:
 
 ```
-# Build optimized, monolithic, with XNNPACK enabled
-bazelisk build -c opt --config=monolithic --define tflite_with_xnnpack=true \
-  //tensorflow/lite:libtensorflowlite.so
+bazelisk build -c opt --define tflite_with_xnnpack=true //tensorflow/lite:libtensorflowlite.so
+sudo install -Dm755 bazel-bin/tensorflow/lite/libtensorflowlite.so /usr/local/lib/libtensorflowlite.so
+sudo rsync -a tensorflow/ /usr/local/include/tensorflow/
+sudo ldconfig
 ```
 
 Make sure it is installed with XNNPACK enabled:
@@ -87,7 +90,7 @@ mkdir -p build && cd build
 cmake .. \
   -DCMAKE_BUILD_TYPE=Release \
   -DTFLITE_INCLUDE_DIR=$HOME/tensorflow \
-  -DTFLITE_LIBRARY=$HOME/tensorflow/bazel-bin/tensorflow/lite/libtensorflowlite.so \
+  -DTFLITE_LIBRARY=/usr/local/lib/libtensorflowlite.so \
   -DFLATBUFFERS_INCLUDE_DIR=$HOME/flatbuffers/include \
   -DPORTAUDIO_INCLUDE_DIR=/usr/include \
   -DPORTAUDIO_LIBRARY=/usr/lib/aarch64-linux-gnu/libportaudio.so \
