@@ -91,6 +91,8 @@ card 0: sndrpihifiberry [snd_rpi_hifiberry_dac8x], device 0: HiFiBerry DAC8xADC8
 
 # Processing audio through a model to disk as a new file
 
+### CLI
+
 Auto style:
 ```
 python piezo2mic.py --process --input in.wav --output out.wav --offline-only
@@ -104,4 +106,13 @@ python piezo2mic.py --process --input in.wav --output out.wav --offline-only --s
 Force finger
 ```
 python piezo2mic.py --process --input in.wav --output out.wav --offline-only --style finger
+```
+
+### UI
+
+You can also du this via a UI:
+
+```
+pip install pyside6
+python -m piezo2mic_app
 ```
