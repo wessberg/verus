@@ -9575,7 +9575,280 @@ def sweep_pickattack_params_with_tflite(
     
     
     
-    
+def _cli_arg_value(args, flag, default=None):
+    for i, a in enumerate(args):
+        if a == flag:
+            return args[i + 1] if i + 1 < len(args) else default
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return default
+
+def _ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+def _open_output_writer(path, sample_rate):
+    _ensure_parent_dir(path)
+    ext = os.path.splitext(path)[1].lower()
+    kwargs = dict(mode="w", samplerate=int(sample_rate), channels=1)
+    if ext == ".wav":
+        kwargs["subtype"] = "FLOAT"
+    return sf.SoundFile(path, **kwargs)
+
+def _load_input_mono(input_path):
+    x2d, sr = sf.read(input_path, dtype="float32", always_2d=True)
+    if x2d.size == 0:
+        raise RuntimeError(f"Input file is empty: {input_path}")
+    if x2d.shape[1] > 1:
+        print(f"[process] '{input_path}' has {x2d.shape[1]} channels; using channel 0.")
+    return x2d[:, 0].astype(np.float32, copy=False), int(sr)
+
+def _filter_feed_to_model_inputs(model, feed):
+    in_names = [_tensor_basename(t) for t in model.inputs]
+    return {k: v for (k, v) in feed.items() if k in in_names}
+
+def prepare_process_knob_feeds(kind, use_finetuned=False):
+    # Important: override demo boosts back to neutral runtime defaults
+    if kind == "realtime":
+        return prepare_demo_knob_feeds(
+            kind="realtime",
+            use_finetuned=use_finetuned,
+            main=KNOB_DEFAULT_MAIN_SCALE,
+            pickattack=KNOB_DEFAULT_PICK_ATTACK_SCALE,
+            pickreso=KNOB_DEFAULT_PICK_RESO_SCALE,
+            ir=KNOB_DEFAULT_IR_SCALE
+        )
+    return prepare_demo_knob_feeds(
+        kind="offline",
+        use_finetuned=use_finetuned,
+        main=KNOB_DEFAULT_MAIN_SCALE,
+        pickattack=KNOB_DEFAULT_PICK_ATTACK_SCALE,
+        pickreso=KNOB_DEFAULT_PICK_RESO_SCALE
+    )
+
+def _resolve_process_output_paths(input_path, output_arg, do_offline, do_realtime):
+    if not do_offline and not do_realtime:
+        raise ValueError("Nothing selected; choose offline, realtime, or both.")
+
+    input_stem = os.path.splitext(os.path.basename(input_path))[0]
+    looks_like_dir = output_arg.endswith(os.sep) or output_arg.endswith("/") or os.path.isdir(output_arg)
+    root, ext = os.path.splitext(output_arg)
+    out = {}
+
+    if looks_like_dir:
+        os.makedirs(output_arg, exist_ok=True)
+        if do_offline:
+            out["offline"] = os.path.join(output_arg, f"{input_stem}_offline.wav")
+        if do_realtime:
+            out["realtime"] = os.path.join(output_arg, f"{input_stem}_realtime.wav")
+        return out
+
+    if ext:
+        if do_offline and do_realtime:
+            out["offline"] = root + "_offline" + ext
+            out["realtime"] = root + "_realtime" + ext
+        elif do_offline:
+            out["offline"] = output_arg
+        else:
+            out["realtime"] = output_arg
+    else:
+        if do_offline and do_realtime:
+            out["offline"] = output_arg + "_offline.wav"
+            out["realtime"] = output_arg + "_realtime.wav"
+        elif do_offline:
+            out["offline"] = output_arg + ".wav"
+        else:
+            out["realtime"] = output_arg + ".wav"
+
+    for p in out.values():
+        _ensure_parent_dir(p)
+    return out
+
+def _style_label(p):
+    if p is None:
+        return "unknown"
+    return "pick" if p >= STYLE_FLAG_PROB_THRESHOLD else "finger"
+
+def process_audio_array_offline(model, x_mod, output_path, use_finetuned=False, block_sec=12.0):
+    knobs = prepare_process_knob_feeds("offline", use_finetuned=use_finetuned)
+    writer = _open_output_writer(output_path, OFFLINE_SAMPLE_RATE)
+
+    left_ctx, right_ctx = _get_model_context_for_streaming(OFFLINE_SAMPLE_RATE, model=model)
+    block_core = max(1, int(round(block_sec * OFFLINE_SAMPLE_RATE)))
+
+    prob_sum = 0.0
+    prob_count = 0
+    pos = 0
+    N = len(x_mod)
+
+    while pos < N:
+        core = min(block_core, N - pos)
+        lctx = min(left_ctx, pos)
+        rctx = min(right_ctx, N - (pos + core))
+
+        x_block = x_mod[pos - lctx: pos + core + rctx]
+        x_in = x_block[None, :, None].astype(np.float32, copy=False)
+
+        feed = {
+            "offline_piezo_input": x_in,
+            "offline_style_true_input": np.zeros((1, 1), dtype=np.float32),
+            "offline_style_force_input": np.zeros((1, 1), dtype=np.float32),
+            **knobs
+        }
+        outs = model.predict(_filter_feed_to_model_inputs(model, feed), batch_size=1, verbose=0)
+        if not isinstance(outs, (list, tuple)):
+            outs = [outs]
+
+        y_pred = np.asarray(outs[0], dtype=np.float32)[0, :, 0]
+        style_prob = float(np.asarray(outs[1], dtype=np.float32)[0, 0]) if len(outs) > 1 else 0.0
+        y_core = y_pred[lctx:lctx + core]
+
+        writer.write(y_core)
+        prob_sum += style_prob * float(core)
+        prob_count += core
+        pos += core
+
+    writer.close()
+    return (prob_sum / float(prob_count)) if prob_count > 0 else None
+
+def process_audio_array_realtime(model, x_mod, output_path, use_finetuned=False):
+    knobs = prepare_process_knob_feeds("realtime", use_finetuned=use_finetuned)
+
+    in_tensors = list(model.inputs)
+    state_in_tensors = [t for t in in_tensors if _tensor_basename(t).startswith("realtime_state_")]
+    if not state_in_tensors:
+        raise RuntimeError("Realtime processing requires the saved streaming realtime model.")
+
+    state_in_names = [_tensor_basename(t) for t in state_in_tensors]
+    out_names = _output_names_from_model(model)
+    out_idx = {n: i for i, n in enumerate(out_names)}
+
+    state_out_indices = {}
+    for nm in state_in_names:
+        nm_next = nm + "_next"
+        if nm_next in out_idx:
+            state_out_indices[nm] = out_idx[nm_next]
+
+    if len(state_out_indices) != len(state_in_names):
+        first_state_out = next(
+            (i for i, n in enumerate(out_names) if n.startswith("realtime_state_") and n.endswith("_next")),
+            None
+        )
+        if first_state_out is None:
+            if len(model.outputs) >= 3 + len(state_in_names):
+                first_state_out = 3  # audio, style, dry
+            elif len(model.outputs) >= 2 + len(state_in_names):
+                first_state_out = 2  # audio, style
+        if first_state_out is None or (first_state_out + len(state_in_names) > len(model.outputs)):
+            raise RuntimeError("Could not map realtime state outputs.")
+        state_out_indices = {nm: (first_state_out + i) for i, nm in enumerate(state_in_names)}
+
+    piezo_in = next((t for t in in_tensors if _tensor_basename(t) == "realtime_piezo_input"), None)
+    if piezo_in is None:
+        raise RuntimeError("Could not find realtime_piezo_input.")
+
+    fixed_T = int(piezo_in.shape[1]) if piezo_in.shape[1] is not None else None
+    hop = fixed_T if fixed_T is not None else REALTIME_TFLITE_T
+
+    state_bufs = {}
+    for nm, t in zip(state_in_names, state_in_tensors):
+        s1 = int(t.shape[1]) if t.shape[1] is not None else 0
+        s2 = int(t.shape[2]) if t.shape[2] is not None else 1
+        state_bufs[nm] = np.zeros((1, s1, s2), dtype=np.float32)
+
+    writer = _open_output_writer(output_path, REALTIME_SAMPLE_RATE)
+
+    prob_sum = 0.0
+    prob_count = 0
+    pos = 0
+    N = len(x_mod)
+
+    while pos < N:
+        core = min(hop, N - pos)
+
+        if fixed_T is None:
+            x_in = x_mod[pos:pos + core][None, :, None].astype(np.float32, copy=False)
+        else:
+            x_in = np.zeros((1, fixed_T, 1), dtype=np.float32)
+            x_in[0, :core, 0] = x_mod[pos:pos + core]
+
+        feed = {
+            "realtime_piezo_input": x_in,
+            "realtime_style_true_input": np.zeros((1, 1), dtype=np.float32),
+            "realtime_style_force_input": np.zeros((1, 1), dtype=np.float32),
+            **state_bufs,
+            **knobs
+        }
+        outs = model.predict(_filter_feed_to_model_inputs(model, feed), batch_size=1, verbose=0)
+        if not isinstance(outs, (list, tuple)):
+            outs = [outs]
+
+        y_pred = np.asarray(outs[0], dtype=np.float32)
+        style_prob = float(np.asarray(outs[1], dtype=np.float32)[0, 0]) if len(outs) > 1 else 0.0
+
+        y_core = y_pred[0, :, 0] if fixed_T is None else y_pred[0, :core, 0]
+        writer.write(y_core)
+
+        for nm in state_in_names:
+            idx = state_out_indices.get(nm, None)
+            if idx is not None and idx < len(outs):
+                state_bufs[nm] = np.asarray(outs[idx], dtype=np.float32)
+
+        prob_sum += style_prob * float(core)
+        prob_count += core
+        pos += core
+
+    writer.close()
+    return (prob_sum / float(prob_count)) if prob_count > 0 else None
+
+def run_process_cli(input_path, output_arg, do_offline=True, do_realtime=True, use_finetuned=False):
+    if not os.path.exists(input_path):
+        print(f"ERROR: input file not found: {input_path}")
+        sys.exit(1)
+
+    x_raw, input_sr = _load_input_mono(input_path)
+    outputs = _resolve_process_output_paths(input_path, output_arg, do_offline, do_realtime)
+
+    if do_offline:
+        offline_model_path = _select_stems_model_path("offline", use_finetuned=use_finetuned, prefer_static=False)
+        if offline_model_path is None or not os.path.exists(offline_model_path):
+            print("ERROR: offline model not found. Run --train-offline first.")
+            sys.exit(1)
+
+        print("[process/offline] Loading:", offline_model_path)
+        offline_model = tf.keras.models.load_model(offline_model_path, compile=False)
+        x_off = x_raw if input_sr == OFFLINE_SAMPLE_RATE else resample_to_model_sr(x_raw, input_sr, OFFLINE_SAMPLE_RATE)
+        p_off = process_audio_array_offline(
+            model=offline_model,
+            x_mod=x_off,
+            output_path=outputs["offline"],
+            use_finetuned=use_finetuned
+        )
+        if p_off is None:
+            print(f"✅ Offline written: {outputs['offline']} ({OFFLINE_SAMPLE_RATE} Hz)")
+        else:
+            print(f"✅ Offline written: {outputs['offline']} ({OFFLINE_SAMPLE_RATE} Hz, avg style={_style_label(p_off)} ({p_off:.4f}))")
+
+    if do_realtime:
+        realtime_model_path = _select_stems_model_path("realtime", use_finetuned=use_finetuned, prefer_static=True)
+        if realtime_model_path is None or not os.path.exists(realtime_model_path):
+            print("ERROR: realtime model not found. Run --train-realtime first.")
+            sys.exit(1)
+
+        print("[process/realtime] Loading:", realtime_model_path)
+        realtime_model = tf.keras.models.load_model(realtime_model_path, compile=False)
+        x_rt = x_raw if input_sr == REALTIME_SAMPLE_RATE else resample_to_model_sr(x_raw, input_sr, REALTIME_SAMPLE_RATE)
+        p_rt = process_audio_array_realtime(
+            model=realtime_model,
+            x_mod=x_rt,
+            output_path=outputs["realtime"],
+            use_finetuned=use_finetuned
+        )
+        if p_rt is None:
+            print(f"✅ Realtime written: {outputs['realtime']} ({REALTIME_SAMPLE_RATE} Hz)")
+        else:
+            print(f"✅ Realtime written: {outputs['realtime']} ({REALTIME_SAMPLE_RATE} Hz, avg style={_style_label(p_rt)} ({p_rt:.4f}))")
     
 
 def main ():
@@ -9833,6 +10106,43 @@ def main ():
                 generate_demo_tflite(kind="realtime", use_finetuned=use_finetuned, hop=hop)
         time_end = time.time()
         print(f"[TFLite/demo] All done in {time_end - time_start:.1f} seconds.")
+        sys.exit(0)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--process":
+        args_list = sys.argv[2:]
+        args = set(args_list)
+
+        input_path = _cli_arg_value(args_list, "--input")
+        output_arg = _cli_arg_value(args_list, "--output")
+
+        if input_path is None or output_arg is None:
+            print(
+                "Usage:\n"
+                "  python piezo2mic.py --process --input <input_audio> --output <output_path> "
+                "[--offline-only|--realtime-only|--both] [--finetuned]\n\n"
+                "Notes:\n"
+                "  - If neither --offline-only nor --realtime-only is passed, both models are run.\n"
+                "  - If both models are run, --output is treated as a prefix or directory and\n"
+                "    '_offline' / '_realtime' are appended automatically.\n"
+                "  - Output is written at the model sample rate: offline=96k, realtime=48k.\n"
+            )
+            sys.exit(1)
+
+        do_offline = ("--realtime-only" not in args)
+        do_realtime = ("--offline-only" not in args)
+
+        if not do_offline and not do_realtime:
+            print("ERROR: choose --offline-only, --realtime-only, or neither/--both.")
+            sys.exit(1)
+
+        use_finetuned = ("--finetuned" in args)
+
+        run_process_cli(
+            input_path=input_path,
+            output_arg=output_arg,
+            do_offline=do_offline,
+            do_realtime=do_realtime,
+            use_finetuned=use_finetuned
+        )
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--migrate-realtime":
         migrate_realtime_models_inplace()
