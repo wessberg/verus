@@ -9627,6 +9627,124 @@ def prepare_process_knob_feeds(kind, use_finetuned=False):
         pickreso=KNOB_DEFAULT_PICK_RESO_SCALE
     )
 
+
+def _normalize_process_style(forced_style):
+    """
+    Normalize a requested process style to:
+      - None  -> auto
+      - 1.0   -> pick / picked
+      - 0.0   -> finger
+    Accepts strings or numeric values.
+    """
+    if forced_style is None:
+        return None
+
+    if isinstance(forced_style, (int, float, np.integer, np.floating)):
+        v = float(forced_style)
+        if abs(v - 1.0) <= 1e-7:
+            return 1.0
+        if abs(v - 0.0) <= 1e-7:
+            return 0.0
+        raise ValueError("forced_style must be None, 0/1, or one of: auto, pick, picked, finger")
+
+    s = str(forced_style).strip().lower()
+    if s in ("", "auto", "none", "pred", "predicted", "detect", "classifier"):
+        return None
+    if s in ("pick", "picked", "p", "1", "true", "yes"):
+        return 1.0
+    if s in ("finger", "fingerstyle", "f", "0", "false", "no"):
+        return 0.0
+
+    raise ValueError(
+        f"Invalid style '{forced_style}'. Valid values are: auto, pick, picked, finger"
+    )
+
+
+def _parse_process_style_arg(args_list):
+    """
+    CLI parser for process style.
+    Supports:
+      --style <auto|pick|picked|finger>
+      --style=<...>
+      --force-style <...>
+      --force-style=<...>
+      --pick / --picked
+      --finger
+    """
+    args = set(args_list)
+
+    raw_style = _cli_arg_value(args_list, "--style")
+    raw_force_style = _cli_arg_value(args_list, "--force-style")
+
+    if raw_style is not None and str(raw_style).startswith("--"):
+        print("ERROR: --style requires a value: auto, pick, picked, or finger")
+        sys.exit(1)
+
+    if raw_force_style is not None and str(raw_force_style).startswith("--"):
+        print("ERROR: --force-style requires a value: auto, pick, picked, or finger")
+        sys.exit(1)
+
+    short_values = []
+    if "--pick" in args or "--picked" in args:
+        short_values.append("pick")
+    if "--finger" in args:
+        short_values.append("finger")
+
+    raw_values = [v for v in (raw_style, raw_force_style) if v is not None] + short_values
+    if not raw_values:
+        return None
+
+    try:
+        normalized = [_normalize_process_style(v) for v in raw_values]
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+    uniq = {("auto" if v is None else _style_label(v)) for v in normalized}
+    if len(uniq) > 1:
+        print("ERROR: conflicting style flags. Use only one of --style/--force-style/--pick/--finger.")
+        sys.exit(1)
+
+    return normalized[0]
+
+
+def _make_process_style_arrays(forced_style):
+    """
+    Returns:
+      style_true_input  shape (1,1)
+      style_force_input shape (1,1)
+      normalized_style  None|0.0|1.0
+    """
+    forced_style = _normalize_process_style(forced_style)
+
+    if forced_style is None:
+        return (
+            np.zeros((1, 1), dtype=np.float32),
+            np.zeros((1, 1), dtype=np.float32),
+            None
+        )
+
+    return (
+        np.array([[forced_style]], dtype=np.float32),
+        np.ones((1, 1), dtype=np.float32),
+        forced_style
+    )
+
+
+def _format_process_write_message(label, output_path, sample_rate, avg_prob=None, forced_style=None):
+    msg = f"✅ {label} written: {output_path} ({int(sample_rate)} Hz"
+
+    if forced_style is None:
+        if avg_prob is not None:
+            msg += f", avg style={_style_label(avg_prob)} ({avg_prob:.4f})"
+    else:
+        msg += f", forced style={_style_label(forced_style)}"
+        if avg_prob is not None:
+            msg += f", classifier avg={_style_label(avg_prob)} ({avg_prob:.4f})"
+
+    msg += ")"
+    return msg
+
 def _resolve_process_output_paths(input_path, output_arg, do_offline, do_realtime):
     if not do_offline and not do_realtime:
         raise ValueError("Nothing selected; choose offline, realtime, or both.")
@@ -9670,7 +9788,10 @@ def _style_label(p):
         return "unknown"
     return "pick" if p >= STYLE_FLAG_PROB_THRESHOLD else "finger"
 
-def process_audio_array_offline(model, x_mod, output_path, use_finetuned=False, block_sec=12.0):
+def process_audio_array_offline(model, x_mod, output_path, use_finetuned=False, block_sec=12.0, forced_style=None):
+    forced_style = _normalize_process_style(forced_style)
+    style_true_arr, style_force_arr, _ = _make_process_style_arrays(forced_style)
+
     knobs = prepare_process_knob_feeds("offline", use_finetuned=use_finetuned)
     writer = _open_output_writer(output_path, OFFLINE_SAMPLE_RATE)
 
@@ -9692,8 +9813,8 @@ def process_audio_array_offline(model, x_mod, output_path, use_finetuned=False, 
 
         feed = {
             "offline_piezo_input": x_in,
-            "offline_style_true_input": np.zeros((1, 1), dtype=np.float32),
-            "offline_style_force_input": np.zeros((1, 1), dtype=np.float32),
+            "offline_style_true_input": style_true_arr,
+            "offline_style_force_input": style_force_arr,
             **knobs
         }
         outs = model.predict(_filter_feed_to_model_inputs(model, feed), batch_size=1, verbose=0)
@@ -9712,7 +9833,10 @@ def process_audio_array_offline(model, x_mod, output_path, use_finetuned=False, 
     writer.close()
     return (prob_sum / float(prob_count)) if prob_count > 0 else None
 
-def process_audio_array_realtime(model, x_mod, output_path, use_finetuned=False):
+def process_audio_array_realtime(model, x_mod, output_path, use_finetuned=False, forced_style=None):
+    forced_style = _normalize_process_style(forced_style)
+    style_true_arr, style_force_arr, _ = _make_process_style_arrays(forced_style)
+
     knobs = prepare_process_knob_feeds("realtime", use_finetuned=use_finetuned)
 
     in_tensors = list(model.inputs)
@@ -9775,8 +9899,8 @@ def process_audio_array_realtime(model, x_mod, output_path, use_finetuned=False)
 
         feed = {
             "realtime_piezo_input": x_in,
-            "realtime_style_true_input": np.zeros((1, 1), dtype=np.float32),
-            "realtime_style_force_input": np.zeros((1, 1), dtype=np.float32),
+            "realtime_style_true_input": style_true_arr,
+            "realtime_style_force_input": style_force_arr,
             **state_bufs,
             **knobs
         }
@@ -9802,13 +9926,20 @@ def process_audio_array_realtime(model, x_mod, output_path, use_finetuned=False)
     writer.close()
     return (prob_sum / float(prob_count)) if prob_count > 0 else None
 
-def run_process_cli(input_path, output_arg, do_offline=True, do_realtime=True, use_finetuned=False):
+def run_process_cli(input_path, output_arg, do_offline=True, do_realtime=True, use_finetuned=False, forced_style=None):
+    forced_style = _normalize_process_style(forced_style)
+
     if not os.path.exists(input_path):
         print(f"ERROR: input file not found: {input_path}")
         sys.exit(1)
 
     x_raw, input_sr = _load_input_mono(input_path)
     outputs = _resolve_process_output_paths(input_path, output_arg, do_offline, do_realtime)
+
+    if forced_style is None:
+        print("[process] style mode: auto")
+    else:
+        print(f"[process] style mode: forced {_style_label(forced_style)}")
 
     if do_offline:
         offline_model_path = _select_stems_model_path("offline", use_finetuned=use_finetuned, prefer_static=False)
@@ -9823,12 +9954,16 @@ def run_process_cli(input_path, output_arg, do_offline=True, do_realtime=True, u
             model=offline_model,
             x_mod=x_off,
             output_path=outputs["offline"],
-            use_finetuned=use_finetuned
+            use_finetuned=use_finetuned,
+            forced_style=forced_style
         )
-        if p_off is None:
-            print(f"✅ Offline written: {outputs['offline']} ({OFFLINE_SAMPLE_RATE} Hz)")
-        else:
-            print(f"✅ Offline written: {outputs['offline']} ({OFFLINE_SAMPLE_RATE} Hz, avg style={_style_label(p_off)} ({p_off:.4f}))")
+        print(_format_process_write_message(
+            label="Offline",
+            output_path=outputs["offline"],
+            sample_rate=OFFLINE_SAMPLE_RATE,
+            avg_prob=p_off,
+            forced_style=forced_style
+        ))
 
     if do_realtime:
         realtime_model_path = _select_stems_model_path("realtime", use_finetuned=use_finetuned, prefer_static=True)
@@ -9843,13 +9978,16 @@ def run_process_cli(input_path, output_arg, do_offline=True, do_realtime=True, u
             model=realtime_model,
             x_mod=x_rt,
             output_path=outputs["realtime"],
-            use_finetuned=use_finetuned
+            use_finetuned=use_finetuned,
+            forced_style=forced_style
         )
-        if p_rt is None:
-            print(f"✅ Realtime written: {outputs['realtime']} ({REALTIME_SAMPLE_RATE} Hz)")
-        else:
-            print(f"✅ Realtime written: {outputs['realtime']} ({REALTIME_SAMPLE_RATE} Hz, avg style={_style_label(p_rt)} ({p_rt:.4f}))")
-    
+        print(_format_process_write_message(
+            label="Realtime",
+            output_path=outputs["realtime"],
+            sample_rate=REALTIME_SAMPLE_RATE,
+            avg_prob=p_rt,
+            forced_style=forced_style
+        ))
 
 def main ():
     if len(sys.argv)>1 and sys.argv[1]=="--train-offline":
@@ -10114,12 +10252,27 @@ def main ():
         input_path = _cli_arg_value(args_list, "--input")
         output_arg = _cli_arg_value(args_list, "--output")
 
+        if input_path is not None and str(input_path).startswith("--"):
+            input_path = None
+        if output_arg is not None and str(output_arg).startswith("--"):
+            output_arg = None
+
+        forced_style = _parse_process_style_arg(args_list)
+
         if input_path is None or output_arg is None:
             print(
                 "Usage:\n"
                 "  python piezo2mic.py --process --input <input_audio> --output <output_path> "
-                "[--offline-only|--realtime-only|--both] [--finetuned]\n\n"
+                "[--offline-only|--realtime-only|--both] [--finetuned] "
+                "[--style <auto|pick|picked|finger>]\n\n"
+                "Style aliases:\n"
+                "  --force-style <auto|pick|picked|finger>\n"
+                "  --pick / --picked\n"
+                "  --finger\n\n"
                 "Notes:\n"
+                "  - If no style is provided, style is auto-detected (same behavior as today).\n"
+                "  - If a style is forced, the render uses that style.\n"
+                "  - The printed style average is still the classifier prediction, for reference.\n"
                 "  - If neither --offline-only nor --realtime-only is passed, both models are run.\n"
                 "  - If both models are run, --output is treated as a prefix or directory and\n"
                 "    '_offline' / '_realtime' are appended automatically.\n"
@@ -10141,7 +10294,8 @@ def main ():
             output_arg=output_arg,
             do_offline=do_offline,
             do_realtime=do_realtime,
-            use_finetuned=use_finetuned
+            use_finetuned=use_finetuned,
+            forced_style=forced_style
         )
         sys.exit(0)
     elif len(sys.argv)>1 and sys.argv[1]=="--migrate-realtime":
