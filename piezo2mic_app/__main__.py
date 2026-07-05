@@ -12,6 +12,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output")
     parser.add_argument("--style", choices=("autodetect", "finger", "picked"))
     parser.add_argument("--model", choices=("offline", "realtime"))
+    parser.add_argument("--pickup", choices=("piezo", "magnetic", "electric"), default="piezo")
 
     args = parser.parse_args(argv)
 
@@ -34,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             style=args.style,
             model=args.model,
+            pickup=args.pickup,
         )
 
     try:

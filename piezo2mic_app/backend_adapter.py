@@ -23,6 +23,7 @@ def build_backend_argv(
     output_path: str,
     style: str,
     model: str,
+    pickup: str = "piezo",
 ) -> list[str]:
     return [
         "--process",
@@ -32,6 +33,8 @@ def build_backend_argv(
         output_path,
         "--style",
         style,
+        "--pickup",
+        pickup,
         f"--{model}-only"
     ]
 
@@ -41,8 +44,9 @@ def run_backend_job(
     output_path: str,
     style: str,
     model: str,
+    pickup: str = "piezo",
 ) -> int:
-    argv = build_backend_argv(input_path, output_path, style, model)
+    argv = build_backend_argv(input_path, output_path, style, model, pickup)
     return _run_backend(argv)
 
 

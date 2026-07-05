@@ -190,6 +190,11 @@
 // ───────────────────────── GLOBALS/FLAGS ─────────────────────────
 // Rolling window of style prob (weighted by coreLen)
 static constexpr float windowSec = 2.0;
+// Runtime pick-branch make-up gain applied at "0 dB" knob position. These mirror
+// REALTIME_PICK_ATTACK_RUNTIME_BASELINE_DB / REALTIME_PICK_RESO_RUNTIME_BASELINE_DB in
+// piezo2mic.py — keep them in sync so the pedal, demos, and --process all sit at the same
+// level. NOTE: finetuned models were auditioned with an 8 dB pickreso boost in Python; there
+// is no way to detect "finetuned" from the TFLite file, so adjust here if you deploy one.
 static constexpr float kPickAttackBaselineBoostDB = 22.0f;
 static constexpr float kPickResoBaselineBoostDB   = 32.0f;
 
@@ -273,6 +278,9 @@ struct Knobs {
   std::atomic<float> ir_dB{0.0f};
   std::atomic<float> wet_pct{100.0f}; // 0..100
 
+  // Pickup type fed to the model: 0.0 = piezo, 1.0 = magnetic (electric guitars)
+  std::atomic<float> pickup01{0.0f};
+
   // Output gain (dB → converted to linear for TFLite input)
   std::atomic<float> outGain_dB{-3.0f};
 
@@ -293,9 +301,10 @@ struct Knobs {
   std::atomic<int>   afb_enabled{0};   // 0/1 (OFF by default)
   std::atomic<float> afb_shift_hz{5.0f}; // Hz
 
-  // Low-cut (high-pass)
+  // Low-cut (high-pass). Defaults must match the Python training-time knob defaults
+  // (KNOB_DEFAULT_LOW_CUT_*), otherwise the pedal deviates from what the model was trained with.
   std::atomic<float> lc_hz{20.0f};
-  std::atomic<float> lc_slope_dbpoct{12.0f};
+  std::atomic<float> lc_slope_dbpoct{6.0f};
 
   // Low shelf
   std::atomic<float> ls_gain_db{0.0f};
@@ -3594,23 +3603,10 @@ static inline bool isIntType(TfLiteType t) {
 // ───────────────────────── TFLITE WRAPPER ─────────────────────────
 class TFLiteRealtime {
 public:
-  float getStyleEma() const {
-    int idx = findStateSlotIndex("realtime_state_style_ema");
-    if (idx < 0) return std::numeric_limits<float>::quiet_NaN();
-    const StateSlot& s = stateSlots_[idx];
-    if (s.buf.empty()) return std::numeric_limits<float>::quiet_NaN();
-    // state is [1,1,1] flattened
-    return s.buf[0];
-  }
-
-private:
-  int findStateSlotIndex(const std::string& name) const {
-    for (size_t i = 0; i < stateSlots_.size(); ++i) {
-      if (stateSlots_[i].name == name) return static_cast<int>(i);
-    }
-    return -1;
-  }
-public:
+  // NOTE: the exported style output (out_style_) is now the EMA-smoothed probability itself
+  // (the model EMAs the classifier logit and applies sigmoid after), so callers should use
+  // the styleProb returned by invoke*() directly. The old getStyleEma() hack that read the
+  // raw state slot has been removed — the state now stores the logit, not a probability.
   explicit TFLiteRealtime(const std::string& modelPath) {
     model_ = tflite::FlatBufferModel::BuildFromFile(modelPath.c_str());
     if (!model_) {
@@ -3728,6 +3724,9 @@ public:
     int idx = findInput(name);
     if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
   };
+
+  // Pickup type (0 = piezo, 1 = magnetic); optional for older models
+  setIf("realtime_pickup_input", gKnobs.pickup01.load());
 
   // NEW: Main stem gain (realtime_knob_main), dB -> lin
   const float main_lin = db2lin(gKnobs.main_dB.load());
@@ -3848,6 +3847,9 @@ public:
     int idx = findInput(name);
     if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
   };
+
+  // Pickup type (0 = piezo, 1 = magnetic); optional for older models
+  setIf("realtime_pickup_input", gKnobs.pickup01.load());
 
   // NEW: Main stem gain (realtime_knob_main), dB -> lin
   const float main_lin = db2lin(gKnobs.main_dB.load());
@@ -4087,9 +4089,16 @@ void inferenceThread(InferCtx ctx) {
     gStopFlag = true; return;
   }
 
-  // Make sure we run with hop == T for best behavior (classifier looks over full T)
-  if (hop != T) {
-    std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<"). Consider --blocksize "<<T<<" for best style stability.\n";
+  // Streaming models REQUIRE hop == T: with hop < T the zero-padded tail of every block is
+  // fed into the model states and the same samples are re-fed next hop — state corruption,
+  // not just reduced style stability.
+  if (rt.isStreaming() && hop != T) {
+    std::cerr << "[inference] Error: streaming model requires --blocksize "<<T
+              << " (got "<<hop<<"); a smaller hop corrupts the streaming states.\n";
+    gStopFlag = true; return;
+  }
+  if (!rt.isStreaming() && hop != T) {
+    std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<") on a windowed model; sliding-window mode.\n";
   }
 
   uint64_t lastBypassEpoch = gBypassEpoch.load(std::memory_order_acquire);
@@ -4197,8 +4206,9 @@ void inferenceThread(InferCtx ctx) {
   };
 
   auto do_invoke_windowed = [&](const float* windowT, float guidedStableForAuto){
-    float pa_lin = std::pow(10.0f, gKnobs.pickAttack_dB.load() / 20.0f);
-    float pr_lin = std::pow(10.0f, gKnobs.pickReso_dB.load()   / 20.0f);
+    // Same baseline boosts as the streaming path — both paths must sit at the same level.
+    float pa_lin = std::pow(10.0f, (gKnobs.pickAttack_dB.load() + kPickAttackBaselineBoostDB) / 20.0f);
+    float pr_lin = std::pow(10.0f, (gKnobs.pickReso_dB.load()   + kPickResoBaselineBoostDB)   / 20.0f);
     float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
     float wet    = std::max(0.0f, std::min(100.0f, gKnobs.wet_pct.load()));
     float dryFrac= 1.0f - (wet / 100.0f);
@@ -4220,8 +4230,7 @@ void inferenceThread(InferCtx ctx) {
     do_invoke_streaming(xhop.data(), hop, stable_for_next);
     ctx.sh->out.push(yT.data(), hop);
     // Update 5s window with EMA (or raw) from this hop
-    float emaP = rt.getStyleEma();
-    float pHop = std::isfinite(emaP) ? emaP : styleP;
+    float pHop = styleP;  // exported style output is already the EMA-smoothed probability
     probWin.push(pHop, float(hop));
     float pAvgWindowSec = probWin.mean();
     float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
@@ -4234,8 +4243,7 @@ void inferenceThread(InferCtx ctx) {
     std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
     do_invoke_windowed(win.data(), stable_for_next);
     ctx.sh->out.push(yT.data() + left, hop);
-    float emaP = rt.getStyleEma();
-    float pHop = std::isfinite(emaP) ? emaP : styleP;
+    float pHop = styleP;  // exported style output is already the EMA-smoothed probability
     probWin.push(pHop, float(hop));
     float pAvgWindowSec = probWin.mean();
     float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
@@ -4265,8 +4273,7 @@ void inferenceThread(InferCtx ctx) {
       ctx.sh->out.push(yT.data(), hop);
 
       // Update rolling {windowSec}s window and stabilized display prob
-      float emaP = rt.getStyleEma();
-      float pHop = std::isfinite(emaP) ? emaP : styleP;
+      float pHop = styleP;  // exported style output is already the EMA-smoothed probability
       probWin.push(pHop, float(hop));
       float pAvgWindowSec = probWin.mean();
       float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
@@ -4319,8 +4326,7 @@ void inferenceThread(InferCtx ctx) {
       do_invoke_windowed(win.data(), stable_for_next);
       ctx.sh->out.push(yT.data() + (T - hop), hop);
 
-      float emaP = rt.getStyleEma();
-      float pHop = std::isfinite(emaP) ? emaP : styleP;
+      float pHop = styleP;  // exported style output is already the EMA-smoothed probability
       probWin.push(pHop, float(hop));
       float pAvgWindowSec = probWin.mean();
       float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
@@ -4671,6 +4677,7 @@ shared.tempFxReturnR.resize(blockSize);
     << "t=Style mode (auto→pick→finger)  "
     << "g=Guided AUTO on/off  "
     << "l=FX loop on/off  "          // NEW
+    << "u=Pickup piezo/magnetic  "
     << "p=print"
     << "\n";
 
@@ -4698,12 +4705,12 @@ shared.tempFxReturnR.resize(blockSize);
                       : "DISABLED (main outs/headphones from internal processing)")
                   << "\n";
 
-      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
-        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+      } else if (c=='q') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()+1.0f, -MAX_PICK_ATTACK_KNOB_CHANGE, MAX_PICK_ATTACK_KNOB_CHANGE) ); }
+        else if (c=='a') { gKnobs.pickAttack_dB.store( clampf(gKnobs.pickAttack_dB.load()-1.0f, -MAX_PICK_ATTACK_KNOB_CHANGE, MAX_PICK_ATTACK_KNOB_CHANGE) ); }
         else if (c=='w') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
         else if (c=='s') { gKnobs.pickReso_dB.store( clampf(gKnobs.pickReso_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
-        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
-        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -MAX_PICK_RESO_KNOB_CHANGE, MAX_PICK_RESO_KNOB_CHANGE) ); }
+        else if (c=='e') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()+1.0f, -MAX_IR_KNOB_CHANGE, MAX_IR_KNOB_CHANGE) ); }
+        else if (c=='d') { gKnobs.ir_dB.store( clampf(gKnobs.ir_dB.load()-1.0f, -MAX_IR_KNOB_CHANGE, MAX_IR_KNOB_CHANGE) ); }
         else if (c=='r') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()+5.0f, 0.0f, 100.0f) ); }
         else if (c=='f') { gKnobs.wet_pct.store( clampf(gKnobs.wet_pct.load()-5.0f, 0.0f, 100.0f) ); }
         else if (c=='t') {
@@ -4722,10 +4729,15 @@ shared.tempFxReturnR.resize(blockSize);
                    <<"Style="<<styleModeName(gStyleMode.load())<<"\n";
         }
 
+        else if (c=='u' || c=='U') {
+          float now = (gKnobs.pickup01.load() >= 0.5f) ? 0.0f : 1.0f;
+          gKnobs.pickup01.store(now);
+          std::cout << "[UI] Pickup = " << (now >= 0.5f ? "MAGNETIC" : "PIEZO") << "\n";
+        }
         else if (c=='g' || c=='G') {
           bool now = !gGuidedAuto.load();
           gGuidedAuto.store(now);
-          std::cout << "[UI] Guided AUTO style " << (now ? "ON (model style overridden by " + std::to_string(windowSec) + "s-stabilized prob)" : "OFF") << "\n";
+          std::cout << "[UI] Guided AUTO style " << (now ? "ON (model style overridden by " + std::to_string((int)windowSec) + "s-stabilized prob)" : "OFF") << "\n";
         }
     }
   });

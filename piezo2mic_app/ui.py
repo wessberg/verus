@@ -23,6 +23,7 @@ PACKAGE_NAME = (__package__ or "piezo2mic_app").split(".")[0]
 
 STYLE_CHOICES = ("autodetect", "finger", "picked")
 MODEL_CHOICES = ("offline", "realtime")
+PICKUP_CHOICES = ("piezo", "magnetic")
 
 
 def build_worker_command(
@@ -30,6 +31,7 @@ def build_worker_command(
     output_path: str,
     style: str,
     model: str,
+    pickup: str = "piezo",
 ) -> list[str]:
     if getattr(sys, "frozen", False):
         return [
@@ -43,6 +45,8 @@ def build_worker_command(
             style,
             "--model",
             model,
+            "--pickup",
+            pickup,
         ]
 
     return [
@@ -58,6 +62,8 @@ def build_worker_command(
         style,
         "--model",
         model,
+        "--pickup",
+        pickup,
     ]
 
 
@@ -79,7 +85,7 @@ class Piezo2MicWindow(QWidget):
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(10)
         layout.setColumnStretch(1, 1)
-        layout.setRowStretch(5, 1)
+        layout.setRowStretch(6, 1)
 
         layout.addWidget(QLabel("Input"), 0, 0)
         self.input_edit = QLineEdit()
@@ -109,6 +115,12 @@ class Piezo2MicWindow(QWidget):
         self.model_combo.setCurrentText("offline")
         layout.addWidget(self.model_combo, 3, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
+        layout.addWidget(QLabel("Pickup"), 4, 0)
+        self.pickup_combo = QComboBox()
+        self.pickup_combo.addItems(PICKUP_CHOICES)
+        self.pickup_combo.setCurrentText("piezo")
+        layout.addWidget(self.pickup_combo, 4, 1, alignment=Qt.AlignmentFlag.AlignLeft)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
 
@@ -120,15 +132,15 @@ class Piezo2MicWindow(QWidget):
         self.quit_button.clicked.connect(self.close)
         buttons.addWidget(self.quit_button)
 
-        layout.addLayout(buttons, 4, 0, 1, 3)
+        layout.addLayout(buttons, 5, 0, 1, 3)
 
-        layout.addWidget(QLabel("Log"), 5, 0, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(QLabel("Log"), 6, 0, alignment=Qt.AlignmentFlag.AlignTop)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        layout.addWidget(self.log, 5, 1, 1, 2)
+        layout.addWidget(self.log, 6, 1, 1, 2)
 
         self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label, 6, 0, 1, 3)
+        layout.addWidget(self.status_label, 7, 0, 1, 3)
 
     def _browse_input(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -175,6 +187,7 @@ class Piezo2MicWindow(QWidget):
         output_path = self.output_edit.text().strip()
         style = self.style_combo.currentText().strip()
         model = self.model_combo.currentText().strip()
+        pickup = self.pickup_combo.currentText().strip()
 
         if not input_path:
             QMessageBox.critical(self, "Piezo2Mic", "Please choose an input file.")
@@ -208,6 +221,7 @@ class Piezo2MicWindow(QWidget):
             str(out_file),
             style,
             model,
+            pickup,
         )
 
         self._append_log(
@@ -215,7 +229,8 @@ class Piezo2MicWindow(QWidget):
             f"  input : {in_file}\n"
             f"  output: {out_file}\n"
             f"  style : {style}\n"
-            f"  model : {model}\n\n"
+            f"  model : {model}\n"
+            f"  pickup: {pickup}\n\n"
         )
 
         self.status_label.setText("Processing…")
@@ -296,6 +311,7 @@ class Piezo2MicWindow(QWidget):
             self.output_button,
             self.style_combo,
             self.model_combo,
+            self.pickup_combo,
             self.process_button,
         ):
             widget.setEnabled(enabled)

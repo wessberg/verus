@@ -7,3 +7,5 @@ out/csv-logs/
 
 cpp/lib/
 cpp/build/
+__pycache__/
+*.pyc

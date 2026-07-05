@@ -1,0 +1,10 @@
+# Core training / inference (Keras 3 API is required; the code uses e.g.
+# LeakyReLU(negative_slope=...) and registered-serializable Lambdas)
+tensorflow>=2.19,<2.21
+ai-edge-litert
+numpy
+scipy
+soundfile
+
+# Optional: desktop UI (python -m piezo2mic_app)
+# pyside6

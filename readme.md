@@ -1,3 +1,8 @@
+# Start here
+
+**See [TRAINING.md](TRAINING.md)** for the full training / inference / Raspberry-Pi
+deployment runbook (data layout, command order, sharp edges, magnetic-pickup roadmap).
+
 # Model outputs
 
 The model has 5 outputs:
@@ -24,7 +29,9 @@ The model has 5 outputs:
 
 # Python dependencies
 
-`pip install soundfile tflite`
+`pip install -r requirements.txt`
+
+(TensorFlow with Keras 3, ai-edge-litert, numpy, scipy, soundfile; add pyside6 for the UI.)
 
 # Dead code removal
 
@@ -107,6 +114,21 @@ Force finger
 ```
 python piezo2mic.py --process --input in.wav --output out.wav --offline-only --style finger
 ```
+
+Magnetic pickup source (e.g. an electric guitar; `electric` is an alias for `magnetic`):
+```
+python piezo2mic.py --process --input in.wav --output out.wav --offline-only --pickup magnetic
+```
+
+# Training data layout
+
+```
+input/<pickup>/<style>/{source,target}/takeN_source.wav + takeN_target.wav
+```
+
+with `pickup` in `piezo|magnetic` and `style` in `pick|finger`. The legacy layout
+`input/<style>/{source,target}` is still read and treated as piezo. Record piezo + magnetic +
+mic simultaneously where possible so both sources share the identical mic target.
 
 ### UI
 
