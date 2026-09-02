@@ -110,3 +110,17 @@ E.g.:
 ```
 cmake --build . && sudo ./stream_audio_cpp --tflite ../../out/models/realtime/piezo2mic_baseline_realtime_t32_fp32.tflite --blocksize 32 --input-device 0 --output-device 0
 ```
+
+Notes:
+
+- `--blocksize` MUST equal the model's T (32 for the exported `_t32_` models); the binary refuses
+  other values for streaming models because a smaller hop corrupts the streaming states.
+- The master EQ (low cut / shelves / mid) runs inside this binary (`MasterEqIIR`, post-model),
+  not in the model. The knobs are the existing EQ fields in `Knobs` / the (optional) web UI.
+- Every two seconds the main thread prints processing time, style, and health counters:
+  `xruns` (callback found no processed audio), `inDrops` (input ring full — the inference
+  thread is too slow), `resyncs` (backlog trimmed after an xrun to keep latency at one hop).
+  All three should stay at 0 during normal operation.
+- The September 2026 changes (lockstep DI/processed rings, semaphore-driven inference thread,
+  post-model EQ, DSP prewarm, main-thread telemetry) were syntax-checked against stub headers
+  only; the first build on the Pi may need trivial fixes.

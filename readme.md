@@ -5,27 +5,31 @@ deployment runbook (data layout, command order, sharp edges, magnetic-pickup roa
 
 # Model outputs
 
-The model has 5 outputs:
+The realtime TFLite model has 4 outputs (there is exactly ONE 3-D output, so runtimes can pick
+the audio tensor by shape when TFLite drops the names):
 
 1. Processed mono audio
    - Shape: [1, T, 1]
    - Name: realtime_audio_out
 
-2. Style probability (pick vs finger)
+2. Style probability (pick vs finger, EMA-smoothed by the model)
    - Shape: [1, 1]
    - Name: realtime_style_prob_out
 
-3. Unprocessed / dry mono signal, time‑aligned to model I/O
-   - Shape: [1, T, 1]
-   - Name: realtime_dry_out_export
-
-4. Packed streaming state bundle
+3. Packed streaming state bundle (lexicographic order of the `realtime_state_*` inputs)
    - Shape: [1, N] (2‑D float)
    - Name: realtime_states_bundle_out
 
-5. Splits (lengths of each state in the bundle)
+4. Splits (lengths of each state in the bundle)
    - Shape: [1, Nstates] or [Nstates] (int32)
    - Name: realtime_states_splits_out
+
+The offline TFLite model has 2 outputs: audio [1, T, 1] and style probability [1, 1].
+(The former "dry" output was a copy of the input — the models are zero-latency — and was removed
+because a second [1, T, 1] tensor made the audio output ambiguous.)
+
+The master EQ is not part of the models: the pedal applies it post-model (`MasterEqIIR` in
+`cpp/src/main.cpp`) and `--process --eq ...` applies the identical biquads in Python.
 
 # Python dependencies
 
@@ -118,6 +122,11 @@ python piezo2mic.py --process --input in.wav --output out.wav --offline-only --s
 Magnetic pickup source (e.g. an electric guitar; `electric` is an alias for `magnetic`):
 ```
 python piezo2mic.py --process --input in.wav --output out.wav --offline-only --pickup magnetic
+```
+
+With the pedal's master EQ (low cut 80 Hz @ 24 dB/oct, +2 dB high shelf):
+```
+python piezo2mic.py --process --input in.wav --output out.wav --offline-only --eq lc_hz=80,lc_slope=24,hs_gain_db=2
 ```
 
 # Training data layout

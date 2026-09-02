@@ -42,17 +42,21 @@
   2. Inference thread (TFLite)
      --------------------------
      - Runs on a separate thread using a streaming or windowed TFLite model.
-     - Reads mono hops from `Shared::in`.
-     - Feeds the model input `realtime_piezo_input` and the various control knobs
-       (pick attack, pick resonance, IR, wet, main, EQ, etc.).
+     - Blocks on a semaphore posted by the PortAudio callback (no busy-spin), reads mono hops
+       from `Shared::in`.
+     - Feeds the model input `realtime_piezo_input` and the in-graph control knobs
+       (main, pick attack, pick resonance, IR, dry/wet, output gain, phase, pickup type).
      - Produces:
          - Processed mono audio y[n] (piezo → mic),
-         - Style probability (pick vs finger),
-         - Updated model states (if streaming).
-     - Writes:
-         - processed mono y[n] → `Shared::out` ring,
-         - time‑aligned dry mono x[n] → `Shared::dry` ring
-           (the DI path is latency‑matched to the processed path).
+         - Style probability (pick vs finger; already EMA-smoothed by the model),
+         - Updated model states (streaming bundle).
+     - Writes, AFTER the model ran, in lockstep (same hop, dry first):
+         - time‑aligned dry mono x[n] → `Shared::dry` ring,
+         - processed mono y[n] → `Shared::out` ring.
+       The callback pops the same number of samples from both rings, so DI and processed
+       audio can never drift apart, and trims any backlog beyond one hop so an xrun costs a
+       one-hop dropout instead of permanently adding a hop of latency.
+     - Never prints: telemetry goes into `gTelemetry` atomics and is printed by main().
 
   3. Audio callback post‑processing
      ------------------------------
@@ -63,6 +67,8 @@
         - time‑aligned DI → `tempDry` (dry)
 
      b) Insert processors on the processed mono path:
+        - Master EQ (RBJ biquads: low cut 6/12/24/36 dB/oct, low shelf, mid bell, high shelf;
+          identical to master_eq_sos() in piezo2mic.py — the EQ is no longer part of the model)
         - Noise gate (side‑chain HPF, attack/hold/release, hysteresis, range)
         - Feedback protection frequency shifter (Hilbert-based)
         - Hall reverb:
@@ -128,9 +134,13 @@
      ----------------
      - Global bypass is controlled by gBypass (keyboard 'b').
      - On bypass:
-         * All rings (in/out/dry) are flushed.
+         * All rings (in/out/dry) are flushed — by the PortAudio callback only (the single
+           writer of the ring read pointers on the consumer side; other threads just bump
+           gBypassEpoch).
          * Time‑domain FX (reverb, delay, chorus, gate, feedback shifter)
            are reset via their respective reset epochs.
+         * The model keeps running on the live input while bypassed, so its streaming states
+           are warm and un-bypassing is seamless (states are NOT reset on bypass edges).
          * The callback routes **dry mono input** from ADC ch1 to:
 
              MAIN L/R      : dry
@@ -144,8 +154,8 @@
   Notes
   =====
   - Sample rate is fixed to 48 kHz.
-  - Hop size (PortAudio blocksize) must be <= model T; streaming models are
-    preferred (T==hop) for best latency/behavior.
+  - Streaming models REQUIRE hop == model T (--blocksize 32 for the exported T=32 models);
+    windowed (non-streaming) models accept hop <= T.
   - All knob controls are atomic and can be changed at runtime via:
       * stdin keyboard shortcuts, and/or
       * the optional HTTP/JS Web UI (when enabled in main()).
@@ -177,6 +187,10 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <limits>
+#if defined(__linux__)
+  #include <semaphore.h>
+  #include <time.h>
+#endif
 
 // TensorFlow Lite
 #include "tensorflow/lite/interpreter.h"
@@ -203,6 +217,40 @@ std::atomic<uint64_t> gBypassEpoch{0};
 std::atomic<uint64_t> gReverbResetEpoch{0};
 std::atomic<bool> gFxLoopEnabled(false);
 
+// ───────────────────────── Telemetry (RT threads write atomics, main() prints) ─────────────
+// No std::cout/std::cerr from the inference thread or the PortAudio callback: terminal I/O can
+// block for milliseconds (SSH, scrollback), which is an xrun at a 0.67 ms block period.
+struct Telemetry {
+  std::atomic<double>   procMsAvg{0.0};
+  std::atomic<double>   predWindow{0.5};
+  std::atomic<double>   dispP{0.5};
+  std::atomic<uint64_t> periodicSeq{0};   // bumped every PROCESSING_LOGGING_WAIT_SEC by the inference thread
+  std::atomic<uint64_t> knobSeq{0};       // bumped when a knob/mode changed
+  std::atomic<bool>     streaming{true};
+  std::atomic<uint32_t> outUnderruns{0};  // callback found < hop processed samples (xrun)
+  std::atomic<uint32_t> inDrops{0};       // input ring full: inference thread fell behind
+  std::atomic<uint32_t> resyncs{0};       // backlog trimmed to keep latency at one hop
+};
+static Telemetry gTelemetry;
+
+// Input-available signal: the PortAudio callback posts once per pushed hop; the inference thread
+// blocks on it (with a short timeout) instead of busy-spinning at SCHED_FIFO, which pinned one
+// core at 100% and heated the Pi for nothing.
+#if defined(__linux__)
+static sem_t gInputSem;
+static inline void inputSignalInit() { sem_init(&gInputSem, 0, 0); }
+static inline void inputSignalPost() { sem_post(&gInputSem); }
+static inline void inputSignalWaitMs(int ms) {
+  timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_nsec += (long)ms * 1000000L;
+  while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec += 1; }
+  sem_timedwait(&gInputSem, &ts);
+}
+#else
+static inline void inputSignalInit() {}
+static inline void inputSignalPost() {}
+static inline void inputSignalWaitMs(int) { std::this_thread::sleep_for(std::chrono::microseconds(100)); }
+#endif
 
 void signalHandler(int){ gStopFlag = true; }
 
@@ -301,8 +349,9 @@ struct Knobs {
   std::atomic<int>   afb_enabled{0};   // 0/1 (OFF by default)
   std::atomic<float> afb_shift_hz{5.0f}; // Hz
 
-  // Low-cut (high-pass). Defaults must match the Python training-time knob defaults
-  // (KNOB_DEFAULT_LOW_CUT_*), otherwise the pedal deviates from what the model was trained with.
+  // Master EQ — a runtime IIR effect applied post-model (MasterEqIIR below), NOT a model input
+  // any more. Defaults are the neutral position (LC at 20 Hz = bypass, all gains 0 dB) and
+  // mirror master_eq_defaults() in piezo2mic.py; `--process --eq ...` uses the same formulas.
   std::atomic<float> lc_hz{20.0f};
   std::atomic<float> lc_slope_dbpoct{6.0f};
 
@@ -637,18 +686,9 @@ static void ReverbProcessMonoToStereo(const float* inMono,
                                       float* outLRInterleaved,
                                       size_t n,
                                       unsigned long /*framesPerBuffer*/,
-                                      const PaStreamCallbackTimeInfo* /*timeInfo*/)
+                                      const PaStreamCallbackTimeInfo* /*timeInfo*/,
+                                      bool prewarmOnly = false)
 {
-  // Hard bypass when reverb is disabled: copy mono to L/R and return.
-  if (RvbEnabledStore().load(std::memory_order_relaxed) == 0) {
-    for (size_t i = 0; i < n; ++i) {
-      float v = inMono[i];
-      outLRInterleaved[2*i + 0] = v;
-      outLRInterleaved[2*i + 1] = v;
-    }
-    return;
-  }
-
   struct Freeverb48Stereo {
 
     // 48 kHz tuned delays (samples) (scaled and rounded from 44.1k Jezar tables)
@@ -876,6 +916,19 @@ static void ReverbProcessMonoToStereo(const float* inMono,
   };
 
   static Freeverb48Stereo R;
+  if (prewarmOnly) {           // allocate/initialise from main() before the stream starts
+    if (!R.inited) R.init();
+    return;
+  }
+  // Hard bypass when reverb is disabled: copy mono to L/R and return.
+  if (RvbEnabledStore().load(std::memory_order_relaxed) == 0) {
+    for (size_t i = 0; i < n; ++i) {
+      float v = inMono[i];
+      outLRInterleaved[2*i + 0] = v;
+      outLRInterleaved[2*i + 1] = v;
+    }
+    return;
+  }
   if (n == 0) return;
   R.process(inMono, outLRInterleaved, n);
 }
@@ -1098,6 +1151,148 @@ struct NoiseGate {
 
 
 
+// ───────────────────────── MASTER EQ (post-model IIR) ─────────────────────────
+// Mirrors master_eq_sos() in piezo2mic.py exactly (same RBJ formulas, same slope mapping), so
+// `--process --eq ...` and the pedal produce the same curve. The EQ used to be four in-graph FIR
+// banks; 33–193-tap FIRs cannot realise 20–300 Hz cuts and the banks were ~35% of the model's
+// MACs, so it now lives here.
+//   Low cut : bypass at <= 20 Hz; slope 6 = 1st-order HP, 12/24/36 = Butterworth biquad cascade
+//   Shelves / mid bell: RBJ cookbook; 0 dB = bypass
+struct Biquad {
+  float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+  float z1 = 0.0f, z2 = 0.0f;   // transposed direct form II state
+  inline float process(float x) {
+    const float y = b0 * x + z1;
+    z1 = b1 * x - a1 * y + z2;
+    z2 = b2 * x - a2 * y;
+    return y;
+  }
+  void reset() { z1 = 0.0f; z2 = 0.0f; }
+};
+
+static inline void rbjFirstOrderHP(Biquad& q, float sr, float f0) {
+  const double w0 = 2.0 * M_PI * double(clampf(f0, 1.0f, 0.49f * sr)) / double(sr);
+  const double k = std::tan(w0 / 2.0);
+  const double n = 1.0 / (1.0 + k);
+  q.b0 = float(n); q.b1 = float(-n); q.b2 = 0.0f; q.a1 = float((k - 1.0) * n); q.a2 = 0.0f;
+}
+
+enum class RbjKind { HP2, LowShelf, HighShelf, Peak };
+
+static inline void rbjBiquad(Biquad& q, RbjKind kind, float sr, float f0, float Q, float gain_db) {
+  const double w0 = 2.0 * M_PI * double(clampf(f0, 1.0f, 0.49f * sr)) / double(sr);
+  const double cw = std::cos(w0), sw = std::sin(w0);
+  const double alpha = sw / (2.0 * std::max(double(Q), 1e-3));
+  const double A = std::pow(10.0, double(gain_db) / 40.0);
+  double b0, b1, b2, a0, a1, a2;
+  switch (kind) {
+    case RbjKind::HP2:
+      b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = (1 + cw) / 2;
+      a0 = 1 + alpha;    a1 = -2 * cw;   a2 = 1 - alpha;
+      break;
+    case RbjKind::Peak:
+      b0 = 1 + alpha * A; b1 = -2 * cw; b2 = 1 - alpha * A;
+      a0 = 1 + alpha / A; a1 = -2 * cw; a2 = 1 - alpha / A;
+      break;
+    case RbjKind::LowShelf: {
+      const double sa = 2.0 * std::sqrt(A) * alpha;
+      b0 = A * ((A + 1) - (A - 1) * cw + sa); b1 =  2 * A * ((A - 1) - (A + 1) * cw); b2 = A * ((A + 1) - (A - 1) * cw - sa);
+      a0 =      (A + 1) + (A - 1) * cw + sa;  a1 = -2 *     ((A - 1) + (A + 1) * cw); a2 =      (A + 1) + (A - 1) * cw - sa;
+      break; }
+    case RbjKind::HighShelf:
+    default: {
+      const double sa = 2.0 * std::sqrt(A) * alpha;
+      b0 = A * ((A + 1) + (A - 1) * cw + sa); b1 = -2 * A * ((A - 1) + (A + 1) * cw); b2 = A * ((A + 1) + (A - 1) * cw - sa);
+      a0 =      (A + 1) - (A - 1) * cw + sa;  a1 =  2 *     ((A - 1) - (A + 1) * cw); a2 =      (A + 1) - (A - 1) * cw - sa;
+      break; }
+  }
+  q.b0 = float(b0 / a0); q.b1 = float(b1 / a0); q.b2 = float(b2 / a0); q.a1 = float(a1 / a0); q.a2 = float(a2 / a0);
+}
+
+// RBJ shelf "slope" S in (0,1]: 12 dB/oct ~ S=1 (steepest without overshoot)
+static inline float rbjShelfQFromSlope(float gain_db, float slope_dbpoct) {
+  const double A = std::pow(10.0, double(gain_db) / 40.0);
+  const double S = std::min(1.0, std::max(0.25, double(slope_dbpoct) / 12.0));
+  return float(1.0 / std::sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0));
+}
+
+struct MasterEqIIR {
+  // Fixed slots by role so a knob change never moves a section's state into another role:
+  //   0..2 low-cut sections, 3 low shelf, 4 mid bell, 5 high shelf
+  static constexpr int kSlots = 6;
+  static constexpr float kLcBypassHz = 20.0f;
+  Biquad sec[kSlots];
+  bool   active[kSlots] = {false, false, false, false, false, false};
+  bool   anyActive = false;
+  float  sr = kSR;
+  // cached knob values (coefficients are recomputed only on change)
+  float c_lc_hz = -1.0f, c_lc_slope = -1.0f, c_ls_g = -999.0f, c_ls_hz = -1.0f, c_ls_slope = -1.0f,
+        c_mid_g = -999.0f, c_mid_hz = -1.0f, c_mid_q = -1.0f, c_hs_g = -999.0f, c_hs_hz = -1.0f, c_hs_slope = -1.0f;
+
+  void reset() { for (auto& s : sec) s.reset(); }
+
+  static float nearestSlope(float s) {
+    const float cands[4] = {6.0f, 12.0f, 24.0f, 36.0f};
+    float best = cands[0];
+    for (float c : cands) if (std::fabs(c - s) < std::fabs(best - s)) best = c;
+    return best;
+  }
+
+  // Rebuild sections from gKnobs (called per block from the audio callback; cheap unless changed)
+  void updateFromKnobs() {
+    const float lc_hz = gKnobs.lc_hz.load(std::memory_order_relaxed);
+    const float lc_sl = gKnobs.lc_slope_dbpoct.load(std::memory_order_relaxed);
+    const float ls_g  = gKnobs.ls_gain_db.load(std::memory_order_relaxed);
+    const float ls_hz = gKnobs.ls_hz.load(std::memory_order_relaxed);
+    const float ls_sl = gKnobs.ls_slope_dbpoct.load(std::memory_order_relaxed);
+    const float md_g  = gKnobs.mid_gain_db.load(std::memory_order_relaxed);
+    const float md_hz = gKnobs.mid_hz.load(std::memory_order_relaxed);
+    const float md_q  = gKnobs.mid_q.load(std::memory_order_relaxed);
+    const float hs_g  = gKnobs.hs_gain_db.load(std::memory_order_relaxed);
+    const float hs_hz = gKnobs.hs_hz.load(std::memory_order_relaxed);
+    const float hs_sl = gKnobs.hs_slope_dbpoct.load(std::memory_order_relaxed);
+    const bool same = lc_hz == c_lc_hz && lc_sl == c_lc_slope && ls_g == c_ls_g && ls_hz == c_ls_hz && ls_sl == c_ls_slope &&
+                      md_g == c_mid_g && md_hz == c_mid_hz && md_q == c_mid_q && hs_g == c_hs_g && hs_hz == c_hs_hz && hs_sl == c_hs_slope;
+    if (same) return;
+    c_lc_hz = lc_hz; c_lc_slope = lc_sl; c_ls_g = ls_g; c_ls_hz = ls_hz; c_ls_slope = ls_sl;
+    c_mid_g = md_g; c_mid_hz = md_hz; c_mid_q = md_q; c_hs_g = hs_g; c_hs_hz = hs_hz; c_hs_slope = hs_sl;
+
+    bool act[kSlots] = {false, false, false, false, false, false};
+    if (lc_hz > kLcBypassHz + 1e-6f) {
+      const float slope = nearestSlope(lc_sl);
+      if (slope == 6.0f) {
+        rbjFirstOrderHP(sec[0], sr, lc_hz); act[0] = true;
+      } else {
+        static const float q12[1] = {0.70710678f};
+        static const float q24[2] = {0.54119610f, 1.30656296f};
+        static const float q36[3] = {0.51763809f, 0.70710678f, 1.93185165f};
+        const float* qs = (slope == 12.0f) ? q12 : (slope == 24.0f) ? q24 : q36;
+        const int nq = (slope == 12.0f) ? 1 : (slope == 24.0f) ? 2 : 3;
+        for (int i = 0; i < nq; ++i) { rbjBiquad(sec[i], RbjKind::HP2, sr, lc_hz, qs[i], 0.0f); act[i] = true; }
+      }
+    }
+    if (std::fabs(ls_g) > 1e-6f) { rbjBiquad(sec[3], RbjKind::LowShelf,  sr, ls_hz, rbjShelfQFromSlope(ls_g, ls_sl), ls_g); act[3] = true; }
+    if (std::fabs(md_g) > 1e-6f) { rbjBiquad(sec[4], RbjKind::Peak,      sr, md_hz, md_q, md_g);                        act[4] = true; }
+    if (std::fabs(hs_g) > 1e-6f) { rbjBiquad(sec[5], RbjKind::HighShelf, sr, hs_hz, rbjShelfQFromSlope(hs_g, hs_sl), hs_g); act[5] = true; }
+    anyActive = false;
+    for (int i = 0; i < kSlots; ++i) {
+      if (!act[i]) sec[i].reset();       // a section that just switched off starts clean next time
+      active[i] = act[i];
+      anyActive = anyActive || act[i];
+    }
+  }
+
+  inline void processBlock(float* x, size_t n) {
+    if (!anyActive) return;
+    for (size_t i = 0; i < n; ++i) {
+      float v = x[i];
+      for (int s = 0; s < kSlots; ++s) if (active[s]) v = sec[s].process(v);
+      x[i] = std::isfinite(v) ? v : 0.0f;
+    }
+  }
+};
+static MasterEqIIR gMasterEq;
+
 // ───────────────────────── TAPE/MOD DELAY (Mono in → Stereo wet add) ─────────────────────────
 // Features:
 //  - Mono input, stereo wet output (added to existing LR).
@@ -1248,12 +1443,9 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
                                            float* ioLRInterleaved,
                                            size_t n,
                                            unsigned long /*framesPerBuffer*/,
-                                           const PaStreamCallbackTimeInfo* /*timeInfo*/)
+                                           const PaStreamCallbackTimeInfo* /*timeInfo*/,
+                                           bool prewarmOnly = false)
 {
-  if (DlyEnabledStore().load(std::memory_order_relaxed) == 0) {
-    return;
-  }
-
   struct TapeDelayStereo {
     struct OnePoleLP {
       float a = 0.0f;
@@ -1441,6 +1633,11 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
   };
 
   static TapeDelayStereo D;
+  if (prewarmOnly) {           // 2 x 4 s delay lines: allocate from main(), never in the callback
+    if (!D.inited) D.init();
+    return;
+  }
+  if (DlyEnabledStore().load(std::memory_order_relaxed) == 0) return;
   if (n == 0) return;
   D.processAdd(inMono, ioLRInterleaved, n, kSR);
 }
@@ -1518,10 +1715,9 @@ static void ChorusProcessAddMonoToStereoWet(const float* inMono,
                                             float* ioLRInterleaved,
                                             size_t n,
                                             unsigned long /*framesPerBuffer*/,
-                                            const PaStreamCallbackTimeInfo* /*timeInfo*/)
+                                            const PaStreamCallbackTimeInfo* /*timeInfo*/,
+                                            bool prewarmOnly = false)
 {
-  if (ChEnabledStore().load(std::memory_order_relaxed) == 0) return;
-
   struct StereoChorus {
     DelayLine dlL, dlR;
 
@@ -1626,6 +1822,11 @@ static void ChorusProcessAddMonoToStereoWet(const float* inMono,
   };
 
   static StereoChorus C;
+  if (prewarmOnly) {
+    if (!C.inited) C.init();
+    return;
+  }
+  if (ChEnabledStore().load(std::memory_order_relaxed) == 0) return;
   if (n == 0) return;
   C.processAdd(inMono, ioLRInterleaved, n, kSR);
 }
@@ -1750,6 +1951,24 @@ struct AntiFeedbackShifter {
     }
   }
 };
+
+// Mono-path insert processors used by the PortAudio callback (file-scope so they can be
+// constructed and warmed up from main() instead of on the first RT callback).
+static NoiseGate           gGate;
+static AntiFeedbackShifter gAfb;
+
+// Construct/allocate every static DSP processor BEFORE the stream starts, so neither the first
+// audio callback nor the first time an effect is switched on ever mallocs at RT priority.
+static void PrewarmDsp() {
+  ReverbProcessMonoToStereo(nullptr, nullptr, 0, 0, nullptr, true);
+  DelayProcessAddMonoToStereoWet(nullptr, nullptr, 0, 0, nullptr, true);
+  ChorusProcessAddMonoToStereoWet(nullptr, nullptr, 0, 0, nullptr, true);
+  gGate.setSampleRate(kSR);
+  gAfb.setSampleRate(kSR);
+  gAfb.init();
+  gMasterEq.sr = kSR;
+  gMasterEq.updateFromKnobs();
+}
 
 
 
@@ -3654,6 +3873,30 @@ public:
     in_knob_ir_ = findInput("realtime_knob_ir");
     in_knob_dw_ = findInput("realtime_knob_drywet");
 
+    // Optional inputs (resolved once; -1 when the export does not have them)
+    in_pickup_        = findInput("realtime_pickup_input");
+    in_knob_main_     = findInput("realtime_knob_main");
+    in_knob_outgain_  = findInput("realtime_knob_outgain");
+    in_knob_phaseinv_ = findInput("realtime_knob_phaseinv");
+
+    // Legacy exports (before the master EQ moved to MasterEqIIR) still carry in-graph EQ knob
+    // inputs: feed them their neutral, training-time values so the in-graph EQ is transparent.
+    {
+      const std::pair<const char*, float> legacy[] = {
+        {"realtime_knob_lc_hz", 20.0f}, {"realtime_knob_lc_slope_dbpoct", 6.0f},
+        {"realtime_knob_ls_gain_db", 0.0f}, {"realtime_knob_ls_hz", 200.0f}, {"realtime_knob_ls_slope_dbpoct", 12.0f},
+        {"realtime_knob_mid_gain_db", 0.0f}, {"realtime_knob_mid_hz", 1000.0f}, {"realtime_knob_mid_q", 1.0f},
+        {"realtime_knob_hs_gain_db", 0.0f}, {"realtime_knob_hs_hz", 4000.0f}, {"realtime_knob_hs_slope_dbpoct", 12.0f},
+      };
+      for (auto& kv : legacy) {
+        int idx = findInput(kv.first);
+        if (idx >= 0) in_legacy_eq_.emplace_back(idx, kv.second);
+      }
+      if (!in_legacy_eq_.empty())
+        std::cout << "[TFLite] NOTE: legacy export with " << in_legacy_eq_.size()
+                  << " in-graph master-EQ inputs (fed neutral values; the EQ runs post-model now)\n";
+    }
+
     // Determine T
     auto* tin = (in_piezo_ >= 0) ? interp_->tensor(in_piezo_) : nullptr;
     if (!tin || tin->dims->size < 2) {
@@ -3679,6 +3922,10 @@ public:
       std::exit(1);
     }
 
+    if (ambiguousAudio_) {
+      std::cerr << "[TFLite] WARNING: " << n3dOutputs_ << " 3-D float outputs and none named "
+                   "'realtime_audio_out' — audio output selection is ambiguous; re-run --export-tflite.\n";
+    }
     std::cout<<"[TFLite] Ready. T="<<T_<<"  streaming="<<(isStreaming()?"true":"false")
              <<"  states="<<stateSlots_.size()<<"\n";
   }
@@ -3719,42 +3966,7 @@ public:
   *interp_->typed_tensor<float>(in_knob_ir_) = ir_lin;
   *interp_->typed_tensor<float>(in_knob_dw_) = dry_frac;
 
-  // Helper to set optional scalar inputs by name
-  auto setIf = [&](const char* name, float v){
-    int idx = findInput(name);
-    if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
-  };
-
-  // Pickup type (0 = piezo, 1 = magnetic); optional for older models
-  setIf("realtime_pickup_input", gKnobs.pickup01.load());
-
-  // NEW: Main stem gain (realtime_knob_main), dB -> lin
-  const float main_lin = db2lin(gKnobs.main_dB.load());
-  setIf("realtime_knob_main", main_lin);
-
-  // Output/Phase + Master EQ (all scalar [1,1])
-  const float out_lin = db2lin(gKnobs.outGain_dB.load());
-  setIf("realtime_knob_outgain", out_lin);
-  setIf("realtime_knob_phaseinv", gKnobs.phaseInvert01.load());
-
-  // Low cut (HP)
-  setIf("realtime_knob_lc_hz",          gKnobs.lc_hz.load());
-  setIf("realtime_knob_lc_slope_dbpoct",gKnobs.lc_slope_dbpoct.load());
-
-  // Low shelf
-  setIf("realtime_knob_ls_gain_db",     gKnobs.ls_gain_db.load());
-  setIf("realtime_knob_ls_hz",          gKnobs.ls_hz.load());
-  setIf("realtime_knob_ls_slope_dbpoct",gKnobs.ls_slope_dbpoct.load());
-
-  // Mid
-  setIf("realtime_knob_mid_gain_db",    gKnobs.mid_gain_db.load());
-  setIf("realtime_knob_mid_hz",         gKnobs.mid_hz.load());
-  setIf("realtime_knob_mid_q",          gKnobs.mid_q.load());
-
-  // High shelf
-  setIf("realtime_knob_hs_gain_db",     gKnobs.hs_gain_db.load());
-  setIf("realtime_knob_hs_hz",          gKnobs.hs_hz.load());
-  setIf("realtime_knob_hs_slope_dbpoct",gKnobs.hs_slope_dbpoct.load());
+  setOptionalScalarInputs();
 
   // Feed state inputs (if streaming)
   if (isStreaming()) {
@@ -3843,36 +4055,7 @@ public:
   *interp_->typed_tensor<float>(in_knob_ir_)  = ir_lin;
   *interp_->typed_tensor<float>(in_knob_dw_)  = dry_frac;
 
-  auto setIf = [&](const char* name, float v){
-    int idx = findInput(name);
-    if (idx >= 0) { *interp_->typed_tensor<float>(idx) = v; }
-  };
-
-  // Pickup type (0 = piezo, 1 = magnetic); optional for older models
-  setIf("realtime_pickup_input", gKnobs.pickup01.load());
-
-  // NEW: Main stem gain (realtime_knob_main), dB -> lin
-  const float main_lin = db2lin(gKnobs.main_dB.load());
-  setIf("realtime_knob_main", main_lin);
-
-  const float out_lin = db2lin(gKnobs.outGain_dB.load());
-  setIf("realtime_knob_outgain", out_lin);
-  setIf("realtime_knob_phaseinv", gKnobs.phaseInvert01.load());
-
-  setIf("realtime_knob_lc_hz",           gKnobs.lc_hz.load());
-  setIf("realtime_knob_lc_slope_dbpoct", gKnobs.lc_slope_dbpoct.load());
-
-  setIf("realtime_knob_ls_gain_db",      gKnobs.ls_gain_db.load());
-  setIf("realtime_knob_ls_hz",           gKnobs.ls_hz.load());
-  setIf("realtime_knob_ls_slope_dbpoct", gKnobs.ls_slope_dbpoct.load());
-
-  setIf("realtime_knob_mid_gain_db",     gKnobs.mid_gain_db.load());
-  setIf("realtime_knob_mid_hz",          gKnobs.mid_hz.load());
-  setIf("realtime_knob_mid_q",           gKnobs.mid_q.load());
-
-  setIf("realtime_knob_hs_gain_db",      gKnobs.hs_gain_db.load());
-  setIf("realtime_knob_hs_hz",           gKnobs.hs_hz.load());
-  setIf("realtime_knob_hs_slope_dbpoct", gKnobs.hs_slope_dbpoct.load());
+  setOptionalScalarInputs();
 
   if (interp_->Invoke() != kTfLiteOk) {
     std::cerr << "[TFLite] Invoke failed\n";
@@ -3908,11 +4091,16 @@ private:
 
   int findInput(const std::string& name) const {
     auto it = in_map_.find(name);
-    if (it != in_map_.end()) return it->second;
-    for (auto &kv : in_map_) {
-      if (kv.first == name) return kv.second;
-    }
-    return -1;
+    return (it != in_map_.end()) ? it->second : -1;
+  }
+
+  // Optional scalar inputs; indices were resolved once in the constructor (no per-hop lookups).
+  inline void setOptionalScalarInputs() {
+    if (in_pickup_ >= 0)        *interp_->typed_tensor<float>(in_pickup_)        = gKnobs.pickup01.load();
+    if (in_knob_main_ >= 0)     *interp_->typed_tensor<float>(in_knob_main_)     = db2lin(gKnobs.main_dB.load());
+    if (in_knob_outgain_ >= 0)  *interp_->typed_tensor<float>(in_knob_outgain_)  = db2lin(gKnobs.outGain_dB.load());
+    if (in_knob_phaseinv_ >= 0) *interp_->typed_tensor<float>(in_knob_phaseinv_) = float(gKnobs.phaseInvert01.load());
+    for (auto &kv : in_legacy_eq_) *interp_->typed_tensor<float>(kv.first) = kv.second;
   }
 
   void discoverStateInputs() {
@@ -3956,11 +4144,15 @@ private:
   size_t bestAudioTotal  = 0;
   size_t bestBundleTotal = 0;
 
-  // 1) Audio = 3D float (prefer [1,T,1]); pick the largest 3D if multiple
+  // 1) Audio = the 3D float output. Prefer the exported name when TFLite kept it; otherwise the
+  //    largest 3D tensor. Current exports have exactly one 3D output (the old "dry" copy of the
+  //    input was removed because it made this choice ambiguous); warn if that is not the case.
+  n3dOutputs_ = 0;
   for (int idx : interp_->outputs()) {
     TfLiteTensor* t = interp_->tensor(idx);
     if (!t || !t->dims) continue;
     if (t->type == kTfLiteFloat32 && t->dims->size == 3) {
+      ++n3dOutputs_;
       size_t total = 1;
       for (int i = 0; i < t->dims->size; ++i) total *= t->dims->data[i];
       if (total > bestAudioTotal) {
@@ -3968,6 +4160,11 @@ private:
         out_audio_ = idx;
       }
     }
+  }
+  {
+    auto it = out_map_.find("realtime_audio_out");
+    if (it != out_map_.end()) { out_audio_ = it->second; ambiguousAudio_ = false; }
+    else ambiguousAudio_ = (n3dOutputs_ > 1);
   }
 
   // 2) Style = 2D float (1,1) if present
@@ -4058,7 +4255,11 @@ private:
 
   std::unordered_map<std::string, int> in_map_, out_map_;
   int in_piezo_=-1, in_st_true_=-1, in_st_force_=-1, in_knob_pa_=-1, in_knob_pr_=-1, in_knob_ir_=-1, in_knob_dw_=-1;
+  int in_pickup_=-1, in_knob_main_=-1, in_knob_outgain_=-1, in_knob_phaseinv_=-1;
+  std::vector<std::pair<int,float>> in_legacy_eq_;
   int out_audio_=-1, out_style_=-1, out_bundle_=-1, out_splits_=-1;
+  int n3dOutputs_ = 0;
+  bool ambiguousAudio_ = false;
   int T_ = 0;
 
   std::vector<StateSlot> stateSlots_;
@@ -4101,92 +4302,53 @@ void inferenceThread(InferCtx ctx) {
     std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<") on a windowed model; sliding-window mode.\n";
   }
 
-  uint64_t lastBypassEpoch = gBypassEpoch.load(std::memory_order_acquire);
   std::vector<float> xhop(hop, 0.0f);
   std::vector<float> yT(T, 0.0f);
-  float styleP = 0.0f;  // raw per-hop style tensor
+  float styleP = 0.0f;  // per-hop style output (already EMA-smoothed by the model)
 
   size_t hopsInWindow = std::max<size_t>(1, (size_t)std::ceil(windowSec * double(ctx.sampleRate) / double(hop)));
   ProbWindow probWin;
   probWin.init(nextPow2(hopsInWindow + 8));
 
-  // Stabilized display probability = blend(avg_5s, current_ema)
+  // Stabilized display probability = blend(avg_windowSec, current)
   const float kStabBlend = 0.7f;  // larger → more weight to long window
   float stable_for_next  = 0.5f;  // used if guided-auto feeds model (one-hop lag)
 
-  // Track last printed knob values
+  // Last seen knob values (a change publishes a telemetry event; main() prints it)
   float prev_pa  = gKnobs.pickAttack_dB.load();
   float prev_pr  = gKnobs.pickReso_dB.load();
   float prev_ir  = gKnobs.ir_dB.load();
   float prev_wet = gKnobs.wet_pct.load();
+  float prev_main= gKnobs.main_dB.load();
   int   prev_mode= gStyleMode.load();
 
-  auto pickOrFinger = [&](float p, int styleMode)->const char* {
-    if (styleMode == static_cast<int>(StyleMode::ForcePick))   return "PICK (forced)";
-    if (styleMode == static_cast<int>(StyleMode::ForceFinger)) return "FINGER (forced)";
-    return (p >= 0.60f) ? "PICK" : "FINGER"; // slightly conservative UI threshold
-  };
+  const bool streaming = rt.isStreaming();
+  gTelemetry.streaming.store(streaming, std::memory_order_relaxed);
+  if (streaming) rt.resetStates();
+  // NOTE: states are deliberately NOT reset on bypass edges. The model keeps running on the
+  // live input while bypassed (the callback just discards its output), so its states are warm
+  // and un-bypassing is seamless; resetting them produced cold-start artefacts instead.
 
-  auto printKnobStatus = [&](const char* tag, float dispP){
-    int sm = gStyleMode.load();
-    std::cout << (tag ? tag : "[UI]") << " PA=" << gKnobs.pickAttack_dB.load() << " dB  "
-              << "PR=" << gKnobs.pickReso_dB.load()   << " dB  "
-              << "IR=" << gKnobs.ir_dB.load()         << " dB  "
-              << "Wet="<< gKnobs.wet_pct.load()       << " %  "
-              << "Pred P=" << dispP << "  "
-              << "Pred=" << pickOrFinger(dispP, sm) << "  "
-              << "Mode=" << styleModeName(sm)
-              << (gGuidedAuto.load() ? "  (Guided AUTO ON)" : "");
-    AppendSoCTemp(std::cout);
-    std::cout << "\n";
-  };
-
-  auto checkAndReportKnobChanges = [&](float dispP){
+  auto publishKnobChangeIfAny = [&](float dispP){
     float pa  = gKnobs.pickAttack_dB.load();
     float pr  = gKnobs.pickReso_dB.load();
     float ir  = gKnobs.ir_dB.load();
     float wet = gKnobs.wet_pct.load();
+    float mn  = gKnobs.main_dB.load();
     int   sm  = gStyleMode.load();
-    if (pa != prev_pa || pr != prev_pr || ir != prev_ir || wet != prev_wet || sm != prev_mode) {
-      printKnobStatus("[UI]", dispP);
-      prev_pa = pa; prev_pr = pr; prev_ir = ir; prev_wet = wet; prev_mode = sm;
+    if (pa != prev_pa || pr != prev_pr || ir != prev_ir || wet != prev_wet || mn != prev_main || sm != prev_mode) {
+      gTelemetry.dispP.store(dispP, std::memory_order_relaxed);
+      gTelemetry.knobSeq.fetch_add(1, std::memory_order_relaxed);
+      prev_pa = pa; prev_pr = pr; prev_ir = ir; prev_wet = wet; prev_main = mn; prev_mode = sm;
     }
   };
 
-  // Wait for at least one hop of input
-  while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
-    std::this_thread::yield();
-  if (gStopFlag) return;
+  const int left = T - hop;               // windowed models only
+  std::vector<float> win(T, 0.0f);
 
-  const bool streaming = rt.isStreaming();
-  if (streaming) {
-    rt.resetStates();
-  }
-
-  auto onBypassEdgeIfAny = [&](){
-    uint64_t cur = gBypassEpoch.load(std::memory_order_acquire);
-    if (cur != lastBypassEpoch) {
-      lastBypassEpoch = cur;
-      if (streaming) {
-        rt.resetStates();
-      }
-      probWin.reset();
-      // Drop any queued processed audio to be extra safe
-      ctx.sh->in .r.store(ctx.sh->in .w.load(std::memory_order_acquire), std::memory_order_release);
-      ctx.sh->out.r.store(ctx.sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-      ctx.sh->dry.r.store(ctx.sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
-    }
-  };
-
-  // Initial hop
-  size_t got = ctx.sh->in.pop(xhop.data(), hop);
-  if (got < (size_t)hop) std::fill(xhop.begin()+got, xhop.end(), 0.0f);
-
-  // enqueue dry path with the same hop
-  ctx.sh->dry.push(xhop.data(), hop);
-
-  // Helpers to call TFLite for one block
-  auto do_invoke_streaming = [&](const float* coreBuf, int coreLen, float guidedStableForAuto){
+  // Run the model on one hop (streaming) or on the slid window (legacy windowed models).
+  auto invokeOne = [&](const float* hopBuf, float guidedStableForAuto){
+    // Same baseline boosts on both paths — they must sit at the same level (and match Python).
     float pa_lin = std::pow(10.0f, (gKnobs.pickAttack_dB.load() + kPickAttackBaselineBoostDB) / 20.0f);
     float pr_lin = std::pow(10.0f, (gKnobs.pickReso_dB.load()   + kPickResoBaselineBoostDB)   / 20.0f);
     float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
@@ -4199,162 +4361,105 @@ void inferenceThread(InferCtx ctx) {
     if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
     if (sm == static_cast<int>(StyleMode::Auto) && gGuidedAuto.load()) {
       st_true  = std::max(0.0f, std::min(1.0f, guidedStableForAuto));
-      st_force = 1.0f; // override model’s internal style with 5s-stabilized prob
+      st_force = 1.0f; // override the model's internal style with the windowSec-stabilized prob
     }
 
-    rt.invokeStreamingBlock(coreBuf, coreLen, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
-  };
-
-  auto do_invoke_windowed = [&](const float* windowT, float guidedStableForAuto){
-    // Same baseline boosts as the streaming path — both paths must sit at the same level.
-    float pa_lin = std::pow(10.0f, (gKnobs.pickAttack_dB.load() + kPickAttackBaselineBoostDB) / 20.0f);
-    float pr_lin = std::pow(10.0f, (gKnobs.pickReso_dB.load()   + kPickResoBaselineBoostDB)   / 20.0f);
-    float ir_lin = std::pow(10.0f, gKnobs.ir_dB.load()         / 20.0f);
-    float wet    = std::max(0.0f, std::min(100.0f, gKnobs.wet_pct.load()));
-    float dryFrac= 1.0f - (wet / 100.0f);
-
-    int sm = gStyleMode.load();
-    float st_true = 0.0f, st_force = 0.0f;
-    if (sm == static_cast<int>(StyleMode::ForcePick))   { st_true = 1.0f; st_force = 1.0f; }
-    if (sm == static_cast<int>(StyleMode::ForceFinger)) { st_true = 0.0f; st_force = 1.0f; }
-    if (sm == static_cast<int>(StyleMode::Auto) && gGuidedAuto.load()) {
-      st_true  = std::max(0.0f, std::min(1.0f, guidedStableForAuto));
-      st_force = 1.0f;
+    if (streaming) {
+      rt.invokeStreamingBlock(hopBuf, hop, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
+    } else {
+      // Slide window left by hop; append new hop at end (a zero window == legacy first block)
+      if (left > 0) std::memmove(win.data(), win.data() + hop, sizeof(float) * (T - hop));
+      std::memcpy(win.data() + left, hopBuf, sizeof(float) * hop);
+      rt.invokeWindowed(win.data(), yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
     }
-
-    rt.invokeWindowed(windowT, yT.data(), styleP, pa_lin, pr_lin, ir_lin, dryFrac, st_true, st_force);
   };
 
-  // First block
-  if (streaming) {
-    do_invoke_streaming(xhop.data(), hop, stable_for_next);
-    ctx.sh->out.push(yT.data(), hop);
-    // Update 5s window with EMA (or raw) from this hop
-    float pHop = styleP;  // exported style output is already the EMA-smoothed probability
+  auto last_report = std::chrono::steady_clock::now();
+  double sum_proc = 0.0;
+  size_t cnt = 0;
+
+  while (!gStopFlag.load(std::memory_order_relaxed)) {
+    // Block until the callback has pushed a hop (bounded wait so gStopFlag is honoured)
+    while (!gStopFlag.load(std::memory_order_relaxed) && ctx.sh->in.available() < (size_t)hop)
+      inputSignalWaitMs(2);
+    if (gStopFlag.load(std::memory_order_relaxed)) break;
+
+    size_t got = ctx.sh->in.pop(xhop.data(), hop);
+    if (got < (size_t)hop) std::fill(xhop.begin() + got, xhop.end(), 0.0f);
+
+    auto t0 = std::chrono::steady_clock::now();
+    // Use the previous stabilized prob for guided AUTO (one-hop lag)
+    invokeOne(xhop.data(), stable_for_next);
+    auto t1 = std::chrono::steady_clock::now();
+
+    // Publish DI and processed audio in lockstep, dry FIRST then out: the callback pops
+    // min(hop, out.available()) samples from BOTH rings, so they can never drift apart. (The
+    // old code pushed dry before running the model and popped the rings independently: one
+    // late block permanently offset DI vs processed by a hop.)
+    ctx.sh->dry.push(xhop.data(), hop);
+    ctx.sh->out.push(streaming ? yT.data() : yT.data() + left, hop);
+
+    // Rolling {windowSec}s window and stabilized display prob
+    float pHop = styleP;
     probWin.push(pHop, float(hop));
     float pAvgWindowSec = probWin.mean();
     float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
     stable_for_next = dispP;
-    checkAndReportKnobChanges(dispP);
-  } else {
-    // Legacy windowed: left = T - hop, right=0
-    const int left = T - hop;
-    std::vector<float> win(T, 0.0f);
-    std::memcpy(win.data() + left, xhop.data(), sizeof(float)*hop);
-    do_invoke_windowed(win.data(), stable_for_next);
-    ctx.sh->out.push(yT.data() + left, hop);
-    float pHop = styleP;  // exported style output is already the EMA-smoothed probability
-    probWin.push(pHop, float(hop));
-    float pAvgWindowSec = probWin.mean();
-    float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
-    stable_for_next = dispP;
-    checkAndReportKnobChanges(dispP);
-  }
 
-  // Main loop
-  if (streaming) {
-    while (!gStopFlag) {
-      while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
-        std::this_thread::yield();
-      if (gStopFlag) break;
+    publishKnobChangeIfAny(dispP);
 
-      size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
-      if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
-
-      ctx.sh->dry.push(xhop.data(), hop);
-
-      // Reset state/rings on bypass edge
-      onBypassEdgeIfAny();
-
-      auto t0 = std::chrono::steady_clock::now();
-
-      // Use the previous stabilized prob for guided AUTO (one-hop lag)
-      do_invoke_streaming(xhop.data(), hop, stable_for_next);
-      ctx.sh->out.push(yT.data(), hop);
-
-      // Update rolling {windowSec}s window and stabilized display prob
-      float pHop = styleP;  // exported style output is already the EMA-smoothed probability
-      probWin.push(pHop, float(hop));
-      float pAvgWindowSec = probWin.mean();
-      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
-      stable_for_next = dispP;
-
-      auto t1 = std::chrono::steady_clock::now();
-      checkAndReportKnobChanges(dispP);
-
-      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
-      static auto   last_report = t1;
-      static double sum_proc = 0.0;
-      static size_t cnt = 0;
-      sum_proc += proc_ms; ++cnt;
-      if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
-        double avg_proc = sum_proc / double(cnt);
-        double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
-        double total_ms = avg_proc + io_ms;
-        int sm = gStyleMode.load();
-        std::cerr << "[inference/stream] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
-                  << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
-                  << (gGuidedAuto.load() ? "  (Guided)" : "");
-        AppendSoCTemp(std::cerr);
-        std::cerr << "\n";
-        last_report = t1; sum_proc = 0.0; cnt = 0;
-      }
-    }
-  } else {
-    const int left = T - hop;
-    std::vector<float> win(T, 0.0f);
-    while (!gStopFlag) {
-      while (!gStopFlag && ctx.sh->in.available() < (size_t)hop)
-        std::this_thread::yield();
-      if (gStopFlag) break;
-
-      size_t got2 = ctx.sh->in.pop(xhop.data(), hop);
-      if (got2 < (size_t)hop) std::fill(xhop.begin()+got2, xhop.end(), 0.0f);
-
-      ctx.sh->dry.push(xhop.data(), hop);
-
-      // Reset state/rings on bypass edge
-      onBypassEdgeIfAny();
-
-      auto t0 = std::chrono::steady_clock::now();
-
-      // Slide window left by hop; append new hop at end
-      if (left > 0) std::memmove(win.data(), win.data()+hop, sizeof(float)*(T-hop));
-      std::memcpy(win.data() + (T - hop), xhop.data(), sizeof(float)*hop);
-
-      do_invoke_windowed(win.data(), stable_for_next);
-      ctx.sh->out.push(yT.data() + (T - hop), hop);
-
-      float pHop = styleP;  // exported style output is already the EMA-smoothed probability
-      probWin.push(pHop, float(hop));
-      float pAvgWindowSec = probWin.mean();
-      float dispP = (1.0f - kStabBlend) * pHop + kStabBlend * pAvgWindowSec;
-      stable_for_next = dispP;
-
-      auto t1 = std::chrono::steady_clock::now();
-      checkAndReportKnobChanges(dispP);
-
-      double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
-      static auto   last_report = t1;
-      static double sum_proc = 0.0;
-      static size_t cnt = 0;
-      sum_proc += proc_ms; ++cnt;
-      if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
-        double avg_proc = sum_proc / double(cnt);
-        double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec)*1000.0;
-        double total_ms = avg_proc + io_ms;
-        int sm = gStyleMode.load();
-        std::cerr << "[inference/window] Proc="<<avg_proc<<" ms  I/O="<<io_ms<<" ms  Total~"<<total_ms<<" ms"
-                  << "  Pred" << windowSec << "s=" << pAvgWindowSec << "  DispP=" << dispP
-                  << "  pred="<<pickOrFinger(dispP, sm)<<"  mode="<<styleModeName(sm)
-                  << (gGuidedAuto.load() ? "  (Guided)" : "");
-        AppendSoCTemp(std::cerr);
-        std::cerr << "\n";
-        last_report = t1; sum_proc = 0.0; cnt = 0;
-      }
+    double proc_ms = std::chrono::duration<double,std::milli>(t1 - t0).count();
+    sum_proc += proc_ms; ++cnt;
+    if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
+      gTelemetry.procMsAvg.store(sum_proc / double(std::max<size_t>(1, cnt)), std::memory_order_relaxed);
+      gTelemetry.predWindow.store(pAvgWindowSec, std::memory_order_relaxed);
+      gTelemetry.dispP.store(dispP, std::memory_order_relaxed);
+      gTelemetry.periodicSeq.fetch_add(1, std::memory_order_relaxed);
+      last_report = t1; sum_proc = 0.0; cnt = 0;
     }
   }
+}
+
+// ───────────────────────── Telemetry printing (main thread only) ─────────────────────────
+static inline const char* pickOrFingerLabel(float p, int styleMode) {
+  if (styleMode == static_cast<int>(StyleMode::ForcePick))   return "PICK (forced)";
+  if (styleMode == static_cast<int>(StyleMode::ForceFinger)) return "FINGER (forced)";
+  return (p >= 0.60f) ? "PICK" : "FINGER"; // slightly conservative UI threshold
+}
+
+static void printKnobStatus(const char* tag) {
+  const int sm = gStyleMode.load();
+  const float dispP = float(gTelemetry.dispP.load(std::memory_order_relaxed));
+  std::cout << (tag ? tag : "[UI]")
+            << " Main=" << gKnobs.main_dB.load() << " dB  "
+            << "PA=" << gKnobs.pickAttack_dB.load() << " dB  "
+            << "PR=" << gKnobs.pickReso_dB.load()   << " dB  "
+            << "IR=" << gKnobs.ir_dB.load()         << " dB  "
+            << "Wet="<< gKnobs.wet_pct.load()       << " %  "
+            << "Pred P=" << dispP << "  "
+            << "Pred=" << pickOrFingerLabel(dispP, sm) << "  "
+            << "Mode=" << styleModeName(sm)
+            << (gGuidedAuto.load() ? "  (Guided AUTO ON)" : "");
+  AppendSoCTemp(std::cout);
+  std::cout << "\n";
+}
+
+static void printPeriodicTelemetry() {
+  const int sm = gStyleMode.load();
+  const double avg_proc = gTelemetry.procMsAvg.load(std::memory_order_relaxed);
+  const double io_ms    = (gIOInputLatencySec + gIOOutputLatencySec) * 1000.0;
+  const float  pAvg     = float(gTelemetry.predWindow.load(std::memory_order_relaxed));
+  const float  dispP    = float(gTelemetry.dispP.load(std::memory_order_relaxed));
+  std::cerr << (gTelemetry.streaming.load() ? "[inference/stream] " : "[inference/window] ")
+            << "Proc=" << avg_proc << " ms  I/O=" << io_ms << " ms  Total~" << (avg_proc + io_ms) << " ms"
+            << "  Pred" << windowSec << "s=" << pAvg << "  DispP=" << dispP
+            << "  pred=" << pickOrFingerLabel(dispP, sm) << "  mode=" << styleModeName(sm)
+            << (gGuidedAuto.load() ? "  (Guided)" : "")
+            << "  xruns=" << gTelemetry.outUnderruns.load(std::memory_order_relaxed)
+            << " inDrops=" << gTelemetry.inDrops.load(std::memory_order_relaxed)
+            << " resyncs=" << gTelemetry.resyncs.load(std::memory_order_relaxed);
+  AppendSoCTemp(std::cerr);
+  std::cerr << "\n";
 }
 
 // ───────────────────────── PA CALLBACK ─────────────────────────
@@ -4378,7 +4483,8 @@ static int paCallback(const void *inputBuffer,
   float *fxRetL  = sh->tempFxReturnL.data();
   float *fxRetR  = sh->tempFxReturnR.data();
 
-  // Handle bypass edge + reset time-based DSP
+  // Handle bypass edge + reset time-based DSP. This callback is the ONLY place that writes the
+  // out/dry read pointers (flushes from the keyboard/inference threads raced with pop()).
   if (timeInfo) {
     static uint64_t s_lastBypassEpoch = 0;
     static bool     s_lastBypass      = false;
@@ -4386,8 +4492,8 @@ static int paCallback(const void *inputBuffer,
     uint64_t curEpoch  = gBypassEpoch.load(std::memory_order_acquire);
     bool     curBypass = gBypass.load(std::memory_order_relaxed);
     if (curEpoch != s_lastBypassEpoch || curBypass != s_lastBypass) {
-      // Flush all rings
-      sh->in.r.store (sh->in.w.load (std::memory_order_acquire), std::memory_order_release);
+      // Flush the processed/DI rings (the input ring keeps feeding the model so its streaming
+      // states stay warm across bypass)
       sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
       sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
 
@@ -4400,10 +4506,37 @@ static int paCallback(const void *inputBuffer,
       DelayReset();
       ChorusReset();
       AFBReset();
+      gMasterEq.reset();
     }
   }
 
-  // Deinterleave ADC channels:
+  // 1) Pop processed + DI from the rings FIRST — before this block's input is pushed — so the
+  //    rings only ever hold blocks from earlier callbacks and the steady-state latency is exactly
+  //    one hop (popping after the push would race the inference thread on multi-core).
+  float *proc = sh->tempOut.data();
+  float *dry  = sh->tempDry.data();
+  {
+    const size_t availP = sh->out.available();
+    if (availP >= 2 * hop) {
+      // Backlog: an earlier xrun let the inference thread get a hop ahead. Drop whole hops from
+      // BOTH rings so DI/processed stay sample-aligned and latency returns to one hop instead of
+      // creeping up by a hop per xrun.
+      size_t excess = availP - hop;
+      excess -= excess % hop;
+      sh->out.r.store((sh->out.r.load(std::memory_order_acquire) + excess) & sh->out.mask, std::memory_order_release);
+      sh->dry.r.store((sh->dry.r.load(std::memory_order_acquire) + excess) & sh->dry.mask, std::memory_order_release);
+      gTelemetry.resyncs.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+  const size_t gotP = sh->out.pop(proc, hop);
+  const size_t gotD = sh->dry.pop(dry, gotP);          // same count as processed → stays aligned
+  if (gotP < hop) {
+    std::memset(proc + gotP, 0, sizeof(float) * (hop - gotP));
+    gTelemetry.outUnderruns.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (gotD < hop) std::memset(dry + gotD, 0, sizeof(float) * (hop - gotD));
+
+  // 2) Deinterleave ADC channels:
   //  - ch1 (index 0): guitar input -> monoIn
   //  - ch3 (index 2): FX RETURN L  -> fxRetL
   //  - ch4 (index 3): FX RETURN R  -> fxRetR
@@ -4413,18 +4546,18 @@ static int paCallback(const void *inputBuffer,
       fxRetL[i] = in[numInCh * i + 2]; // ADC ch3: FX return L
       fxRetR[i] = in[numInCh * i + 3]; // ADC ch4: FX return R
     }
-    // Feed mono input to inference thread ring
-    sh->in.push(monoIn, hop);
   } else {
     std::memset(monoIn, 0, sizeof(float) * hop);
     std::memset(fxRetL, 0, sizeof(float) * hop);
     std::memset(fxRetR, 0, sizeof(float) * hop);
-    sh->in.push(monoIn, hop);
   }
+  // Feed mono input to the inference thread and wake it
+  if (sh->in.push(monoIn, hop) < hop) gTelemetry.inDrops.fetch_add(1, std::memory_order_relaxed);
+  inputSignalPost();
 
   // Global bypass: route monoIn to outputs
-    if (gBypass.load(std::memory_order_relaxed)) {
-    // Ensure processed/dry rings are empty while bypassed
+  if (gBypass.load(std::memory_order_relaxed)) {
+    // Keep the processed/dry rings drained while bypassed (the model keeps running)
     sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
     sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
     for (size_t i = 0; i < hop; ++i) {
@@ -4443,26 +4576,16 @@ static int paCallback(const void *inputBuffer,
     return paContinue;
   }
 
-  // Pop processed mono and delayed dry mono from rings
-  float *proc = sh->tempOut.data();
-  float *dry  = sh->tempDry.data();
-  size_t gotP = sh->out.pop(proc, hop);
-  size_t gotD = sh->dry.pop(dry,  hop);
-  if (gotP < hop) std::memset(proc + gotP, 0, sizeof(float) * (hop - gotP));
-  if (gotD < hop) std::memset(dry  + gotD, 0, sizeof(float) * (hop - gotD));
+  // Master EQ on processed mono (post-model; the model itself is EQ-free)
+  gMasterEq.updateFromKnobs();
+  gMasterEq.processBlock(proc, hop);
 
   // Noise gate on processed mono
   {
-    static NoiseGate s_gate;
-    static bool s_inited = false;
-    if (!s_inited) {
-      s_gate.setSampleRate(kSR);
-      s_inited = true;
-    }
     static uint64_t s_lastGateEpoch = 0;
     uint64_t curGateEpoch = GateGetResetEpoch();
     if (curGateEpoch != s_lastGateEpoch) {
-      s_gate.reset();
+      gGate.reset();
       s_lastGateEpoch = curGateEpoch;
     }
 
@@ -4475,25 +4598,22 @@ static int paCallback(const void *inputBuffer,
     const float range_db = GateRangeDBStore().load(std::memory_order_relaxed);
     const float hpf_hz   = GateScHPHzStore().load(std::memory_order_relaxed);
 
-    s_gate.setParams(th_db, hy_db, atk_ms, rel_ms, hold_ms, range_db, hpf_hz);
-    s_gate.processBlock(proc, hop, gate_enabled);
+    gGate.setParams(th_db, hy_db, atk_ms, rel_ms, hold_ms, range_db, hpf_hz);
+    gGate.processBlock(proc, hop, gate_enabled);
   }
 
   // Anti-feedback shifter on processed mono
   {
-    static AntiFeedbackShifter s_afb;
-    static bool s_inited = false;
-    if (!s_inited) { s_afb.setSampleRate(kSR); s_afb.init(); s_inited = true; }
     static uint64_t s_lastAfbEpoch = 0;
     uint64_t curAfbEpoch = AFBGetResetEpoch();
     if (curAfbEpoch != s_lastAfbEpoch) {
-      s_afb.reset();
+      gAfb.reset();
       s_lastAfbEpoch = curAfbEpoch;
     }
     const bool afb_on = (AFBEnabledStore().load(std::memory_order_relaxed) != 0);
     const float shz   = AFBShiftHzStore().load(std::memory_order_relaxed);
-    s_afb.setShiftHz(shz);
-    s_afb.processBlock(proc, hop, afb_on);
+    gAfb.setShiftHz(shz);
+    gAfb.processBlock(proc, hop, afb_on);
   }
 
   const bool rvbOn = (RvbEnabledStore().load(std::memory_order_relaxed) != 0);
@@ -4686,14 +4806,8 @@ shared.tempFxReturnR.resize(blockSize);
       if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
       if (c=='b'||c=='B') {
         bool now = !gBypass.load(std::memory_order_relaxed);
-        bool prev = gBypass.exchange(now, std::memory_order_acq_rel);
-        gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);
-
-        // Drop all queued audio immediately
-        shared.in.r .store(shared.in .w.load(std::memory_order_acquire), std::memory_order_release);
-        shared.out.r.store(shared.out.w.load(std::memory_order_acquire), std::memory_order_release);
-        shared.dry.r.store(shared.dry.w.load(std::memory_order_acquire), std::memory_order_release);
-
+        gBypass.store(now, std::memory_order_release);
+        gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);   // the callback flushes the rings
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
 
       } else if (c=='l' || c=='L') {          // NEW: FX loop toggle
@@ -4722,11 +4836,7 @@ shared.tempFxReturnR.resize(blockSize);
           std::cout<<"[UI] Style mode = "<<styleModeName(next)<<"\n";
         }
         else if (c=='p') {
-          std::cout<<"[UI] PA="<<gKnobs.pickAttack_dB.load()<<" dB  "
-                   <<"PR="<<gKnobs.pickReso_dB.load()<<" dB  "
-                   <<"IR="<<gKnobs.ir_dB.load()<<" dB  "
-                   <<"Wet="<<gKnobs.wet_pct.load()<<" %  "
-                   <<"Style="<<styleModeName(gStyleMode.load())<<"\n";
+          printKnobStatus("[UI]");
         }
 
         else if (c=='u' || c=='U') {
@@ -4744,6 +4854,9 @@ shared.tempFxReturnR.resize(blockSize);
 
   // Comment out for now
   // StartKnobWebUI(8088);
+
+  inputSignalInit();
+  PrewarmDsp();   // allocate every FX/EQ processor before the first RT callback
 
   PaStream *stream = nullptr;
   err = Pa_OpenStream(&stream, &ip, &op, sampleRate, (unsigned long)blockSize, paNoFlag, paCallback, &shared);
@@ -4772,7 +4885,15 @@ shared.tempFxReturnR.resize(blockSize);
   StartTempMonitor(1000); // 1 Hz is plenty
 
   std::cout<<"[MAIN] Streaming… (Ctrl-C to quit)\n";
-  while (!gStopFlag) Pa_Sleep(100);
+  // Telemetry is printed here (main thread) — never from the RT inference thread / callback.
+  uint64_t seenPeriodic = 0, seenKnob = 0;
+  while (!gStopFlag) {
+    Pa_Sleep(50);
+    const uint64_t ks = gTelemetry.knobSeq.load(std::memory_order_relaxed);
+    if (ks != seenKnob) { seenKnob = ks; printKnobStatus("[UI]"); }
+    const uint64_t ps = gTelemetry.periodicSeq.load(std::memory_order_relaxed);
+    if (ps != seenPeriodic) { seenPeriodic = ps; printPeriodicTelemetry(); }
+  }
 
   std::cout<<"[MAIN] Stopping…\n";
 
