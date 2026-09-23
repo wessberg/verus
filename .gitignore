@@ -9,3 +9,4 @@ cpp/lib/
 cpp/build/
 __pycache__/
 *.pyc
+out/analysis/

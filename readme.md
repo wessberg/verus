@@ -1,7 +1,11 @@
 # Start here
 
 **See [TRAINING.md](TRAINING.md)** for the full training / inference / Raspberry-Pi
-deployment runbook (data layout, command order, sharp edges, magnetic-pickup roadmap).
+deployment runbook (data layout, command order, sharp edges).
+
+Where things stand and what's next: [rounds/INDEX.md](rounds/INDEX.md) (one line per working
+round; the latest round's file ends with the hand-off) and [BACKLOG.md](BACKLOG.md) (open work).
+[AGENTS.md](AGENTS.md) describes how work is organized, for agents and people alike.
 
 # Model outputs
 

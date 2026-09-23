@@ -41,7 +41,10 @@
 
   2. Inference thread (TFLite)
      --------------------------
-     - Runs on a separate thread using a streaming or windowed TFLite model.
+     - The model is loaded, validated (hop == T for streaming models) and warmed up by main()
+       BEFORE the stream starts; the inference thread only runs it.
+     - Runs on a separate SCHED_FIFO thread (priority 35; the PortAudio callback thread sets
+       itself to 40 on its first call — callback > inference > everything else).
      - Blocks on a semaphore posted by the PortAudio callback (no busy-spin), reads mono hops
        from `Shared::in`.
      - Feeds the model input `realtime_piezo_input` and the in-graph control knobs
@@ -154,6 +157,11 @@
   Notes
   =====
   - Sample rate is fixed to 48 kHz.
+  - Rings are SPSC with monotonic counters; out/dry are only ever consumed (popped, trimmed or
+    flushed) together by the same count, so DI and processed audio cannot drift apart.
+  - The processed signal is sanitised (non-finite → 0, clamped to ±kProcSampleLimit) right after
+    it is popped, before any stateful FX can latch a NaN.
+  - Optional web UI: `--webui [port]` (127.0.0.1 only).
   - Streaming models REQUIRE hop == model T (--blocksize 32 for the exported T=32 models);
     windowed (non-streaming) models accept hop <= T.
   - All knob controls are atomic and can be changed at runtime via:
@@ -187,6 +195,11 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <limits>
+#include <stdexcept>
+#include <memory>
+#include <cstdlib>
+#include <cctype>
+#include <cstdio>
 #if defined(__linux__)
   #include <semaphore.h>
   #include <time.h>
@@ -230,6 +243,10 @@ struct Telemetry {
   std::atomic<uint32_t> outUnderruns{0};  // callback found < hop processed samples (xrun)
   std::atomic<uint32_t> inDrops{0};       // input ring full: inference thread fell behind
   std::atomic<uint32_t> resyncs{0};       // backlog trimmed to keep latency at one hop
+  std::atomic<uint32_t> paXruns{0};       // PortAudio reported input overflow / output underflow
+  std::atomic<uint32_t> badBlocks{0};     // callback got framesPerBuffer != blockSize (silenced)
+  std::atomic<uint32_t> invokeFails{0};   // TFLite Invoke() errors (output silenced for that hop)
+  std::atomic<bool>     rtPrioFailed{false};
 };
 static Telemetry gTelemetry;
 
@@ -241,10 +258,18 @@ static sem_t gInputSem;
 static inline void inputSignalInit() { sem_init(&gInputSem, 0, 0); }
 static inline void inputSignalPost() { sem_post(&gInputSem); }
 static inline void inputSignalWaitMs(int ms) {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 30))
+  // Monotonic clock: a wall-clock step (NTP at boot) cannot stretch or collapse the wait
+  timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts.tv_nsec += (long)ms * 1000000L;
+  while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec += 1; }
+  sem_clockwait(&gInputSem, CLOCK_MONOTONIC, &ts);
+#else
   timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
   ts.tv_nsec += (long)ms * 1000000L;
   while (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ts.tv_sec += 1; }
   sem_timedwait(&gInputSem, &ts);
+#endif
 }
 #else
 static inline void inputSignalInit() {}
@@ -253,6 +278,38 @@ static inline void inputSignalWaitMs(int) { std::this_thread::sleep_for(std::chr
 #endif
 
 void signalHandler(int){ gStopFlag = true; }
+
+// ───────────────────────── RT thread helpers ─────────────────────────
+// Priorities: PortAudio callback > inference thread > everything else (main/keyboard stay at the
+// process default). Both stay below the default PREEMPT_RT IRQ-thread priority (50) so the I2S/DMA
+// interrupt threads that feed the callback are never starved.
+static constexpr int kCallbackRtPriority  = 40;
+static constexpr int kInferenceRtPriority = 35;
+
+static inline bool setThreadRealtime(int priority) {
+#if defined(__linux__)
+  sched_param sp{}; sp.sched_priority = priority;
+  return pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0;
+#else
+  (void)priority; return false;
+#endif
+}
+
+// Denormals: long reverb/delay/IIR tails decay into subnormals, which are slow on many CPUs. Flush
+// them to zero on the RT threads (idempotent; the -ffast-math startup code may already have).
+static inline void enableFlushToZero() {
+#if defined(__aarch64__)
+  uint64_t fpcr; __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr |= (1ull << 24);                                   // FZ
+  __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+#elif defined(__x86_64__) || defined(__SSE__)
+  unsigned int csr = __builtin_ia32_stmxcsr();
+  __builtin_ia32_ldmxcsr(csr | 0x8040u);                  // FTZ | DAZ
+#endif
+}
+
+// Hard ceiling for a processed sample entering the post-model FX (+12 dBFS; normal output is ≤ 1)
+static constexpr float kProcSampleLimit = 4.0f;
 
 enum class StyleMode : int { Auto = 0, ForcePick = 1, ForceFinger = 2 };
 std::atomic<int> gStyleMode{ static_cast<int>(StyleMode::Auto) };
@@ -665,7 +722,7 @@ struct ModDelay {
 
     float D = baseSamp;
     if (enabled) {
-      float m = std::sinf(phase);
+      float m = std::sin(phase);
       phase += phaseInc;
       if (phase >= 2.0f * float(M_PI)) phase -= 2.0f * float(M_PI);
       D += depthSamp * m;
@@ -976,7 +1033,6 @@ static inline uint64_t GateGetResetEpoch() {
 }
 
 // Clamp helpers for Gate UI
-static inline float clampf_pos(float x, float hi) { return std::max(0.0f, std::min(hi, x)); }
 static inline float clampf_range(float x, float lo, float hi) { return std::max(lo, std::min(hi, x)); }
 
 // UI set/get for gate (thread-safe atomics)
@@ -1046,7 +1102,7 @@ struct NoiseGate {
 
   static inline float coeffFromMs(float ms, float sr) {
     float t = std::max(0.0001f, ms * 0.001f);
-    float a = 1.0f - std::expf(-1.0f / (t * std::max(1.0f, sr)));
+    float a = 1.0f - std::exp(-1.0f / (t * std::max(1.0f, sr)));
     if (a < 0.000001f) a = 0.000001f;
     if (a > 1.0f) a = 1.0f;
     return a;
@@ -1378,7 +1434,7 @@ struct OnePoleLP {
   void setCutoff(float fc, float sr) {
     float f = clampf(fc, 20.0f, 20000.0f);
     float srSafe = std::max(1.0f, sr);
-    float x = std::expf(-2.0f * float(M_PI) * f / srSafe);
+    float x = std::exp(-2.0f * float(M_PI) * f / srSafe);
     a = 1.0f - x; // y += a*(x - y)
   }
   inline float process(float x) {
@@ -1453,7 +1509,7 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
       void setCutoff(float fc, float sr) {
         float f = clampf(fc, 20.0f, 20000.0f);
         float srSafe = std::max(1.0f, sr);
-        float x = std::expf(-2.0f * float(M_PI) * f / srSafe);
+        float x = std::exp(-2.0f * float(M_PI) * f / srSafe);
         a = 1.0f - x;
       }
       inline float process(float x) {
@@ -1591,8 +1647,8 @@ static void DelayProcessAddMonoToStereoWet(const float* inMono,
         curBaseL += stepBaseL;
         curBaseR += stepBaseR;
 
-        float mL = 0.7f * std::sinf(wowPhaseL) + 0.3f * std::sinf(fltPhaseL);
-        float mR = 0.7f * std::sinf(wowPhaseR) + 0.3f * std::sinf(fltPhaseR);
+        float mL = 0.7f * std::sin(wowPhaseL) + 0.3f * std::sin(fltPhaseL);
+        float mR = 0.7f * std::sin(wowPhaseR) + 0.3f * std::sin(fltPhaseR);
 
         float DL = curBaseL + depthSamp * mL;
         float DR = curBaseR + depthSamp * mR;
@@ -1794,8 +1850,8 @@ static void ChorusProcessAddMonoToStereoWet(const float* inMono,
         curBaseL += stepBaseL;
         curBaseR += stepBaseR;
 
-        float mL = std::sinf(phaseL);
-        float mR = std::sinf(phaseR);
+        float mL = std::sin(phaseL);
+        float mR = std::sin(phaseR);
 
         float DL = curBaseL + depthSamp * mL;
         float DR = curBaseR + depthSamp * mR;
@@ -1993,9 +2049,8 @@ static void PrewarmDsp() {
 
 
 // ───────────────────────── KNOB WEB UI (SEPARATE WINDOW VIA BROWSER) ─────────────────────────
-// Add these functions anywhere after the globals (they reference gKnobs, gStyleMode, gBypass, gGuidedAuto).
-// Call StartKnobWebUI(8088); from main() after printing the "Keys" help (e.g., right before opening PA stream).
-// Optionally call StopKnobWebUI() during shutdown (it also stops automatically when gStopFlag is set).
+// Enabled with `--webui [port]` (default 8088, bound to 127.0.0.1 only). Runs in its own
+// non-RT thread; it only reads/writes the same atomics as the keyboard handler.
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -2429,6 +2484,8 @@ static std::string ui_htmlIndex() {
         </div>
         <div class="btn" id="btnGuided">Guided AUTO: OFF</div>
         <div class="btn" id="btnBypass">Bypass: OFF</div>
+        <div class="btn" id="btnPickup">Pickup: PIEZO</div>
+        <div class="btn" id="btnFxLoop">FX Loop: OFF</div>
       </div>
       <div class="row status" style="margin-top:10px;">
         <div class="kv">Mode: <span id="modeName">AUTO</span></div>
@@ -2581,6 +2638,8 @@ const el = (id)=>document.getElementById(id);
 const $modeSeg = el('modeSeg');
 const $btnGuided = el('btnGuided');
 const $btnBypass = el('btnBypass');
+const $btnPickup = el('btnPickup');
+const $btnFxLoop = el('btnFxLoop');
 const $btnPhase  = el('btnPhase');
 const $btnReverb   = el('btnReverb');
 const $btnGate   = el('btnGate');
@@ -2738,6 +2797,15 @@ function setMode(m) { fetch('/mode?v='+m).catch(()=>{}); }
 function setGuided(on) { fetch('/guided?v='+(on?1:0)).catch(()=>{}); }
 function setBypass(on) { fetch('/bypass?v='+(on?1:0)).catch(()=>{}); }
 function setPhase(on) { fetch('/set?phase='+(on?1:0)).catch(()=>{}); }
+function setPickup(mag) { fetch('/set?pickup='+(mag?1:0)).catch(()=>{}); }
+function setFxLoop(on) { fetch('/set?fxloop='+(on?1:0)).catch(()=>{}); }
+
+$btnPickup.addEventListener('click', ()=>{
+  const isMag = $btnPickup.classList.contains('on'); setPickup(!isMag);
+});
+$btnFxLoop.addEventListener('click', ()=>{
+  const isOn = $btnFxLoop.classList.contains('on'); setFxLoop(!isOn);
+});
 
 $modeSeg.querySelectorAll('.segbtn').forEach(btn=>{
   btn.addEventListener('click', ()=>{ const v = parseInt(btn.dataset.mode,10); setMode(v); });
@@ -2894,6 +2962,18 @@ function applyStatus(s){
   el('guidedState').textContent = s.guidedAuto ? 'ON' : 'OFF';
   el('bypassState').textContent = s.bypass ? 'ON' : 'OFF';
 
+  if ('pickup01' in s) {
+    const mag = (s.pickup01 >= 0.5);
+    $btnPickup.textContent = 'Pickup: ' + (mag ? 'MAGNETIC' : 'PIEZO');
+    $btnPickup.classList.toggle('on', mag);
+    $btnPickup.classList.toggle('off', !mag);
+  }
+  if ('fxLoop' in s) {
+    $btnFxLoop.textContent = 'FX Loop: ' + (s.fxLoop ? 'ON' : 'OFF');
+    $btnFxLoop.classList.toggle('on', !!s.fxLoop);
+    $btnFxLoop.classList.toggle('off', !s.fxLoop);
+  }
+
   $btnGuided.textContent = 'Guided AUTO: ' + (s.guidedAuto?'ON':'OFF');
   $btnGuided.classList.toggle('on', !!s.guidedAuto);
   $btnGuided.classList.toggle('off', !s.guidedAuto);
@@ -3017,6 +3097,8 @@ static std::string ui_jsonStatus() {
   oss << "\"bypass\":"       << (gBypass.load()?1:0) << ",";
   oss << "\"mode\":"         << gStyleMode.load()    << ",";
   oss << "\"modeName\":"     << ui_styleModeName_jsonsafe() << ",";
+  oss << "\"pickup01\":"     << gKnobs.pickup01.load() << ",";
+  oss << "\"fxLoop\":"       << (gFxLoopEnabled.load()?1:0) << ",";
   oss << "\"guidedAuto\":"   << (gGuidedAuto.load()?1:0);
   oss << "}";
   return oss.str();
@@ -3116,6 +3198,16 @@ static inline void ui_handleSet(const std::unordered_map<std::string,std::string
       int v = std::stoi(itPh->second);
       gKnobs.phaseInvert01.store((v!=0) ? 1 : 0);
     } catch (...) {}
+  }
+
+  // Pickup type (0 = piezo, 1 = magnetic) and FX loop switch
+  auto itPu = q.find("pickup");
+  if (itPu != q.end()) {
+    try { gKnobs.pickup01.store(std::stoi(itPu->second) != 0 ? 1.0f : 0.0f); } catch (...) {}
+  }
+  auto itFx = q.find("fxloop");
+  if (itFx != q.end()) {
+    try { gFxLoopEnabled.store(std::stoi(itFx->second) != 0, std::memory_order_relaxed); } catch (...) {}
   }
 
   // Low cut
@@ -3345,8 +3437,7 @@ static inline void ui_handleMode(const std::unordered_map<std::string,std::strin
   if (it != q.end()) {
     try {
       int v = std::stoi(it->second);
-      if (v < 0) v = 0; if (v > 2) v = 2;
-      gStyleMode.store(v);
+      gStyleMode.store(std::max(0, std::min(2, v)));
     } catch (...) {}
   }
 }
@@ -3685,19 +3776,8 @@ static void StartKnobWebUI(uint16_t port) {
 }
 
 static void StopKnobWebUI() {
+  // The accept loop polls gWebUIShouldStop / gStopFlag every 200 ms (select timeout)
   gWebUIShouldStop.store(true);
-  if (gWebUIListenFd >= 0) {
-    // poke the accept()
-    int s = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (s >= 0) {
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      addr.sin_port = htons( (uint16_t) ( (gWebUIListenFd>=0) ? 0 : 0 ) ); // not used
-      // Best-effort connect to wake; we don't know bound port in this snippet, so rely on ShouldStop and select timeout
-      ::close(s);
-    }
-  }
   if (gWebUIThread.joinable()) gWebUIThread.join();
 }
 
@@ -3714,38 +3794,62 @@ static void StopKnobWebUI() {
 
 
 // ───────────────────────── RING BUFFER ─────────────────────────
+// Single-producer / single-consumer. r and w are MONOTONIC sample counters (only the buffer index
+// is masked), so available() is exact and a completely full ring is distinguishable from an empty
+// one — with masked indices a ring filled to capacity read back as EMPTY (w == r) and the next
+// push overwrote unread data. push() is producer-only, pop()/drop() consumer-only.
 struct RingBuffer {
   std::vector<float> buf;
   size_t mask;
   std::atomic<size_t> r{0}, w{0};
   explicit RingBuffer(size_t cap): buf(cap), mask(cap-1){
-    assert((cap & mask)==0); // must be power-of-two
+    assert(cap > 0 && (cap & mask)==0); // must be power-of-two
   }
+  size_t capacity() const { return mask + 1; }
   size_t available() const {
-    return (w.load(std::memory_order_acquire)
-          - r.load(std::memory_order_acquire)) & mask;
+    return w.load(std::memory_order_acquire) - r.load(std::memory_order_acquire);
   }
   size_t freeSpace() const {
-    return (mask+1) - available();
+    return capacity() - available();
   }
   size_t push(const float *data, size_t n){
-    size_t free = freeSpace(), toW = std::min(n, free);
-    size_t w0 = w.load(std::memory_order_relaxed);
+    const size_t w0 = w.load(std::memory_order_relaxed);
+    const size_t free = capacity() - (w0 - r.load(std::memory_order_acquire));
+    const size_t toW = std::min(n, free);
     for(size_t i=0;i<toW;i++) buf[(w0+i)&mask] = data[i];
-    w.store((w0+toW)&mask, std::memory_order_release);
+    w.store(w0+toW, std::memory_order_release);
     return toW;
   }
   size_t pop(float *out, size_t n){
-    size_t av = available(), toR = std::min(n,av);
-    size_t r0 = r.load(std::memory_order_relaxed);
+    const size_t r0 = r.load(std::memory_order_relaxed);
+    const size_t toR = std::min(n, w.load(std::memory_order_acquire) - r0);
     for(size_t i=0;i<toR;i++) out[i] = buf[(r0+i)&mask];
-    r.store((r0+toR)&mask, std::memory_order_release);
+    r.store(r0+toR, std::memory_order_release);
+    return toR;
+  }
+  // Consumer-side discard of up to n samples (no copy). Returns the number dropped.
+  size_t drop(size_t n){
+    const size_t r0 = r.load(std::memory_order_relaxed);
+    const size_t toR = std::min(n, w.load(std::memory_order_acquire) - r0);
+    r.store(r0+toR, std::memory_order_release);
     return toR;
   }
 };
 
+// Drop the same number of samples from the processed and DI rings. The inference thread pushes
+// dry FIRST, then out, so dry.available() >= out.available() at any instant and dropping
+// out.available() from both keeps them sample-aligned. (Flushing each ring to its own write
+// pointer raced that push order: a flush between the two pushes left DI one hop ahead of the
+// processed audio for good.)
+static inline void dropAligned(RingBuffer& out, RingBuffer& dry, size_t n) {
+  const size_t k = out.drop(n);
+  dry.drop(k);
+}
+
 struct Shared {
   RingBuffer in, out, dry;
+  size_t hop = 0;                 // frames per callback == model hop (fixed before the stream starts)
+  size_t latencyHops = 1;         // processed hops queued ahead of the callback (1 = minimum latency)
   std::vector<float> tempIn;      // mono input (from ADC ch1)
   std::vector<float> tempOut;     // processed mono
   std::vector<float> tempStereo;  // processed stereo L/R
@@ -3826,18 +3930,14 @@ public:
   // (the model EMAs the classifier logit and applies sigmoid after), so callers should use
   // the styleProb returned by invoke*() directly. The old getStyleEma() hack that read the
   // raw state slot has been removed — the state now stores the logit, not a probability.
+  // Throws std::runtime_error on any load/validation failure (constructed on the main thread
+  // before any stream or RT thread exists, so the caller can clean up and exit).
   explicit TFLiteRealtime(const std::string& modelPath) {
     model_ = tflite::FlatBufferModel::BuildFromFile(modelPath.c_str());
-    if (!model_) {
-      std::cerr << "[TFLite] Cannot load model: " << modelPath << "\n";
-      std::exit(1);
-    }
+    if (!model_) throw std::runtime_error("[TFLite] Cannot load model: " + modelPath);
     tflite::ops::builtin::BuiltinOpResolver resolver;
     tflite::InterpreterBuilder(*model_, resolver)(&interp_);
-    if (!interp_) {
-      std::cerr << "[TFLite] InterpreterBuilder failed\n";
-      std::exit(1);
-    }
+    if (!interp_) throw std::runtime_error("[TFLite] InterpreterBuilder failed");
     interp_->SetNumThreads(1);
 
     #ifdef TFLITE_WITH_XNNPACK
@@ -3845,14 +3945,12 @@ public:
         TfLiteXNNPackDelegateOptions opt = TfLiteXNNPackDelegateOptionsDefault();
         opt.num_threads = 1; // keep real-time friendly
         xnnpack_ = TfLiteXNNPackDelegateCreate(&opt);
-        if (xnnpack_) interp_->ModifyGraphWithDelegate(xnnpack_);
+        if (xnnpack_ && interp_->ModifyGraphWithDelegate(xnnpack_) != kTfLiteOk)
+          std::cerr << "[TFLite] WARNING: XNNPACK delegate could not be applied; running the builtin kernels\n";
       }
     #endif
 
-    if (interp_->AllocateTensors() != kTfLiteOk) {
-      std::cerr << "[TFLite] AllocateTensors failed\n";
-      std::exit(1);
-    }
+    if (interp_->AllocateTensors() != kTfLiteOk) throw std::runtime_error("[TFLite] AllocateTensors failed");
 
     // Build input/output maps
     for (int i : interp_->inputs()) {
@@ -3899,14 +3997,9 @@ public:
 
     // Determine T
     auto* tin = (in_piezo_ >= 0) ? interp_->tensor(in_piezo_) : nullptr;
-    if (!tin || tin->dims->size < 2) {
-      std::cerr<<"[TFLite] Unexpected/no piezo input; want [1,T,1]\n";
-      std::exit(1);
-    }
-    if (tin->dims->size == 3 && (tin->dims->data[0] != 1 || tin->dims->data[2] != 1)) {
-      std::cerr<<"[TFLite] Unexpected piezo shape; want [1,T,1]\n";
-      std::exit(1);
-    }
+    if (!tin || tin->dims->size < 2) throw std::runtime_error("[TFLite] Unexpected/no piezo input; want [1,T,1]");
+    if (tin->dims->size == 3 && (tin->dims->data[0] != 1 || tin->dims->data[2] != 1))
+      throw std::runtime_error("[TFLite] Unexpected piezo shape; want [1,T,1]");
     T_ = tin->dims->data[1];
 
     // Discover streaming states by input names
@@ -3917,23 +4010,53 @@ public:
 
     // Basic checks for required non-state I/O
     if (in_piezo_ < 0 || out_audio_ < 0 || in_st_true_ < 0 || in_st_force_ < 0 ||
-        in_knob_pa_ < 0 || in_knob_pr_ < 0 || in_knob_ir_ < 0 || in_knob_dw_ < 0) {
-      std::cerr << "[TFLite] Missing required I/O tensors (check model names)\n";
-      std::exit(1);
+        in_knob_pa_ < 0 || in_knob_pr_ < 0 || in_knob_ir_ < 0 || in_knob_dw_ < 0)
+      throw std::runtime_error("[TFLite] Missing required I/O tensors (check model names)");
+    for (int idx : {in_piezo_, in_st_true_, in_st_force_, in_knob_pa_, in_knob_pr_, in_knob_ir_, in_knob_dw_,
+                    in_pickup_, in_knob_main_, in_knob_outgain_, in_knob_phaseinv_, out_audio_}) {
+      if (idx >= 0 && interp_->tensor(idx)->type != kTfLiteFloat32)
+        throw std::runtime_error(std::string("[TFLite] non-float32 tensor: ") + interp_->tensor(idx)->name);
+    }
+    for (const auto& s : stateSlots_) {
+      if (interp_->tensor(s.input_idx)->type != kTfLiteFloat32)
+        throw std::runtime_error("[TFLite] non-float32 state input: " + s.name);
     }
 
     if (ambiguousAudio_) {
       std::cerr << "[TFLite] WARNING: " << n3dOutputs_ << " 3-D float outputs and none named "
                    "'realtime_audio_out' — audio output selection is ambiguous; re-run --export-tflite.\n";
     }
+
+    // The per-state lengths ('splits') are constants of the export: resolve the bundle → state
+    // copy plan ONCE (the RT hop loop must not allocate) and validate it against the inputs.
+    buildStateCopyPlan();
+
     std::cout<<"[TFLite] Ready. T="<<T_<<"  streaming="<<(isStreaming()?"true":"false")
              <<"  states="<<stateSlots_.size()<<"\n";
   }
 
   ~TFLiteRealtime() {
+    // The delegate must outlive the interpreter that references it: destroy the interpreter first
+    // (member destruction would otherwise run AFTER this body deleted the delegate).
+    interp_.reset();
   #ifdef TFLITE_WITH_XNNPACK
       if (xnnpack_) TfLiteXNNPackDelegateDelete(xnnpack_);
   #endif
+  }
+
+  TFLiteRealtime(const TFLiteRealtime&) = delete;
+  TFLiteRealtime& operator=(const TFLiteRealtime&) = delete;
+
+  // Run a few zero hops so lazy one-time work (XNNPACK weight packing, first-touch of the arena)
+  // happens before the stream starts instead of in the first RT hops; then clear the states.
+  void warmUp(int hops = 8) {
+    std::vector<float> zin(T_, 0.0f), zout(T_, 0.0f);
+    float p = 0.0f;
+    for (int i = 0; i < hops; ++i) {
+      if (isStreaming()) invokeStreamingBlock(zin.data(), T_, zout.data(), p, 1.f, 1.f, 1.f, 0.f, 0.f, 0.f);
+      else               invokeWindowed(zin.data(), zout.data(), p, 1.f, 1.f, 1.f, 0.f, 0.f, 0.f);
+    }
+    resetStates();
   }
 
   int T() const { return T_; }
@@ -3977,7 +4100,7 @@ public:
   }
 
   if (interp_->Invoke() != kTfLiteOk) {
-    std::cerr << "[TFLite] Invoke failed\n";
+    invokeFailures_.fetch_add(1, std::memory_order_relaxed);   // reported by main(), never printed here
     std::memset(outBlockT, 0, sizeof(float) * T_);
     styleProb = 0.0f;
     return;
@@ -4000,42 +4123,12 @@ public:
     }
   }
 
-  // Update states from packed bundle (if present)
+  // Update states from the packed bundle (plan precomputed in buildStateCopyPlan: no allocation,
+  // no splits decoding per hop)
   if (isStreaming() && out_bundle_ >= 0) {
-    const TfLiteTensor* bt = interp_->tensor(out_bundle_);
     const float* bundle = interp_->typed_tensor<float>(out_bundle_);
-    int total = 1;
-    for (int i = 0; i < bt->dims->size; ++i) total *= bt->dims->data[i];
-    if (out_splits_ >= 0) {
-      const TfLiteTensor* sp = interp_->tensor(out_splits_);
-      std::vector<int> lens;
-      if (sp->type == kTfLiteInt32) {
-        const int32_t* p = interp_->typed_tensor<int32_t>(out_splits_);
-        int N = 1; for (int i=0;i<sp->dims->size;i++) N *= sp->dims->data[i];
-        for (int i=0;i<N;i++) lens.push_back((int)p[i]);
-      } else if (sp->type == kTfLiteInt64) {
-        const int64_t* p = interp_->typed_tensor<int64_t>(out_splits_);
-        int N = 1; for (int i=0;i<sp->dims->size;i++) N *= sp->dims->data[i];
-        for (int i=0;i<N;i++) lens.push_back((int)p[i]);
-      }
-      size_t offset = 0;
-      for (size_t i = 0; i < stateSlots_.size(); ++i) {
-        int need = (i < lens.size()) ? lens[i] : stateSlots_[i].len();
-        int have = std::max(0, std::min(need, total - (int)offset));
-        if (have > 0) {
-          std::memcpy(stateSlots_[i].buf.data(), bundle + offset, sizeof(float) * std::min(have, stateSlots_[i].len()));
-        }
-        offset += have;
-      }
-    } else {
-      size_t offset = 0;
-      for (auto &s : stateSlots_) {
-        int have = std::max(0, std::min(s.len(), total - (int)offset));
-        if (have > 0) {
-          std::memcpy(s.buf.data(), bundle + offset, sizeof(float) * have);
-        }
-        offset += have;
-      }
+    for (const auto& c : copyPlan_) {
+      std::memcpy(stateSlots_[c.slot].buf.data(), bundle + c.offset, sizeof(float) * c.count);
     }
   }
 }
@@ -4058,7 +4151,7 @@ public:
   setOptionalScalarInputs();
 
   if (interp_->Invoke() != kTfLiteOk) {
-    std::cerr << "[TFLite] Invoke failed\n";
+    invokeFailures_.fetch_add(1, std::memory_order_relaxed);
     std::memset(outWindowT, 0, sizeof(float) * T_);
     styleProb = 0.0f;
     return;
@@ -4079,6 +4172,8 @@ public:
   }
 }
 
+  uint32_t invokeFailures() const { return invokeFailures_.load(std::memory_order_relaxed); }
+
 private:
   struct StateSlot {
     std::string name;
@@ -4088,6 +4183,50 @@ private:
     std::vector<float> buf;
     int len() const { return L * C; }
   };
+  struct StateCopy { size_t slot; size_t offset; size_t count; };
+
+  // Bundle layout = states in lexicographic input-name order (stateSlots_ is sorted the same way),
+  // each 'splits[i]' floats long. The splits output is a constant tensor; read it after one
+  // invoke (constant outputs are materialised by then) and fall back to the input shapes.
+  void buildStateCopyPlan() {
+    copyPlan_.clear();
+    if (!isStreaming()) return;
+    if (out_bundle_ < 0) throw std::runtime_error("[TFLite] streaming model without a states bundle output");
+    // Invoke once with zero inputs so constant outputs (splits) are populated.
+    for (int i : interp_->inputs()) {
+      TfLiteTensor* t = interp_->tensor(i);
+      if (t->type == kTfLiteFloat32 && t->data.raw) std::memset(t->data.raw, 0, t->bytes);
+    }
+    if (interp_->Invoke() != kTfLiteOk) throw std::runtime_error("[TFLite] warm-up Invoke failed");
+
+    std::vector<int64_t> lens;
+    if (out_splits_ >= 0) {
+      const TfLiteTensor* sp = interp_->tensor(out_splits_);
+      int N = 1; for (int i = 0; i < sp->dims->size; ++i) N *= sp->dims->data[i];
+      for (int i = 0; i < N; ++i) {
+        if (sp->type == kTfLiteInt32)      lens.push_back(interp_->typed_tensor<int32_t>(out_splits_)[i]);
+        else if (sp->type == kTfLiteInt64) lens.push_back(interp_->typed_tensor<int64_t>(out_splits_)[i]);
+      }
+    }
+    const TfLiteTensor* bt = interp_->tensor(out_bundle_);
+    size_t total = 1;
+    for (int i = 0; i < bt->dims->size; ++i) total *= size_t(bt->dims->data[i]);
+
+    size_t offset = 0;
+    for (size_t i = 0; i < stateSlots_.size(); ++i) {
+      const size_t want = size_t(stateSlots_[i].len());
+      const size_t seg  = (i < lens.size()) ? size_t(std::max<int64_t>(0, lens[i])) : want;
+      if (seg != want)
+        std::cerr << "[TFLite] WARNING: state '" << stateSlots_[i].name << "' bundle length " << seg
+                  << " != input length " << want << "\n";
+      const size_t n = std::min(want, seg);
+      if (offset + n > total) throw std::runtime_error("[TFLite] states bundle shorter than the state inputs");
+      if (n > 0) copyPlan_.push_back({i, offset, n});
+      offset += seg;
+    }
+    if (offset != total)
+      std::cerr << "[TFLite] WARNING: bundle length " << total << " != sum of state lengths " << offset << "\n";
+  }
 
   int findInput(const std::string& name) const {
     auto it = in_map_.find(name);
@@ -4263,6 +4402,8 @@ private:
   int T_ = 0;
 
   std::vector<StateSlot> stateSlots_;
+  std::vector<StateCopy> copyPlan_;
+  std::atomic<uint32_t> invokeFailures_{0};
 };
 
 // ───────────────────────── INFERENCE THREAD ─────────────────────────
@@ -4270,37 +4411,17 @@ struct InferCtx {
   Shared* sh;
   int hop;
   int sampleRate;
-  std::string modelPath;
+  TFLiteRealtime* rt;   // loaded, validated (hop vs T) and warmed up by main() before the stream starts
 };
 
 void inferenceThread(InferCtx ctx) {
-#if defined(__linux__)
-  struct sched_param sp;
-  std::memset(&sp, 0, sizeof(sp));
-  sp.sched_priority = 30;  // slightly higher than main
-  pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-#endif
+  if (!setThreadRealtime(kInferenceRtPriority))
+    gTelemetry.rtPrioFailed.store(true, std::memory_order_relaxed);   // main() reports it
+  enableFlushToZero();
 
-  TFLiteRealtime rt(ctx.modelPath);
+  TFLiteRealtime& rt = *ctx.rt;
   const int T   = rt.T();
   const int hop = ctx.hop;
-
-  if (hop > T) {
-    std::cerr << "[inference] Error: blocksize/hop ("<<hop<<") must be <= T ("<<T<<")\n";
-    gStopFlag = true; return;
-  }
-
-  // Streaming models REQUIRE hop == T: with hop < T the zero-padded tail of every block is
-  // fed into the model states and the same samples are re-fed next hop — state corruption,
-  // not just reduced style stability.
-  if (rt.isStreaming() && hop != T) {
-    std::cerr << "[inference] Error: streaming model requires --blocksize "<<T
-              << " (got "<<hop<<"); a smaller hop corrupts the streaming states.\n";
-    gStopFlag = true; return;
-  }
-  if (!rt.isStreaming() && hop != T) {
-    std::cerr << "[inference] WARN: hop ("<<hop<<") != T ("<<T<<") on a windowed model; sliding-window mode.\n";
-  }
 
   std::vector<float> xhop(hop, 0.0f);
   std::vector<float> yT(T, 0.0f);
@@ -4412,6 +4533,7 @@ void inferenceThread(InferCtx ctx) {
     sum_proc += proc_ms; ++cnt;
     if (t1 - last_report >= std::chrono::seconds(PROCESSING_LOGGING_WAIT_SEC)) {
       gTelemetry.procMsAvg.store(sum_proc / double(std::max<size_t>(1, cnt)), std::memory_order_relaxed);
+      gTelemetry.invokeFails.store(rt.invokeFailures(), std::memory_order_relaxed);
       gTelemetry.predWindow.store(pAvgWindowSec, std::memory_order_relaxed);
       gTelemetry.dispP.store(dispP, std::memory_order_relaxed);
       gTelemetry.periodicSeq.fetch_add(1, std::memory_order_relaxed);
@@ -4456,8 +4578,13 @@ static void printPeriodicTelemetry() {
             << "  pred=" << pickOrFingerLabel(dispP, sm) << "  mode=" << styleModeName(sm)
             << (gGuidedAuto.load() ? "  (Guided)" : "")
             << "  xruns=" << gTelemetry.outUnderruns.load(std::memory_order_relaxed)
+            << " paXruns=" << gTelemetry.paXruns.load(std::memory_order_relaxed)
             << " inDrops=" << gTelemetry.inDrops.load(std::memory_order_relaxed)
             << " resyncs=" << gTelemetry.resyncs.load(std::memory_order_relaxed);
+  const uint32_t bad = gTelemetry.badBlocks.load(std::memory_order_relaxed);
+  if (bad) std::cerr << " badBlocks=" << bad;
+  const uint32_t invf = gTelemetry.invokeFails.load(std::memory_order_relaxed);
+  if (invf) std::cerr << " invokeFails=" << invf;
   AppendSoCTemp(std::cerr);
   std::cerr << "\n";
 }
@@ -4468,24 +4595,52 @@ static int paCallback(const void *inputBuffer,
                       void *outputBuffer,
                       unsigned long framesPerBuffer,
                       const PaStreamCallbackTimeInfo *timeInfo,
-                      PaStreamCallbackFlags,
+                      PaStreamCallbackFlags statusFlags,
                       void *userData)
 {
   auto *sh  = static_cast<Shared*>(userData);
   auto *in  = static_cast<const float*>(inputBuffer);
   auto *out = static_cast<float*>(outputBuffer);
 
-  const size_t   hop      = framesPerBuffer;
   const unsigned numInCh  = 8;
   const unsigned numOutCh = 8;
+
+  // One-time RT setup of the PortAudio callback thread (it inherits main()'s policy otherwise,
+  // which left it BELOW the inference thread): explicit SCHED_FIFO priority + flush-to-zero.
+  {
+    static bool s_threadSetup = false;
+    if (!s_threadSetup) {
+      s_threadSetup = true;
+      if (!setThreadRealtime(kCallbackRtPriority))
+        gTelemetry.rtPrioFailed.store(true, std::memory_order_relaxed);
+      enableFlushToZero();
+    }
+  }
+
+  if (statusFlags & (paInputOverflow | paOutputUnderflow))
+    gTelemetry.paXruns.fetch_add(1, std::memory_order_relaxed);
+
+  // Every scratch buffer is sized for exactly `blockSize` frames and hop == T is enforced; if the
+  // host ever delivers a different block size, output silence instead of overrunning buffers.
+  if (framesPerBuffer != sh->hop) {
+    if (out) std::memset(out, 0, sizeof(float) * numOutCh * framesPerBuffer);
+    gTelemetry.badBlocks.fetch_add(1, std::memory_order_relaxed);
+    return paContinue;
+  }
+  const size_t   hop      = framesPerBuffer;
 
   float *monoIn  = sh->tempIn.data();
   float *fxRetL  = sh->tempFxReturnL.data();
   float *fxRetR  = sh->tempFxReturnR.data();
 
-  // Handle bypass edge + reset time-based DSP. This callback is the ONLY place that writes the
-  // out/dry read pointers (flushes from the keyboard/inference threads raced with pop()).
-  if (timeInfo) {
+  // Jitter buffer: after start-up, a flush or an underrun, nothing is popped (silence out) until
+  // latencyHops processed hops are queued again, so the configured scheduling headroom is
+  // restored instead of being lost for good. Both rings are skipped together → DI stays aligned.
+  static bool s_buffering = true;
+
+  // Handle bypass edge + reset time-based DSP. This callback is the ONLY consumer of the out/dry
+  // rings (flushes from the keyboard/inference threads raced with pop()).
+  {
     static uint64_t s_lastBypassEpoch = 0;
     static bool     s_lastBypass      = false;
 
@@ -4494,8 +4649,8 @@ static int paCallback(const void *inputBuffer,
     if (curEpoch != s_lastBypassEpoch || curBypass != s_lastBypass) {
       // Flush the processed/DI rings (the input ring keeps feeding the model so its streaming
       // states stay warm across bypass)
-      sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-      sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
+      dropAligned(sh->out, sh->dry, sh->out.available());
+      s_buffering = true;
 
       s_lastBypassEpoch = curEpoch;
       s_lastBypass      = curBypass;
@@ -4516,25 +4671,39 @@ static int paCallback(const void *inputBuffer,
   float *proc = sh->tempOut.data();
   float *dry  = sh->tempDry.data();
   {
+    // Steady state: latencyHops processed hops are queued when the callback runs (the inference
+    // thread must finish hop k before callback k+latencyHops). More than that is backlog from an
+    // earlier stall: drop whole hops from BOTH rings so DI/processed stay sample-aligned and the
+    // latency returns to latencyHops instead of creeping up by a hop per xrun.
+    const size_t L = sh->latencyHops;
     const size_t availP = sh->out.available();
-    if (availP >= 2 * hop) {
-      // Backlog: an earlier xrun let the inference thread get a hop ahead. Drop whole hops from
-      // BOTH rings so DI/processed stay sample-aligned and latency returns to one hop instead of
-      // creeping up by a hop per xrun.
-      size_t excess = availP - hop;
+    if (availP >= (L + 1) * hop) {
+      size_t excess = availP - L * hop;
       excess -= excess % hop;
-      sh->out.r.store((sh->out.r.load(std::memory_order_acquire) + excess) & sh->out.mask, std::memory_order_release);
-      sh->dry.r.store((sh->dry.r.load(std::memory_order_acquire) + excess) & sh->dry.mask, std::memory_order_release);
+      dropAligned(sh->out, sh->dry, excess);
       gTelemetry.resyncs.fetch_add(1, std::memory_order_relaxed);
     }
   }
-  const size_t gotP = sh->out.pop(proc, hop);
-  const size_t gotD = sh->dry.pop(dry, gotP);          // same count as processed → stays aligned
-  if (gotP < hop) {
-    std::memset(proc + gotP, 0, sizeof(float) * (hop - gotP));
-    gTelemetry.outUnderruns.fetch_add(1, std::memory_order_relaxed);
+  if (s_buffering && sh->out.available() >= sh->latencyHops * hop) s_buffering = false;
+  size_t gotP = 0, gotD = 0;
+  if (!s_buffering) {
+    gotP = sh->out.pop(proc, hop);
+    gotD = sh->dry.pop(dry, gotP);                     // same count as processed → stays aligned
+    if (gotP < hop) {
+      gTelemetry.outUnderruns.fetch_add(1, std::memory_order_relaxed);
+      s_buffering = true;                              // re-establish the headroom before resuming
+    }
   }
+  if (gotP < hop) std::memset(proc + gotP, 0, sizeof(float) * (hop - gotP));
   if (gotD < hop) std::memset(dry + gotD, 0, sizeof(float) * (hop - gotD));
+
+  // Model output guard: a NaN/Inf (or a wild sample) must never reach the stateful FX below —
+  // the reverb/delay feedback loops would latch it forever. (The build uses -ffast-math; see
+  // CMakeLists.txt for why -fno-finite-math-only keeps std::isfinite meaningful.)
+  for (size_t i = 0; i < hop; ++i) {
+    const float v = proc[i];
+    proc[i] = std::isfinite(v) ? clampf(v, -kProcSampleLimit, kProcSampleLimit) : 0.0f;
+  }
 
   // 2) Deinterleave ADC channels:
   //  - ch1 (index 0): guitar input -> monoIn
@@ -4558,8 +4727,8 @@ static int paCallback(const void *inputBuffer,
   // Global bypass: route monoIn to outputs
   if (gBypass.load(std::memory_order_relaxed)) {
     // Keep the processed/dry rings drained while bypassed (the model keeps running)
-    sh->out.r.store(sh->out.w.load(std::memory_order_acquire), std::memory_order_release);
-    sh->dry.r.store(sh->dry.w.load(std::memory_order_acquire), std::memory_order_release);
+    dropAligned(sh->out, sh->dry, sh->out.available());
+    s_buffering = true;
     for (size_t i = 0; i < hop; ++i) {
       float v = monoIn[i];
       size_t idx = numOutCh * i;
@@ -4689,8 +4858,10 @@ static int paCallback(const void *inputBuffer,
 
 // ───────────────────────── MAIN ─────────────────────────
 int main(int argc, char** argv) {
-  int  blockSize = 32; // must be <= T
+  int  blockSize = 32; // must equal the streaming model's T
   int  inDevId = -1, outDevId = -1;
+  int  webUiPort = 0;  // 0 = web UI off
+  int  latencyHops = 1; // processed hops queued ahead of the callback (jitter headroom vs latency)
   std::string tflitePath;
 
   bool listDev = false;
@@ -4700,6 +4871,11 @@ int main(int argc, char** argv) {
     else if(!strcmp(argv[i],"--input-device") && i+1<argc) inDevId  = atoi(argv[++i]);
     else if(!strcmp(argv[i],"--output-device")&&i+1<argc) outDevId = atoi(argv[++i]);
     else if(!strcmp(argv[i],"--tflite") && i+1<argc) tflitePath = argv[++i];
+    else if(!strcmp(argv[i],"--latency-hops") && i+1<argc) latencyHops = std::max(1, std::min(8, atoi(argv[++i])));
+    else if(!strcmp(argv[i],"--webui")) {
+      webUiPort = 8088;
+      if (i+1<argc && argv[i+1][0] != '-') webUiPort = atoi(argv[++i]);
+    }
     else {
       std::cerr<<"Unknown arg "<<argv[i]<<"\n";
       return 1;
@@ -4709,37 +4885,67 @@ int main(int argc, char** argv) {
   auto devices = getDevices();
   if (listDev) { listDevices(devices); return 0; }
 
-  if (inDevId<0 || outDevId<0 || tflitePath.empty()) {
-    std::cerr << "Usage: --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N]\n";
+  if (inDevId<0 || outDevId<0 || tflitePath.empty() || blockSize <= 0) {
+    std::cerr << "Usage: --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N] "
+                 "[--latency-hops N] [--webui [port]]\n";
     listDevices(devices);
     return 1;
   }
 
-  DeviceInfo inDev{}, outDev{};
+  bool haveIn = false, haveOut = false;
   for (auto &d : devices) {
-    if (d.devId == inDevId)  inDev = d;
-    if (d.devId == outDevId) outDev = d;
+    if (d.devId == inDevId)  haveIn  = (d.maxInputChannels  >= 8);
+    if (d.devId == outDevId) haveOut = (d.maxOutputChannels >= 8);
   }
-  if (inDev.devId<0 || outDev.devId<0) {
-    std::cerr<<"Invalid device IDs\n";
+  if (!haveIn || !haveOut) {
+    std::cerr<<"Invalid device IDs (need an existing input device with >= 8 inputs and an output device with >= 8 outputs)\n";
     listDevices(devices);
     return 1;
   }
 
   #ifdef __linux__
-    // Lock current and future memory to avoid page faults in RT audio threads
+    // Lock current and future memory to avoid page faults in RT audio threads (the model below is
+    // loaded AFTER this, so its weights/arena are locked too)
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
       perror("mlockall");
     }
-
-    // Try to give the process a SCHED_FIFO policy (requires CAP_SYS_NICE / root)
-    struct sched_param sp;
-    std::memset(&sp, 0, sizeof(sp));
-    sp.sched_priority = 20;  // tune as needed (1–99)
-    if (sched_setscheduler(0, SCHED_FIFO, &sp) != 0) {
-      perror("sched_setscheduler");
-    }
+    // NOTE: no process-wide SCHED_FIFO any more. The PortAudio callback and the inference thread
+    // set their own priorities (kCallbackRtPriority > kInferenceRtPriority); main/keyboard/UI
+    // threads stay SCHED_OTHER instead of inheriting an RT policy.
   #endif
+
+  // Load, validate and warm up the model BEFORE any thread or stream exists: a bad model or a
+  // wrong --blocksize fails cleanly here (instead of std::exit() inside the inference thread while
+  // the stream was already running and the terminal in raw mode), and lazy first-invoke work does
+  // not land in the first real-time hops.
+  std::unique_ptr<TFLiteRealtime> model;
+  try {
+    model = std::make_unique<TFLiteRealtime>(tflitePath);
+  } catch (const std::exception& e) {
+    std::cerr << e.what() << "\n";
+    return 1;
+  }
+  const int T = model->T();
+  if (model->isStreaming() && blockSize != T) {
+    // Streaming models REQUIRE hop == T: with hop < T the zero-padded tail of every block is fed
+    // into the model states and the same samples are re-fed next hop — state corruption.
+    std::cerr << "[MAIN] Error: this streaming model requires --blocksize " << T << " (got " << blockSize
+              << "); a different hop corrupts the streaming states.\n";
+    return 1;
+  }
+  if (!model->isStreaming() && blockSize > T) {
+    std::cerr << "[MAIN] Error: blocksize (" << blockSize << ") must be <= T (" << T << ")\n";
+    return 1;
+  }
+  if (!model->isStreaming() && blockSize != T)
+    std::cerr << "[MAIN] WARN: hop (" << blockSize << ") != T (" << T << ") on a windowed model; sliding-window mode.\n";
+  {
+    auto t0 = std::chrono::steady_clock::now();
+    model->warmUp();
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << "[MAIN] model warm-up: " << std::chrono::duration<double, std::milli>(t1 - t0).count() / 8.0
+              << " ms/hop (budget " << 1000.0 * blockSize / 48000.0 << " ms)\n";
+  }
 
   PaError err = Pa_Initialize();
   if (err != paNoError) {
@@ -4748,6 +4954,11 @@ int main(int argc, char** argv) {
   }
   auto *diIn  = Pa_GetDeviceInfo(inDevId);
   auto *diOut = Pa_GetDeviceInfo(outDevId);
+  if (!diIn || !diOut) {
+    std::cerr << "Pa_GetDeviceInfo failed for the selected devices\n";
+    Pa_Terminate();
+    return 1;
+  }
   int sampleRate = 48000;
 
   std::cout<<"[MAIN] In ["<<inDevId<<"] "<<diIn->name<<" sr="<<diIn->defaultSampleRate<<"\n";
@@ -4760,28 +4971,38 @@ int main(int argc, char** argv) {
   PaStreamParameters ip = { inDevId, 8, paFloat32, wantLatencySecs, nullptr };
   PaStreamParameters op = { outDevId, 8, paFloat32, wantLatencySecs, nullptr };
 
-  // stdin non-blocking for UI
-  termios oldt,newt;
-  tcgetattr(STDIN_FILENO,&oldt);
-  newt = oldt; newt.c_lflag &= ~(ICANON|ECHO);
-  tcsetattr(STDIN_FILENO,TCSANOW,&newt);
+  // stdin non-blocking for UI (only if stdin is a terminal; e.g. under systemd it is not)
+  termios oldt{}, newt{};
+  const bool haveTty = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO,&oldt) == 0;
+  if (haveTty) {
+    newt = oldt; newt.c_lflag &= ~(ICANON|ECHO);
+    tcsetattr(STDIN_FILENO,TCSANOW,&newt);
+  }
+  const int oldStdinFlags = fcntl(STDIN_FILENO, F_GETFL);
   fcntl(STDIN_FILENO,F_SETFL,O_NONBLOCK);
+  auto restoreTerminal = [&](){
+    if (haveTty) tcsetattr(STDIN_FILENO,TCSANOW,&oldt);
+    if (oldStdinFlags >= 0) fcntl(STDIN_FILENO, F_SETFL, oldStdinFlags);
+  };
 
   std::signal(SIGINT, signalHandler);
+  std::signal(SIGTERM, signalHandler);   // systemd / kill: shut down cleanly and restore the terminal
 
-// Shared rings
-size_t cap = 1<<14;
-Shared shared(cap);
-shared.tempIn.resize(blockSize);
-shared.tempOut.resize(blockSize);
-shared.tempStereo.resize(blockSize * 2);
-shared.tempDry.resize(blockSize);
-shared.tempFxReturnL.resize(blockSize);
-shared.tempFxReturnR.resize(blockSize);
+  // Shared rings (>= 16384 samples and >= 64 hops of headroom)
+  size_t cap = nextPow2(std::max<size_t>(size_t(1) << 14, size_t(64) * size_t(blockSize)));
+  Shared shared(cap);
+  shared.hop = size_t(blockSize);
+  shared.latencyHops = size_t(latencyHops);
+  shared.tempIn.resize(blockSize);
+  shared.tempOut.resize(blockSize);
+  shared.tempStereo.resize(blockSize * 2);
+  shared.tempDry.resize(blockSize);
+  shared.tempFxReturnL.resize(blockSize);
+  shared.tempFxReturnR.resize(blockSize);
 
   // Spawn inference thread
   InferCtx ictx;
-  ictx.sh = &shared; ictx.hop = blockSize; ictx.sampleRate = sampleRate; ictx.modelPath = tflitePath;
+  ictx.sh = &shared; ictx.hop = blockSize; ictx.sampleRate = sampleRate; ictx.rt = model.get();
   std::thread infThread([&](){ inferenceThread(ictx); });
 
   // Keyboard thread for bypass + knobs
@@ -4796,21 +5017,21 @@ shared.tempFxReturnR.resize(blockSize);
     << "r/f=Wet +/-5%  "
     << "t=Style mode (auto→pick→finger)  "
     << "g=Guided AUTO on/off  "
-    << "l=FX loop on/off  "          // NEW
+    << "l=FX loop on/off  "
     << "u=Pickup piezo/magnetic  "
     << "p=print"
     << "\n";
 
     while (!gStopFlag) {
       int c = getchar();
-      if (c == EOF) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+      if (c == EOF) { clearerr(stdin); std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
       if (c=='b'||c=='B') {
         bool now = !gBypass.load(std::memory_order_relaxed);
         gBypass.store(now, std::memory_order_release);
         gBypassEpoch.fetch_add(1, std::memory_order_acq_rel);   // the callback flushes the rings
         std::cout<<"[UI] Bypass "<<(now?"ON":"OFF")<<"\n";
 
-      } else if (c=='l' || c=='L') {          // NEW: FX loop toggle
+      } else if (c=='l' || c=='L') {
         bool now = !gFxLoopEnabled.load(std::memory_order_relaxed);
         gFxLoopEnabled.store(now, std::memory_order_relaxed);
         std::cout << "[UI] FX loop "
@@ -4852,33 +5073,42 @@ shared.tempFxReturnR.resize(blockSize);
     }
   });
 
-  // Comment out for now
-  // StartKnobWebUI(8088);
+  if (webUiPort > 0) StartKnobWebUI(static_cast<uint16_t>(webUiPort));
 
   inputSignalInit();
   PrewarmDsp();   // allocate every FX/EQ processor before the first RT callback
+  if (latencyHops > 1)
+    std::cout << "[MAIN] latency-hops=" << latencyHops << " (+" << 1000.0 * (latencyHops - 1) * blockSize / sampleRate
+              << " ms latency for " << latencyHops - 1 << " hop(s) of scheduling-jitter headroom)\n";
+
+  auto shutdownThreads = [&](){
+    gStopFlag = true;
+    if (webUiPort > 0) StopKnobWebUI();
+    infThread.join(); kbThread.join();
+    restoreTerminal();
+  };
 
   PaStream *stream = nullptr;
   err = Pa_OpenStream(&stream, &ip, &op, sampleRate, (unsigned long)blockSize, paNoFlag, paCallback, &shared);
   if (err != paNoError) {
     std::cerr<<"Pa_OpenStream failed: "<<Pa_GetErrorText(err)<<"\n";
-    Pa_Terminate(); gStopFlag = true;
-    infThread.join(); kbThread.join();
-    tcsetattr(STDIN_FILENO,TCSANOW,&oldt);
+    Pa_Terminate();
+    shutdownThreads();
     return 1;
   }
   err = Pa_StartStream(stream);
   if (err != paNoError) {
     std::cerr<<"Pa_StartStream failed: "<<Pa_GetErrorText(err)<<"\n";
-    Pa_CloseStream(stream); Pa_Terminate(); gStopFlag = true;
-    infThread.join(); kbThread.join();
-    tcsetattr(STDIN_FILENO,TCSANOW,&oldt);
+    Pa_CloseStream(stream); Pa_Terminate();
+    shutdownThreads();
     return 1;
   }
 
   auto *info = Pa_GetStreamInfo(stream);
-  gIOInputLatencySec  = info->inputLatency;
-  gIOOutputLatencySec = info->outputLatency;
+  if (info) {
+    gIOInputLatencySec  = info->inputLatency;
+    gIOOutputLatencySec = info->outputLatency;
+  }
   std::cerr<<"[MAIN] Actual I/O buffer: in="<<(int)std::round(gIOInputLatencySec*sampleRate)
            <<" out="<<(int)std::round(gIOOutputLatencySec*sampleRate)<<" frames\n";
   
@@ -4887,27 +5117,35 @@ shared.tempFxReturnR.resize(blockSize);
   std::cout<<"[MAIN] Streaming… (Ctrl-C to quit)\n";
   // Telemetry is printed here (main thread) — never from the RT inference thread / callback.
   uint64_t seenPeriodic = 0, seenKnob = 0;
+  bool warnedPrio = false, warnedXruns = false;
   while (!gStopFlag) {
     Pa_Sleep(50);
     const uint64_t ks = gTelemetry.knobSeq.load(std::memory_order_relaxed);
     if (ks != seenKnob) { seenKnob = ks; printKnobStatus("[UI]"); }
     const uint64_t ps = gTelemetry.periodicSeq.load(std::memory_order_relaxed);
     if (ps != seenPeriodic) { seenPeriodic = ps; printPeriodicTelemetry(); }
+    if (!warnedPrio && gTelemetry.rtPrioFailed.load(std::memory_order_relaxed)) {
+      warnedPrio = true;
+      std::cerr << "[MAIN] WARNING: could not set SCHED_FIFO priorities (run with sudo / CAP_SYS_NICE); expect xruns.\n";
+    }
+    if (!warnedXruns && gTelemetry.outUnderruns.load(std::memory_order_relaxed) >= 20) {
+      warnedXruns = true;
+      std::cerr << "[MAIN] HINT: the inference thread keeps missing its " << 1000.0 * blockSize / sampleRate
+                << " ms deadline (latency-hops=" << latencyHops << "). Each miss is a dropped hop (a click). "
+                   "Try --latency-hops " << latencyHops + 1 << " (+" << 1000.0 * blockSize / sampleRate
+                << " ms latency, one more period of headroom) or check the Proc= time above.\n";
+    }
   }
 
   std::cout<<"[MAIN] Stopping…\n";
-
-  // Comment out for now
-  // StopKnobWebUI();
 
   Pa_StopStream(stream);
   Pa_CloseStream(stream);
   Pa_Terminate();
   StopTempMonitor();
 
-  infThread.join();
-  kbThread.join();
-  tcsetattr(STDIN_FILENO,TCSANOW,&oldt);
+  shutdownThreads();
+  model.reset();   // after the inference thread is gone
   std::cout<<"[MAIN] Done.\n";
   return 0;
 }

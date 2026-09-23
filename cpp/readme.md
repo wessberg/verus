@@ -102,7 +102,7 @@ cmake --build .
 # USAGE
 
 ```
-cmake --build . && sudo ./stream_audio_cpp --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N]
+cmake --build . && sudo ./stream_audio_cpp --tflite <model.tflite> --input-device <id> --output-device <id> [--blocksize N] [--latency-hops N] [--webui [port]]
 ```
 
 E.g.:
@@ -118,9 +118,20 @@ Notes:
 - The master EQ (low cut / shelves / mid) runs inside this binary (`MasterEqIIR`, post-model),
   not in the model. The knobs are the existing EQ fields in `Knobs` / the (optional) web UI.
 - Every two seconds the main thread prints processing time, style, and health counters:
-  `xruns` (callback found no processed audio), `inDrops` (input ring full — the inference
-  thread is too slow), `resyncs` (backlog trimmed after an xrun to keep latency at one hop).
-  All three should stay at 0 during normal operation.
-- The September 2026 changes (lockstep DI/processed rings, semaphore-driven inference thread,
-  post-model EQ, DSP prewarm, main-thread telemetry) were syntax-checked against stub headers
-  only; the first build on the Pi may need trivial fixes.
+  `xruns` (callback found no processed audio → a dropped hop), `paXruns` (PortAudio/ALSA
+  reported an overflow/underflow), `inDrops` (input ring full — the inference thread is too
+  slow), `resyncs` (backlog trimmed after a stall to keep the latency at `--latency-hops`).
+  All of them should stay at 0 during normal operation.
+- At start-up the model is loaded, validated and warmed up before the stream opens; the warm-up
+  prints the measured ms/hop next to the 0.67 ms budget. If `Proc=` is close to the budget or
+  `xruns` climb, use `--latency-hops 2` (+0.67 ms latency, one extra period of headroom).
+- Run with `sudo` (or CAP_SYS_NICE): the callback thread uses SCHED_FIFO 40 and the inference
+  thread SCHED_FIFO 35; a warning is printed if that is not permitted.
+- `--webui [port]` serves the knob UI on 127.0.0.1 (default port 8088).
+- Build verification (2026-09-22): `src/main.cpp` compiles warning-free (`-Wall -Wextra`) with
+  GCC 12.2 on Debian Bookworm arm64 (the Raspberry Pi OS toolchain) against the real TFLite
+  2.20, flatbuffers 24.3.25 and PortAudio headers, and its TFLite wrapper, master EQ, ring buffers
+  and callback/inference pipeline were exercised in a native test harness (outputs bit-identical
+  to the Python TFLite runner). It has not been run on real audio hardware yet.
+- The CMake file defaults to a Release build. It keeps `-ffast-math` but adds
+  `-fno-finite-math-only`; without it the compiler deletes every `std::isfinite` NaN guard.

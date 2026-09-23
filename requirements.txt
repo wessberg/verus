@@ -8,3 +8,6 @@ soundfile
 
 # Optional: desktop UI (python -m piezo2mic_app)
 # pyside6
+
+# Optional: train_guard.py (memory/swap/disk watchdog for long training runs)
+# psutil
