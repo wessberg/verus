@@ -122,6 +122,8 @@ round 06 a training run swapped until the SSD filled and macOS crashed.
 | `piezo2mic_app/` | PySide6 desktop converter (shells out to `--process`) |
 | `train_guard.py` | memory / swap / disk watchdog for long jobs |
 | `eq_match.py` | acoustic magnetic → electric humbucker EQ match ("fake electric" sources) |
+| `RECORDING.md` | the booth session guide: what to play, how, in which order, and how the files are prepared |
+| booth sheet | https://claude.ai/artifact/6FcdUY47gjuzV5oNALoJjj — tick-through version with take timer and noise log (its database: BACKLOG B-23) |
 | `input/` | training audio (layout: `TRAINING.md` §4); `input/eqmatch/` is not read by training |
 | `out/models/` | trained models; `out/models/offline/legacy_2025-10/` = backup of the Oct-2025 offline model |
 | `out/checkpoints/`, `out/logs/`, `out/analysis/` | checkpoints, training logs, `--analyze-attacks` results |

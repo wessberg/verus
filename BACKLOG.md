@@ -6,14 +6,18 @@ delete it and say so in that round's file. How this fits with the rounds: `AGENT
 
 ## Now — blocked on the user
 
-### B-1 [user] Record the magnetic triplets
-Piezo + magnetic soundhole pickup + mic, **simultaneously**, on the same acoustic, 96 kHz / 24-bit,
-aligned, ≥ 1 h per style (pick / finger). Layout and requirements: `TRAINING.md` §4. Use the same
-soundhole-pickup settings as the EQ-match recording (B-2). Unblocks B-6, B-7, B-8, B-13.
+### B-1 [user] Record the four-track session (the "magnetic triplets", now with two mics)
+Piezo + magnetic soundhole pickup + soundhole mic + 12th-fret mic, **simultaneously**, on the acoustic,
+96 kHz / 24-bit, ≥ 1 h per style (pick / finger). **The session step by step, what to play: `RECORDING.md`**
+(eight 15-min takes alternating styles + an EQ-match take, ~3 h in the booth); requirements:
+`TRAINING.md` §4 "The four-track session". Same soundhole-pickup settings as the EQ-match pair (B-2).
+**Free disk first:** ~16 GB with the DAW session and the exports, 12 GB free on 2026-09-23 (round 08).
+Unblocks B-6, B-7, B-8, B-13, B-22.
 
 ### B-2 [user] Record the EQ-match pair
 The same material on the electric (humbucker DI) and on the acoustic's magnetic pickup, ≥ 5 min each,
-same style, into `input/eqmatch/`. Instructions: `TRAINING.md` §4 "EQ-match recordings". Why ≥ 5 min
+same style, into `input/eqmatch/`. The acoustic half is take 9 of the booth session; the electric
+half is played along to it at home (`RECORDING.md`). Requirements: `TRAINING.md` §4 "EQ-match recordings". Why ≥ 5 min
 and the same material: round 07's synthetic test (the curve is limited by what was played). Unblocks B-5.
 
 ### B-3 [user] Check the pedal's input impedance
@@ -23,6 +27,32 @@ needs high impedance too, so one Hi-Z buffer in front of the ADC would serve bot
 DI through the same kind of input the pedal will have. (Round 07.)
 
 ## Next — once the recordings exist
+
+### B-23 Session prep: raw booth exports → `input/`
+`RECORDING.md` has the user export each take raw: four mono WAVs (`takeNN_<style>_piezo`,
+`_magnetic`, `_mic_soundhole`, `_mic_12th`), unaligned and untrimmed, plus room tone and a log. A
+standalone tool (like `eq_match.py`) implementing `RECORDING.md` "Preparing the files":
+- **aligns on the three bridge taps** (median of the three onset offsets, piezo vs the earlier mic)
+  and shifts **both** mics by it; checks with midband (80 Hz–1 kHz) onsets after silence, median
+  ≈ 0 ms like the old corpus. Not by cross-correlation of the playing: ambiguous by 2.9 ms on this
+  guitar (body resonance ~175 Hz) and pulled by the 6.5 ms high-band pick-contact lead (round 08);
+- checks polarity (low-band correlation at zero offset positive, as in the old corpus; else invert
+  the mic pair together); reports the inter-mic delay and the offset's consistency across takes;
+- one gain constant per track for the whole session (pickups to the old piezo level, the mic pair
+  with one shared gain to the old mic-vs-piezo relation); no per-take normalization;
+- writes `input/piezo|magnetic/<style>/{source,target}/takeNN_*.wav` with a stereo target
+  (channel 1 = soundhole, channel 2 = 12th fret) and the magnetic target as a hard link;
+- cuts the noise times from the log (1 s before to 2 s after; splits the take there, 5 ms fades,
+  drops pieces < 30 s) and trims the leading taps. The log is the booth sheet's database
+  (https://claude.ai/artifact/6FcdUY47gjuzV5oNALoJjj; `ArtifactData`): `takes/t01`…`t11` with `startedAt`/`endedAt` (epoch ms), `start`,
+  `length`, `pick`, `capo`, `noise` ("mm:ss, mm:ss", time into the take, tapped by hand — so ± 1–2 s:
+  look for the transient near each mark), `notes`; `booth/setup` `fields` (mic models, distances,
+  gains, guitar controls); `booth/checks` `items`;
+- checks every take: clipping, pickup hum, DC, rumble, noise floor against the room tone, levels,
+  style and length, and says what's wrong;
+- writes take 9's magnetic track as `input/eqmatch/acoustic_magnetic.wav` (silence kept, taps removed).
+Streams in blocks (the disk and memory rules in `AGENTS.md`). The same alignment is needed for
+end-user fine-tuning (B-20). First thing to do when the recordings arrive.
 
 ### B-5 Run the EQ match and A/B it by ear
 `python eq_match.py input/eqmatch/acoustic_magnetic.wav input/eqmatch/electric_humbucker.wav` →
@@ -46,6 +76,32 @@ listened to.
 ### B-7 Cross-pickup consistency loss
 `model(piezo_src) ≈ model(magnetic_src)` (and ≈ `model(fake_electric_src)`) for the same take; the
 `TODO(data)` marker in `load_training_data()`. Needs triplet pairing (B-1).
+
+### B-22 Stereo output: the user's two-mic setup as the target
+Proposed and decided by the user (round 08): the target is recorded as they record acoustic guitar
+anyway — one mic in front of the soundhole, one at the shoulder pointing down at the 12th fret — and
+the model outputs both channels; the player chooses stereo or mono. Why it fits: the pedal already has a stereo path
+(the mono model output is copied to L/R before the stereo FX; DAC output 8 is the mono sum), and the
+two mics differ mostly in ways the pickup signal can predict (body and low end at the soundhole,
+string and fretboard at the 12th fret, different arrival times). What it needs:
+- **Recording:** `TRAINING.md` §4 "The four-track session" (both mics as separate tracks, the pair
+  aligned to the pickups as a group — their relative delay is the stereo image).
+- **Loader:** stereo targets (channel 1 = soundhole, channel 2 = 12th fret); `_LazyMono` reads
+  channel 1 only today.
+- **Losses for the image, not just each channel:** per-channel losses only constrain the
+  inter-channel phase below `OFFLINE_PHASE_LOSS_CUTOFF_HZ` (3 kHz); above it both channels are trained
+  on magnitude alone, so their relationship would be arbitrary (too narrow or phasey). Also supervise
+  mid (L+R) and side (L−R) magnitudes, and give the discriminators both channels.
+- **Mono:** summing spaced mics comb-filters (~20–30 cm spacing → ~0.5–1 ms → first notch around
+  0.5–1 kHz) — the same as summing the real mics. Offer a blend control (ends = a single mic, no
+  comb) and/or an aligned sum (delay the earlier mic by the measured inter-mic delay before summing).
+- **Model/runtime:** a two-channel output head; the realtime cost on the Pi rises by however much of
+  the output stage is per channel — measure (B-9). C++ and `--process` write stereo; parity checks
+  per channel.
+- **Old data:** the 2 h corpus's mic (a small condenser some distance off the soundhole, angled)
+  matches neither position, so it only warm-starts: initialize both output channels from the old
+  single output head, then train on the four-track session.
+Implement before B-8 (the retrain), together with B-6 and B-7.
 
 ### B-8 Full retrain → export
 Offline warm start under the guard with the Mac otherwise idle (`TRAINING.md` §5 Step 1; ~13–14 h),

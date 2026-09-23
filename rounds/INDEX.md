@@ -15,3 +15,4 @@ state sections and the previous agent's notes.
 | [05](round_05.md) | 2026-09-22 | Third pass: KD alignment and `val_loss` fixes, polyphase upsamplers (2.2x faster), pedal builds on the Pi toolchain, ring/DI race fixes |
 | [06](round_06.md) | 2026-09-23 | Pick attack: the mic hears the pick contact ~6.5 ms before the piezo; split phase/magnitude + adversarial offline loss, `--analyze-attacks`, pilot; retrain crashed the Mac |
 | [07](round_07.md) | 2026-09-23 | Memory-safe training + `train_guard.py`; retrain postponed until magnetic triplets; electric-guitar strategy; `eq_match.py`; this rounds structure; future desktop app, DAW plugins (VST3/AU + ARA) and end-user fine-tuning in the backlog |
+| [08](round_08.md) | 2026-09-23 | Stereo two-mic target (soundhole + 12th fret) decided: B-22; the next corpus is a four-track session (`TRAINING.md` §4); booth guide `RECORDING.md` |

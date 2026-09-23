@@ -135,12 +135,50 @@ input/
   auto-alignment in the pipeline).
 - At least ~1 hour per style, roughly 50/50 pick vs finger.
 - Source = pickup DI (piezo under-saddle, or magnetic soundhole pickup). Target = mic.
-- **For magnetic support, record triplets**: piezo + magnetic soundhole pickup + mic
-  *simultaneously* on the same acoustic guitar. Every take then yields two training pairs
-  sharing one identical mic target, and later enables the cross-pickup consistency loss
-  (`TODO(data)` marker in `load_training_data()` — not implemented until triplets exist).
+- **For magnetic support, record the pickups together**: piezo + magnetic soundhole pickup + the
+  mics *simultaneously* on the same acoustic guitar ("triplets"; with two mics, the four-track
+  session below). Every take then yields two training pairs sharing one identical mic target, and
+  later enables the cross-pickup consistency loss (`TODO(data)` marker in `load_training_data()` —
+  not implemented until such takes exist).
 - Train/val split is automatic: the **last ~20% of each file** is held out (contiguous tail,
   no leakage). Longer takes → more meaningful validation.
+
+### The four-track session (piezo + magnetic + two mics)
+
+The next corpus (BACKLOG B-1) is recorded the way the user records acoustic guitar anyway, so the
+model can output that stereo pair (B-22). **What to play, how, and the session step by step:
+`RECORDING.md`.** The requirements:
+
+- **Four tracks at once**, through one interface (one clock), 96 kHz / 24-bit: piezo DI, magnetic
+  soundhole pickup DI (both on high-impedance inputs), **mic 1 in front of the soundhole**, **mic 2
+  at the shoulder pointing down at the 12th fret**. ≥ 1 h per style, as above.
+- Keep the mic positions fixed for the whole session and write them down (mic models, distances,
+  angles; a photo helps) next to the takes — the model learns this exact setup.
+- The soundhole pickup with the same settings as the EQ-match pair (below).
+- **Alignment** (the prep step B-23 does it from the raw exports; by hand otherwise — details and
+  the reasons: `RECORDING.md` "Preparing the files"): move the two mic tracks *together, as a
+  group*, until the earlier of the two lines up with the piezo, measured on the bridge taps (the old
+  takes' midband onsets line up at a median of 0.0 ms fingerstyle, −1.5 ms picked; round 08). Never nudge one mic against the other — their relative delay
+  is the stereo image. The two pickups need no shift (same clock, no acoustic path). Each take
+  starts with three knuckle taps on the bridge as a reference (`RECORDING.md`).
+- **Files** — the same take has the same name under `piezo/` and `magnetic/`; that is how the triplet
+  pairing (B-7) will find it:
+
+  ```
+  input/piezo/<style>/source/takeN_source.wav     piezo, mono
+  input/magnetic/<style>/source/takeN_source.wav  magnetic, mono
+  input/piezo/<style>/target/takeN_target.wav     stereo: channel 1 = soundhole mic, channel 2 = 12th-fret mic
+  input/magnetic/<style>/target/takeN_target.wav  a hard link to the file above (ln: no extra disk)
+  ```
+
+  Until stereo training exists (B-22) the loader reads channel 1 only — the soundhole mic, the
+  closest to where the old corpus's mic stood (a small condenser some distance off the soundhole,
+  angled).
+- **Disk:** 2 h of four tracks is ~8.3 GB in the DAW session and ~8.3 GB again once exported into
+  `input/`; the dev Mac had 12 GB free on 2026-09-23 and training needs ≥ 6 GB free (`train_guard.py`).
+  Record the session to an external drive and free space before exporting, or keep `input/` on an
+  external SSD (training reads per segment, so that's fine; the hard link then needs both files on
+  that drive).
 
 ### EQ-match recordings (fake electric sources)
 
