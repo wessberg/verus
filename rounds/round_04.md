@@ -3,7 +3,7 @@
 - **Date:** 2026-09-02
 - **Agent:** Claude (Claude Code)
 - **Goal:** second review and fix pass over training, export and the pedal.
-- **Commits:** `3e73234a` "fix: bug fixes"
+- **Commits:** `02a62b88` "fix: bug fixes"
 
 *Written retroactively in round 07 from the previous agent's notes and `TRAINING.md`.*
 

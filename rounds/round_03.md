@@ -4,7 +4,7 @@
 - **Agent:** Claude (Claude Code)
 - **Goal:** review `piezo2mic.py` and the pedal, fix what was found, and add a pickup-type input so the
   model can take a magnetic pickup as well as the piezo.
-- **Commits:** `d5d775af` "Fix all review findings and add magnetic-pickup conditioning"
+- **Commits:** `e80bc943` "Fix all review findings and add magnetic-pickup conditioning"
 
 *Written retroactively in round 07 from the previous agent's notes and `TRAINING.md`.*
 
