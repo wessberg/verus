@@ -1,3 +1,4 @@
+# Same as the dependencies in pyproject.toml (`pip install -e .` installs them).
 # Core training / inference (Keras 3 API is required; the code uses e.g.
 # LeakyReLU(negative_slope=...) and registered-serializable Lambdas)
 tensorflow>=2.19,<2.21
@@ -6,8 +7,8 @@ numpy
 scipy
 soundfile
 
-# Optional: desktop UI (python -m piezo2mic_app)
+# Optional: desktop UI (python -m verus.app)
 # pyside6
 
-# Optional: train_guard.py (memory/swap/disk watchdog for long training runs)
+# Optional: tools/train_guard.py (memory/swap/disk watchdog for long training runs)
 # psutil

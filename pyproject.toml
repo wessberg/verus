@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "verus"
+version = "0.1.0"
+description = "Turns a guitar pickup signal into the sound of a mic'd acoustic guitar, in stereo."
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dependencies = [
+    # Keras 3 API is required; the code uses e.g. LeakyReLU(negative_slope=...) and
+    # registered-serializable Lambdas.
+    "tensorflow>=2.19,<2.21",
+    "ai-edge-litert",
+    "numpy",
+    "scipy",
+    "soundfile",
+]
+
+[project.optional-dependencies]
+app = ["pyside6"]     # desktop converter: python -m verus.app
+tools = ["psutil"]    # tools/train_guard.py: memory / swap / disk watchdog for long training runs
+
+[project.scripts]
+verus = "verus.cli:main"
+verus-app = "verus.app.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

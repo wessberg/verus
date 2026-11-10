@@ -5,8 +5,15 @@ out/checkpoints/
 out/logs/
 out/csv-logs/
 
-cpp/lib/
-cpp/build/
+runtime/lib/
+runtime/build/
 __pycache__/
 *.pyc
 out/analysis/
+
+.claude/
+*.egg-info/
+build/
+dist/
+.venv/
+.vscode/
